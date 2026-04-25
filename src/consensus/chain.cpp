@@ -295,6 +295,25 @@ bool CChainState::ActivateBestChain(CBlockIndex* pindexNew, const CBlock& block,
         if (g_verbose.load(std::memory_order_relaxed))
             std::cout << "[Chain] VDF DISTRIBUTION REPLACEMENT -- 1-block reorg" << std::endl;
 
+        // v4.0.21 — Patch B: Capture the old tip's block data BEFORE disconnect so
+        // we can roll back if ConnectTip(pindexNew) fails.
+        //
+        // Pre-fix bug (incident 2026-04-25): if ConnectTip below failed, undo data
+        // for oldTip was already deleted by DisconnectTip → UndoBlock → batch.Delete(undoKey).
+        // The function then returned false, leaving "block-is-tip-but-undo-missing".
+        // Any subsequent reorg attempt would deterministically fail trying to disconnect
+        // that block, looping forever. Fix B: re-apply old tip on failure.
+        CBlockIndex* pindexOldTip = pindexTip;
+        CBlock oldTipBlock;
+        bool oldTipBlockLoaded = false;
+        if (pdb != nullptr && pindexOldTip != nullptr) {
+            oldTipBlockLoaded = pdb->ReadBlock(pindexOldTip->GetBlockHash(), oldTipBlock);
+            if (!oldTipBlockLoaded) {
+                std::cerr << "[Chain] WARN: Could not pre-load old tip block for Case 2.5 rollback safety; "
+                          << "proceeding without rollback capability for height " << pindexOldTip->nHeight << std::endl;
+            }
+        }
+
         // Disconnect current tip
         if (!DisconnectTip(pindexTip)) {
             std::cerr << "[Chain] ERROR: Failed to disconnect tip for VDF replacement" << std::endl;
@@ -304,9 +323,26 @@ bool CChainState::ActivateBestChain(CBlockIndex* pindexNew, const CBlock& block,
         // Connect new block (shares same parent as old tip)
         if (!ConnectTip(pindexNew, block)) {
             std::cerr << "[Chain] CRITICAL: Failed to connect VDF replacement block" << std::endl;
-            std::cerr << "[Chain] Chain is in intermediate state (tip disconnected)." << std::endl;
-            // NOTE: This is the same failure mode as any reorg ConnectTip failure
-            // in Case 3. The chain is in an inconsistent state and will need a restart.
+
+            // v4.0.21 — Patch B: roll back to old tip to restore undo data.
+            if (oldTipBlockLoaded && pindexOldTip != nullptr) {
+                std::cerr << "[Chain] Case 2.5 rollback: re-applying old tip "
+                          << pindexOldTip->GetBlockHash().GetHex().substr(0, 16)
+                          << " at height " << pindexOldTip->nHeight << std::endl;
+                if (!ConnectTip(pindexOldTip, oldTipBlock)) {
+                    std::cerr << "[CRITICAL] Case 2.5 rollback FAILED — chain state inconsistent at height "
+                              << pindexOldTip->nHeight << ". Triggering auto_rebuild." << std::endl;
+                    m_chain_needs_rebuild.store(true);
+                    return false;
+                }
+                pindexTip = pindexOldTip;
+                m_cachedHeight.store(pindexOldTip->nHeight, std::memory_order_release);
+                std::cerr << "[Chain] Case 2.5 rollback succeeded; old tip restored." << std::endl;
+            } else {
+                std::cerr << "[CRITICAL] Case 2.5 ConnectTip failed and old tip block was unreadable. "
+                          << "Cannot roll back. Triggering auto_rebuild." << std::endl;
+                m_chain_needs_rebuild.store(true);
+            }
             return false;
         }
 

@@ -300,8 +300,34 @@ bool CheckConsecutiveMiner(
     // Force recalc at this height to avoid stale cache (Cursor review finding #2).
     tracker.IsInCooldown(currentMik, pindex->nHeight);
     int activeMiners = tracker.GetActiveMiners();
-    if (activeMiners <= 1)
-        return true;
+
+    // v4.0.21 — Patch C: tighten solo-miner exemption with deterministic
+    // lifetime gate. Pre-fix bug (incident 2026-04-25): if the active sliding
+    // window happened to contain mostly one MIK's blocks (Vector 3
+    // self-reinforcing dominance), activeMiners reports 1, solo exemption
+    // fires, that MIK keeps mining freely. New rule: solo exemption only
+    // applies if BOTH activeMiners <= 1 AND the chain has had <= bootstrap
+    // threshold (5) distinct MIKs in its entire history. Once the chain has
+    // seen more miners, "solo" is no longer a legitimate state — it's a
+    // concentration symptom and the consecutive-miner cap applies.
+    int soloLifetimeGateHeight = Dilithion::g_chainParams ?
+        Dilithion::g_chainParams->soloExemptionLifetimeGateHeight : 999999999;
+    constexpr int kBootstrapMinerThreshold = 5;
+    if (activeMiners <= 1) {
+        if (pindex->nHeight < soloLifetimeGateHeight) {
+            // Pre-activation: original solo exemption applies (no lifetime gate).
+            return true;
+        }
+        // Post-activation: solo exemption gated on lifetime miner count.
+        int lifetimeMiners = tracker.GetLifetimeMinerCount();
+        if (lifetimeMiners <= kBootstrapMinerThreshold) {
+            return true;  // genuine bootstrap network, allow solo
+        }
+        // Otherwise: even though activeMiners is 1 right now, the chain has
+        // seen many distinct MIKs over its history — fall through to consecutive
+        // check. The rule will reject 4+ same-MIK in a row even with reported
+        // activeMiners=1. Network self-heals as other miners come back online.
+    }
 
     // Walk back through parent chain, counting consecutive same-miner blocks
     int consecutiveCount = 0;
@@ -324,29 +350,37 @@ bool CheckConsecutiveMiner(
     }
 
     if (consecutiveCount >= MAX_CONSECUTIVE_SAME_MINER) {
-        // Stall exemption: if no block has been produced for a long time,
-        // allow the same miner past the consecutive limit to keep the chain
-        // alive.  Without this, a chain where only one miner is active (but
-        // many MIKs are registered) deadlocks permanently — the sole miner
-        // hits the consecutive cap and nobody else produces blocks.
-        //
-        // 3600s threshold (raised from 600s): at 600s, a solo miner produced
-        // ~18 blocks/hour, fast enough to outpace legitimate chains. At 3600s,
-        // a solo miner produces ~3 blocks/hour — too slow to exploit but
-        // keeps chain alive when genuinely only one miner is online.
-        static constexpr int64_t CONSECUTIVE_STALL_THRESHOLD_SECS = 3600;
+        // v4.0.21 — Patch A: retire stall exemption above activation height.
+        // The 1-hour stall exemption was an attack surface during the 2026-04-25
+        // incident. With 50+ active miners, a 1-hour stall is not a real failure
+        // mode; if it does happen, operator action (forcerebuild RPC, manual
+        // intervention) is the right response, not a quiet rule bypass.
+        // For activation see consecutiveMinerStallExemptionRetiredHeight (DilV: 44600).
+        // For pre-activation history we keep the original behaviour so this
+        // change is forward-only and does not invalidate existing chain history.
+        int stallRetiredHeight = Dilithion::g_chainParams ?
+            Dilithion::g_chainParams->consecutiveMinerStallExemptionRetiredHeight : 999999999;
 
-        if (pindex->pprev) {
-            int64_t gap = static_cast<int64_t>(block.nTime) -
-                          static_cast<int64_t>(pindex->pprev->nTime);
-            if (gap >= CONSECUTIVE_STALL_THRESHOLD_SECS) {
-                std::cout << "[Chain] CheckConsecutiveMiner: stall exemption at height "
-                          << pindex->nHeight << " (gap=" << gap
-                          << "s >= " << CONSECUTIVE_STALL_THRESHOLD_SECS << "s, "
-                          << (consecutiveCount + 1) << " consecutive)" << std::endl;
-                return true;
+        if (pindex->nHeight < stallRetiredHeight) {
+            // Pre-activation: original stall exemption applies.
+            // Stall exemption: if no block has been produced for a long time,
+            // allow the same miner past the consecutive limit to keep the chain
+            // alive. 3600s threshold = ~3 blocks/hour for a solo miner.
+            static constexpr int64_t CONSECUTIVE_STALL_THRESHOLD_SECS = 3600;
+
+            if (pindex->pprev) {
+                int64_t gap = static_cast<int64_t>(block.nTime) -
+                              static_cast<int64_t>(pindex->pprev->nTime);
+                if (gap >= CONSECUTIVE_STALL_THRESHOLD_SECS) {
+                    std::cout << "[Chain] CheckConsecutiveMiner: stall exemption at height "
+                              << pindex->nHeight << " (gap=" << gap
+                              << "s >= " << CONSECUTIVE_STALL_THRESHOLD_SECS << "s, "
+                              << (consecutiveCount + 1) << " consecutive)" << std::endl;
+                    return true;
+                }
             }
         }
+        // Post-activation OR no stall exemption matched: fall through to error below.
 
         std::ostringstream oss;
         oss << "CheckConsecutiveMiner: MIK ";
@@ -929,12 +963,20 @@ bool CheckVDFReplacementPreflight(
             }
 
             if (consecutiveCount >= MAX_CONSECUTIVE_SAME_MINER) {
-                static constexpr int64_t CONSECUTIVE_STALL_THRESHOLD_SECS = 3600;
+                // v4.0.21 — Patch A: retire stall exemption above activation height.
+                // Mirror of the change in CheckConsecutiveMiner (line ~326).
+                // Both call sites updated in lockstep so a block rejected by the
+                // authoritative connect path is also rejected by preflight.
+                int stallRetiredHeight = Dilithion::g_chainParams ?
+                    Dilithion::g_chainParams->consecutiveMinerStallExemptionRetiredHeight : 999999999;
                 bool stallExempt = false;
-                if (pindexNew && pindexNew->pprev) {
-                    int64_t gap = static_cast<int64_t>(block.nTime) -
-                                  static_cast<int64_t>(pindexNew->pprev->nTime);
-                    if (gap >= CONSECUTIVE_STALL_THRESHOLD_SECS) stallExempt = true;
+                if (height < stallRetiredHeight) {
+                    static constexpr int64_t CONSECUTIVE_STALL_THRESHOLD_SECS = 3600;
+                    if (pindexNew && pindexNew->pprev) {
+                        int64_t gap = static_cast<int64_t>(block.nTime) -
+                                      static_cast<int64_t>(pindexNew->pprev->nTime);
+                        if (gap >= CONSECUTIVE_STALL_THRESHOLD_SECS) stallExempt = true;
+                    }
                 }
                 if (!stallExempt) {
                     error = "CheckVDFReplacementPreflight: consecutive-miner preflight failed";

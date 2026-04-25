@@ -190,6 +190,26 @@ public:
     // 999999999 = disabled
     int consecutiveMinerCheckHeight;
 
+    // v4.0.21 — Patch A: After this height, the 1-hour stall exemption in
+    // CheckConsecutiveMiner and CheckVDFReplacementPreflight is RETIRED.
+    // The exemption was an attack surface during the 2026-04-25 incident:
+    // chain stalls during fork churn allowed consecutive-miner bypass which
+    // compounded with cooldown self-reinforcement. With 50+ active miners
+    // on mainnet, a 1-hour gap is not a real failure mode; if it does happen,
+    // operator action (forcerebuild RPC) is the right response, not a quiet
+    // rule bypass. Set to a future height (DilV mainnet = 44600) so v4.0.21
+    // is forward-only and existing chain history retains the prior rule.
+    // 999999999 = disabled
+    int consecutiveMinerStallExemptionRetiredHeight;
+
+    // v4.0.21 — Patch C: After this height, the solo-miner exemption in
+    // CheckConsecutiveMiner only applies if BOTH activeMiners <= 1 AND the
+    // chain has had <= kBootstrapMinerThreshold (5) distinct MIKs in its
+    // entire history. Prevents the "active window dominated → activeMiners
+    // reports 1 → solo exemption fires" self-reinforcing exploit.
+    // 999999999 = disabled
+    int soloExemptionLifetimeGateHeight;
+
     // VDF cooldown short window (blocks) for dual-window cooldown.
     // After stabilizationForkHeight, effective cooldown = min(longCooldown, shortCooldown).
     // Short window tracks recent participation; long window prevents gaming.

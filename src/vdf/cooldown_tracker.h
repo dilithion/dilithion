@@ -95,6 +95,14 @@ public:
     /** Number of unique miners seen in the short window. */
     int GetShortActiveMiners() const;
 
+    /** v4.0.21 — Patch C: Number of distinct MIKs with at least one block on
+     *  the active chain (lifetime, not a sliding window). Used by the
+     *  consecutive-miner consensus rule's solo-exemption gate. Deterministic:
+     *  a function purely of canonical chain state, not of node restart history.
+     *  See OnBlockConnected/OnBlockDisconnected for the per-MIK count maintenance.
+     *  Reloaded by replaying connect events from genesis on startup. */
+    int GetLifetimeMinerCount() const;
+
     /** All MIK addresses that have ever mined (for DNA discovery). */
     std::vector<Address> GetKnownAddresses() const;
 
@@ -169,6 +177,15 @@ private:
 
     // Layer 3: height → MIK identity (only for registration blocks, for rate limiting)
     std::map<int, Address> m_heightToRegistration;
+
+    // v4.0.21 — Patch C: per-MIK count of blocks currently contributing to the
+    // active chain. Updated in OnBlockConnected (++) and OnBlockDisconnected (--).
+    // A MIK is "lifetime active" iff its count > 0. Lifetime miner count =
+    // m_lifetimeBlockCount.size().
+    // Deterministic: the count is a function purely of canonical chain state,
+    // not of node restart history. Reloaded by replaying connect events from
+    // genesis on startup (NOT from sliding window).
+    std::map<Address, int> m_lifetimeBlockCount;
 
     /** Recount active miners up to `height` (long window).  Caller must hold m_mutex. */
     void RecalcActiveMiners(int height) const;

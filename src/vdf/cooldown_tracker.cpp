@@ -262,6 +262,10 @@ void CCooldownTracker::OnBlockConnected(int height, const Address& winner, int64
     m_lastWinHeight[winner] = height;
     m_heightToWinner[height] = winner;
 
+    // v4.0.21 — Patch C: increment lifetime block count for this winner.
+    // Deterministic: pure function of canonical chain state.
+    m_lifetimeBlockCount[winner]++;
+
     // Store timestamp for time-based expiry
     if (blockTimestamp > 0) {
         m_lastWinTimestamp[winner] = blockTimestamp;
@@ -301,6 +305,16 @@ void CCooldownTracker::OnBlockDisconnected(int height)
     m_heightToTimestamp.erase(height);
     m_heightToRegistration.erase(height);  // Layer 3: undo registration tracking
 
+    // v4.0.21 — Patch C: decrement lifetime block count. Remove the entry
+    // entirely if it reaches zero so GetLifetimeMinerCount() returns the
+    // accurate count of MIKs with at least one block on the active chain.
+    auto lifeIt = m_lifetimeBlockCount.find(winner);
+    if (lifeIt != m_lifetimeBlockCount.end()) {
+        if (--lifeIt->second <= 0) {
+            m_lifetimeBlockCount.erase(lifeIt);
+        }
+    }
+
     // Recompute the address's last win height from remaining entries.
     // Scan backwards from the end of m_heightToWinner.
     int lastWin = -1;
@@ -338,10 +352,22 @@ void CCooldownTracker::Clear()
     m_lastWinTimestamp.clear();
     m_heightToTimestamp.clear();
     m_heightToRegistration.clear();
+    m_lifetimeBlockCount.clear();  // v4.0.21 — Patch C
     m_cachedActiveMinersMut = 0;
     m_cachedAtHeightMut = -1;
     m_cachedShortActiveMinersMut = 0;
     m_cachedShortAtHeightMut = -1;
+}
+
+// v4.0.21 — Patch C: lifetime distinct-miner count. Deterministic across nodes
+// with the same canonical chain because populated only via connect/disconnect
+// callbacks, which fire deterministically per-block. On startup, the populator
+// at dilithion-node.cpp:~4515 calls OnBlockConnected for every block from
+// genesis to tip in order, rebuilding this map identically on every node.
+int CCooldownTracker::GetLifetimeMinerCount() const
+{
+    std::lock_guard<std::mutex> lock(m_mutex);
+    return static_cast<int>(m_lifetimeBlockCount.size());
 }
 
 void CCooldownTracker::RecalcActiveMiners(int height) const

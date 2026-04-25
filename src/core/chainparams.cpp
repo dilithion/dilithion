@@ -122,6 +122,8 @@ ChainParams ChainParams::Mainnet() {
     params.dfmpCooldownConsensusHeight = 999999999; // Disabled (VDF not active on mainnet)
     params.stallExemptionV2Height = 999999999;     // Disabled (VDF not active on mainnet)
     params.consecutiveMinerCheckHeight = 999999999; // Disabled (VDF not active on mainnet)
+    params.consecutiveMinerStallExemptionRetiredHeight = 999999999;  // v4.0.21 Patch A: disabled on DIL (no VDF)
+    params.soloExemptionLifetimeGateHeight = 999999999;              // v4.0.21 Patch C: disabled on DIL (no VDF)
     params.vdfCooldownShortWindow = 0;               // Disabled (VDF not active on mainnet)
     params.stabilizationForkHeight = 999999999;      // Disabled (VDF not active on mainnet)
     params.mikWindowCapWindow = 0;                   // Disabled (VDF not active on mainnet)
@@ -310,6 +312,8 @@ ChainParams ChainParams::Testnet() {
     params.dfmpCooldownConsensusHeight = 0;    // Consensus-enforced cooldown from genesis
     params.stallExemptionV2Height = 0;         // Tightened stall exemption from genesis
     params.consecutiveMinerCheckHeight = 0;    // Reject >3 consecutive from genesis
+    params.consecutiveMinerStallExemptionRetiredHeight = 0;  // v4.0.21 Patch A: testnet retires stall exemption from genesis
+    params.soloExemptionLifetimeGateHeight = 0;              // v4.0.21 Patch C: testnet activates lifetime gate from genesis
     params.vdfCooldownShortWindow = 0;         // Disabled — avoids MIN_COOLDOWN bypass
     params.stabilizationForkHeight = 0;        // Dual-window + time expiry from genesis
     params.mikWindowCapWindow = 480;           // 480 blocks = ~6h at 45s/block (MVP)
@@ -448,6 +452,14 @@ ChainParams ChainParams::DilV() {
     params.dfmpCooldownConsensusHeight = 0;    // Consensus-enforced cooldown from genesis
     params.stallExemptionV2Height = 0;         // Tightened stall exemption from genesis
     params.consecutiveMinerCheckHeight = 0;    // Reject >3 consecutive blocks from same miner from genesis
+    // v4.0.21 — Patch A: retire 1-hour stall exemption in CheckConsecutiveMiner +
+    // CheckVDFReplacementPreflight. Activation = 44600 (forward-only, ~150 blocks
+    // above current network tip ~44400 to give miners ~110 minutes to upgrade).
+    // Existing chain history below 44600 retains the prior rule.
+    params.consecutiveMinerStallExemptionRetiredHeight = 44600;
+    // v4.0.21 — Patch C: tighten solo-miner exemption with deterministic lifetime
+    // gate. Same activation height as Patch A.
+    params.soloExemptionLifetimeGateHeight = 44600;
     params.vdfCooldownShortWindow = 0;         // Disabled at genesis — avoids short-window MIN_COOLDOWN bypass
     params.stabilizationForkHeight = 0;        // Dual-window cooldown + time-based expiry from genesis
 

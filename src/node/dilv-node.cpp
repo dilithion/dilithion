@@ -4380,14 +4380,23 @@ load_genesis_block:  // Bug #29: Label for automatic retry after blockchain wipe
         if (g_node_context.cooldown_tracker != nullptr) {
             CBlockIndex* pindexTip = g_chainstate.GetTip();
             if (pindexTip != nullptr && pindexTip->nHeight > 0) {
-                const int windowSize = cooldown_tracker.GetActiveWindow();
-                int startHeight = std::max(vdf_activation, pindexTip->nHeight - windowSize + 1);
+                // v4.0.21 — Patch C: walk from VDF activation (effectively
+                // genesis on DilV) so m_lifetimeBlockCount is deterministic and
+                // covers the full chain history. Active-window state still ends
+                // up correct because OnBlockConnected auto-evicts entries
+                // outside the active window. The lifetime count needs every
+                // block's MIK observed at least once, so a full-chain walk
+                // is required for determinism across nodes with different
+                // restart histories. Cost: O(chain_length) block reads at
+                // startup (~tens of seconds for 44k blocks). Acceptable.
+                int startHeight = std::max(vdf_activation, 1);
 
                 // Only attempt population if we're past VDF activation
                 if (pindexTip->nHeight >= vdf_activation) {
-                    std::cout << "Populating VDF cooldown tracker from existing chain..." << std::endl;
+                    std::cout << "Populating VDF cooldown tracker from existing chain "
+                              << "(full-history scan for v4.0.21 lifetime determinism)..." << std::endl;
 
-                    // Walk back from tip to startHeight
+                    // Walk back from tip to startHeight (typically VDF activation height = 0 on DilV)
                     std::vector<CBlockIndex*> recentBlocks;
                     CBlockIndex* pindex = pindexTip;
                     while (pindex != nullptr && pindex->nHeight >= startHeight) {
