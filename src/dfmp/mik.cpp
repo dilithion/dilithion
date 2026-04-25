@@ -231,7 +231,7 @@ std::vector<uint8_t> BuildMIKSignatureMessage(
     return message;
 }
 
-bool VerifyMIKSignature(
+bool VerifyMIKSignatureExact(
     const std::vector<uint8_t>& pubkey,
     const std::vector<uint8_t>& signature,
     const uint256& prevHash,
@@ -264,6 +264,52 @@ bool VerifyMIKSignature(
     );
 
     return result == 0;
+}
+
+bool VerifyMIKSignature(
+    const std::vector<uint8_t>& pubkey,
+    const std::vector<uint8_t>& signature,
+    const uint256& prevHash,
+    int height,
+    uint32_t timestamp,
+    const Identity& identity) {
+    // First try the supplied timestamp directly. In the common case (signature
+    // was created over block.nTime exactly, e.g. for blocks produced by miners
+    // running the post-v4.1.0 fixed signing path), this single check passes
+    // and we return immediately — no perceptible cost added vs. v4.0.19.
+    if (VerifyMIKSignatureExact(pubkey, signature, prevHash, height, timestamp, identity)) {
+        return true;
+    }
+
+    // Fast-path validation: skip brute-force if obviously malformed.
+    // (These all fail quickly inside Exact too, but checking here avoids the
+    // 180-iteration loop on garbage input.)
+    if (pubkey.size() != MIK_PUBKEY_SIZE || signature.size() != MIK_SIGNATURE_SIZE) {
+        return false;
+    }
+    Identity derivedIdentity = DeriveIdentityFromMIK(pubkey);
+    if (derivedIdentity != identity) {
+        return false;
+    }
+
+    // v4.0.20 backward-window brute force.
+    // The signing happens at wall-clock T1 (in RPC), the block's final nTime
+    // is set at T3 (after VDF + grace period in vdf_miner.cpp). For DilV
+    // mainnet, T3 - T1 can be up to ~90s. We scan back kMIKVerifyBackwardWindowSeconds
+    // (180s) for safety margin. Stop at first match.
+    //
+    // Underflow guard: don't wrap below the genesis timestamp on chains
+    // with very early blocks.
+    constexpr uint32_t kFloor = 1;
+    for (uint32_t k = 1; k <= kMIKVerifyBackwardWindowSeconds; ++k) {
+        if (timestamp <= k) break;            // Don't subtract past 0
+        const uint32_t earlier = timestamp - k;
+        if (earlier < kFloor) break;
+        if (VerifyMIKSignatureExact(pubkey, signature, prevHash, height, earlier, identity)) {
+            return true;
+        }
+    }
+    return false;
 }
 
 Identity DeriveIdentityFromMIK(const std::vector<uint8_t>& pubkey) {

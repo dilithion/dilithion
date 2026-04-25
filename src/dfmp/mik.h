@@ -213,17 +213,72 @@ std::vector<uint8_t> BuildMIKSignatureMessage(
     const Identity& identity);
 
 /**
- * Verify a MIK signature
+ * v4.0.20: Backward-time-window for MIK signature verification.
+ *
+ * The current signing path has a race: signing happens in the RPC handler at
+ * wall-clock T1, but the block's final nTime is set later — once after
+ * CreateBlockTemplate (T2 ≈ T1), and again inside vdf_miner.cpp after the VDF
+ * computation + grace period (T3, can be 45+ seconds after T1 on DilV).
+ * Verification at fork-time uses block.nTime (T3), which doesn't match the
+ * signed-with timestamp (T1). Result: every v4.0.18/4.0.19 block from a
+ * v4.0.18+ miner fails fork-validation. This caused the 2026-04-25 mainnet
+ * chain split between v4.0.17 and v4.0.18+ nodes.
+ *
+ * Until the signing path is moved to AFTER the final nTime is set
+ * (planned for v4.1.0 — see roadmap below), v4.0.20 verifiers brute-force a
+ * backward window from block.nTime, trying each candidate signing-time. The
+ * window is sized to cover VDF (45s) + grace period (45s) + clock skew (90s
+ * margin) = 180s.
+ *
+ * Roadmap to v4.1.0 (Option B from the v4.0.20 design discussion):
+ *   - Move signing to immediately before block submission so it commits to
+ *     the FINAL block.nTime — fixes the race at the source.
+ *   - Once all miners are on v4.1.0+, the brute-force loop in this file is
+ *     dead code and can be removed.
+ *   - Activation: hard-fork height where verifiers REJECT signatures that
+ *     don't match block.nTime exactly. Drop the backward window.
+ *
+ * Cost: in the worst case 181 Dilithium3 verifies (~1 ms each on x86_64).
+ * For the common case (signature was made over block.nTime exactly), the
+ * very first attempt succeeds and the window is never iterated.
+ */
+constexpr uint32_t kMIKVerifyBackwardWindowSeconds = 180;
+
+/**
+ * Verify a MIK signature.
+ *
+ * v4.0.20: First tries verification with the supplied timestamp; on failure,
+ * scans backward up to kMIKVerifyBackwardWindowSeconds seconds to catch
+ * blocks signed by v4.0.18/4.0.19 miners whose signing time predated
+ * block.nTime by up to that window.
  *
  * @param pubkey Public key (1,952 bytes)
  * @param signature Signature to verify (3,309 bytes)
  * @param prevHash Previous block hash
  * @param height Block height
- * @param timestamp Block timestamp
+ * @param timestamp Block timestamp (typically block.nTime); also the upper
+ *                  bound of the backward search window
  * @param identity Expected identity (must match SHA3-256(pubkey)[:20])
- * @return true if signature is valid
+ * @return true if signature is valid for some timestamp in
+ *         [timestamp - kMIKVerifyBackwardWindowSeconds, timestamp]
  */
 bool VerifyMIKSignature(
+    const std::vector<uint8_t>& pubkey,
+    const std::vector<uint8_t>& signature,
+    const uint256& prevHash,
+    int height,
+    uint32_t timestamp,
+    const Identity& identity);
+
+/**
+ * Verify a MIK signature with EXACT timestamp match (no backward-window).
+ *
+ * Internal helper used by VerifyMIKSignature for each candidate timestamp.
+ * Exposed for tests and for code paths that need strict matching (e.g. the
+ * post-v4.1.0 strict verifier path once the timestamp race is fixed at the
+ * signer side).
+ */
+bool VerifyMIKSignatureExact(
     const std::vector<uint8_t>& pubkey,
     const std::vector<uint8_t>& signature,
     const uint256& prevHash,
