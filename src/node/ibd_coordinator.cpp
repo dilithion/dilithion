@@ -143,14 +143,20 @@ void CIbdCoordinator::Tick() {
                 if (Dilithion::g_chainParams) {
                     datadir = Dilithion::g_chainParams->dataDir;
                 }
+                // Build combined reason when BOTH signals fire so operators see the
+                // full picture in auto_rebuild (Cursor review feedback, 2026-04-25).
                 std::string reason;
-                if (utxo_rebuild) {
-                    reason = "UTXO corruption detected at height " + std::to_string(m_chainstate.GetHeight());
+                const std::string heightStr = std::to_string(m_chainstate.GetHeight());
+                if (utxo_rebuild && chain_rebuild) {
+                    uint256 failing = m_chainstate.GetLastUndoFailureHash();
+                    reason = "UTXO corruption AND persistent UndoBlock failure at height "
+                             + heightStr + " hash=" + failing.GetHex();
+                } else if (utxo_rebuild) {
+                    reason = "UTXO corruption detected at height " + heightStr;
                 } else {
                     uint256 failing = m_chainstate.GetLastUndoFailureHash();
                     reason = "Persistent UndoBlock failure at height "
-                             + std::to_string(m_chainstate.GetHeight())
-                             + " hash=" + failing.GetHex();
+                             + heightStr + " hash=" + failing.GetHex();
                 }
                 Dilithion::WriteAutoRebuildMarker(datadir, reason);
 

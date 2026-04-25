@@ -1806,8 +1806,11 @@ bool CChainState::VerifyRecentUndoIntegrity(int probeDepth,
     CBlockIndex* pwalker = pindexTip;
     int probed = 0;
     while (pwalker != nullptr && probed < probeDepth) {
-        // Don't probe the genesis block — it has no undo data by design
-        // (no inputs to restore, no outputs to remove from a prior state).
+        // Stop walking at genesis — we don't need to reorg past it, so verifying
+        // its undo entry adds no operational value. (ApplyBlock does write an
+        // undo_<hash> record for every connected block including genesis when
+        // the genesis path runs through it; we just don't need to assert that
+        // here. Per Cursor review 2026-04-25.)
         if (pwalker->pprev == nullptr) {
             break;
         }
