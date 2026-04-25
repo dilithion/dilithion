@@ -171,6 +171,18 @@ public:
     bool UndoBlock(const CBlock& block, const uint256& blockHash);
 
     /**
+     * v4.0.19: Cheap probe for whether undo data exists for a given block hash.
+     * Reads the value from LevelDB to confirm presence (no atomicity guarantees
+     * against concurrent writes, but used at startup before block processing
+     * begins, so concurrency is not a concern).
+     * Used by CChainState::VerifyRecentUndoIntegrity during startup to detect
+     * the missing-undo-data corruption mode (incident 2026-04-25).
+     * @param blockHash The block hash to probe
+     * @return true if an undo_<blockhash> entry exists in LevelDB
+     */
+    bool HasUndoData(const uint256& blockHash) const;
+
+    /**
      * Flush all pending changes to disk
      * This writes all cached additions/deletions to LevelDB
      * @return true if successful

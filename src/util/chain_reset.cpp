@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <string>
 #include <system_error>
@@ -99,6 +100,33 @@ ChainResetReport ResetChainState(const std::string& datadir) {
     }
 
     return report;
+}
+
+bool WriteAutoRebuildMarker(const std::string& datadir, const std::string& reason) {
+    if (datadir.empty()) {
+        std::cerr << "[Recovery] WriteAutoRebuildMarker: empty datadir, refusing to write marker"
+                  << std::endl;
+        return false;
+    }
+    std::filesystem::path markerPath = std::filesystem::path(datadir) / "auto_rebuild";
+    std::ofstream marker(markerPath);
+    if (!marker.is_open()) {
+        std::cerr << "[Recovery] WriteAutoRebuildMarker: failed to open " << markerPath.string()
+                  << " for write" << std::endl;
+        return false;
+    }
+    // Single-line reason. The startup handler reads this and logs it; some operators
+    // also tail the file directly. Keep newline-terminated for log readability.
+    marker << reason << std::endl;
+    marker.close();
+    if (marker.fail()) {
+        std::cerr << "[Recovery] WriteAutoRebuildMarker: write to " << markerPath.string()
+                  << " failed (stream error)" << std::endl;
+        return false;
+    }
+    std::cerr << "[Recovery] Wrote auto_rebuild marker to " << markerPath.string()
+              << " (reason: " << reason << ")" << std::endl;
+    return true;
 }
 
 bool ConfirmChainReset(const std::string& datadir, bool yesFlag) {

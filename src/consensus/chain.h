@@ -70,6 +70,21 @@ private:
     std::atomic<bool> m_utxo_needs_rebuild{false};
     static constexpr int MAX_UTXO_FAILURES_BEFORE_REBUILD = 3;
 
+    // v4.0.19: Persistent UndoBlock failure detection (parallel to BUG #277).
+    // Catches the failure mode where DisconnectTip's UndoBlock returns false
+    // repeatedly on the same block hash because undo data is missing on disk.
+    // Without this, the node loops forever attempting reorgs it cannot complete
+    // (incident 2026-04-25, NYC + LDN DilV seeds).
+    // Counter is incremented on UndoBlock failure for the same hash, reset to 1
+    // when the failing hash changes, and reset to 0 on any successful disconnect.
+    // m_last_undo_failure_hash is uint256 (not trivially atomic) — protected by
+    // m_undo_failure_mutex which is held only briefly to update both fields.
+    std::atomic<int> m_consecutive_undo_failures{0};
+    std::atomic<bool> m_chain_needs_rebuild{false};
+    uint256 m_last_undo_failure_hash;
+    mutable std::mutex m_undo_failure_mutex;
+    static constexpr int kPersistentUndoFailureThreshold = 3;
+
     // Bug #40 fix: Callback mechanism for tip updates
     // Allows HeadersManager and other components to be notified when chain tip changes
     using TipUpdateCallback = std::function<void(const CBlockIndex*)>;
@@ -139,6 +154,62 @@ public:
      * BUG #277: Clear the UTXO rebuild flag (after recovery is initiated)
      */
     void ClearUTXORebuildFlag() { m_utxo_needs_rebuild.store(false); m_consecutive_utxo_failures.store(0); }
+
+    /**
+     * v4.0.19: Check if persistent UndoBlock failure was detected and the chain
+     * needs a full resync. Polled by IBDCoordinator::Tick alongside NeedsUTXORebuild.
+     * @return true if chain undo state is unrecoverable and a rebuild is needed
+     */
+    bool NeedsChainRebuild() const { return m_chain_needs_rebuild.load(); }
+
+    /**
+     * v4.0.19: Clear the chain rebuild flag (after recovery is initiated).
+     * Resets the consecutive failure counter and the last-failure hash.
+     */
+    void ClearChainRebuildFlag();
+
+    /**
+     * v4.0.19: Get the hash that triggered the most recent persistent undo failure.
+     * Used by IBDCoordinator to write a useful reason into the auto_rebuild marker.
+     * Returns null hash if no failure has been recorded.
+     */
+    uint256 GetLastUndoFailureHash() const;
+
+    /**
+     * v4.0.19: Record an UndoBlock failure for a specific block.
+     * Increments counter if same hash as last failure, resets to 1 if different.
+     * Sets m_chain_needs_rebuild when threshold reached.
+     * Internal — called from DisconnectTip on UndoBlock failure path.
+     */
+    void RecordUndoFailure(const uint256& blockHash, int height);
+
+    /**
+     * v4.0.19: Reset undo failure tracking after a successful disconnect.
+     * Called whenever DisconnectTip succeeds.
+     */
+    void ResetUndoFailureCounter();
+
+    /**
+     * v4.0.19: Startup-time integrity check for undo data on the active chain.
+     *
+     * Walks back up to probeDepth blocks from the current tip and confirms that
+     * each block has a corresponding undo_<hash> entry in the UTXO LevelDB.
+     * Catches the missing-undo-data corruption mode that causes reorg loops
+     * (incident 2026-04-25). The check is cheap — one LevelDB Get per block,
+     * called once at startup.
+     *
+     * If any probed block is missing its undo entry, fills the out parameters
+     * with the FIRST missing block (closest to tip) and returns false.
+     *
+     * @param probeDepth Maximum number of blocks to walk back from tip
+     * @param outMissingHash Receives the hash of the first missing-undo block
+     * @param outMissingHeight Receives that block's height
+     * @return true if all probed blocks have undo data (or chain is empty);
+     *         false if any block is missing undo (out params populated)
+     */
+    bool VerifyRecentUndoIntegrity(int probeDepth,
+                                   uint256& outMissingHash,
+                                   int& outMissingHeight) const;
 
     /**
      * Get current chain tip (most work)

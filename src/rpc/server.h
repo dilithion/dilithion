@@ -336,6 +336,10 @@ private:
     std::string RPC_ExportMnemonic(const std::string& params);
     std::string RPC_DumpPrivKey(const std::string& params);
     std::string RPC_ImportPrivKey(const std::string& params);
+
+    // v4.0.19: Operator escape hatch — write auto_rebuild marker and shut down.
+    // Admin-gated (ADMIN_SERVER), rate-limited 1/min, hidden from public help.
+    std::string RPC_ForceRebuild(const std::string& params);
     std::string RPC_GetHDWalletInfo(const std::string& params);
     std::string RPC_ListHDAddresses(const std::string& params);
     std::string RPC_RescanWallet(const std::string& params);

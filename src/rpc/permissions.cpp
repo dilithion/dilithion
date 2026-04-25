@@ -131,6 +131,9 @@ void CRPCPermissions::InitializeMethodPermissions() {
     uint32_t adminServer = static_cast<uint32_t>(RPCPermission::ADMIN_SERVER);
 
     m_methodPermissions["stop"]               = adminServer;
+    // v4.0.19: forcerebuild writes auto_rebuild marker and shuts down. Treated
+    // as an admin-server operation alongside `stop` because it triggers shutdown.
+    m_methodPermissions["forcerebuild"]       = adminServer;
 
     // ========================================================================
     // Public Methods (no permission required)

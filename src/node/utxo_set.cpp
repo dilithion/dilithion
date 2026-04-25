@@ -1141,3 +1141,25 @@ bool CUTXOSet::Clear() {
 
     return true;
 }
+
+// ============================================================================
+// v4.0.19: HasUndoData — cheap existence probe for undo_<blockhash> entry
+// ============================================================================
+// Used at startup by CChainState::VerifyRecentUndoIntegrity to detect the
+// missing-undo-data corruption mode (incident 2026-04-25). Symmetric with the
+// undo key construction in ApplyBlock (line ~562) and UndoBlock (line ~606):
+// key format is "undo_" + 32 bytes of blockHash.data.
+
+bool CUTXOSet::HasUndoData(const uint256& blockHash) const {
+    if (!IsOpen()) {
+        return false;
+    }
+    std::lock_guard<std::recursive_mutex> lock(cs_utxo);
+
+    std::string undoKey = "undo_";
+    undoKey.append(reinterpret_cast<const char*>(blockHash.data), 32);
+
+    std::string undoValue;
+    leveldb::Status status = db->Get(leveldb::ReadOptions(), undoKey, &undoValue);
+    return status.ok();
+}

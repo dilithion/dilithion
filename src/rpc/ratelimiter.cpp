@@ -37,6 +37,8 @@ const std::map<std::string, CRateLimiter::MethodRateLimit> CRateLimiter::METHOD_
     {"exportmnemonic",         {20.0, 0.333, 1.0}},  // 20/min - sensitive data export
     {"dumpprivkey",            {5.0,  0.083, 1.0}},  // 5/min - sensitive key export
     {"importprivkey",          {5.0,  0.083, 1.0}},  // 5/min - wallet key import
+    // v4.0.19: forcerebuild triggers wipe + IBD; 1/min is intentionally conservative.
+    {"forcerebuild",           {1.0,  0.0167, 1.0}}, // 1/min - destructive operator action
 
     // === HIGH: Mining Control (20/min) ===
     {"startmining",            {20.0, 0.333, 1.0}},  // 20/min - resource intensive

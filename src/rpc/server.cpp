@@ -36,6 +36,7 @@
 #include <dfmp/identity_db.h>  // DFMP v2.0: Identity database
 #include <digital_dna/dna_verification.h>  // DFMP v3.4: Verification-aware free tier
 #include <core/chainparams.h>  // For Dilithion::g_chainParams
+#include <util/chain_reset.h>   // v4.0.19: WriteAutoRebuildMarker
 #include <script/htlc.h>        // HTLC script templates
 #include <script/script.h>      // CScript, opcodes
 #include <script/atomic_swap.h> // Atomic swap state machine
@@ -227,6 +228,7 @@ CRPCServer::CRPCServer(uint16_t port)
     m_handlers["exportmnemonic"] = [this](const std::string& p) { return RPC_ExportMnemonic(p); };
     m_handlers["dumpprivkey"] = [this](const std::string& p) { return RPC_DumpPrivKey(p); };
     m_handlers["importprivkey"] = [this](const std::string& p) { return RPC_ImportPrivKey(p); };
+    m_handlers["forcerebuild"] = [this](const std::string& p) { return RPC_ForceRebuild(p); };
     m_handlers["gethdwalletinfo"] = [this](const std::string& p) { return RPC_GetHDWalletInfo(p); };
     m_handlers["listhdaddresses"] = [this](const std::string& p) { return RPC_ListHDAddresses(p); };
     m_handlers["rescanwallet"] = [this](const std::string& p) { return RPC_RescanWallet(p); };
@@ -1469,7 +1471,7 @@ void CRPCServer::HandleClient(int clientSocket) {
     } else if (rpcReq.method == "sendtoaddress" || rpcReq.method == "encryptwallet" ||
                rpcReq.method == "walletpassphrase" || rpcReq.method == "exportmnemonic" ||
                rpcReq.method == "dumpprivkey" || rpcReq.method == "importprivkey" ||
-               rpcReq.method == "stop") {
+               rpcReq.method == "stop" || rpcReq.method == "forcerebuild") {
         // Log sensitive operations
         std::cout << "[RPC-AUDIT] " << clientIP << " called " << rpcReq.method
                   << " - SUCCESS" << std::endl;
@@ -4196,6 +4198,83 @@ std::string CRPCServer::RPC_ImportPrivKey(const std::string& params) {
         << "\"success\":true"
         << "}";
 
+    return oss.str();
+}
+
+// ============================================================================
+// v4.0.19: forcerebuild — operator escape hatch for stuck-chain recovery
+// ============================================================================
+// Writes the auto_rebuild marker file with operator-supplied reason and triggers
+// graceful shutdown. On restart, the wrapper sees the marker and the startup
+// code wipes blocks/chainstate for a clean resync. Used when an operator
+// already knows a node is stuck (e.g. NYC/LDN incident 2026-04-25) and doesn't
+// want to wait for the in-process detection threshold (Fix A) to fire.
+//
+// Auth: ADMIN_SERVER (registered in permissions.cpp). Rate limit: 1/min.
+// Hidden from public help — operators learn it from runbooks.
+//
+// Params (object): {"reason": "<string, max 256 chars, alnum/space/._-:>"}
+std::string CRPCServer::RPC_ForceRebuild(const std::string& params) {
+    constexpr size_t kMaxReasonLen = 256;
+
+    std::string reason;
+    if (!params.empty()) {
+        try {
+            auto j = nlohmann::json::parse(params);
+            if (j.is_object() && j.contains("reason")) {
+                reason = j["reason"].get<std::string>();
+            }
+        } catch (...) {}
+    }
+
+    if (reason.empty()) {
+        throw std::runtime_error("Missing required parameter: reason (string)");
+    }
+    if (reason.size() > kMaxReasonLen) {
+        throw std::runtime_error("Parameter 'reason' too long (max "
+                                 + std::to_string(kMaxReasonLen) + " chars)");
+    }
+    // Sanitise: alphanumeric + space, underscore, hyphen, dot, colon. No quotes,
+    // newlines, or shell metachars — keeps the marker file safe to grep, log,
+    // and embed in operator alerts.
+    for (char c : reason) {
+        const bool ok = std::isalnum(static_cast<unsigned char>(c))
+                     || c == ' ' || c == '_' || c == '-' || c == '.' || c == ':';
+        if (!ok) {
+            throw std::runtime_error("Parameter 'reason' contains disallowed characters; "
+                                     "allowed: alphanumeric, space, _-.:");
+        }
+    }
+
+    std::string datadir;
+    if (Dilithion::g_chainParams) {
+        datadir = Dilithion::g_chainParams->dataDir;
+    }
+    if (datadir.empty()) {
+        throw std::runtime_error("ChainParams not initialised — refusing to write marker");
+    }
+
+    const std::string fullReason = "operator_forcerebuild: " + reason;
+    if (!Dilithion::WriteAutoRebuildMarker(datadir, fullReason)) {
+        throw std::runtime_error("Failed to write auto_rebuild marker");
+    }
+
+    std::cerr << "[CRITICAL] forcerebuild: operator-initiated rebuild scheduled. Shutting down."
+              << std::endl;
+
+    // Trigger graceful shutdown after a brief delay so the response can be sent.
+    std::thread([]() {
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        g_node_state.running = false;
+    }).detach();
+
+    const std::string markerPath = datadir + "/auto_rebuild";
+    std::ostringstream oss;
+    oss << "{"
+        << "\"status\":\"shutdown_initiated\","
+        << "\"marker_path\":\"" << EscapeJSON(markerPath) << "\","
+        << "\"reason\":\"" << EscapeJSON(fullReason) << "\""
+        << "}";
     return oss.str();
 }
 

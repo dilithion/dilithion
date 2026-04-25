@@ -23,6 +23,7 @@
 #include <net/peers.h>
 #include <net/protocol.h>
 #include <node/block_validation_queue.h>  // Phase 2: Async block validation
+#include <util/chain_reset.h>  // v4.0.19: WriteAutoRebuildMarker
 #include <node/fork_manager.h>  // Validate-before-disconnect fork handling
 #include <net/orphan_manager.h>  // IBD STUCK FIX #3: Periodic orphan scan
 #include <node/block_processing.h>  // BUG #260: ProcessNewBlock for orphan re-processing
@@ -114,40 +115,49 @@ void CIbdCoordinator::Tick() {
     }
 
     // =========================================================================
-    // BUG #277: Auto-recovery from UTXO corruption
+    // BUG #277 + v4.0.19: Auto-recovery from chain corruption
     // =========================================================================
-    // When ConnectTip fails repeatedly due to UTXO lookup errors (e.g., after
-    // OOM crash), the chain state signals that a rebuild is needed. We write
-    // a marker file and trigger graceful shutdown. On next restart, the node
-    // detects the marker and auto-wipes blocks+chainstate for a clean resync.
-    if (m_chainstate.NeedsUTXORebuild()) {
-        static bool recovery_triggered = false;
-        if (!recovery_triggered) {
-            recovery_triggered = true;
-            std::cerr << "\n==========================================================" << std::endl;
-            std::cerr << "CRITICAL: UTXO corruption detected! Auto-recovery initiated." << std::endl;
-            std::cerr << "The node will shut down and rebuild on next restart." << std::endl;
-            std::cerr << "==========================================================" << std::endl;
-
-            // Write marker file so startup code knows to wipe and resync
-            std::string datadir;
-            if (Dilithion::g_chainParams) {
-                datadir = Dilithion::g_chainParams->dataDir;
-            }
-            if (!datadir.empty()) {
-                std::string markerPath = datadir + "/auto_rebuild";
-                std::ofstream marker(markerPath);
-                if (marker.is_open()) {
-                    marker << "UTXO corruption detected at height " << m_chainstate.GetHeight() << std::endl;
-                    marker.close();
-                    std::cerr << "[Recovery] Wrote auto_rebuild marker to " << markerPath << std::endl;
+    // Two failure modes feed into one recovery path:
+    //   - NeedsUTXORebuild()  : ConnectTip's ApplyBlock fails repeatedly (BUG #277)
+    //   - NeedsChainRebuild() : DisconnectTip's UndoBlock fails repeatedly on the
+    //                           same hash (v4.0.19, incident 2026-04-25)
+    // In either case we write the auto_rebuild marker file with a reason describing
+    // which signal fired, then trigger graceful shutdown.
+    {
+        const bool utxo_rebuild = m_chainstate.NeedsUTXORebuild();
+        const bool chain_rebuild = m_chainstate.NeedsChainRebuild();
+        if (utxo_rebuild || chain_rebuild) {
+            static bool recovery_triggered = false;
+            if (!recovery_triggered) {
+                recovery_triggered = true;
+                std::cerr << "\n==========================================================" << std::endl;
+                if (utxo_rebuild) {
+                    std::cerr << "CRITICAL: UTXO corruption detected! Auto-recovery initiated." << std::endl;
+                } else {
+                    std::cerr << "CRITICAL: Persistent UndoBlock failure detected! Auto-recovery initiated." << std::endl;
                 }
-            }
+                std::cerr << "The node will shut down and rebuild on next restart." << std::endl;
+                std::cerr << "==========================================================" << std::endl;
 
-            // Trigger graceful shutdown
-            g_node_state.running = false;
+                std::string datadir;
+                if (Dilithion::g_chainParams) {
+                    datadir = Dilithion::g_chainParams->dataDir;
+                }
+                std::string reason;
+                if (utxo_rebuild) {
+                    reason = "UTXO corruption detected at height " + std::to_string(m_chainstate.GetHeight());
+                } else {
+                    uint256 failing = m_chainstate.GetLastUndoFailureHash();
+                    reason = "Persistent UndoBlock failure at height "
+                             + std::to_string(m_chainstate.GetHeight())
+                             + " hash=" + failing.GetHex();
+                }
+                Dilithion::WriteAutoRebuildMarker(datadir, reason);
+
+                g_node_state.running = false;
+            }
+            return;
         }
-        return;
     }
 
     int header_height = m_node_context.headers_manager->GetBestHeight();

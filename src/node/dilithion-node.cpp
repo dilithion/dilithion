@@ -2748,6 +2748,37 @@ load_genesis_block:  // Bug #29: Label for automatic retry after blockchain wipe
                     }
                 }
 
+                // v4.0.19 Fix B: Startup undo-presence integrity check.
+                // Catches the missing-undo-data corruption mode (incident 2026-04-25)
+                // BEFORE the node starts trying to reorg and loops forever. If any
+                // recent block lacks its undo entry, write auto_rebuild marker and exit.
+                {
+                    constexpr int kStartupUndoIntegrityProbeDepth = 100;
+                    uint256 missingHash;
+                    int missingHeight = 0;
+                    if (!g_chainstate.VerifyRecentUndoIntegrity(kStartupUndoIntegrityProbeDepth,
+                                                                missingHash, missingHeight)) {
+                        std::cerr << "\n==========================================================" << std::endl;
+                        std::cerr << "[CRITICAL] Startup integrity check failed: undo data missing"
+                                  << " for block at height " << missingHeight
+                                  << " hash=" << missingHash.GetHex() << std::endl;
+                        std::cerr << "This node cannot perform reorgs without manual recovery."
+                                  << " Writing auto_rebuild marker — node will wipe and resync"
+                                  << " on next launch." << std::endl;
+                        std::cerr << "==========================================================" << std::endl;
+
+                        const std::string reason =
+                            "Startup integrity: undo missing at height " + std::to_string(missingHeight)
+                            + " hash=" + missingHash.GetHex();
+                        Dilithion::WriteAutoRebuildMarker(config.datadir, reason);
+
+                        delete Dilithion::g_chainParams;
+                        return 2;  // Distinguishable exit code; wrapper restarts and wipes
+                    }
+                    std::cout << "  [OK] Startup undo integrity check passed (probed last "
+                              << kStartupUndoIntegrityProbeDepth << " blocks)" << std::endl;
+                }
+
                 std::cout << "  [OK] Loaded chain state: " << chainHashes.size() + 1 << " blocks (height "
                           << pindexTip->nHeight << ")" << std::endl;
             } else {
