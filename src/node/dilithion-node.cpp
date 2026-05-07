@@ -34,6 +34,7 @@
 #include <node/block_processing.h>
 #include <node/mempool.h>
 #include <node/utxo_set.h>
+#include <node/chainstate_integrity_monitor.h>  // v4.4 Block 8
 #include <node/genesis.h>
 #include <node/block_index.h>
 #include <consensus/params.h>
@@ -2285,6 +2286,14 @@ int main(int argc, char* argv[]) {
         std::cout << "  [OK] UTXO set opened" << std::endl;
         g_utxo_set.store(&utxo_set);  // BUG #108 FIX: Set global pointer for TX validation
 
+        // v4.4 Block 8: ChainstateIntegrityMonitor lifecycle.
+        // Constructed AFTER the startup integrity check passes (below); started
+        // via main-loop poll once g_utxo_sync_enabled.load() == true (i.e. IBD
+        // has fully exited). Destructor (Stop() + join) runs when this scope
+        // exits at end of main().
+        std::unique_ptr<Dilithion::ChainstateIntegrityMonitor> integrity_monitor;
+        bool integrity_monitor_started = false;
+
         // Initialize transaction validator
         CTransactionValidator tx_validator;
         g_tx_validator.store(&tx_validator);  // BUG #108 FIX: Set global pointer for TX validation
@@ -2858,6 +2867,19 @@ load_genesis_block:  // Bug #29: Label for automatic retry after blockchain wipe
                         std::cout << "  [OK] Startup integrity check passed: "
                                   << (toHeight - fromHeight + 1)
                                   << " blocks verified clean (pprev walk, O(N))" << std::endl;
+
+                        // v4.4 Block 8: construct the periodic integrity monitor
+                        // ONLY when the startup check actually walked (real chain
+                        // past first checkpoint). Skipped on regtest (no checkpoints)
+                        // and on chains whose tip is at-or-below the highest
+                        // checkpoint, per contract scope item 5.
+                        // Throws std::runtime_error if a second instance is
+                        // constructed in the same process — the unique_ptr scope
+                        // guarantees exactly-one for the lifetime of this run.
+                        // Start() is deferred until the main-loop poll sees
+                        // g_utxo_sync_enabled == true.
+                        integrity_monitor = std::make_unique<Dilithion::ChainstateIntegrityMonitor>(
+                            g_chainstate, utxo_set, config.datadir, &g_node_state.running);
                     }
                 }
 
@@ -7315,6 +7337,20 @@ load_genesis_block:  // Bug #29: Label for automatic retry after blockchain wipe
             // --datadir=PATH; startup marker detection reads config.datadir.
             // Divergent paths silently sever recovery on non-default datadirs.
             Dilithion::MaybeTriggerChainRebuild(g_chainstate, config.datadir, &g_node_state.running);
+
+            // v4.4 Block 8: start the periodic integrity monitor once IBD has
+            // fully exited (g_utxo_sync_enabled == true). Lifecycle gate per
+            // RT F-4 — the monitor would otherwise see read-merged LevelDB
+            // state during IBD-tail that masks partial-write durability gaps.
+            // Construction happened post-startup-integrity-check above; we just
+            // need to flip the start-flag once the IBD exit signal fires.
+            if (integrity_monitor && !integrity_monitor_started &&
+                g_utxo_sync_enabled.load(std::memory_order_relaxed)) {
+                integrity_monitor->Start();
+                integrity_monitor_started = true;
+                std::cout << "[v4.4] ChainstateIntegrityMonitor started "
+                          << "(6h cycle, last 500 blocks, snapshot-then-walk)" << std::endl;
+            }
 
             // IBD DEBUG: Log that Tick() returned and main loop continues
             static int main_loop_count = 0;
