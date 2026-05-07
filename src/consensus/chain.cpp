@@ -2356,6 +2356,81 @@ bool CChainState::VerifyRecentUndoIntegrity(int probeDepth,
 }
 
 // ============================================================================
+// v4.4 Block 6: ChainstateIntegrityMonitor support
+// ============================================================================
+
+std::vector<std::pair<int, uint256>>
+CChainState::SnapshotIntegrityWindow(int windowBlocks) const {
+    std::vector<std::pair<int, uint256>> snapshot;
+    if (windowBlocks <= 0) return snapshot;
+
+    std::lock_guard<std::recursive_mutex> lock(cs_main);
+    if (pindexTip == nullptr) return snapshot;
+
+    // Reserve up-front so we don't realloc inside the lock-held walk.
+    snapshot.reserve(static_cast<size_t>(windowBlocks));
+
+    CBlockIndex* pwalker = pindexTip;
+    int collected = 0;
+    while (pwalker != nullptr && collected < windowBlocks) {
+        // Genesis-exempt: stop walking past height 1 (matching the legacy
+        // VerifyRecentUndoIntegrity semantic). pprev == nullptr is the
+        // pre-genesis sentinel; height 0 is genesis.
+        if (pwalker->pprev == nullptr) {
+            break;
+        }
+        snapshot.emplace_back(pwalker->nHeight, pwalker->GetBlockHash());
+        ++collected;
+        pwalker = pwalker->pprev;
+    }
+    return snapshot;
+}
+
+bool CChainState::RevalidateUnderCsMain(
+    int height,
+    const uint256& expectedHash,
+    const std::function<void()>& onConfirmedCorruption) const
+{
+    std::lock_guard<std::recursive_mutex> lock(cs_main);
+
+    // Inverse Adversarial trap 2A: query a FRESH active tip, NOT a captured
+    // CBlockIndex* from snapshot time.
+    CBlockIndex* freshTip = pindexTip;
+    if (freshTip == nullptr) {
+        // No active chain — can't revalidate. Treat as orphan-skip.
+        return false;
+    }
+
+    // Walk the fresh tip back via pprev to the failure height.
+    CBlockIndex* pwalker = freshTip;
+    while (pwalker != nullptr && pwalker->nHeight > height) {
+        pwalker = pwalker->pprev;
+    }
+
+    const bool stillOnActiveChain =
+        (pwalker != nullptr) &&
+        (pwalker->nHeight == height) &&
+        (pwalker->GetBlockHash() == expectedHash);
+
+    if (!stillOnActiveChain) {
+        // Block at the failure height is no longer on the active chain (or
+        // a reorg replaced it with a different hash). UndoBlock at
+        // utxo_set.cpp:881-882 deletes the disconnected block's undo entry,
+        // which is what the periodic walk picked up. Not corruption.
+        return false;
+    }
+
+    // Genuine corruption — block is still on active chain but its undo
+    // entry is missing/corrupt. Run the caller-supplied marker-write
+    // callback WHILE STILL holding cs_main (Inverse Adversarial trap 2B —
+    // marker write must happen under the same lock acquisition as the
+    // revalidation decision; releasing and re-acquiring opens a window
+    // where another reorg invalidates the decision).
+    onConfirmedCorruption();
+    return true;
+}
+
+// ============================================================================
 // Phase 5: chain-selection helpers — PR5.1 scaffold (assert(false) bodies).
 // ============================================================================
 //

@@ -424,6 +424,49 @@ public:
                                    int& outMissingHeight) const;
 
     /**
+     * v4.4 Block 6: ChainstateIntegrityMonitor support — build a
+     * (height, blockHash) snapshot of the most-recent windowBlocks of the
+     * active chain, under a brief cs_main acquisition. Released on return.
+     * The monitor walks the resulting vector lock-free (no cs_main held
+     * during LevelDB reads).
+     *
+     * Returns an empty vector if the chain is too short, has no tip, or
+     * windowBlocks <= 0. Heights in the returned vector are NOT clamped to
+     * 1; if the chain is shorter than windowBlocks, the snapshot includes
+     * everything from height 1 to the tip (genesis at height 0 is excluded
+     * to mirror the genesis-exempt semantic in VerifyRecentUndoIntegrity).
+     *
+     * Pair ordering: descending height (tip first, oldest last) — matches
+     * the pprev walk order.
+     */
+    std::vector<std::pair<int, uint256>> SnapshotIntegrityWindow(int windowBlocks) const;
+
+    /**
+     * v4.4 Block 6: ChainstateIntegrityMonitor revalidation gate (Inverse
+     * Adversarial traps 2A + 2B). Under FRESH cs_main acquisition, walk back
+     * from the current tip via pprev to the block at `height` and compare
+     * its hash to `expectedHash`.
+     *
+     * Two outcomes:
+     *   - Hashes match (block is still on the active chain): the failure
+     *     represents real corruption. Calls onConfirmedCorruption() WHILE
+     *     STILL HOLDING cs_main (trap 2B — marker write must happen under
+     *     the same lock acquisition as the revalidation decision). Returns
+     *     true.
+     *   - Hashes differ (a reorg disconnected the snapshotted block; its
+     *     undo entry was deleted by UndoBlock per utxo_set.cpp:881-882): the
+     *     failure is an orphan-skip, not corruption. onConfirmedCorruption
+     *     is NOT called. Returns false.
+     *
+     * The callback runs synchronously inside cs_main, so it MUST be quick
+     * and non-recursive into any code that takes cs_main again (no risk
+     * here since the mutex is recursive, but minimise lock-hold anyway).
+     */
+    bool RevalidateUnderCsMain(int height,
+                               const uint256& expectedHash,
+                               const std::function<void()>& onConfirmedCorruption) const;
+
+    /**
      * Get current chain tip (most work)
      * CRITICAL-1 FIX: Now implemented in .cpp with mutex protection
      */

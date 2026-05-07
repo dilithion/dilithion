@@ -14,6 +14,8 @@
 #include <list>
 #include <vector>
 #include <cstdint>
+#include <atomic>
+#include <utility>
 
 // Forward declaration — VerifyUndoDataInRange takes CBlockIndex* without needing the full type.
 class CBlockIndex;
@@ -225,6 +227,31 @@ public:
                                int fromHeight,
                                int toHeight,
                                UndoIntegrityFailure& failure_out);
+
+    /**
+     * v4.4 Block 6: walk a caller-supplied (height, blockHash) snapshot,
+     * verifying every entry has a present, SHA3-checksummed undo record.
+     * Used by ChainstateIntegrityMonitor's periodic check; the snapshot is
+     * built under cs_main by CChainState::SnapshotIntegrityWindow before the
+     * walk, so this method is lock-free w.r.t. cs_main (acquires cs_utxo
+     * internally for the LevelDB reads).
+     *
+     * Stop-flag discipline (Inverse Adversarial trap 3B): if abortFlag is
+     * non-null and reads true with std::memory_order_seq_cst, the walk
+     * returns early with cause="aborted_for_shutdown". Checked between every
+     * 10 LevelDB reads so mid-walk shutdown latency is bounded by ~10 reads
+     * (millisecond range), not the full walk duration.
+     *
+     * @param snapshot      Vector of (height, blockHash) pairs to verify.
+     * @param failure_out   Populated on failure with height + blockHash + cause.
+     * @param abortFlag     Optional shutdown signal; nullable.
+     * @return true iff every entry has valid undo data; false on first failure
+     *         OR shutdown abort.
+     */
+    bool VerifyUndoDataFromSnapshot(
+        const std::vector<std::pair<int, uint256>>& snapshot,
+        UndoIntegrityFailure& failure_out,
+        const std::atomic<bool>* abortFlag = nullptr);
 
     /**
      * v4.4 test-only: write a synthetic undo record for the given block hash.

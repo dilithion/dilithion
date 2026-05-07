@@ -40,6 +40,43 @@ UndoChecksumResult VerifyUndoChecksum(const std::string& undoValue) {
     return UndoChecksumResult::Valid;
 }
 
+// v4.4 Block 6: single canonical fetch+verify primitive shared by both
+// VerifyUndoDataInRange (pprev walk, Block 3) and VerifyUndoDataFromSnapshot
+// (vector walk, Block 6). Storage-of-record principle: any future change to
+// undo-record fetch or framing lands once. Returns true iff the entry exists
+// and verifies clean; populates failure_out with cause taxonomy on failure.
+bool FetchAndVerifyUndo(leveldb::DB* db,
+                        const uint256& blockHash,
+                        int height,
+                        UndoIntegrityFailure& failure_out) {
+    std::string undoKey = "undo_";
+    undoKey.append(reinterpret_cast<const char*>(blockHash.data), 32);
+
+    std::string undoValue;
+    leveldb::Status st = db->Get(leveldb::ReadOptions(), undoKey, &undoValue);
+    if (!st.ok()) {
+        failure_out.height = height;
+        failure_out.blockHash = blockHash;
+        failure_out.cause = "missing";
+        return false;
+    }
+    switch (VerifyUndoChecksum(undoValue)) {
+        case UndoChecksumResult::Valid:
+            return true;
+        case UndoChecksumResult::SizeInvalid:
+            failure_out.height = height;
+            failure_out.blockHash = blockHash;
+            failure_out.cause = "size_invalid";
+            return false;
+        case UndoChecksumResult::ChecksumMismatch:
+            failure_out.height = height;
+            failure_out.blockHash = blockHash;
+            failure_out.cause = "checksum_mismatch";
+            return false;
+    }
+    return false;  // Unreachable; silences -Werror=return-type warnings.
+}
+
 } // anonymous namespace
 
 // Global flag to track IBD state for disk sync optimization
@@ -1229,37 +1266,56 @@ bool CUTXOSet::VerifyUndoDataInRange(
         }
 
         // pwalker->nHeight is in [fromHeight, toHeight].
-        const uint256 hash = pwalker->GetBlockHash();
-
-        std::string undoKey = "undo_";
-        undoKey.append(reinterpret_cast<const char*>(hash.data), 32);
-
-        std::string undoValue;
-        leveldb::Status st = db->Get(leveldb::ReadOptions(), undoKey, &undoValue);
-        if (!st.ok()) {
-            failure_out.height = pwalker->nHeight;
-            failure_out.blockHash = hash;
-            failure_out.cause = "missing";
-            return false;
-        }
-
-        UndoChecksumResult chk = VerifyUndoChecksum(undoValue);
-        if (chk == UndoChecksumResult::SizeInvalid) {
-            failure_out.height = pwalker->nHeight;
-            failure_out.blockHash = hash;
-            failure_out.cause = "size_invalid";
-            return false;
-        }
-        if (chk == UndoChecksumResult::ChecksumMismatch) {
-            failure_out.height = pwalker->nHeight;
-            failure_out.blockHash = hash;
-            failure_out.cause = "checksum_mismatch";
+        if (!FetchAndVerifyUndo(db.get(), pwalker->GetBlockHash(), pwalker->nHeight, failure_out)) {
             return false;
         }
 
         pwalker = pwalker->pprev;
     }
 
+    return true;
+}
+
+// ============================================================================
+// v4.4 Block 6: VerifyUndoDataFromSnapshot — periodic-monitor walk
+// ============================================================================
+// Walks a caller-supplied (height, blockHash) snapshot, calling the canonical
+// FetchAndVerifyUndo primitive per entry. Snapshot is taken under cs_main by
+// the caller (CChainState::SnapshotIntegrityWindow) so this method is
+// lock-free w.r.t. cs_main; it acquires cs_utxo internally for the LevelDB
+// reads.
+//
+// Stop-flag discipline (Inverse Adversarial trap 3B): if abortFlag is non-null
+// and reads true with seq_cst, the walk returns early with cause=
+// "aborted_for_shutdown". Checked between every 10 LevelDB reads so mid-walk
+// shutdown latency is bounded by ~10 reads (millisecond range on commodity
+// hardware), regardless of disk pressure.
+
+bool CUTXOSet::VerifyUndoDataFromSnapshot(
+    const std::vector<std::pair<int, uint256>>& snapshot,
+    UndoIntegrityFailure& failure_out,
+    const std::atomic<bool>* abortFlag)
+{
+    if (!IsOpen()) {
+        failure_out.cause = "db_not_open";
+        return false;
+    }
+
+    std::lock_guard<std::recursive_mutex> lock(cs_utxo);
+
+    int readsSinceCheck = 0;
+    for (const auto& entry : snapshot) {
+        if (++readsSinceCheck >= 10) {
+            readsSinceCheck = 0;
+            if (abortFlag && abortFlag->load(std::memory_order_seq_cst)) {
+                failure_out.cause = "aborted_for_shutdown";
+                return false;
+            }
+        }
+        if (!FetchAndVerifyUndo(db.get(), entry.second, entry.first, failure_out)) {
+            return false;
+        }
+    }
     return true;
 }
 
