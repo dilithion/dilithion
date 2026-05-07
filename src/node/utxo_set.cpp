@@ -1262,3 +1262,62 @@ bool CUTXOSet::VerifyUndoDataInRange(
 
     return true;
 }
+
+// ============================================================================
+// v4.4 test-only helpers — surgical mutation of undo records for the
+// chainstate-integrity test suite (src/test/chainstate_integrity_tests.cpp).
+// ============================================================================
+// Production code MUST NOT call these. They exist solely so the integrity-walk
+// test fixtures can simulate the corruption modes the walk is designed to catch.
+
+bool CUTXOSet::WriteFramedUndoForTesting(const uint256& blockHash,
+                                         const std::vector<uint8_t>& payload) {
+    if (!IsOpen()) return false;
+    std::lock_guard<std::recursive_mutex> lock(cs_utxo);
+
+    // Frame: payload || SHA3-256(payload), per the P1-3 undo-record protocol.
+    std::vector<uint8_t> framed;
+    framed.reserve(payload.size() + 32);
+    framed.insert(framed.end(), payload.begin(), payload.end());
+    uint8_t cs[32];
+    SHA3_256(payload.data(), payload.size(), cs);
+    framed.insert(framed.end(), cs, cs + 32);
+
+    std::string undoKey = "undo_";
+    undoKey.append(reinterpret_cast<const char*>(blockHash.data), 32);
+
+    leveldb::Slice value(reinterpret_cast<const char*>(framed.data()), framed.size());
+    leveldb::Status st = db->Put(leveldb::WriteOptions(), undoKey, value);
+    return st.ok();
+}
+
+bool CUTXOSet::DeleteUndoForTesting(const uint256& blockHash) {
+    if (!IsOpen()) return false;
+    std::lock_guard<std::recursive_mutex> lock(cs_utxo);
+
+    std::string undoKey = "undo_";
+    undoKey.append(reinterpret_cast<const char*>(blockHash.data), 32);
+    return db->Delete(leveldb::WriteOptions(), undoKey).ok();
+}
+
+bool CUTXOSet::CorruptUndoForTesting(const uint256& blockHash) {
+    if (!IsOpen()) return false;
+    std::lock_guard<std::recursive_mutex> lock(cs_utxo);
+
+    std::string undoKey = "undo_";
+    undoKey.append(reinterpret_cast<const char*>(blockHash.data), 32);
+
+    std::string undoValue;
+    leveldb::Status st = db->Get(leveldb::ReadOptions(), undoKey, &undoValue);
+    if (!st.ok()) return false;
+    if (undoValue.size() < 36) return false;  // No payload byte to flip safely.
+
+    // Flip a bit inside the payload (offset 1 — within the 4-byte spentCount
+    // field). The trailing 32-byte SHA3 checksum is left untouched, so
+    // VerifyUndoChecksum recomputes SHA3 over the new payload and gets a
+    // different value than the stored trailer ⇒ ChecksumMismatch.
+    std::string corrupted = undoValue;
+    corrupted[1] = static_cast<char>(corrupted[1] ^ 0x80);
+
+    return db->Put(leveldb::WriteOptions(), undoKey, corrupted).ok();
+}

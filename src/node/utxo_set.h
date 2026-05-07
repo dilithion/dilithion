@@ -12,6 +12,8 @@
 #include <mutex>
 #include <map>
 #include <list>
+#include <vector>
+#include <cstdint>
 
 // Forward declaration — VerifyUndoDataInRange takes CBlockIndex* without needing the full type.
 class CBlockIndex;
@@ -223,6 +225,28 @@ public:
                                int fromHeight,
                                int toHeight,
                                UndoIntegrityFailure& failure_out);
+
+    /**
+     * v4.4 test-only: write a synthetic undo record for the given block hash.
+     * The payload is SHA3-256-framed (P1-3 protocol) before write so it passes
+     * VerifyUndoChecksum. Production code MUST NOT call this; it exists for
+     * chainstate-integrity test fixtures only.
+     */
+    bool WriteFramedUndoForTesting(const uint256& blockHash,
+                                   const std::vector<uint8_t>& payload);
+
+    /**
+     * v4.4 test-only: delete the undo record for the given block hash.
+     * Simulates the missing-undo corruption mode (incident 2026-04-25).
+     */
+    bool DeleteUndoForTesting(const uint256& blockHash);
+
+    /**
+     * v4.4 test-only: corrupt the undo record for the given block hash by
+     * flipping one byte in the payload (NOT the trailing 32-byte checksum).
+     * After this call, VerifyUndoChecksum returns ChecksumMismatch on the entry.
+     */
+    bool CorruptUndoForTesting(const uint256& blockHash);
 
     /**
      * Flush all pending changes to disk
