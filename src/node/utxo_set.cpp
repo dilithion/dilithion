@@ -2,6 +2,7 @@
 // Distributed under the MIT software license
 
 #include <node/utxo_set.h>
+#include <node/block_index.h>  // v4.4: VerifyUndoDataInRange takes CBlockIndex*
 #include <consensus/validation.h>
 #include <core/chainparams.h>
 #include <crypto/sha3.h>  // P1-3: For undo data integrity checksum
@@ -10,6 +11,36 @@
 #include <cstring>
 #include <iostream>
 #include <atomic>
+
+namespace {
+
+// v4.4 trap-7 (storage-of-record) fix: single canonical undo-checksum verifier.
+// Both CUTXOSet::UndoBlock (existing P1-3 disconnect path) and the new
+// CUTXOSet::VerifyUndoDataInRange call into here so any future change to the
+// undo-record framing lands once, not in two places that drift apart.
+enum class UndoChecksumResult {
+    Valid,
+    SizeInvalid,
+    ChecksumMismatch,
+};
+
+UndoChecksumResult VerifyUndoChecksum(const std::string& undoValue) {
+    // P1-3 framing: payload || checksum, where checksum = SHA3-256(payload), 32 bytes.
+    // Minimum size: 4 (spentCount) + 32 (checksum) = 36 bytes.
+    if (undoValue.size() < 36) {
+        return UndoChecksumResult::SizeInvalid;
+    }
+    const uint8_t* raw = reinterpret_cast<const uint8_t*>(undoValue.data());
+    const size_t payloadSize = undoValue.size() - 32;
+    uint8_t expected[32];
+    SHA3_256(raw, payloadSize, expected);
+    if (std::memcmp(expected, raw + payloadSize, 32) != 0) {
+        return UndoChecksumResult::ChecksumMismatch;
+    }
+    return UndoChecksumResult::Valid;
+}
+
+} // anonymous namespace
 
 // Global flag to track IBD state for disk sync optimization
 // Set by IBD coordinator, read by UTXO set
@@ -700,33 +731,26 @@ bool CUTXOSet::UndoBlock(const CBlock& block, const uint256& blockHash) {
         return true;
     }
 
-    // P1-3 FIX: Verify SHA3-256 integrity checksum (32 bytes at end)
-    // Minimum size: 4 (spentCount) + 32 (checksum) = 36 bytes
-    if (undoValue.size() < 36) {
+    // P1-3 FIX: Verify SHA3-256 integrity checksum (last 32 bytes).
+    // v4.4: delegated to canonical helper VerifyUndoChecksum (anon ns above) so
+    // CUTXOSet::VerifyUndoDataInRange uses the same single source of truth.
+    UndoChecksumResult chk = VerifyUndoChecksum(undoValue);
+    if (chk == UndoChecksumResult::SizeInvalid) {
         std::cerr << "[ERROR] CUTXOSet::UndoBlock: Invalid undo data (too small: " << undoValue.size() << " bytes)" << std::endl;
         return false;
     }
-
-    // Extract stored checksum (last 32 bytes)
-    const uint8_t* raw_data = reinterpret_cast<const uint8_t*>(undoValue.data());
-    size_t data_size = undoValue.size() - 32;  // Size without checksum
-    const uint8_t* stored_checksum = raw_data + data_size;
-
-    // Compute checksum of data (excluding stored checksum)
-    uint8_t computed_checksum[32];
-    SHA3_256(raw_data, data_size, computed_checksum);
-
-    // Verify checksum
-    if (std::memcmp(stored_checksum, computed_checksum, 32) != 0) {
+    if (chk == UndoChecksumResult::ChecksumMismatch) {
         std::cerr << "[ERROR] CUTXOSet::UndoBlock: Undo data checksum mismatch - CORRUPTION DETECTED!" << std::endl;
         std::cerr << "        Block hash: " << blockHash.GetHex() << std::endl;
         return false;
     }
 
-    // Parse undo data (excluding checksum)
+    // Parse undo data (excluding 32-byte trailing checksum).
+    const uint8_t* raw_data = reinterpret_cast<const uint8_t*>(undoValue.data());
+    size_t data_size = undoValue.size() - 32;
     const uint8_t* data = raw_data;
     const uint8_t* ptr = data;
-    const uint8_t* end = data + data_size;  // P1-3: Exclude checksum from parsing
+    const uint8_t* end = data + data_size;
 
     uint32_t spentCount;
     std::memcpy(&spentCount, ptr, 4);
@@ -1162,4 +1186,79 @@ bool CUTXOSet::HasUndoData(const uint256& blockHash) const {
     std::string undoValue;
     leveldb::Status status = db->Get(leveldb::ReadOptions(), undoKey, &undoValue);
     return status.ok();
+}
+
+// ============================================================================
+// v4.4: VerifyUndoDataInRange — chainstate integrity walk
+// ============================================================================
+// pprev walk pattern (RT F-1 fix). Used by CChainState::VerifyRecentUndoIntegrity
+// (thin delegator) and ChainstateIntegrityMonitor (periodic) to detect the
+// missing/corrupt undo-data corruption mode (incident 2026-04-25).
+//
+// Walk pattern: pwalker = pindexFrom; pwalker = pwalker->pprev; ... until
+// pwalker is null or pwalker->nHeight < fromHeight. Each iteration is O(1):
+// single pointer dereference + single LevelDB point-read + 32-byte SHA3 compare.
+// Total cost O(N) where N = (toHeight - fromHeight + 1).
+//
+// Lock discipline: caller holds cs_main (or guarantees pindexFrom is otherwise
+// stable). This method acquires cs_utxo internally.
+
+bool CUTXOSet::VerifyUndoDataInRange(
+    CBlockIndex* pindexFrom,
+    int fromHeight,
+    int toHeight,
+    UndoIntegrityFailure& failure_out)
+{
+    if (!IsOpen()) {
+        failure_out.cause = "db_not_open";
+        return false;
+    }
+    if (pindexFrom == nullptr) {
+        failure_out.cause = "block_index_missing";
+        return false;
+    }
+
+    std::lock_guard<std::recursive_mutex> lock(cs_utxo);
+
+    CBlockIndex* pwalker = pindexFrom;
+    while (pwalker != nullptr && pwalker->nHeight >= fromHeight) {
+        if (pwalker->nHeight > toHeight) {
+            // Block above the verification window — keep walking pprev.
+            pwalker = pwalker->pprev;
+            continue;
+        }
+
+        // pwalker->nHeight is in [fromHeight, toHeight].
+        const uint256 hash = pwalker->GetBlockHash();
+
+        std::string undoKey = "undo_";
+        undoKey.append(reinterpret_cast<const char*>(hash.data), 32);
+
+        std::string undoValue;
+        leveldb::Status st = db->Get(leveldb::ReadOptions(), undoKey, &undoValue);
+        if (!st.ok()) {
+            failure_out.height = pwalker->nHeight;
+            failure_out.blockHash = hash;
+            failure_out.cause = "missing";
+            return false;
+        }
+
+        UndoChecksumResult chk = VerifyUndoChecksum(undoValue);
+        if (chk == UndoChecksumResult::SizeInvalid) {
+            failure_out.height = pwalker->nHeight;
+            failure_out.blockHash = hash;
+            failure_out.cause = "size_invalid";
+            return false;
+        }
+        if (chk == UndoChecksumResult::ChecksumMismatch) {
+            failure_out.height = pwalker->nHeight;
+            failure_out.blockHash = hash;
+            failure_out.cause = "checksum_mismatch";
+            return false;
+        }
+
+        pwalker = pwalker->pprev;
+    }
+
+    return true;
 }

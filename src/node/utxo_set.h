@@ -13,6 +13,21 @@
 #include <map>
 #include <list>
 
+// Forward declaration — VerifyUndoDataInRange takes CBlockIndex* without needing the full type.
+class CBlockIndex;
+
+/**
+ * v4.4: Result info for chainstate integrity walk failure.
+ * Populated by CUTXOSet::VerifyUndoDataInRange when the walk detects a missing
+ * or corrupt undo record. The cause field distinguishes failure modes for
+ * operator diagnostics + auto-rebuild marker reason text.
+ */
+struct UndoIntegrityFailure {
+    int height = -1;
+    uint256 blockHash;
+    std::string cause;  // "missing" | "checksum_mismatch" | "size_invalid" | "db_not_open" | "block_index_missing"
+};
+
 /**
  * UTXO (Unspent Transaction Output) entry
  * Stores information about a single unspent output
@@ -181,6 +196,33 @@ public:
      * @return true if an undo_<blockhash> entry exists in LevelDB
      */
     bool HasUndoData(const uint256& blockHash) const;
+
+    /**
+     * v4.4: Walk the chain backward from pindexFrom via pprev, verifying every
+     * block in the inclusive height range [fromHeight, toHeight] has its undo
+     * record present in LevelDB and SHA3-256-checksummed correctly. Used by
+     * CChainState::VerifyRecentUndoIntegrity (delegator) and
+     * ChainstateIntegrityMonitor (periodic) to detect the missing/corrupt
+     * undo-data corruption mode (incident 2026-04-25).
+     *
+     * Walk pattern: pindexFrom, pindexFrom->pprev, ... — RT F-1 fix; explicitly
+     * NOT lambda-per-height GetAncestor (would be O(N log N)) or naive
+     * retry-from-tip (O(N^2)). Total cost is O(N) where N = (toHeight - fromHeight + 1).
+     *
+     * Lock discipline: the caller is responsible for cs_main (or for guaranteeing
+     * pindexFrom is otherwise stable, e.g. during single-threaded startup before
+     * block processing begins). This method acquires cs_utxo internally.
+     *
+     * @param pindexFrom    Starting CBlockIndex (typically pindexTip). Walk pprev from here.
+     * @param fromHeight    Inclusive lower bound of verification window.
+     * @param toHeight      Inclusive upper bound of verification window.
+     * @param failure_out   Populated on failure with height + blockHash + cause.
+     * @return true iff every block in [fromHeight, toHeight] has valid undo data.
+     */
+    bool VerifyUndoDataInRange(CBlockIndex* pindexFrom,
+                               int fromHeight,
+                               int toHeight,
+                               UndoIntegrityFailure& failure_out);
 
     /**
      * Flush all pending changes to disk
