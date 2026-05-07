@@ -62,6 +62,8 @@
 #include <random>
 #include <sstream>
 #include <string>
+#include <thread>
+#include <vector>
 
 namespace {
 
@@ -266,11 +268,87 @@ void test_mode_symmetric_marker_contents() {
     std::cout << " OK (mode-0 == mode-1: " << body_mode0 << ")\n";
 }
 
+// =============================================================================
+// Test 6 (v4.4 follow-up / contract item 8): concurrent-write durability.
+// (See top-of-file includes for <thread> — std::thread used here.)
+//
+// Multiple in-process paths can race to call WriteAutoRebuildMarker:
+//   - startup integrity check (dilv-node.cpp / dilithion-node.cpp)
+//   - periodic ChainstateIntegrityMonitor callback
+//   - MaybeTriggerChainRebuild from main-loop poll
+//   - forcerebuild RPC handler
+//
+// Without process-level serialization two writers can truncate-overwrite each
+// other and produce a torn file (one writer's prefix concatenated with another
+// writer's suffix). v4.4 adds a process-lifetime mutex inside
+// WriteAutoRebuildMarker plus atomic-rename so the marker file is always one
+// of the proposed reasons in full, never a torn mix.
+//
+// This test spawns N threads that all call WriteAutoRebuildMarker against the
+// same datadir simultaneously with distinct reason strings. After the join,
+// the resulting marker MUST equal exactly one of the proposed reasons — no
+// torn or partial content. Order isn't asserted (last-writer-wins is fine);
+// atomicity IS the contract.
+// =============================================================================
+void test_concurrent_marker_writes_produce_well_formed_file() {
+    std::cout << "  test_concurrent_marker_writes_produce_well_formed_file..." << std::flush;
+
+    constexpr int kThreads = 8;
+    TempDir td("concurrent");
+
+    // Generate N distinct reason strings, each long enough that a torn write
+    // would produce a string that is NOT a complete reason (mid-string cut).
+    std::vector<std::string> reasons;
+    reasons.reserve(kThreads);
+    for (int i = 0; i < kThreads; ++i) {
+        std::ostringstream oss;
+        oss << "concurrent-test-thread-" << i
+            << "-padded-with-text-so-tearing-is-detectable-"
+            << std::string(64, 'A' + i);  // 64 distinguishable bytes per thread
+        reasons.push_back(oss.str());
+    }
+
+    std::vector<std::thread> writers;
+    writers.reserve(kThreads);
+    std::atomic<int> ok_count{0};
+    for (int i = 0; i < kThreads; ++i) {
+        writers.emplace_back([&td, &reasons, &ok_count, i] {
+            const bool ok = Dilithion::WriteAutoRebuildMarker(td.str(), reasons[i]);
+            if (ok) ok_count.fetch_add(1, std::memory_order_relaxed);
+        });
+    }
+    for (auto& t : writers) t.join();
+
+    // All N writers should have succeeded — the mutex serializes but doesn't
+    // fail any caller.
+    assert(ok_count.load() == kThreads && "every writer must succeed under serialization");
+
+    // Marker file must equal exactly ONE of the proposed reasons (not torn).
+    const std::string body = ReadMarker(td.marker());
+    assert(!body.empty() && "marker file must exist after concurrent writes");
+    bool matched = false;
+    for (const auto& r : reasons) {
+        if (body == r) {
+            matched = true;
+            break;
+        }
+    }
+    assert(matched && "marker contents must equal exactly one writer's reason — "
+                      "torn write detected");
+
+    // No leftover .tmp file (atomic-rename should have moved it).
+    const std::filesystem::path tmpPath = td.path / "auto_rebuild.tmp";
+    assert(!std::filesystem::exists(tmpPath) && ".tmp file must not leak");
+
+    std::cout << " OK (" << kThreads << " concurrent writers, no torn content)\n";
+}
+
 }  // namespace
 
 int main() {
     std::cout << "\n=== v4.3.2 M1 — auto_rebuild marker mode-symmetry tests ===\n"
               << "    (regression suite for LDN canary 2026-05-04)\n"
+              << "    + v4.4 follow-up: concurrent-write durability\n"
               << std::endl;
     try {
         test_marker_written_when_chain_rebuild_flagged();
@@ -278,7 +356,8 @@ int main() {
         test_idempotent_double_call();
         test_disk_write_failure_still_triggers_shutdown();
         test_mode_symmetric_marker_contents();
-        std::cout << "\n=== All 5 tests passed ===\n" << std::endl;
+        test_concurrent_marker_writes_produce_well_formed_file();
+        std::cout << "\n=== All 6 tests passed ===\n" << std::endl;
         return 0;
     } catch (const std::exception& e) {
         std::cerr << "Test failed: " << e.what() << std::endl;

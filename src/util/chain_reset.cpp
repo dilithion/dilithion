@@ -7,11 +7,26 @@
 #include <uint256.h>          // v4.3.2 M1: GetLastUndoFailureHash() return type
 
 #include <algorithm>
+#include <atomic>
+#include <cstdio>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <mutex>
 #include <string>
 #include <system_error>
+
+// v4.4 follow-up (contract item 8): atomic-rename + fsync hardening for the
+// auto_rebuild marker write path. Need direct fd access for fsync.
+#ifdef _WIN32
+  #include <io.h>      // _commit (Windows fsync equivalent)
+  #ifndef _CRT_SECURE_NO_WARNINGS
+    #define _CRT_SECURE_NO_WARNINGS  // for std::fopen
+  #endif
+#else
+  #include <fcntl.h>   // open, O_RDONLY, O_DIRECTORY
+  #include <unistd.h>  // fsync, close
+#endif
 
 namespace Dilithion {
 
@@ -105,28 +120,133 @@ ChainResetReport ResetChainState(const std::string& datadir) {
     return report;
 }
 
+// v4.4 follow-up (contract item 8): in-process serialization for marker writes.
+// Multiple paths can call WriteAutoRebuildMarker concurrently — startup
+// integrity check, periodic monitor, MaybeTriggerChainRebuild, RPC forcerebuild.
+// Without serialization, two writers can truncate-overwrite each other and
+// produce a torn file. Process-lifetime mutex is the simplest correct fix.
+namespace {
+std::mutex g_marker_write_mutex;
+
+// Cross-platform fd-level fsync. POSIX fsync / Windows _commit. Both block
+// until the file's data + metadata are durable on the underlying device.
+inline int FsyncFd(int fd) {
+#ifdef _WIN32
+    return _commit(fd);
+#else
+    return ::fsync(fd);
+#endif
+}
+
+// fsync the parent directory so the rename(tmp, marker) is durable across
+// power loss. Without this the rename can sit in the dentry cache and be
+// lost on power-cycle even though the file content was fsynced.
+//
+// POSIX-only. Windows persists directory entries via the file handle close;
+// there's no equivalent of opening a directory for O_RDONLY+fsync.
+bool FsyncParentDir(const std::filesystem::path& filepath) {
+#ifdef _WIN32
+    (void)filepath;
+    return true;  // Windows handles dirent durability differently.
+#else
+    auto parent = filepath.parent_path();
+    if (parent.empty()) return true;
+    int dir_fd = ::open(parent.c_str(), O_RDONLY
+#ifdef O_DIRECTORY
+                                            | O_DIRECTORY
+#endif
+                       );
+    if (dir_fd == -1) return false;
+    int rc = ::fsync(dir_fd);
+    ::close(dir_fd);
+    return rc == 0;
+#endif
+}
+
+}  // namespace
+
 bool WriteAutoRebuildMarker(const std::string& datadir, const std::string& reason) {
     if (datadir.empty()) {
         std::cerr << "[Recovery] WriteAutoRebuildMarker: empty datadir, refusing to write marker"
                   << std::endl;
         return false;
     }
+
+    // v4.4 follow-up: serialize with any other in-process writers so concurrent
+    // calls cannot produce a torn file (Layer-3 RT F-3, contract item 8).
+    std::lock_guard<std::mutex> lock(g_marker_write_mutex);
+
     std::filesystem::path markerPath = std::filesystem::path(datadir) / "auto_rebuild";
-    std::ofstream marker(markerPath);
-    if (!marker.is_open()) {
-        std::cerr << "[Recovery] WriteAutoRebuildMarker: failed to open " << markerPath.string()
+    std::filesystem::path tmpPath = std::filesystem::path(datadir) / "auto_rebuild.tmp";
+
+    // Phase 1: write content to <datadir>/auto_rebuild.tmp via FILE* so we can
+    // get the fd and fsync it before close. std::ofstream's pubsync() flushes
+    // to OS but doesn't guarantee disk durability.
+    std::FILE* fp = std::fopen(tmpPath.string().c_str(), "w");
+    if (fp == nullptr) {
+        std::cerr << "[Recovery] WriteAutoRebuildMarker: failed to open " << tmpPath.string()
                   << " for write" << std::endl;
         return false;
     }
-    // Single-line reason. The startup handler reads this and logs it; some operators
-    // also tail the file directly. Keep newline-terminated for log readability.
-    marker << reason << std::endl;
-    marker.close();
-    if (marker.fail()) {
-        std::cerr << "[Recovery] WriteAutoRebuildMarker: write to " << markerPath.string()
-                  << " failed (stream error)" << std::endl;
+
+    if (std::fprintf(fp, "%s\n", reason.c_str()) < 0) {
+        std::cerr << "[Recovery] WriteAutoRebuildMarker: write to " << tmpPath.string()
+                  << " failed (fprintf)" << std::endl;
+        std::fclose(fp);
+        std::error_code ec;
+        std::filesystem::remove(tmpPath, ec);
         return false;
     }
+
+    if (std::fflush(fp) != 0) {
+        std::cerr << "[Recovery] WriteAutoRebuildMarker: fflush " << tmpPath.string()
+                  << " failed" << std::endl;
+        std::fclose(fp);
+        std::error_code ec;
+        std::filesystem::remove(tmpPath, ec);
+        return false;
+    }
+
+    // fsync the file-level fd so payload is durable on the device.
+#ifdef _WIN32
+    int fd = _fileno(fp);
+#else
+    int fd = ::fileno(fp);
+#endif
+    if (fd < 0 || FsyncFd(fd) != 0) {
+        std::cerr << "[Recovery] WriteAutoRebuildMarker: fsync of " << tmpPath.string()
+                  << " failed" << std::endl;
+        std::fclose(fp);
+        std::error_code ec;
+        std::filesystem::remove(tmpPath, ec);
+        return false;
+    }
+    std::fclose(fp);
+
+    // Phase 2: atomic rename tmp → marker. POSIX rename() is atomic at the
+    // filesystem level; Windows rename via std::filesystem maps to
+    // MoveFileEx with MOVEFILE_REPLACE_EXISTING.
+    std::error_code rec;
+    std::filesystem::rename(tmpPath, markerPath, rec);
+    if (rec) {
+        std::cerr << "[Recovery] WriteAutoRebuildMarker: rename " << tmpPath.string()
+                  << " -> " << markerPath.string()
+                  << " failed: " << rec.message() << std::endl;
+        std::error_code ec;
+        std::filesystem::remove(tmpPath, ec);
+        return false;
+    }
+
+    // Phase 3: fsync parent dir so the rename itself is durable across power
+    // loss (POSIX only; Windows handles this via the file handle close path).
+    // Soft warning on failure — content IS on disk, just not necessarily
+    // visible across an immediate power cut. Operator gets a non-fatal log.
+    if (!FsyncParentDir(markerPath)) {
+        std::cerr << "[Recovery] WriteAutoRebuildMarker: parent-dir fsync failed; "
+                  << "marker content present but rename may not be durable across "
+                  << "an immediate power loss" << std::endl;
+    }
+
     std::cerr << "[Recovery] Wrote auto_rebuild marker to " << markerPath.string()
               << " (reason: " << reason << ")" << std::endl;
     return true;
