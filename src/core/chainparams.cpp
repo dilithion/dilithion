@@ -625,6 +625,11 @@ ChainParams ChainParams::DilV() {
     // mandatory upgrade.
     params.checkpoints.emplace_back(44233, uint256S("927a1e79a410e73c1778dd3eaebae1c07ce5271431abffa9b62a6f6b3177e373"));
 
+    // v4.4 chainstate-integrity anchor: lower bound of the rolling integrity-check
+    // window (highest_checkpoint+1 .. tip). Verified unanimous across all 4 DilV
+    // mainnet seeds 2026-05-06. See v4_4_chainstate_integrity_contract.md decision (a).
+    params.checkpoints.emplace_back(47500, uint256S("1094f7ca0197845a120a5440ce01c88e65b72f84f42a456f29e43c81b0cddbce"));
+
     // v4.1 lifetime-miner deterministic snapshot (closes CRIT-1 from
     // v0.1 spec review — non-deterministic Patch C lifetime gate at
     // activation height if pre-44233 history is ingested differently
