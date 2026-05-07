@@ -55,6 +55,7 @@ const char* const kRemoveDirs[] = {
 const char* const kRemoveFiles[] = {
     "mempool.dat",
     "auto_rebuild",
+    "auto_rebuild.tmp",  // v4.4: leftover from interrupted atomic-rename write path
     "fee_estimates.dat",
     "dfmp_heat.dat",
     "dfmp_payout_heat.dat",
