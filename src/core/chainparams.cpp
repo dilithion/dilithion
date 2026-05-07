@@ -630,6 +630,15 @@ ChainParams ChainParams::DilV() {
     // mainnet seeds 2026-05-06. See v4_4_chainstate_integrity_contract.md decision (a).
     params.checkpoints.emplace_back(47500, uint256S("1094f7ca0197845a120a5440ce01c88e65b72f84f42a456f29e43c81b0cddbce"));
 
+    // v4.4 release-time anchor (resolved decision (j) — two checkpoints per v4.x
+    // release for rolling-checkpoint discipline). Verified unanimous across all
+    // 4 DilV mainnet seeds 2026-05-08 at canary cut time (LDN, NYC, SGP, SYD via
+    // getblockhash {height:49000}). After v4.4 ships, this becomes the new
+    // highest_checkpoint and the integrity-check window narrows to
+    // [49001..tip]. Decision (k) mandates max 4 weeks between v4.x releases so
+    // the rolling-checkpoint cadence stays operational.
+    params.checkpoints.emplace_back(49000, uint256S("de4316096f6993e4263c562130317810011ecc9f14f20b49022fefa6e8d28f17"));
+
     // v4.1 lifetime-miner deterministic snapshot (closes CRIT-1 from
     // v0.1 spec review — non-deterministic Patch C lifetime gate at
     // activation height if pre-44233 history is ingested differently
