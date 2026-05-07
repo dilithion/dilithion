@@ -2312,6 +2312,15 @@ uint256 CChainState::GetLastUndoFailureHash() const {
 // startup to detect the missing-undo-data state BEFORE reorg attempts begin.
 // On detection, the caller writes auto_rebuild and exits, instead of letting
 // the node loop forever like NYC + LDN did 2026-04-25.
+//
+// v4.4: thin delegator. Routes through CUTXOSet::VerifyUndoDataInRange so all
+// integrity-check call sites (this legacy 100-block-probe API + the new
+// rolling-window startup walk + the periodic monitor) share one canonical
+// pprev-walk + SHA3-checksum implementation. The legacy two-output failure
+// shape (uint256 + int) is preserved for backwards-compatibility with any
+// remaining callers; the v4.4 startup integration in dilv-node.cpp +
+// dilithion-node.cpp uses the richer UndoIntegrityFailure shape directly.
+// Marked deprecated; cleanup pass scheduled for v4.5.
 
 bool CChainState::VerifyRecentUndoIntegrity(int probeDepth,
                                             uint256& outMissingHash,
@@ -2327,29 +2336,23 @@ bool CChainState::VerifyRecentUndoIntegrity(int probeDepth,
         return true;  // Empty chain or zero depth — nothing to check.
     }
 
-    CBlockIndex* pwalker = pindexTip;
-    int probed = 0;
-    while (pwalker != nullptr && probed < probeDepth) {
-        // Stop walking at genesis — we don't need to reorg past it, so verifying
-        // its undo entry adds no operational value. (ApplyBlock does write an
-        // undo_<hash> record for every connected block including genesis when
-        // the genesis path runs through it; we just don't need to assert that
-        // here. Per Cursor review 2026-04-25.)
-        if (pwalker->pprev == nullptr) {
-            break;
-        }
+    const int tipHeight = pindexTip->nHeight;
+    // Genesis is exempt from the walk (matching v4.0.19 semantic): probeDepth=N
+    // probes the most recent N non-genesis blocks. We translate that to
+    // [tipHeight - probeDepth + 1, tipHeight] but clamp the lower bound to 1
+    // so genesis itself (height 0) is never queried.
+    const int fromHeight = std::max(1, tipHeight - probeDepth + 1);
+    const int toHeight = tipHeight;
 
-        const uint256 hash = pwalker->GetBlockHash();
-        if (!pUTXOSet->HasUndoData(hash)) {
-            outMissingHash = hash;
-            outMissingHeight = pwalker->nHeight;
-            return false;
-        }
-
-        pwalker = pwalker->pprev;
-        ++probed;
+    UndoIntegrityFailure failure;
+    if (pUTXOSet->VerifyUndoDataInRange(pindexTip, fromHeight, toHeight, failure)) {
+        return true;
     }
-    return true;
+
+    // Map v4.4 failure shape onto the legacy two-output API.
+    outMissingHash = failure.blockHash;
+    outMissingHeight = failure.height;
+    return false;
 }
 
 // ============================================================================
