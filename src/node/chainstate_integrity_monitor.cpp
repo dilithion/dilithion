@@ -120,7 +120,19 @@ bool ChainstateIntegrityMonitor::ExecuteSingleCycle() {
                       << std::endl;
             std::cerr << "=========================================================="
                       << std::endl;
-            Dilithion::WriteAutoRebuildMarker(m_datadir, reason);
+            // Layer-3 RT F-1 fix: capture marker-write result and log failure.
+            // We still proceed to flip running_flag below (caller's job) so the
+            // node shuts down — startup-integrity-check is the defense-in-depth
+            // path that re-detects + re-attempts the marker on next launch.
+            // Failure here adds one extra restart cycle, not a stuck loop.
+            const bool wrote = Dilithion::WriteAutoRebuildMarker(m_datadir, reason);
+            if (!wrote) {
+                std::cerr << "[CRITICAL] ChainstateIntegrityMonitor: auto_rebuild marker "
+                          << "write FAILED (datadir='" << m_datadir << "'). Forcing "
+                          << "shutdown anyway — startup-integrity-check on next launch "
+                          << "will re-detect and re-attempt the marker write."
+                          << std::endl;
+            }
         });
 
     if (!genuine) {
