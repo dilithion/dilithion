@@ -19,6 +19,7 @@
 #include <primitives/block.h>
 #include <primitives/transaction.h>
 #include <rpc/server.h>
+#include <rpc/auth.h>  // CVE-2026-RPC-AUTH: tests must init auth before Start()
 #include <uint256.h>
 
 #include <atomic>
@@ -204,10 +205,15 @@ std::string SendRPCRequest(uint16_t port, const std::string& method,
     std::string body_str = body.str();
 
     std::ostringstream req;
+    // CVE-2026-RPC-AUTH: tests must now send Basic Auth — base64("testuser:testpass")
+    // matches the fixture-installed credentials. Pre-H1 the server silently
+    // accepted unauth'd requests; that bug is closed, so the test client also
+    // needs to authenticate now.
     req << "POST / HTTP/1.1\r\n"
         << "Host: localhost\r\n"
         << "Content-Type: application/json\r\n"
         << "X-Dilithion-RPC: 1\r\n"
+        << "Authorization: Basic dGVzdHVzZXI6dGVzdHBhc3M=\r\n"
         << "Content-Length: " << body_str.size() << "\r\n\r\n"
         << body_str;
     std::string req_str = req.str();
@@ -332,6 +338,14 @@ struct IntegrationFixture {
         server->RegisterMempool(&mempool);
         server->RegisterBlockchain(&chain_db);
         server->RegisterChainState(&g_chainstate);
+        // CVE-2026-RPC-AUTH: Start() now requires auth + permissions
+        // configured (H1 + Cursor's defense-in-depth assert). Before the
+        // H1 fix, production silently skipped auth, so tests didn't need
+        // to init it. Now they must. Use a fixture-local InitializePermissions
+        // to populate m_permissions, and InitializeAuth to flip g_authConfigured.
+        std::string perms_file = idx_scope.path() + "/rpc_permissions.json";
+        BOOST_REQUIRE(server->InitializePermissions(perms_file, "testuser", "testpass"));
+        BOOST_REQUIRE(RPCAuth::InitializeAuth("testuser", "testpass"));
         BOOST_REQUIRE(server->Start());
         // Tiny pause so the listener is accepting before the first request.
         std::this_thread::sleep_for(std::chrono::milliseconds(50));
