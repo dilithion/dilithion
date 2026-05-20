@@ -419,6 +419,25 @@ bool CRPCServer::Start() {
         return false;
     }
 
+    // CVE-2026-RPC-AUTH (Cursor close-readiness nit): defense-in-depth
+    // invariant. If the production startup order ever changes such that
+    // RPCAuth::InitializeAuth() is not called before Start(), refuse to
+    // serve RPC. Belt-and-braces on the H1 wiring — the same class of
+    // bug as the never-wired-in-production failure that gave the original
+    // CVE its blast radius. CRPCServer::InitializePermissions() is the
+    // *other* required init; verified via m_permissions presence.
+    if (!RPCAuth::IsAuthConfigured()) {
+        std::cerr << "[RPC] CRITICAL: Start() called before RPCAuth::InitializeAuth(). "
+                  << "Refusing to serve RPC. Verify node startup order calls "
+                  << "RPCAuth::InitializeAuth() in every credential path." << std::endl;
+        return false;
+    }
+    if (!m_permissions) {
+        std::cerr << "[RPC] CRITICAL: Start() called before InitializePermissions(). "
+                  << "Refusing to serve RPC." << std::endl;
+        return false;
+    }
+
     // PR #38 red-team C5 follow-up: clear the cluster shutdown flag on
     // every Start(). Required because Boost test suites in this binary
     // run sequentially; a prior test's Stop() sets the flag, and without
@@ -898,7 +917,12 @@ void CRPCServer::HandleClient(int clientSocket) {
             }
             // If overflow would occur, searchStart remains 0 (search from beginning)
 
-            // Pre-compute max index where [i+3] is valid - bufSize >= 4 guaranteed above
+            // CVE-2026-RPC-PARSER (H-A4): RFC 7230 §3 requires CRLF line
+            // termination. Previously this accepted bare LF (`\n\n`) as a
+            // header terminator, but the Phase-2 header walker only splits
+            // on `\r\n` — meaning an LF-only request would have its entire
+            // header block treated as one line, bypassing Content-Length /
+            // Transfer-Encoding smuggling guards entirely. Strict CRLF only.
             const size_t maxIdx = bufSize - 4;
             for (size_t i = searchStart; i <= maxIdx; i++) {
                 if (buffer[i] == '\r' && buffer[i+1] == '\n' &&
@@ -907,37 +931,97 @@ void CRPCServer::HandleClient(int clientSocket) {
                     headerEndPos = i + 4;
                     break;
                 }
-                // Also check for \n\n (less common but valid) - [i+1] valid since i <= bufSize-4
-                if (buffer[i] == '\n' && buffer[i+1] == '\n') {
-                    requestComplete = true;
-                    headerEndPos = i + 2;
-                    break;
-                }
             }
         }
     }
 
-    // Phase 2: If headers found, check Content-Length and read remaining body
+    // Phase 2: If headers found, check Content-Length and read remaining body.
+    // CVE-2026-RPC-PARSER (surgical): line-anchored header parsing.
+    // Previously `headers.find("Content-Length:")` was a substring match that
+    // would have matched `X-Content-Length:` or any other header containing
+    // that substring. Also did not reject duplicate Content-Length or any
+    // Transfer-Encoding header, both classic HTTP-request-smuggling shapes.
+    // The full libevent migration is Phase B; this is the surgical guard.
     if (requestComplete && headerEndPos != std::string::npos) {
-        // Extract Content-Length from headers
         std::string headers(buffer.data(), headerEndPos);
+
+        auto ieq = [](char a, char b) {
+            if (a >= 'A' && a <= 'Z') a = static_cast<char>(a + 32);
+            if (b >= 'A' && b <= 'Z') b = static_cast<char>(b + 32);
+            return a == b;
+        };
+        auto starts_with_ci = [&ieq](const std::string& line, const char* name, size_t name_len) {
+            if (line.size() < name_len + 1) return false;
+            for (size_t i = 0; i < name_len; i++) {
+                if (!ieq(line[i], name[i])) return false;
+            }
+            return line[name_len] == ':';
+        };
+
+        // Walk header lines starting AFTER the request line.
+        size_t pos = headers.find("\r\n");
+        if (pos == std::string::npos) pos = 0; else pos += 2;
+
+        int clCount = 0;
+        bool teSeen = false;
         size_t contentLength = 0;
-        size_t clPos = headers.find("Content-Length:");
-        if (clPos == std::string::npos) {
-            clPos = headers.find("content-length:");
-        }
-        if (clPos != std::string::npos) {
-            size_t valStart = clPos + 15;  // strlen("Content-Length:")
-            while (valStart < headers.size() && headers[valStart] == ' ') valStart++;
-            size_t valEnd = headers.find("\r\n", valStart);
-            if (valEnd == std::string::npos) valEnd = headers.find("\n", valStart);
-            if (valEnd != std::string::npos) {
-                contentLength = std::stoul(headers.substr(valStart, valEnd - valStart));
+        bool malformed = false;
+
+        while (pos < headers.size()) {
+            size_t lineEnd = headers.find("\r\n", pos);
+            if (lineEnd == std::string::npos) lineEnd = headers.size();
+            if (lineEnd == pos) break;  // blank line: end of headers
+            std::string line = headers.substr(pos, lineEnd - pos);
+            pos = lineEnd + 2;
+
+            // Reject obs-fold (leading whitespace continuation lines)
+            if (!line.empty() && (line[0] == ' ' || line[0] == '\t')) {
+                malformed = true;
+                break;
+            }
+
+            if (starts_with_ci(line, "Content-Length", 14)) {
+                clCount++;
+                if (clCount > 1) { malformed = true; break; }
+                size_t v = 15;
+                while (v < line.size() && (line[v] == ' ' || line[v] == '\t')) v++;
+                // Value must be only digits and within sane range
+                if (v >= line.size()) { malformed = true; break; }
+                size_t end = line.size();
+                while (end > v && (line[end-1] == ' ' || line[end-1] == '\t')) end--;
+                if (end - v > 19) { malformed = true; break; }  // 64-bit decimal max ~19 digits
+                size_t cl = 0;
+                for (size_t k = v; k < end; k++) {
+                    if (line[k] < '0' || line[k] > '9') { malformed = true; break; }
+                    cl = cl * 10 + static_cast<size_t>(line[k] - '0');
+                    if (cl > MAX_REQUEST_SIZE) { malformed = true; break; }
+                }
+                if (malformed) break;
+                contentLength = cl;
+            } else if (starts_with_ci(line, "Transfer-Encoding", 17)) {
+                // CVE-2026-RPC-PARSER: refuse Transfer-Encoding entirely.
+                // Dilithion RPC speaks Content-Length-framed HTTP/1.1 only.
+                // TE creates ambiguity (TE.CL / CL.TE smuggling).
+                teSeen = true;
+                break;
             }
         }
 
+        if (malformed || teSeen) {
+            std::string body = "{\"error\":\"Malformed HTTP request (CVE-2026-RPC-PARSER)\",\"code\":-32700}";
+            std::ostringstream oss;
+            oss << "HTTP/1.1 400 Bad Request\r\n"
+                << "Content-Type: application/json\r\n"
+                << "Content-Length: " << body.size() << "\r\n"
+                << "Connection: close\r\n"
+                << "\r\n"
+                << body;
+            std::string resp = oss.str();
+            send_response_and_cleanup(resp);
+            return;
+        }
+
         // Read remaining body bytes if needed
-        size_t bodyBytesRead = buffer.size() - headerEndPos;
         size_t totalNeeded = headerEndPos + contentLength;
         if (totalNeeded > MAX_REQUEST_SIZE) totalNeeded = MAX_REQUEST_SIZE;
 
@@ -999,14 +1083,11 @@ void CRPCServer::HandleClient(int clientSocket) {
         return;
     }
 
-    // CORS: Handle OPTIONS preflight requests for web wallet and REST API
-    // Browsers send OPTIONS before cross-origin requests with custom headers
+    // CVE-2026-RPC-CORS: No CORS. All OPTIONS preflights rejected.
+    // Same-origin requests (bundled web wallet at /wallet) don't preflight.
+    // Cross-origin callers are unsupported — they cannot read RPC responses.
     if (request.find("OPTIONS ") == 0) {
-        std::string response = "HTTP/1.1 204 No Content\r\n"
-                               "Access-Control-Allow-Origin: *\r\n"
-                               "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n"
-                               "Access-Control-Allow-Headers: Content-Type, Authorization, X-Dilithion-RPC\r\n"
-                               "Access-Control-Max-Age: 86400\r\n"
+        std::string response = "HTTP/1.1 403 Forbidden\r\n"
                                "Content-Length: 0\r\n"
                                "Connection: close\r\n"
                                "\r\n";
@@ -1083,17 +1164,18 @@ void CRPCServer::HandleClient(int clientSocket) {
         }
 
         // RPC-004: Reject requests without CSRF protection header
-        std::string response = "HTTP/1.1 403 Forbidden\r\n"
-                               "Content-Type: application/json\r\n"
-                               "Content-Length: 108\r\n"
-                               "Connection: close\r\n"
-                               "X-Content-Type-Options: nosniff\r\n"
-                               "X-Frame-Options: DENY\r\n"
-                               "Access-Control-Allow-Origin: *\r\n"
-                               "Access-Control-Allow-Methods: POST, OPTIONS\r\n"
-                               "Access-Control-Allow-Headers: Content-Type, Authorization, X-Dilithion-RPC\r\n"
-                               "\r\n"
-                               "{\"error\":\"CSRF protection: Missing X-Dilithion-RPC header. Include 'X-Dilithion-RPC: 1' in request.\",\"code\":-32600}";
+        // CVE-2026-RPC-CORS: No CORS headers on 403 response either.
+        const std::string csrfBody = "{\"error\":\"CSRF protection: Missing X-Dilithion-RPC header. Include 'X-Dilithion-RPC: 1' in request.\",\"code\":-32600}";
+        std::ostringstream csrfOss;
+        csrfOss << "HTTP/1.1 403 Forbidden\r\n"
+                << "Content-Type: application/json\r\n"
+                << "Content-Length: " << csrfBody.size() << "\r\n"
+                << "Connection: close\r\n"
+                << "X-Content-Type-Options: nosniff\r\n"
+                << "X-Frame-Options: DENY\r\n"
+                << "\r\n"
+                << csrfBody;
+        std::string response = csrfOss.str();
         send_response_and_cleanup(response);
         return;
     }
@@ -1101,7 +1183,13 @@ void CRPCServer::HandleClient(int clientSocket) {
     // FIX-014: Declare username/password outside auth block for permission checking
     std::string username = "";
     std::string password = "";
-    uint32_t userPermissions = static_cast<uint32_t>(RPCPermission::ROLE_ADMIN);  // Default to admin if no auth
+    // CVE-2026-RPC-AUTH: previously defaulted to ROLE_ADMIN when the auth
+    // block was skipped (which it always was, because InitializeAuth was
+    // never wired in production). Defense in depth: default to 0 permissions
+    // so any future path that skips the auth block fails closed rather than
+    // open. Post-H1 the block always runs, so this default is normally
+    // never observed — but it must be safe if it ever is.
+    uint32_t userPermissions = 0;
 
     // Check authentication if configured
     if (RPCAuth::IsAuthConfigured()) {
@@ -1155,10 +1243,29 @@ void CRPCServer::HandleClient(int clientSocket) {
         // FIX-014: Get user permissions for authorization checking
         if (m_permissions) {
             if (!m_permissions->AuthenticateUser(username, password, userPermissions)) {
-                // Should not happen (already authenticated above), but handle gracefully
-                std::cerr << "[RPC-PERMISSIONS] ERROR: Permission lookup failed for user: "
-                          << username << std::endl;
-                std::string response = BuildHTTPUnauthorized();
+                // CVE-2026-RPC-AUTH (H-A5): RPCAuth said yes, permissions
+                // store says no. This is NOT an auth failure — both stores
+                // are supposed to agree (port_review row #17). Return 503
+                // so operators investigating a 401 spike don't dismiss it
+                // as bad creds when the real cause is a permissions-store
+                // divergence (the kind of bug that only surfaces during
+                // incidents).
+                std::cerr << "[RPC-PERMISSIONS] CRITICAL: Auth/permissions store divergence for user: "
+                          << username << " (RPCAuth accepted, CRPCPermissions rejected). "
+                          << "Investigate immediately." << std::endl;
+                if (m_logger) {
+                    m_logger->LogSecurityEvent("AUTH_STORE_DIVERGENCE", clientIP, username,
+                        "RPCAuth and CRPCPermissions disagree on credentials");
+                }
+                const std::string body = "{\"error\":\"Server misconfiguration: RPC permissions store inconsistent. See server log.\",\"code\":-32603}";
+                std::ostringstream oss;
+                oss << "HTTP/1.1 503 Service Unavailable\r\n"
+                    << "Content-Type: application/json\r\n"
+                    << "Content-Length: " << body.size() << "\r\n"
+                    << "Connection: close\r\n"
+                    << "\r\n"
+                    << body;
+                std::string response = oss.str();
                 send_response_and_cleanup(response);
                 return;
             }
@@ -1166,9 +1273,28 @@ void CRPCServer::HandleClient(int clientSocket) {
             std::cout << "[RPC-PERMISSIONS] User '" << username << "' has role: "
                       << CRPCPermissions::GetRoleName(userPermissions) << std::endl;
         } else {
-            // Permissions not initialized - allow (backwards compatibility)
-            std::cout << "[RPC-PERMISSIONS] WARNING: Permissions not initialized, allowing request" << std::endl;
-            userPermissions = static_cast<uint32_t>(RPCPermission::ROLE_ADMIN);  // Grant admin if not configured
+            // CVE-2026-RPC-AUTH (H-A5): m_permissions==nullptr means startup
+            // skipped permissions init — an init-invariant violation. Post-H1
+            // startup aborts if init fails, so this branch is dead under
+            // normal conditions. Return 503 (not 401) so an operator sees the
+            // real cause if the invariant is ever broken.
+            std::cerr << "[RPC-PERMISSIONS] CRITICAL: Permissions subsystem not initialized "
+                      << "but request reached permission check. Init invariant violated." << std::endl;
+            if (m_logger) {
+                m_logger->LogSecurityEvent("AUTH_INIT_INVARIANT", clientIP, username,
+                    "m_permissions==nullptr after successful auth — init order broken");
+            }
+            const std::string body = "{\"error\":\"Server misconfiguration: RPC permissions not initialized. See server log.\",\"code\":-32603}";
+            std::ostringstream oss;
+            oss << "HTTP/1.1 503 Service Unavailable\r\n"
+                << "Content-Type: application/json\r\n"
+                << "Content-Length: " << body.size() << "\r\n"
+                << "Connection: close\r\n"
+                << "\r\n"
+                << body;
+            std::string response = oss.str();
+            send_response_and_cleanup(response);
+            return;
         }
     }
 
@@ -1300,7 +1426,7 @@ void CRPCServer::HandleClient(int clientSocket) {
 
         // Phase 2: Execute batch requests
         auto batch_start = std::chrono::steady_clock::now();
-        std::vector<RPCResponse> batch_responses = ExecuteBatchRPC(batch_requests, clientIP, username);
+        std::vector<RPCResponse> batch_responses = ExecuteBatchRPC(batch_requests, clientIP, username, userPermissions);
         auto batch_end = std::chrono::steady_clock::now();
         auto batch_duration = std::chrono::duration_cast<std::chrono::milliseconds>(
             batch_end - batch_start);
@@ -1632,10 +1758,10 @@ std::string CRPCServer::BuildHTTPResponse(const std::string& body) {
     oss << "Strict-Transport-Security: max-age=31536000; includeSubDomains\r\n";  // Force HTTPS (future)
     oss << "Referrer-Policy: no-referrer\r\n";  // Don't leak referrer
 
-    // CORS headers for web wallet support
-    oss << "Access-Control-Allow-Origin: *\r\n";
-    oss << "Access-Control-Allow-Methods: POST, OPTIONS\r\n";
-    oss << "Access-Control-Allow-Headers: Content-Type, Authorization, X-Dilithion-RPC\r\n";
+    // CVE-2026-RPC-CORS: NO CORS headers. Bitcoin Core model: same-origin only.
+    // The bundled web wallet at /wallet works because it is same-origin (browsers
+    // don't enforce CORS for same-origin). Cross-origin callers (any third-party
+    // website) cannot read responses, eliminating drive-by wallet drain entirely.
 
     oss << "\r\n";
     oss << body;
@@ -1658,10 +1784,7 @@ std::string CRPCServer::BuildHTTPUnauthorized() {
     oss << "Content-Security-Policy: default-src 'none'\r\n";
     oss << "Referrer-Policy: no-referrer\r\n";
 
-    // CORS headers for web wallet support
-    oss << "Access-Control-Allow-Origin: *\r\n";
-    oss << "Access-Control-Allow-Methods: POST, OPTIONS\r\n";
-    oss << "Access-Control-Allow-Headers: Content-Type, Authorization, X-Dilithion-RPC\r\n";
+    // CVE-2026-RPC-CORS: NO CORS headers. See BuildHTTPResponse for rationale.
 
     oss << "\r\n";
     oss << body;
@@ -1930,17 +2053,11 @@ std::vector<RPCRequest> CRPCServer::ParseBatchRPCRequest(const std::string& json
 
 std::vector<RPCResponse> CRPCServer::ExecuteBatchRPC(const std::vector<RPCRequest>& requests,
                                                       const std::string& clientIP,
-                                                      const std::string& username) {
+                                                      const std::string& username,
+                                                      uint32_t userPermissions) {
     std::vector<RPCResponse> responses;
-
-    // Get user permissions once (if permissions enabled and user authenticated)
-    uint32_t userPermissions = static_cast<uint32_t>(RPCPermission::ROLE_ADMIN);
-    if (m_permissions && !username.empty()) {
-        // Note: We already authenticated in HandleClient, so we can't re-authenticate here
-        // Instead, we'll use a simplified permission check - in a real implementation,
-        // we'd cache the permissions from HandleClient
-        // For now, we'll check permissions per request (less efficient but correct)
-    }
+    (void)clientIP;
+    (void)username;
 
     for (const auto& request : requests) {
         // Handle invalid requests (from batch parsing)
@@ -1948,20 +2065,29 @@ std::vector<RPCResponse> CRPCServer::ExecuteBatchRPC(const std::vector<RPCReques
             RPCResponse error_resp = RPCResponse::ErrorStructured(-32600,
                 "Invalid Request", request.id, "RPC-INVALID-REQUEST",
                 {"Check JSON-RPC 2.0 format", "Verify request is a valid object"});
-            // Move error response (avoids unnecessary copy)
             responses.push_back(std::move(error_resp));
             continue;
         }
 
-        // Check method permission (if permissions enabled)
-        // Note: Permission checking was already done in HandleClient for the batch,
-        // but we check per-request here for granular control
-        // In a production system, we'd pass the userPermissions from HandleClient
-        // For now, we allow all requests in batch (permissions checked at batch level)
-        
+        // CVE-2026-RPC-AUTH: per-request permission check inside the batch
+        // loop. HandleClient pre-checks the whole batch before calling us,
+        // so this is defense in depth — if the pre-check is ever skipped
+        // or refactored away, we still fail closed per-request.
+        if (m_permissions &&
+            !m_permissions->CheckMethodPermission(userPermissions, request.method)) {
+            std::vector<std::string> recovery = {
+                "Contact administrator to grant required permissions",
+                "Verify you are using the correct user account"
+            };
+            RPCResponse denied = RPCResponse::ErrorStructured(-32000,
+                std::string("Insufficient permissions for method '") + request.method + "'",
+                request.id, "RPC-PERMISSION-DENIED", recovery);
+            responses.push_back(std::move(denied));
+            continue;
+        }
+
         // Execute request
         RPCResponse resp = ExecuteRPC(request);
-        // Move response (avoids unnecessary copy)
         responses.push_back(std::move(resp));
     }
 
@@ -3953,19 +4079,20 @@ std::string CRPCServer::RPC_WalletPassphrase(const std::string& params) {
         throw std::runtime_error("Passphrase too long (max " + std::to_string(MAX_PASSPHRASE_LENGTH) + " characters)");
     }
 
-    // Parse timeout (optional, default 60 seconds, max 24 hours, 0 = forever)
-    int64_t timeout = RPCUtil::GetOptionalInt64(j, "timeout", 60, 0, 86400);
+    // CVE-2026-RPC-AUTH (H-A3): require a positive timeout. Previously `0`
+    // was accepted, which the wallet maps to `time_point::max()` (unlock
+    // until process restart). That combined lethally with any RPC-level
+    // auth weakness — an attacker who reaches the wallet RPC surface could
+    // unlock forever and then call sendtoaddress without re-prompt. Min is
+    // now 1 second; max remains 24 hours.
+    int64_t timeout = RPCUtil::GetOptionalInt64(j, "timeout", 60, 1, 86400);
 
     if (!m_wallet->Unlock(passphrase, timeout)) {
         throw std::runtime_error("Error: The wallet passphrase entered was incorrect");
     }
 
     std::ostringstream oss;
-    oss << "\"Wallet unlocked";
-    if (timeout > 0) {
-        oss << " for " << timeout << " seconds";
-    }
-    oss << "\"";
+    oss << "\"Wallet unlocked for " << timeout << " seconds\"";
     return oss.str();
 }
 

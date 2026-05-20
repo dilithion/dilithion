@@ -151,8 +151,12 @@ public:
     /**
      * Constructor
      * @param port Port to listen on (default: 8334 for testnet)
+     * @param public_api If true, bind to all interfaces (seed nodes / --public-api).
+     *                   If false (default), bind to 127.0.0.1 only.
+     *                   CVE-2026-RPC-CORS: prior default of all-interfaces exposed
+     *                   /api/v1/* + /wallet to LAN.
      */
-    explicit CHttpServer(int port = 8334);
+    explicit CHttpServer(int port = 8334, bool public_api = false);
 
     /**
      * Destructor - ensures server is stopped
@@ -263,6 +267,7 @@ private:
 
     // Configuration
     int m_port;                            // Server port
+    bool m_public_api;                     // CVE-2026: if false, bind 127.0.0.1 only
     int m_num_threads;                     // Number of worker threads
     StatsHandler m_stats_handler;          // Stats handler function
     MetricsHandler m_metrics_handler;      // Prometheus metrics handler

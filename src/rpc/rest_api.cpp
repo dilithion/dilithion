@@ -583,9 +583,8 @@ std::string CRestAPI::BuildHTTPResponse(int statusCode, const std::string& body)
     response << "HTTP/1.1 " << statusCode << " " << statusText << "\r\n";
     response << "Content-Type: application/json\r\n";
     response << "Content-Length: " << body.size() << "\r\n";
-    response << "Access-Control-Allow-Origin: *\r\n";  // CORS for browser access
-    response << "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n";
-    response << "Access-Control-Allow-Headers: Content-Type\r\n";
+    // CVE-2026-RPC-CORS: NO CORS headers. Same-origin only. Browsers cannot
+    // read REST responses cross-origin, preventing drive-by data exfil.
     response << "Cache-Control: no-cache\r\n";
     response << "Connection: close\r\n";
     response << "\r\n";

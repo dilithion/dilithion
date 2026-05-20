@@ -672,9 +672,7 @@ std::string CFacilitator::BuildHTTPResponse(int statusCode, const std::string& b
 
     oss << "HTTP/1.1 " << statusCode << " " << statusText << "\r\n";
     oss << "Content-Type: application/json\r\n";
-    oss << "Access-Control-Allow-Origin: *\r\n";
-    oss << "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n";
-    oss << "Access-Control-Allow-Headers: Content-Type, PAYMENT-SIGNATURE, PAYMENT-REQUIRED\r\n";
+    // CVE-2026-RPC-CORS: NO CORS headers. Same-origin only.
     oss << "Content-Length: " << body.size() << "\r\n";
     oss << "\r\n";
     oss << body;

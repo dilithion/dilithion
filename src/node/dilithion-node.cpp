@@ -71,6 +71,7 @@
 #include <wallet/wallet.h>
 #include <wallet/passphrase_validator.h>
 #include <rpc/server.h>
+#include <rpc/auth.h>      // CVE-2026-RPC-AUTH: RPCAuth::InitializeAuth
 #include <rpc/rest_api.h>  // REST API for light wallet
 #include <core/chainparams.h>
 #include <consensus/pow.h>
@@ -3726,7 +3727,8 @@ load_genesis_block:  // Bug #29: Label for automatic retry after blockchain wipe
         // Create and start HTTP API server for dashboard
         // Use port 18334 for testnet, 8334 for mainnet (Bitcoin convention)
         int api_port = config.testnet ? 18334 : 8334;
-        CHttpServer http_server(api_port);
+        // CVE-2026-RPC-CORS: gate all-interfaces bind on --public-api
+        CHttpServer http_server(api_port, config.public_api);
         g_node_state.http_server = &http_server;
 
         // STRESS TEST FIX: Create cached stats for lock-free API responses
@@ -7107,12 +7109,19 @@ load_genesis_block:  // Bug #29: Label for automatic retry after blockchain wipe
         std::string rpc_permissions_file = config.datadir + "/rpc_permissions.json";
 
         if (!rpcuser.empty() && !rpcpassword.empty()) {
-            // Initialize permissions system
+            // CVE-2026-RPC-AUTH: previously only InitializePermissions was called.
+            // The auth gate at server.cpp checks RPCAuth::IsAuthConfigured(),
+            // which is only set by RPCAuth::InitializeAuth — and that was never
+            // called in production. Wire both, and abort on either failure.
             if (!rpc_server.InitializePermissions(rpc_permissions_file, rpcuser, rpcpassword)) {
-                std::cerr << "WARNING: Failed to initialize RPC permissions, continuing without authentication" << std::endl;
-            } else {
-                std::cout << "  [AUTH] RPC authentication enabled" << std::endl;
+                std::cerr << "ERROR: Failed to initialize RPC permissions. Aborting startup." << std::endl;
+                return 1;
             }
+            if (!RPCAuth::InitializeAuth(rpcuser, rpcpassword)) {
+                std::cerr << "ERROR: Failed to initialize RPC authentication. Aborting startup." << std::endl;
+                return 1;
+            }
+            std::cout << "  [AUTH] RPC authentication enabled" << std::endl;
         } else if (config.public_api) {
             // v4.1-rc2 ISSUE-1 fix: auto-generate secure random RPC credentials
             // for --public-api when none configured, instead of refusing to start.
@@ -7173,47 +7182,80 @@ load_genesis_block:  // Bug #29: Label for automatic retry after blockchain wipe
                 std::cerr << "ERROR: Failed to initialize RPC permissions with auto-generated credentials" << std::endl;
                 return 1;
             }
+            // CVE-2026-RPC-AUTH: wire RPCAuth so the auth gate actually runs.
+            if (!RPCAuth::InitializeAuth(rpcuser, rpcpassword)) {
+                std::cerr << "ERROR: Failed to initialize RPC authentication. Aborting startup." << std::endl;
+                return 1;
+            }
             std::cout << "  [AUTH] RPC authentication enabled (auto-generated)" << std::endl;
         } else {
-            // No credentials configured — generate a cookie file for local auth.
-            // This mirrors Bitcoin Core's .cookie mechanism: a random credential
-            // is written to <datadir>/.cookie on each startup. Local tools (relayer,
-            // CLI) can read it. The file is deleted on clean shutdown.
+            // CVE-2026-RPC-AUTH: previously this path could fail SILENTLY and
+            // leave the node serving RPC with NO authentication. Now any
+            // failure aborts startup. Bitcoin Core's .cookie model.
             std::string cookie_path = config.datadir + "/.cookie";
             std::vector<uint8_t> cookie_bytes(32);
             extern bool GenerateSalt(std::vector<uint8_t>&);
-            if (GenerateSalt(cookie_bytes)) {
-                // Convert to hex string for use as password
-                std::string cookie_password;
-                for (auto b : cookie_bytes) {
-                    char hex[3];
-                    snprintf(hex, sizeof(hex), "%02x", b);
-                    cookie_password += hex;
-                }
-                rpcuser = "__cookie__";
-                rpcpassword = cookie_password;
-
-                // Write cookie file (mode 0600 on Unix for owner-only access)
-                std::ofstream cookie_file(cookie_path);
-                if (cookie_file.is_open()) {
-                    cookie_file << rpcuser << ":" << rpcpassword;
-                    cookie_file.close();
-#ifndef _WIN32
-                    chmod(cookie_path.c_str(), 0600);
-#endif
-                    std::cout << "  [AUTH] RPC cookie authentication enabled (credentials in "
-                              << cookie_path << ")" << std::endl;
-
-                    // Initialize permissions with cookie credentials
-                    rpc_server.InitializePermissions(rpc_permissions_file, rpcuser, rpcpassword);
-                } else {
-                    std::cerr << "  [WARNING] Failed to write RPC cookie file. "
-                              << "RPC authentication disabled." << std::endl;
-                }
-            } else {
-                std::cerr << "  [WARNING] Failed to generate RPC cookie. "
-                          << "RPC authentication disabled." << std::endl;
+            if (!GenerateSalt(cookie_bytes)) {
+                std::cerr << "ERROR: Failed to generate RPC cookie (random source unavailable). "
+                          << "Aborting startup. Configure rpcuser/rpcpassword in "
+                          << config.datadir << "/dilithion.conf to bypass cookie generation."
+                          << std::endl;
+                return 1;
             }
+
+            // Convert to hex string for use as password
+            std::string cookie_password;
+            for (auto b : cookie_bytes) {
+                char hex[3];
+                snprintf(hex, sizeof(hex), "%02x", b);
+                cookie_password += hex;
+            }
+            rpcuser = "__cookie__";
+            rpcpassword = cookie_password;
+
+            // CVE-2026-RPC-AUTH (H-A2): write cookie file at mode 0600
+            // ATOMICALLY on Unix to close the race between ofstream creation
+            // (which uses umask-default, typically 0644) and the chmod 0600
+            // that previously fired only AFTER write+close. In that window
+            // the cookie was world-readable; on a shared host an attacker
+            // with `inotify` could win that race.
+            // Approach: tighten the process umask, write, restore. Belt and
+            // braces: explicit chmod 0600 after close (in case the FS / mount
+            // ignores umask).
+            // On Windows the per-user %APPDATA% datadir provides equivalent
+            // protection at the directory level (Windows ACLs are not
+            // affected by umask).
+#ifndef _WIN32
+            mode_t prev_umask = umask(077);
+#endif
+            std::ofstream cookie_file(cookie_path);
+            if (!cookie_file.is_open()) {
+#ifndef _WIN32
+                umask(prev_umask);
+#endif
+                std::cerr << "ERROR: Failed to write RPC cookie file at "
+                          << cookie_path << ". Aborting startup. "
+                          << "Check filesystem permissions or configure "
+                          << "rpcuser/rpcpassword in dilithion.conf." << std::endl;
+                return 1;
+            }
+            cookie_file << rpcuser << ":" << rpcpassword;
+            cookie_file.close();
+#ifndef _WIN32
+            umask(prev_umask);
+            chmod(cookie_path.c_str(), 0600);
+#endif
+
+            if (!rpc_server.InitializePermissions(rpc_permissions_file, rpcuser, rpcpassword)) {
+                std::cerr << "ERROR: Failed to initialize RPC permissions with cookie credentials. Aborting startup." << std::endl;
+                return 1;
+            }
+            if (!RPCAuth::InitializeAuth(rpcuser, rpcpassword)) {
+                std::cerr << "ERROR: Failed to initialize RPC authentication with cookie credentials. Aborting startup." << std::endl;
+                return 1;
+            }
+            std::cout << "  [AUTH] RPC cookie authentication enabled (credentials in "
+                      << cookie_path << ")" << std::endl;
         }
 
         // Phase 1: Initialize request logging

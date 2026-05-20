@@ -209,10 +209,17 @@ TEST_F(RPCPermissionsMethodMappingTest, AdminServerMethods) {
 }
 
 TEST_F(RPCPermissionsMethodMappingTest, UnknownMethods) {
-    // Unknown methods return 0 (no permissions required, but logged as warning)
-    EXPECT_EQ(perms.GetMethodPermissions("unknownmethod"), 0);
-    EXPECT_EQ(perms.GetMethodPermissions(""), 0);
-    EXPECT_EQ(perms.GetMethodPermissions("getbalancetypo"), 0);
+    // CVE-2026-RPC-PERMDEFAULT (H-A1): unknown methods now require ROLE_ADMIN.
+    // Previously returned 0 (public), which silently exposed wallet-touching
+    // methods missing from the map (setminingaddress, claimhtlc, etc.).
+    EXPECT_EQ(perms.GetMethodPermissions("unknownmethod"),
+              static_cast<uint32_t>(RPCPermission::ROLE_ADMIN));
+    EXPECT_EQ(perms.GetMethodPermissions(""),
+              static_cast<uint32_t>(RPCPermission::ROLE_ADMIN));
+    EXPECT_EQ(perms.GetMethodPermissions("getbalancetypo"),
+              static_cast<uint32_t>(RPCPermission::ROLE_ADMIN));
+    // Methods explicitly mapped as public (required=0) remain public.
+    EXPECT_EQ(perms.GetMethodPermissions("help"), 0u);
 }
 
 /**

@@ -278,11 +278,17 @@ private:
      * @param requests Vector of RPCRequest objects
      * @param clientIP Client IP address (for logging)
      * @param username Username (for logging)
+     * @param userPermissions Permissions of authenticated user (defense in depth;
+     *        HandleClient also pre-checks the whole batch).
+     *        CVE-2026-RPC-AUTH: previously this function defaulted to
+     *        ROLE_ADMIN and contained dead "check permissions per request"
+     *        comments without actually checking. Now enforced.
      * @return Vector of RPCResponse objects
      */
     std::vector<RPCResponse> ExecuteBatchRPC(const std::vector<RPCRequest>& requests,
                                             const std::string& clientIP,
-                                            const std::string& username);
+                                            const std::string& username,
+                                            uint32_t userPermissions);
 
     /**
      * Convert RPCResponse to JSON string
