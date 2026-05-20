@@ -49,10 +49,14 @@ bash "$(dirname "$0")/scripts/bundle-macos-dylibs.sh" "${RELEASE_DIR}" \
 # Copy launcher scripts and documentation
 echo "[3/4] Copying launcher scripts and documentation..."
 cp start-dilv-mining.sh "${RELEASE_DIR}/" || { echo "ERROR: start-dilv-mining.sh not found."; exit 1; }
+cp start-dilv-miner-gui.sh "${RELEASE_DIR}/" || { echo "ERROR: start-dilv-miner-gui.sh not found."; exit 1; }
 cp setup-dilv.sh "${RELEASE_DIR}/" || { echo "ERROR: setup-dilv.sh not found."; exit 1; }
 chmod +x "${RELEASE_DIR}/start-dilv-mining.sh"
+chmod +x "${RELEASE_DIR}/start-dilv-miner-gui.sh"
 chmod +x "${RELEASE_DIR}/setup-dilv.sh"
 cp README-DILV-MAC.txt "${RELEASE_DIR}/README.txt" || { echo "ERROR: README-DILV-MAC.txt not found."; exit 1; }
+cp docs/GETTING-STARTED.md "${RELEASE_DIR}/GETTING-STARTED.md" || { echo "ERROR: docs/GETTING-STARTED.md not found."; exit 1; }
+cp website/wallet.html "${RELEASE_DIR}/wallet.html" || { echo "ERROR: website/wallet.html not found."; exit 1; }
 
 # Create archive
 echo "[4/4] Creating tar.gz archive..."
