@@ -680,3 +680,8 @@ docs/WALLET-INTEGRATION-QUESTIONS-FOR-ZACH.md
 /test-isolation2/
 /test-iso3/
 /test-dll-check/
+
+# Leftover review/scratch clones — never check these in
+# (relocated to c:/tmp/ archive 2026-05-25 to keep them out of Cursor's index)
+_agent_comms_review/
+_review_agent_comms/
