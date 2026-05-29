@@ -685,3 +685,27 @@ docs/WALLET-INTEGRATION-QUESTIONS-FOR-ZACH.md
 # (relocated to c:/tmp/ archive 2026-05-25 to keep them out of Cursor's index)
 _agent_comms_review/
 _review_agent_comms/
+
+# Per-session scratch convention: _tmp_*.{sh,js,md} files at repo root.
+# These are session-local working files (mock harnesses, behavioral validator
+# scratch, red-team scratch notes). Pattern established + 7 instances cleaned
+# 2026-05-29 (autonomy-lane proposal dilithion-repo-audit-tmp-cruft).
+/_tmp_*.sh
+/_tmp_*.js
+/_tmp_*.md
+
+# Loose cursor close-readiness review snapshots at repo root. Authoritative
+# copies live in the corresponding mission dir under .claude/missions/ (or
+# the closed archive in dilithion-strategy/missions/_closed/<mission>_DATE/).
+# Cleaned 2026-05-29.
+/cursor_close_readiness_*.md
+
+# Local MCP server config. Written by agent_comms_sync (entry: seedrpc shims +
+# extreview). Not source-controlled — local machine config only.
+/.mcp.json
+
+# Sibling repo working clones under dilithion/ (not submodules — bind-mount-style
+# Will workflow: `cd ~/dilithion && cd agent-comms` to cross-edit without
+# leaving the IDE workspace).
+/agent-comms/
+/dilithion-strategy/
