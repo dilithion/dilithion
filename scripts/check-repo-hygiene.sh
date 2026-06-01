@@ -77,14 +77,17 @@ ALLOWED_ROOT_FILES=(
   README-WINDOWS.txt
   SETUP-AND-START.bat
   SETUP-DILV.bat
+  START-DILV-MINER-GUI.bat
   START-DILV-MINING.bat
   START-MINER-GUI.bat
   START-MINING.bat
   build-randomx.bat
   dilithion-wallet
   dilithion-wallet.bat
+  dilv-wallet.bat
   setup-and-start.sh
   setup-dilv.sh
+  start-dilv-miner-gui.sh
   start-dilv-mining.sh
   start-miner-gui.sh
   start-mining.sh
