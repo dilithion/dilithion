@@ -5504,12 +5504,24 @@ std::string CRPCServer::RPC_GetPeerInfo(const std::string& params) {
         bool is_inbound = false;
         uint64_t bytes_sent = 0;
         uint64_t bytes_recv = 0;
+        // SSOT fix (2026-06-01): lastsend/lastrecv must come from the live CNode,
+        // not the deprecated CPeer::last_send/last_recv fields. CPeer::last_recv
+        // (and last_send) have NO write site anywhere in the tree — they are
+        // constructed to 0 and never updated — so getpeerinfo always reported
+        // lastrecv:0 / lastsend:0 even for actively-communicating peers (the same
+        // dead-field class that caused the eviction-blind-scoring bug). CNode
+        // nLastRecv is updated in ReceiveMsgBytes and nLastSend in the send path
+        // (connman.cpp:1547). Report those instead; fall back to 0 if no live node.
+        int64_t last_send = 0;
+        int64_t last_recv = 0;
         if (g_node_context.connman) {
             CNode* pnode = g_node_context.connman->GetNode(peer->id);
             if (pnode) {
                 is_inbound = pnode->fInbound;
                 bytes_sent = pnode->nSendBytes.load();
                 bytes_recv = pnode->nRecvBytes.load();
+                last_send = pnode->nLastSend.load();
+                last_recv = pnode->nLastRecv.load();
             }
         }
 
@@ -5517,8 +5529,8 @@ std::string CRPCServer::RPC_GetPeerInfo(const std::string& params) {
         oss << "\"bytes_sent\":" << bytes_sent << ",";
         oss << "\"bytes_recv\":" << bytes_recv << ",";
         oss << "\"conntime\":" << peer->connect_time << ",";
-        oss << "\"lastsend\":" << peer->last_send << ",";
-        oss << "\"lastrecv\":" << peer->last_recv << ",";
+        oss << "\"lastsend\":" << last_send << ",";
+        oss << "\"lastrecv\":" << last_recv << ",";
         oss << "\"version\":" << peer->version << ",";
         // user_agent comes from remote peers and can contain arbitrary bytes,
         // including unescaped quotes that would break JSON. Always escape.

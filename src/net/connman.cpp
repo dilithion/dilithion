@@ -1244,9 +1244,14 @@ void CConnman::SocketHandler() {
                 std::lock_guard<std::mutex> lock(cs_vNodes);
 
                 bool has_outbound = false;
-                int inbound_count = 0;
+                int inbound_count = 0;       // inbound from THIS ip (per-IP cap)
+                size_t total_inbound = 0;    // all inbound (global inbound cap)
+                size_t total_count = m_nodes.size();  // all nodes (global total cap)
                 for (const auto& existing_node : m_nodes) {
                     if (existing_node && !existing_node->fDisconnect.load()) {
+                        if (existing_node->fInbound) {
+                            ++total_inbound;
+                        }
                         if (existing_node->addr.ToStringIP() == std::string(ip_str)) {
                             if (!existing_node->fInbound) {
                                 has_outbound = true;
@@ -1266,6 +1271,34 @@ void CConnman::SocketHandler() {
                 if (inbound_count >= max_per_ip) {
                     LogPrintf(NET, WARN, "[CConnman] Rejecting inbound from %s (%d inbound connections, max %d per IP)\n",
                               ip_str, inbound_count, max_per_ip);
+                    // Node destructor will close socket
+                    continue;  // Skip to next pending connection
+                }
+
+                // Global cap enforcement (2026-06-01 fix): the dedicated
+                // AcceptConnection() helper enforces nMaxInbound/nMaxTotal
+                // (connman.cpp:445-471), but it has NO production caller — every
+                // real inbound is accepted here in SocketHandler, which previously
+                // enforced ONLY the per-IP cap. peers.size()/m_nodes could
+                // therefore race up to MAX_TOTAL_CONNECTIONS unchecked. Mirror
+                // AcceptConnection's caps. We intentionally do NOT call
+                // EvictPeersIfNeeded() here: it would acquire CPeerManager's
+                // cs_peers/cs_nodes while we hold cs_vNodes (extra cross-object
+                // lock nesting in a hot accept path), and — since eviction now
+                // marks-for-disconnect rather than freeing synchronously — it
+                // would not free a slot this pass anyway. PeriodicMaintenance runs
+                // eviction on its own cadence; here we simply reject over-cap
+                // inbounds so the maps cannot exceed the configured limits.
+                if (total_inbound >= static_cast<size_t>(m_options.nMaxInbound)) {
+                    LogPrintf(NET, WARN, "[CConnman] Rejecting inbound from %s (inbound limit reached %zu/%d)\n",
+                              ip_str, total_inbound, m_options.nMaxInbound);
+                    // Node destructor will close socket
+                    continue;  // Skip to next pending connection
+                }
+
+                if (total_count >= static_cast<size_t>(m_options.nMaxTotal)) {
+                    LogPrintf(NET, WARN, "[CConnman] Rejecting inbound from %s (total connection limit reached %zu/%d)\n",
+                              ip_str, total_count, m_options.nMaxTotal);
                     // Node destructor will close socket
                     continue;  // Skip to next pending connection
                 }
