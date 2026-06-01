@@ -360,9 +360,21 @@ bool CPeerManager::CanAcceptConnection() const {
 
 size_t CPeerManager::GetConnectionCount() const {
     std::lock_guard<std::recursive_mutex> lock(cs_peers);
+    // SSOT fix (2026-06-01): count via the live CNode::state, not the deprecated
+    // CPeer::IsConnected() (which reads CPeer::state — peers.h:162-166, marked
+    // DEPRECATED and may be stale). CNode::state is the single source of truth.
+    // Route through the IsConnected(CNode*) overload (peers.h:184) using the live
+    // node from node_refs; a peer with no live CNode falls back to CPeer::state
+    // inside the overload. Lock order cs_peers → cs_nodes matches the established
+    // order used by the BUG#144 stale-handshake path and DisconnectNodes.
+    //
+    // GetNode is non-const (it locks cs_nodes), so const-cast `this` to reuse it
+    // rather than duplicating the node_refs lookup; the call is read-only.
+    auto* self = const_cast<CPeerManager*>(this);
     size_t count = 0;
     for (const auto& pair : peers) {
-        if (pair.second->IsConnected()) {
+        CNode* node = self->GetNode(pair.first);
+        if (pair.second->IsConnected(node)) {
             count++;
         }
     }
@@ -995,8 +1007,14 @@ bool CPeerManager::EvictPeersIfNeeded() {
             score += 100;  // Never received anything (or no live node)
         }
 
-        // Prefer to evict peers that haven't completed handshake
-        if (!peer->IsHandshakeComplete()) {
+        // Prefer to evict peers that haven't completed handshake.
+        // SSOT-drift fix (2026-06-01): the no-arg IsHandshakeComplete() reads the
+        // deprecated CPeer::state. `node` (the live CNode SSOT) is already in scope
+        // here for the fManual / nLastRecv checks, so route through the
+        // IsHandshakeComplete(CNode*) overload that queries CNode::state. A peer
+        // with no live CNode (node==nullptr) falls back to CPeer::state inside the
+        // overload — same behaviour as before for that edge case.
+        if (!peer->IsHandshakeComplete(node)) {
             score += 200;  // Incomplete handshake
         }
 
@@ -1041,14 +1059,37 @@ bool CPeerManager::EvictPeersIfNeeded() {
     if (peer) {
         LogPrintf(NET, INFO, "Evicting peer %d (score: %d, addr: %s)",
                   peer_to_evict, eviction_candidates[0].second, peer->addr.ToString().c_str());
-        // F22 (v4.3.3 Track B): eviction used RemovePeer only, bypassing
-        // CConnman::DispatchPeerDisconnected — port OnPeerDisconnected (F18+)
-        // never ran. Mirror DisconnectNodes ordering: dispatch first while
-        // CPeer/CNode state is still observable, then legacy map removal.
-        if (g_node_context.connman) {
-            g_node_context.connman->DispatchPeerDisconnected(peer_to_evict);
+
+        // Socket-orphan fix (2026-06-01): eviction previously called
+        // DispatchPeerDisconnected + RemovePeer directly. RemovePeer only erases
+        // the CPeerManager `peers` map (peers.cpp:270) — it never closes the OS
+        // socket, never erases node_refs, and never removes the CNode from
+        // CConnman::m_nodes. The evicted peer's fd + CNode therefore leaked: the
+        // node lingered in m_nodes (still counted by the accept-path caps,
+        // re-fetchable via GetNode) with an open socket until some other path
+        // happened to disconnect it. Over many maintenance ticks this orphans
+        // sockets and lets m_nodes drift above the connection caps.
+        //
+        // Mirror the canonical reaper instead: mark the live CNode for disconnect
+        // (exactly like the BUG#144 stale-handshake path below and the
+        // InactivityCheck timeout paths) and let CConnman::DisconnectNodes do the
+        // full, ordered teardown — DispatchPeerDisconnected → RemoveNode (erases
+        // peers + node_refs + scorer slot atomically) → CloseSocket → erase from
+        // m_nodes (connman.cpp:1677). DisconnectNodes already dispatches the
+        // disconnect, so we must NOT dispatch here too (double-dispatch).
+        CNode* node = GetNode(peer_to_evict);
+        if (node) {
+            node->MarkDisconnect();
+        } else {
+            // No live CNode (e.g. peers-map entry with no node_refs mapping):
+            // there is no socket / m_nodes entry for the reaper to find, so fall
+            // back to the legacy direct path to clean up the orphaned peers-map
+            // entry. Dispatch first (while state is still observable), then erase.
+            if (g_node_context.connman) {
+                g_node_context.connman->DispatchPeerDisconnected(peer_to_evict);
+            }
+            RemovePeer(peer_to_evict);
         }
-        RemovePeer(peer_to_evict);
         return true;
     }
 
