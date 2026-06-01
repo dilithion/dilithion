@@ -977,11 +977,22 @@ bool CPeerManager::EvictPeersIfNeeded() {
         // Phase 2 port: misbehavior score lives in CPeerScorer now.
         int score = GetMisbehaviorScore(peer_id);
 
-        // Prefer to evict peers with no recent activity (no messages in last 5 minutes)
-        if (peer->last_recv > 0 && (now - peer->last_recv) > 5 * 60) {
+        // Prefer to evict peers with no recent activity (no messages in last 5 minutes).
+        //
+        // ROOT-CAUSE FIX (2026-06-01 DilV peer-retention collapse): CPeer::last_recv has
+        // no write site anywhere in the tree — it is initialised to 0 and never updated —
+        // so this block previously scored EVERY peer +100 "never received anything". Once
+        // peers.size() reached MAX_TOTAL_CONNECTIONS the node evicted healthy, actively-
+        // receiving peers every maintenance tick, collapsing peer counts network-wide
+        // (verified: getpeerinfo lastrecv=0 while bytes_recv > 200 MB). Score on the live
+        // SSOT CNode::nLastRecv (updated in CConnman::ReceiveMsgBytes) instead. `node` is
+        // already fetched above for the fManual check; a peer with no live CNode is treated
+        // as inactive (eligible for eviction).
+        int64_t node_last_recv = node ? node->nLastRecv.load() : 0;
+        if (node_last_recv > 0 && (now - node_last_recv) > 5 * 60) {
             score += 50;  // Inactive peer
-        } else if (peer->last_recv == 0) {
-            score += 100;  // Never received anything
+        } else if (node_last_recv == 0) {
+            score += 100;  // Never received anything (or no live node)
         }
 
         // Prefer to evict peers that haven't completed handshake
