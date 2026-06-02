@@ -376,4 +376,317 @@ BOOST_AUTO_TEST_CASE(test_clear_above_height) {
     g_node_context.block_tracker = std::move(old_tracker);
 }
 
+// ============================================================================
+// Part B seed-side rate-limited re-send test
+// (dilv-dedup-livelock-fix mission, LOW-1 deterministic proof)
+//
+// Seam: CNetMessageProcessor::ProcessMessage() (public) dispatches to the
+// private ProcessGetDataMessage which contains all the Part B logic.
+//
+// We drive the seam with serialized "getdata" CNetMessages. Pre-seeding the
+// served-block state is automatic: the code records every block hash served
+// via on_getdata in g_peer_served_blocks at the end of ProcessGetDataMessage.
+//
+// Time mocking: GetTime() is a thin inline over time(nullptr) with no mock
+// hook. Assertions that require wall-clock gaps (cooldown) use distinct hashes
+// so each gets its own per-(peer,hash) cooldown entry. Assertions that do NOT
+// require time mocking (budget breach, cleanup observable) work deterministically.
+//
+// Disconnect observable: CleanupPeerRateLimitState() erases g_peer_served_blocks
+// for the disconnected peer. We observe this by sending a post-disconnect GETDATA
+// with one of the previously-served hashes and checking on_getdata fires (meaning
+// the hash is no longer in the served set = cleanup occurred).
+// ============================================================================
+BOOST_AUTO_TEST_CASE(test_partb_seed_rate_limited_resend) {
+    if (!Dilithion::g_chainParams)
+        Dilithion::g_chainParams = new Dilithion::ChainParams();
+
+    // -----------------------------------------------------------------------
+    // Scaffold: a CPeerManager + CNetMessageProcessor with a minimal connman
+    // so DisconnectNode() doesn't crash when called with an unknown peer ID.
+    // CConnman::DisconnectNode iterates m_nodes and silently returns if the
+    // peer ID is not found — safe to call on a default-constructed connman.
+    // -----------------------------------------------------------------------
+    CPeerManager peer_manager("");
+    CNetMessageProcessor proc(peer_manager);
+
+    // Wire g_node_context.connman so the disconnect path in ProcessGetDataMessage
+    // doesn't dereference a null pointer.
+    auto connman = std::make_unique<CConnman>();
+    g_node_context.connman = std::move(connman);
+
+    // Counters / observables updated by the on_getdata callback.
+    std::atomic<int> getdata_call_count{0};
+    std::vector<uint256> served_hashes;
+    std::mutex served_mu;
+
+    proc.SetGetDataHandler([&](int /*peer_id*/, const std::vector<NetProtocol::CInv>& items) {
+        getdata_call_count.fetch_add(1, std::memory_order_relaxed);
+        std::lock_guard<std::mutex> lk(served_mu);
+        for (const auto& inv : items) {
+            if (inv.type == NetProtocol::MSG_BLOCK_INV)
+                served_hashes.push_back(inv.hash);
+        }
+    });
+
+    // Helper: build a serialized "getdata" CNetMessage for a list of CInv.
+    // Mirrors CNetMessageProcessor::SerializeInvMessage + CreateGetDataMessage.
+    auto make_getdata = [](const std::vector<NetProtocol::CInv>& invs) {
+        CDataStream s;
+        s.WriteCompactSize(invs.size());
+        for (const auto& inv : invs) {
+            s.WriteUint32(inv.type);
+            s.WriteUint256(inv.hash);
+        }
+        return CNetMessage("getdata", s.GetData());
+    };
+
+    // Helper: build a single-hash CInv (MSG_BLOCK_INV).
+    auto block_inv = [](uint8_t seed) {
+        NetProtocol::CInv inv;
+        inv.type = NetProtocol::MSG_BLOCK_INV;
+        inv.hash.data[0] = seed;
+        return inv;
+    };
+
+    // Pre-register test peer IDs with the peer manager so Misbehaving() is not
+    // a no-op (CPeerManager::Misbehaving returns early when GetPeer(id) returns
+    // null).  AddPeerWithId creates a minimal CPeer entry without requiring a
+    // live socket or address.
+    const int peer_a = 10, peer_b_id = 10, peer_c = 20, peer_d = 30, peer_e = 40;
+    peer_manager.AddPeerWithId(peer_a);
+    peer_manager.AddPeerWithId(peer_c);
+    peer_manager.AddPeerWithId(peer_d);
+    peer_manager.AddPeerWithId(peer_e);
+
+    // -----------------------------------------------------------------------
+    // (a) Re-send happens: a first GETDATA for an already-served block triggers
+    //     a re-send (via on_getdata), not a permanent skip.
+    //
+    // Peer 10 serves hash A (first time, no duplicate). Then re-requests hash A
+    // (now a duplicate). Under Part B, on_getdata should fire again (re-send
+    // approved, within budget, cooldown just started this instant).
+    //
+    // NOTE: cooldown is RESEND_COOLDOWN_SECONDS=2. The cooldown timer is only
+    // SET after a re-send is approved. Therefore the first re-request of a hash
+    // is ALWAYS approved (no prior cooldown entry for that hash). The second
+    // re-request of the SAME hash within 2s is what cooldown blocks (in (b)).
+    // -----------------------------------------------------------------------
+    {
+        uint256 hash_a; hash_a.data[0] = 0x01;
+
+        // First serve: non-duplicate, recorded in served set.
+        getdata_call_count = 0;
+        BOOST_CHECK(proc.ProcessMessage(peer_a, make_getdata({block_inv(0x01)})));
+        BOOST_CHECK_EQUAL(getdata_call_count.load(), 1);  // served first time
+
+        // Second send (duplicate): first re-request of this hash → no prior cooldown
+        // entry → approved for re-send.
+        int before = getdata_call_count.load();
+        BOOST_CHECK(proc.ProcessMessage(peer_a, make_getdata({block_inv(0x01)})));
+        // on_getdata must have fired again: re-send approved, not permanently skipped.
+        BOOST_CHECK_GT(getdata_call_count.load(), before);  // (a) PASS
+    }
+
+    // -----------------------------------------------------------------------
+    // (b) Cooldown: a second re-request for the SAME hash within 2s does NOT
+    //     trigger another re-send. The re-send timestamp was just set by (a)
+    //     above. We immediately re-request peer 10 hash 0x01 again — cooldown
+    //     should block it (no additional on_getdata call for that hash).
+    //
+    //     We also assert no Misbehaving was applied (cooldown skip is silent).
+    //     Misbehavior score remains at 0 because a cooldown-skipped re-request
+    //     is not a budget breach.
+    // -----------------------------------------------------------------------
+    {
+        // peer_b_id = 10 (same peer as (a), same hash — cooldown was just set above)
+        int before = getdata_call_count.load();
+        int score_before = peer_manager.GetMisbehaviorScore(peer_b_id);
+
+        BOOST_CHECK(proc.ProcessMessage(peer_b_id, make_getdata({block_inv(0x01)})));
+
+        // on_getdata must NOT have fired for the cooldown-blocked hash.
+        // We sent only one item so the batch is purely cooldown-blocked.
+        BOOST_CHECK_EQUAL(getdata_call_count.load(), before);  // (b) re-send count unchanged
+
+        // Misbehaving must not have been called (no budget breach).
+        BOOST_CHECK_EQUAL(peer_manager.GetMisbehaviorScore(peer_b_id), score_before);  // (b) no penalty
+    }
+
+    // -----------------------------------------------------------------------
+    // (c) Within-budget = FREE: an honest peer doing within-budget re-requests
+    //     (distinct hashes, each re-requested once) gets ZERO Misbehaving calls
+    //     and is NOT disconnected.
+    //
+    //     Budget = 16 re-sends * 4MiB = 64 MiB per 60s window.
+    //     We issue 15 distinct-hash re-requests (well under the 16-re-send limit)
+    //     using a fresh peer ID (peer 20) so the budget starts full.
+    //     Each hash is re-requested only once (no cooldown issue — each has
+    //     its own cooldown timer, and the timer is only set on re-send approval).
+    //
+    //     Assertion: misbehavior score stays 0 for the whole batch.
+    // -----------------------------------------------------------------------
+    {
+        const int peer_c = 20;
+        const int WITHIN_BUDGET_REQS = 15;  // 15 < 16 = budget capacity
+
+        // First: serve 15 distinct hashes to populate served set.
+        {
+            std::vector<NetProtocol::CInv> first_batch;
+            for (int i = 0; i < WITHIN_BUDGET_REQS; ++i) {
+                first_batch.push_back(block_inv(static_cast<uint8_t>(0x10 + i)));
+            }
+            BOOST_CHECK(proc.ProcessMessage(peer_c, make_getdata(first_batch)));
+        }
+
+        int score_before = peer_manager.GetMisbehaviorScore(peer_c);
+        BOOST_CHECK_EQUAL(score_before, 0);  // sanity: no prior misbehavior
+
+        // Re-request all 15 in a single batch (distinct hashes, each re-send
+        // is the FIRST re-send for its hash so no cooldown applies).
+        {
+            std::vector<NetProtocol::CInv> dup_batch;
+            for (int i = 0; i < WITHIN_BUDGET_REQS; ++i) {
+                dup_batch.push_back(block_inv(static_cast<uint8_t>(0x10 + i)));
+            }
+            BOOST_CHECK(proc.ProcessMessage(peer_c, make_getdata(dup_batch)));
+        }
+
+        // Misbehaving must be ZERO: within-budget re-requests are served free.
+        BOOST_CHECK_EQUAL(peer_manager.GetMisbehaviorScore(peer_c), 0);  // (c) PASS: no false positive
+    }
+
+    // -----------------------------------------------------------------------
+    // (d) Budget breach penalizes: a peer that exhausts the byte budget by
+    //     rotating distinct already-served hashes triggers a Misbehaving
+    //     penalty on the batch that exceeds the budget.
+    //
+    //     Budget capacity = RESEND_MAX_PER_WINDOW = 16 re-sends per window.
+    //     RESEND_COST_BYTES = MAX_BLOCK_SIZE = 4 MiB per re-send.
+    //     RESEND_BYTE_BUDGET_PER_WINDOW = 16 * 4 MiB = 64 MiB.
+    //
+    //     Strategy: serve 20 distinct hashes to peer 30 (so they're in served
+    //     set). Then re-request all 20 in a single batch. The first 16 are
+    //     approved (draining the budget), the 17th triggers budget_breached =
+    //     true → Misbehaving is called with a non-zero penalty.
+    //
+    //     We use a fresh peer (peer 30) so budget starts full.
+    // -----------------------------------------------------------------------
+    {
+        const int peer_d = 30;
+        const int OVER_BUDGET_HASHES = 20;  // 20 > 16 (budget capacity)
+
+        // First: serve 20 distinct hashes.
+        {
+            std::vector<NetProtocol::CInv> first_batch;
+            for (int i = 0; i < OVER_BUDGET_HASHES; ++i) {
+                first_batch.push_back(block_inv(static_cast<uint8_t>(0x30 + i)));
+            }
+            BOOST_CHECK(proc.ProcessMessage(peer_d, make_getdata(first_batch)));
+        }
+
+        int score_before = peer_manager.GetMisbehaviorScore(peer_d);
+        BOOST_CHECK_EQUAL(score_before, 0);  // no prior misbehavior
+
+        // Re-request all 20 (first 16 approved, 17th breaches budget).
+        {
+            std::vector<NetProtocol::CInv> dup_batch;
+            for (int i = 0; i < OVER_BUDGET_HASHES; ++i) {
+                dup_batch.push_back(block_inv(static_cast<uint8_t>(0x30 + i)));
+            }
+            BOOST_CHECK(proc.ProcessMessage(peer_d, make_getdata(dup_batch)));
+        }
+
+        // Misbehaving must have been called with a non-zero penalty.
+        BOOST_CHECK_GT(peer_manager.GetMisbehaviorScore(peer_d), score_before);  // (d) PASS
+    }
+
+    // -----------------------------------------------------------------------
+    // (e) Backstop disconnects on sustained abuse: 3 budget-breach batches
+    //     accumulate 3 strikes → disconnect fires (via MAX_DEDUP_STRIKES = 3).
+    //
+    //     Strategy: peer 40 serves 20 hashes. We re-request all 20 three times.
+    //     Each batch drains the budget past the breach threshold and increments
+    //     the strike counter. After 3 batches, strikes = 3 = MAX_DEDUP_STRIKES
+    //     → DisconnectNode() + CleanupPeerRateLimitState().
+    //
+    //     Observable: after disconnect, sending the same hash again must trigger
+    //     on_getdata (the served set was erased by cleanup, so the hash is no
+    //     longer a "known duplicate" and gets served as a first-time block).
+    //
+    //     NOTE: the byte token bucket refills at RESEND_BYTE_BUDGET_PER_WINDOW
+    //     / RESEND_BUDGET_WINDOW_SECONDS per second of elapsed time. Within the
+    //     same wall-clock second all three batches arrive, so the bucket stays
+    //     drained (no meaningful refill). Each batch re-sends 16 hashes (budget
+    //     exhausted), then reaches budget_breached on the 17th, incrementing the
+    //     strike counter once per batch. After 3 batches → 3 strikes → disconnect.
+    //
+    //     The second and third batches are NEW rotated hash sets (different
+    //     seeds 0x40+20..0x40+39 and 0x40+40..0x40+59) to avoid the cooldown
+    //     on hashes from the first batch that WERE approved for re-send.
+    //     Budget is already exhausted from the first batch regardless.
+    // -----------------------------------------------------------------------
+    {
+        const int peer_e = 40;
+        const int HASHES_PER_BATCH = 20;   // > 16 (triggers breach on each batch)
+        const int NUM_STRIKE_BATCHES = 3;  // = MAX_DEDUP_STRIKES
+
+        // First: serve HASHES_PER_BATCH * NUM_STRIKE_BATCHES distinct hashes
+        // so we have enough unique "already-served" hashes to rotate across batches.
+        {
+            std::vector<NetProtocol::CInv> first_serve;
+            for (int b = 0; b < NUM_STRIKE_BATCHES; ++b) {
+                for (int i = 0; i < HASHES_PER_BATCH; ++i) {
+                    NetProtocol::CInv inv;
+                    inv.type = NetProtocol::MSG_BLOCK_INV;
+                    inv.hash.data[0] = static_cast<uint8_t>(0x40 + b * HASHES_PER_BATCH + i);
+                    inv.hash.data[1] = 0xEE;  // distinguish from other test peers
+                    first_serve.push_back(inv);
+                }
+            }
+            BOOST_CHECK(proc.ProcessMessage(peer_e, make_getdata(first_serve)));
+        }
+
+        // Three breach batches — one per strike.
+        for (int b = 0; b < NUM_STRIKE_BATCHES; ++b) {
+            std::vector<NetProtocol::CInv> dup_batch;
+            for (int i = 0; i < HASHES_PER_BATCH; ++i) {
+                NetProtocol::CInv inv;
+                inv.type = NetProtocol::MSG_BLOCK_INV;
+                inv.hash.data[0] = static_cast<uint8_t>(0x40 + b * HASHES_PER_BATCH + i);
+                inv.hash.data[1] = 0xEE;
+                dup_batch.push_back(inv);
+            }
+            proc.ProcessMessage(peer_e, make_getdata(dup_batch));
+        }
+
+        // After 3 strike batches the code calls DisconnectNode(peer_e) then
+        // CleanupPeerRateLimitState(peer_e), which erases g_peer_served_blocks[peer_e].
+        // Observable: a now-"served" hash sent again must be treated as a first-time
+        // request (no longer in the served set), so on_getdata fires.
+        // Use hash data[0]=0x40, data[1]=0xEE which was in the first_serve batch.
+        int before = getdata_call_count.load();
+        {
+            NetProtocol::CInv inv;
+            inv.type = NetProtocol::MSG_BLOCK_INV;
+            inv.hash.data[0] = 0x40;
+            inv.hash.data[1] = 0xEE;
+            BOOST_CHECK(proc.ProcessMessage(peer_e, make_getdata({inv})));
+        }
+        // If cleanup happened (disconnect fired), the hash is unknown → on_getdata fired.
+        // If cleanup did NOT happen, the hash is in served set → duplicate path → no re-send.
+        // (Well, the budget may be exhausted too, but clean state = on_getdata fires.)
+        BOOST_CHECK_GT(getdata_call_count.load(), before);  // (e) PASS: cleanup confirms disconnect fired
+
+        // Document which lever fired: the strike counter is the primary lever here.
+        // MAX_DEDUP_STRIKES = 3. Each breach batch increments strikes by 1.
+        // 3 batches → strikes = 3 = MAX_DEDUP_STRIKES → disconnect.
+        // The RESEND_BACKSTOP_TOTAL_BYTES lever (2 GiB = 512 re-sends * 4MiB) would
+        // require ~512 re-sends to trip alone; with 3*16=48 re-sends we are far below it.
+    }
+
+    // Teardown: restore g_node_context.connman to avoid leaking into other tests.
+    g_node_context.connman.reset();
+}
+
 BOOST_AUTO_TEST_SUITE_END()

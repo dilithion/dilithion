@@ -89,6 +89,49 @@ static const int MAX_DEDUP_BATCH_PENALTY = 20;      // Cap per-batch penalty so 
 static const int MAX_DEDUP_STRIKES = 3;             // Disconnect after this many duplicate GETDATA batches
 static std::map<int, int> g_peer_dedup_strikes;      // Per-peer strike counter
 
+// dilv-dedup-livelock-fix Part B (seed-side defense-in-depth).
+// The old behavior at the "Skip already-served blocks" continue was PERMANENT STARVATION:
+// a peer that re-requested an already-served block was never re-served and, after
+// MAX_DEDUP_STRIKES *monotonic* strikes, force-disconnected. That bit honest IBD clients
+// whose async validation lagged the wire by ~1s (the livelock this mission fixes) and the
+// legitimate VDF-divergence parent re-requests (ibd_coordinator.cpp:2057/1657). Part A fixes
+// the client root cause; Part B softens the seed so any residual re-request degrades to
+// BOUNDED wasted bandwidth, not a forced disconnect + IBD stall — while still bounding a
+// hostile peer that deliberately rotates hashes to amplify re-send bandwidth (red-team MED-2).
+static const int64_t RESEND_COOLDOWN_SECONDS = 2;    // <=1 re-send per (peer,blockhash) per this window
+static const int64_t RESEND_BUDGET_WINDOW_SECONDS = 60;
+static const int RESEND_MAX_PER_WINDOW = 16;         // contract: <=16 re-sends/60s, now byte-denominated below
+// MED-2: bound AGGREGATE re-send BYTES, not count — a hash-rotating attacker keeps every
+// per-hash cooldown at 1 while extracting up to 16 * 4MiB = 64 MiB/60s (~8.5 Mbit/s) under a
+// count bucket. Debit the WORST-CASE block size (Consensus::MAX_BLOCK_SIZE) per re-send so the
+// token bucket caps aggregate re-send bandwidth regardless of how many distinct hashes rotate.
+// Over-counting (real DilV blocks are far smaller) only throttles SOONER — the safe direction.
+static const int64_t RESEND_COST_BYTES = static_cast<int64_t>(MAX_BLOCK_VTX_BYTES);
+static const int64_t RESEND_BYTE_BUDGET_PER_WINDOW =
+    static_cast<int64_t>(RESEND_MAX_PER_WINDOW) * RESEND_COST_BYTES;  // 64 MiB / 60s aggregate cap
+// MED-3: this budget governs ONLY re-requests of already-served hashes. First-time block sends
+// never enter this branch, so honest deep-IBD (32 in-transit, first-time delivery) never touches
+// it; the only honest re-requests are the rare parent-recovery path — orders of magnitude under
+// 16 worst-case re-sends/60s. No honest-client throttle.
+// MED-4: the decaying strike counter alone lets a slow-drip attacker grief forever just under the
+// disconnect threshold, so retain an INDEPENDENT non-decaying "you've cost me too much total
+// re-send bandwidth on this connection" backstop that sustained abuse eventually trips regardless
+// of decay. Sized far above any honest re-send total over a full IBD.
+static const int64_t RESEND_BACKSTOP_TOTAL_BYTES = 512LL * RESEND_COST_BYTES;  // 2 GiB / connection
+static const int64_t STRIKE_DECAY_SECONDS = 60;     // MED-4: strikes decay -1 per 60s without duplicates
+
+// Per-(peer,blockhash) last re-send time — enforces RESEND_COOLDOWN_SECONDS.
+static std::map<int, std::map<uint256, int64_t>> g_peer_resend_times;
+// Per-peer byte token bucket (tokens in BYTES, refilled at RESEND_BYTE_BUDGET_PER_WINDOW/window).
+struct ResendBucket { int64_t tokens = 0; int64_t last_refill = 0; bool init = false; };
+static std::map<int, ResendBucket> g_peer_resend_bucket;
+// Per-peer last strike-affecting activity time — drives strike decay.
+static std::map<int, int64_t> g_peer_dedup_last_strike;
+// Per-peer MONOTONIC total re-sent bytes this connection — non-decaying disconnect backstop.
+static std::map<int, int64_t> g_peer_resend_total_bytes;
+// ALL of the above maps (plus g_peer_served_blocks / g_peer_dedup_strikes) are guarded by the
+// single cs_served_blocks mutex — one lock for all per-peer dedup/re-send state, no lock-ordering.
+
 // NET-013 FIX: Maximum size for rate limit maps to prevent memory exhaustion
 static const size_t MAX_RATE_LIMIT_MAP_SIZE = 1000;
 
@@ -143,6 +186,12 @@ void CleanupPeerRateLimitState(int peer_id) {
         std::lock_guard<std::mutex> lock(cs_served_blocks);
         g_peer_served_blocks.erase(peer_id);
         g_peer_dedup_strikes.erase(peer_id);
+        // dilv-dedup-livelock-fix Part B (LOW-2): release the per-peer re-send state on
+        // disconnect so it can't leak across connection churn.
+        g_peer_resend_times.erase(peer_id);
+        g_peer_resend_bucket.erase(peer_id);
+        g_peer_dedup_last_strike.erase(peer_id);
+        g_peer_resend_total_bytes.erase(peer_id);
     }
 }
 
@@ -207,6 +256,37 @@ void PeriodicRateLimitCleanup() {
             auto it = g_peer_served_blocks.begin();
             g_peer_dedup_strikes.erase(it->first);
             g_peer_served_blocks.erase(it);
+        }
+
+        // dilv-dedup-livelock-fix Part B (LOW-2): age out per-(peer,hash) re-send cooldown
+        // entries once the cooldown has elapsed (they carry no further meaning), drop emptied
+        // peers, and cap every per-peer re-send map at MAX_RATE_LIMIT_MAP_SIZE.
+        for (auto pit = g_peer_resend_times.begin(); pit != g_peer_resend_times.end(); ) {
+            auto& hashes = pit->second;
+            for (auto hit = hashes.begin(); hit != hashes.end(); ) {
+                if (now - hit->second > RESEND_COOLDOWN_SECONDS) {
+                    hit = hashes.erase(hit);
+                } else {
+                    ++hit;
+                }
+            }
+            if (hashes.empty()) {
+                pit = g_peer_resend_times.erase(pit);
+            } else {
+                ++pit;
+            }
+        }
+        while (g_peer_resend_times.size() > MAX_RATE_LIMIT_MAP_SIZE) {
+            g_peer_resend_times.erase(g_peer_resend_times.begin());
+        }
+        while (g_peer_resend_bucket.size() > MAX_RATE_LIMIT_MAP_SIZE) {
+            g_peer_resend_bucket.erase(g_peer_resend_bucket.begin());
+        }
+        while (g_peer_dedup_last_strike.size() > MAX_RATE_LIMIT_MAP_SIZE) {
+            g_peer_dedup_last_strike.erase(g_peer_dedup_last_strike.begin());
+        }
+        while (g_peer_resend_total_bytes.size() > MAX_RATE_LIMIT_MAP_SIZE) {
+            g_peer_resend_total_bytes.erase(g_peer_resend_total_bytes.begin());
         }
     }
 }
@@ -1151,54 +1231,155 @@ bool CNetMessageProcessor::ProcessGetDataMessage(int peer_id, CDataStream& strea
         }
 
         if (duplicate_count > 0) {
-            int penalty = std::min(duplicate_count * DUPLICATE_GETDATA_PENALTY, MAX_DEDUP_BATCH_PENALTY);
+            // dilv-dedup-livelock-fix Part B: rate-limited re-send instead of permanent starvation.
+            // Decide everything under ONE cs_served_blocks lock, then do all I/O (Misbehaving,
+            // DisconnectNode, on_getdata, logging) AFTER releasing it.
+            const int64_t now = GetTime();
+            std::set<uint256> resend_set;   // duplicate hashes approved for re-send this batch
+            int resend_count = 0;
+            int cooldown_skipped = 0;
+            bool budget_breached = false;
             int strikes = 0;
+            int64_t total_resent_bytes = 0;
             {
                 std::lock_guard<std::mutex> lock(cs_served_blocks);
-                strikes = ++g_peer_dedup_strikes[peer_id];
+
+                // --- MED-4: decay the strike counter (-1 per STRIKE_DECAY_SECONDS since last
+                //     strike-affecting activity) so honest long-lived connections don't strike out.
+                auto strike_it = g_peer_dedup_strikes.find(peer_id);
+                if (strike_it != g_peer_dedup_strikes.end() && strike_it->second > 0) {
+                    auto last_it = g_peer_dedup_last_strike.find(peer_id);
+                    if (last_it != g_peer_dedup_last_strike.end()) {
+                        int64_t elapsed = now - last_it->second;
+                        if (elapsed > 0) {
+                            int decay = static_cast<int>(elapsed / STRIKE_DECAY_SECONDS);
+                            if (decay > 0) {
+                                strike_it->second = std::max(0, strike_it->second - decay);
+                            }
+                        }
+                    }
+                }
+
+                // --- refill this peer's byte token bucket up to the per-window cap.
+                ResendBucket& bucket = g_peer_resend_bucket[peer_id];
+                if (!bucket.init) {
+                    bucket.tokens = RESEND_BYTE_BUDGET_PER_WINDOW;  // start full
+                    bucket.last_refill = now;
+                    bucket.init = true;
+                } else {
+                    int64_t elapsed = now - bucket.last_refill;
+                    if (elapsed > 0) {
+                        int64_t refill = elapsed * RESEND_BYTE_BUDGET_PER_WINDOW / RESEND_BUDGET_WINDOW_SECONDS;
+                        bucket.tokens = std::min(RESEND_BYTE_BUDGET_PER_WINDOW, bucket.tokens + refill);
+                        bucket.last_refill = now;
+                    }
+                }
+
+                // --- per duplicate hash: approve a re-send iff the per-(peer,hash) cooldown has
+                //     elapsed AND the byte budget has room. Cooldown-blocked dups are skipped
+                //     silently (could be honest impatience). Budget exhaustion is a breach.
+                auto& served = g_peer_served_blocks[peer_id];
+                auto& resend_times = g_peer_resend_times[peer_id];
+                for (const auto& inv : getdata) {
+                    if (inv.type != NetProtocol::MSG_BLOCK_INV) continue;
+                    if (!served.count(inv.hash)) continue;  // not a duplicate
+                    if (resend_set.count(inv.hash)) continue;  // already decided this hash in-batch
+                    auto rt = resend_times.find(inv.hash);
+                    if (rt != resend_times.end() && now - rt->second < RESEND_COOLDOWN_SECONDS) {
+                        ++cooldown_skipped;  // within cooldown — do not re-send, do not penalize
+                        continue;
+                    }
+                    if (bucket.tokens >= RESEND_COST_BYTES) {
+                        bucket.tokens -= RESEND_COST_BYTES;             // MED-2: debit worst-case bytes
+                        resend_times[inv.hash] = now;
+                        resend_set.insert(inv.hash);
+                        ++resend_count;
+                        total_resent_bytes = (g_peer_resend_total_bytes[peer_id] += RESEND_COST_BYTES);
+                    } else {
+                        budget_breached = true;  // out of budget — refuse re-send, penalize below
+                    }
+                }
+                // bound the per-(peer,hash) cooldown map (belt-and-suspenders; also swept periodically)
+                if (resend_times.size() > MAX_SERVED_BLOCKS_TRACK) {
+                    auto it = resend_times.begin();
+                    size_t to_remove = resend_times.size() - MAX_SERVED_BLOCKS_TRACK;
+                    for (size_t i = 0; i < to_remove; ++i) it = resend_times.erase(it);
+                }
+
+                // --- a budget BREACH (not a mere re-request) counts as one strike (post-decay).
+                //     Within-budget / cooldown-skipped re-requests are served (or quietly ignored)
+                //     FREE — no strike, no penalty — so honest low-rate parent-recovery re-requests
+                //     (ibd_coordinator.cpp:2057/1657; F-001 §3) are never disconnected. This keeps the
+                //     disconnect lever (strikes) gated identically to the penalty lever (Misbehaving),
+                //     which also fires only on breach below. re-send NEVER clears strikes.
+                if (budget_breached) {
+                    strikes = ++g_peer_dedup_strikes[peer_id];
+                    g_peer_dedup_last_strike[peer_id] = now;
+                } else {
+                    auto sit = g_peer_dedup_strikes.find(peer_id);
+                    strikes = (sit != g_peer_dedup_strikes.end()) ? sit->second : 0;  // report decayed value
+                }
+                if (total_resent_bytes == 0) {
+                    total_resent_bytes = g_peer_resend_total_bytes[peer_id];  // no re-send this batch
+                }
+            }
+
+            // --- MED-2/contract: Misbehaving penalty ONLY on budget breach (honest within-budget
+            //     re-requests are served free). Penalty scales with the batch, capped as before.
+            if (budget_breached) {
+                int penalty = std::min(duplicate_count * DUPLICATE_GETDATA_PENALTY, MAX_DEDUP_BATCH_PENALTY);
+                if (g_verbose.load(std::memory_order_relaxed))
+                    std::cout << "[P2P] DEDUP: Peer " << peer_id << " exceeded re-send byte budget (+"
+                              << penalty << " misbehavior, strike " << strikes << "/" << MAX_DEDUP_STRIKES
+                              << ")" << std::endl;
+                peer_manager.Misbehaving(peer_id, penalty, MisbehaviorType::GETDATA_RATE_EXCEEDED);
             }
             if (g_verbose.load(std::memory_order_relaxed))
-                std::cout << "[P2P] DEDUP: Peer " << peer_id << " re-requested "
-                          << duplicate_count << " already-served blocks (+"
-                          << penalty << " misbehavior, strike "
-                          << strikes << "/" << MAX_DEDUP_STRIKES << ")" << std::endl;
-            peer_manager.Misbehaving(peer_id, penalty, MisbehaviorType::GETDATA_RATE_EXCEEDED);
+                std::cout << "[P2P] DEDUP: Peer " << peer_id << " re-requested " << duplicate_count
+                          << " already-served blocks (re-send " << resend_count << ", cooldown-skip "
+                          << cooldown_skipped << ", strike " << strikes << "/" << MAX_DEDUP_STRIKES
+                          << ", total re-sent " << total_resent_bytes << "B)" << std::endl;
 
-            if (strikes >= MAX_DEDUP_STRIKES) {
+            // --- disconnect levers: (1) decaying strike counter for fast abuse; (2) MED-4
+            //     non-decaying total-re-sent-bytes backstop for slow-drip abuse under the strike
+            //     threshold. Honest clients trip neither (Part A removes the storm; residual
+            //     parent-recovery re-requests are orders of magnitude below both).
+            bool disconnect = (strikes >= MAX_DEDUP_STRIKES) ||
+                              (total_resent_bytes >= RESEND_BACKSTOP_TOTAL_BYTES);
+            if (disconnect) {
                 if (g_verbose.load(std::memory_order_relaxed))
                     std::cout << "[P2P] DEDUP: Disconnecting peer " << peer_id
-                              << " after " << strikes << " duplicate GETDATA batches (wasting bandwidth)" << std::endl;
+                              << " (strikes " << strikes << "/" << MAX_DEDUP_STRIKES
+                              << ", total re-sent " << total_resent_bytes << "B/"
+                              << RESEND_BACKSTOP_TOTAL_BYTES << "B)" << std::endl;
                 g_node_context.connman->DisconnectNode(peer_id);
-                {
-                    std::lock_guard<std::mutex> lock(cs_served_blocks);
-                    g_peer_served_blocks.erase(peer_id);
-                    g_peer_dedup_strikes.erase(peer_id);
-                }
+                CleanupPeerRateLimitState(peer_id);
                 return true;
             }
 
-            // Filter out already-served blocks, only serve new ones
-            std::vector<NetProtocol::CInv> new_items;
+            // --- serve: all non-duplicate items PLUS the duplicate items approved for re-send.
+            std::vector<NetProtocol::CInv> items_to_serve;
             {
                 std::lock_guard<std::mutex> lock(cs_served_blocks);
                 auto& served = g_peer_served_blocks[peer_id];
                 for (const auto& inv : getdata) {
-                    if (inv.type == NetProtocol::MSG_BLOCK_INV && served.count(inv.hash)) {
-                        continue;  // Skip already-served blocks
+                    bool is_dup = (inv.type == NetProtocol::MSG_BLOCK_INV) && served.count(inv.hash);
+                    if (!is_dup || resend_set.count(inv.hash)) {
+                        items_to_serve.push_back(inv);  // new item, or an approved re-send
                     }
-                    new_items.push_back(inv);
                 }
             }
-            if (!new_items.empty()) {
+            if (!items_to_serve.empty()) {
                 if (g_verbose.load(std::memory_order_relaxed))
-                    std::cout << "[P2P] Invoking GETDATA handler for " << new_items.size()
-                              << " NEW items from peer " << peer_id
-                              << " (skipped " << duplicate_count << " duplicates)" << std::endl;
-                on_getdata(peer_id, new_items);
+                    std::cout << "[P2P] Invoking GETDATA handler for " << items_to_serve.size()
+                              << " items from peer " << peer_id << " (" << resend_count
+                              << " rate-limited re-sends, " << cooldown_skipped << " cooldown-skipped)" << std::endl;
+                on_getdata(peer_id, items_to_serve);
             } else {
                 if (g_verbose.load(std::memory_order_relaxed))
                     std::cout << "[P2P] Skipping GETDATA for peer " << peer_id
-                              << " - all " << getdata.size() << " items already served" << std::endl;
+                              << " - all " << getdata.size() << " items already served, none re-sendable yet"
+                              << std::endl;
             }
         } else {
             // No duplicates - serve normally
