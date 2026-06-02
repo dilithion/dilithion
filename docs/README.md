@@ -15,7 +15,7 @@ codebase. Marketing-facing content lives on [dilithion.org](https://dilithion.or
 | Read the whitepaper | [WHITEPAPER.md](WHITEPAPER.md) · [../Dilithion-Whitepaper-v1.0.pdf](../Dilithion-Whitepaper-v1.0.pdf) |
 | See the threat model | [THREAT-MODEL.md](THREAT-MODEL.md) |
 | Start mining | [mining/MINING_GUIDE_LINUX.md](mining/MINING_GUIDE_LINUX.md) · [mining/MINING_GUIDE_MACOS.md](mining/MINING_GUIDE_MACOS.md) · [mining/MINING_GUIDE_WINDOWS.md](mining/MINING_GUIDE_WINDOWS.md) · [mining/MINING_GUIDE_DILV.md](mining/MINING_GUIDE_DILV.md) |
-| Run a testnet node | [TESTNET-GUIDE.md](TESTNET-GUIDE.md) |
+| Set up and run a node | [GETTING-STARTED.md](GETTING-STARTED.md) |
 | Use the wallet | [HD_WALLET_USER_GUIDE.md](HD_WALLET_USER_GUIDE.md) · [USER-GUIDE.md](USER-GUIDE.md) |
 | Report a vulnerability | [../SECURITY.md](../SECURITY.md) |
 
@@ -71,7 +71,7 @@ codebase. Marketing-facing content lives on [dilithion.org](https://dilithion.or
 
 **Operations**
 - [SETUP.md](SETUP.md) — node setup
-- [TESTNET-GUIDE.md](TESTNET-GUIDE.md) — testnet node
+- [GETTING-STARTED.md](GETTING-STARTED.md) — set up and run a node (DIL or DilV)
 - [MAINTENANCE.md](MAINTENANCE.md) — ongoing maintenance
 - [MANUAL-PEER-SETUP.md](MANUAL-PEER-SETUP.md) — manual peering
 - [TROUBLESHOOTING-WINDOWS.md](TROUBLESHOOTING-WINDOWS.md) — Windows-specific issues
