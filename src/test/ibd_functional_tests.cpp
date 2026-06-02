@@ -33,6 +33,7 @@
 #include <primitives/block.h>
 #include <core/chainparams.h>
 #include <iostream>
+#include <algorithm>
 
 BOOST_AUTO_TEST_SUITE(ibd_functional_tests)
 
@@ -167,6 +168,70 @@ BOOST_AUTO_TEST_CASE(test_block_fetcher_receive) {
     BOOST_CHECK_EQUAL(fetcher.GetInFlightCount(), 0);
 
     // Restore previous tracker
+    g_node_context.block_tracker = std::move(old_tracker);
+}
+
+BOOST_AUTO_TEST_CASE(test_addblock_rejects_completed_height_dedup_livelock) {
+    // Regression for the DilV IBD dedup-livelock (mission dilv-dedup-livelock-fix, F-001).
+    //
+    // ROOT CAUSE: CBlockTracker::AddBlock (block_tracker.h:70) deduplicates ONLY against
+    // m_heights (in-flight), never m_completed_heights -- while IsTracked checks BOTH.
+    // During async IBD a received-but-unconnected block is an orphan whose height is
+    // MarkCompleted'd (block_processing.cpp:1257). So:
+    //   - GetNextBlocksToRequest (selection) skips it via IsTracked  -> the per-block
+    //     request site ibd_coordinator.cpp:1674 never fires (so A2/A1 selection-layer
+    //     fixes are INERT), BUT
+    //   - the stall-recovery DIRECT path (ibd_coordinator.cpp:2135/2057/1657) calls
+    //     RequestBlockFromPeer -> AddBlock directly, which checks only m_heights and
+    //     RE-REQUESTS the completed height every ~1s -> duplicate-GETDATA storm ->
+    //     the seed force-disconnects after 3 monotonic strikes -> IBD stalls.
+    //
+    // This test reproduces the exact tracker state and asserts the direct re-request is
+    // REFUSED. It FAILS today (AddBlock returns true) and PASSES after the one-line
+    // m_completed_heights guard in AddBlock.
+    CPeerManager peer_manager("");
+    CBlockFetcher fetcher(&peer_manager);
+
+    auto block_tracker = std::make_unique<CBlockTracker>();
+    auto old_tracker = std::move(g_node_context.block_tracker);
+    g_node_context.block_tracker = std::move(block_tracker);
+
+    const int H = 100;
+    uint256 hash; hash.data[0] = 0xAB;
+    const NodeId peer_id = 1;
+
+    // 1. Request + receive the block (mirrors the async receive path: OnBlockReceived
+    //    erases the in-flight tracker entry, so H leaves m_heights).
+    BOOST_CHECK(fetcher.RequestBlockFromPeer(peer_id, H, hash));
+    BOOST_CHECK(fetcher.OnBlockReceived(peer_id, H, hash));
+    BOOST_CHECK(!fetcher.IsHeightInFlight(H));  // no longer in-flight
+
+    // 2. Mark the orphan height completed (the orphan receive path does exactly this
+    //    via MarkCompleted(parent_height + 1) in block_processing.cpp:1257).
+    g_node_context.block_tracker->MarkCompleted(H);
+
+    // 3. Selection-layer suppression WORKS: IsTracked sees m_completed_heights, so
+    //    GetNextBlocksToRequest skips H. (This is precisely why the selection-layer
+    //    A2/A1 designs are inert for this bug.)
+    BOOST_CHECK(g_node_context.block_tracker->IsTracked(H));
+    {
+        // GetNextBlocksToRequest must not re-select a completed height.
+        auto sel = fetcher.GetNextBlocksToRequest(/*max_blocks=*/8, /*chain_height=*/H - 1,
+                                                  /*header_height=*/H + 5);
+        BOOST_CHECK(std::find(sel.begin(), sel.end(), H) == sel.end());
+    }
+
+    // 4. THE BUG / THE FIX: the DIRECT stall-recovery re-request must be REFUSED for a
+    //    completed height. Pre-fix AddBlock checks only m_heights and ALLOWS it
+    //    (returns true) -> duplicate GETDATA -> disconnect. This assertion FAILS today
+    //    (red) and PASSES after the AddBlock m_completed_heights guard (green).
+    BOOST_CHECK(!fetcher.RequestBlockFromPeer(peer_id, H, hash));
+    // And the refused request must not have re-entered the IN-FLIGHT set as a side effect.
+    // NOTE: use GetInFlightCount() (delegates to GetTotalInFlight() = m_heights only), NOT
+    // IsHeightInFlight() -- the latter delegates to IsTracked(), which is true for
+    // m_completed_heights entries too, so it is the wrong API for an "in-flight only" check.
+    BOOST_CHECK_EQUAL(fetcher.GetInFlightCount(), 0);
+
     g_node_context.block_tracker = std::move(old_tracker);
 }
 

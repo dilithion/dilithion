@@ -71,6 +71,22 @@ public:
             return false;
         }
 
+        // DEDUP-LIVELOCK FIX (mission dilv-dedup-livelock-fix, F-001):
+        // Also reject heights already marked completed. MarkCompleted means the block
+        // is already in the DB (orphan-with-data / blockInDb / reprocessed paths), so it
+        // must NOT be re-requested over the wire -- it resolves via parent-connection
+        // orphan processing once its parent connects. IsTracked() already consults
+        // m_completed_heights, so GetNextBlocksToRequest skips these; this closes the
+        // gap for DIRECT callers (stall-recovery ibd_coordinator.cpp:2135/2057/1657) that
+        // bypass selection and previously re-requested completed heights every ~1s,
+        // tripping the seed's 3-strike DEDUP disconnect and stalling IBD. Reorg-safe:
+        // ClearAboveHeight() clears m_completed_heights above a fork point before any
+        // legitimate post-reorg re-fetch. Restores the invariant that the dedup read
+        // tracks the MarkCompleted write (principle #3).
+        if (m_completed_heights.count(height) > 0) {
+            return false;
+        }
+
         // Check capacity
         if (GetPeerInFlightCountLocked(peer) >= MAX_PER_PEER) {
             return false;
