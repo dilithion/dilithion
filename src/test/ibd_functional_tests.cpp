@@ -235,6 +235,52 @@ BOOST_AUTO_TEST_CASE(test_addblock_rejects_completed_height_dedup_livelock) {
     g_node_context.block_tracker = std::move(old_tracker);
 }
 
+BOOST_AUTO_TEST_CASE(test_clear_above_height_reenables_completed_refetch_after_reorg) {
+    // Reorg-safety regression for Part A (mission dilv-dedup-livelock-fix, L-e / F-004 LOW-4).
+    //
+    // Part A's AddBlock rejects any height in m_completed_heights so the direct
+    // stall-recovery path can't re-request a height already in the DB
+    // (test_addblock_rejects_completed_height_dedup_livelock proves the reject).
+    // The LOAD-BEARING-BUT-UNTESTED other half of that invariant is reorg safety:
+    // after a reorg, ClearAboveHeight(fork_point) MUST clear m_completed_heights
+    // above the fork point so the orphaned-then-completed height becomes
+    // re-requestable again. If ClearAboveHeight did NOT clear m_completed_heights,
+    // a height completed on the losing fork would be permanently un-fetchable on
+    // the winning fork = a stall. This test exercises that clear-and-re-enable path
+    // end to end through the public CBlockFetcher API.
+    CPeerManager peer_manager("");
+    CBlockFetcher fetcher(&peer_manager);
+
+    auto block_tracker = std::make_unique<CBlockTracker>();
+    auto old_tracker = std::move(g_node_context.block_tracker);
+    g_node_context.block_tracker = std::move(block_tracker);
+
+    const int H = 150;
+    uint256 hash; hash.data[0] = 0xCD;
+    const NodeId peer_id = 1;
+
+    // 1. Mark height H completed (orphan-with-data path: MarkCompleted(parent+1)).
+    g_node_context.block_tracker->MarkCompleted(H);
+    BOOST_CHECK(g_node_context.block_tracker->IsTracked(H));
+
+    // 2. AddBlock(H) is REFUSED while H is completed (Part A guard).
+    BOOST_CHECK(!fetcher.RequestBlockFromPeer(peer_id, H, hash));
+    BOOST_CHECK_EQUAL(fetcher.GetInFlightCount(), 0);
+
+    // 3. A reorg clears everything above the fork point H-1. This MUST drop the
+    //    completed flag for H (ClearAboveHeight clears m_completed_heights > fork_point).
+    fetcher.ClearAboveHeight(H - 1);
+    BOOST_CHECK(!g_node_context.block_tracker->IsTracked(H));  // completed flag gone
+
+    // 4. THE RE-ENABLE: AddBlock(H) now SUCCEEDS — the height is re-requestable on
+    //    the winning fork. Pre-clear it was permanently refused; post-clear it is fetchable.
+    BOOST_CHECK(fetcher.RequestBlockFromPeer(peer_id, H, hash));
+    BOOST_CHECK_EQUAL(fetcher.GetInFlightCount(), 1);
+    BOOST_CHECK(fetcher.IsHeightInFlight(H));
+
+    g_node_context.block_tracker = std::move(old_tracker);
+}
+
 BOOST_AUTO_TEST_CASE(test_headers_manager_basic) {
     // Test basic headers manager functionality
     if (!Dilithion::g_chainParams)
@@ -489,27 +535,38 @@ BOOST_AUTO_TEST_CASE(test_partb_seed_rate_limited_resend) {
     }
 
     // -----------------------------------------------------------------------
-    // (b) Cooldown: a second re-request for the SAME hash within 2s does NOT
-    //     trigger another re-send. The re-send timestamp was just set by (a)
-    //     above. We immediately re-request peer 10 hash 0x01 again — cooldown
-    //     should block it (no additional on_getdata call for that hash).
+    // (b) Cooldown: a re-request for a hash whose re-send was approved earlier in
+    //     THIS test, within RESEND_COOLDOWN_SECONDS (2s), does NOT trigger another
+    //     re-send and is NOT penalized (cooldown skip is silent).
     //
-    //     We also assert no Misbehaving was applied (cooldown skip is silent).
-    //     Misbehavior score remains at 0 because a cooldown-skipped re-request
-    //     is not a budget breach.
+    //     L-d (wall-clock robustness): rather than rely on the (a)->(b) gap being
+    //     < 2s (whole-second GetTime() with no mock hook — a stalled CI box could
+    //     in principle straddle a 2s boundary), we make the cooldown set-and-test
+    //     a single tight pair on a FRESH hash inside this block: approve a re-send
+    //     for hash 0x02 (sets its cooldown at GetTime()=T), then IMMEDIATELY
+    //     re-request 0x02 again. The two ProcessMessage calls are adjacent
+    //     statements (microseconds apart), so the second is guaranteed to fall in
+    //     [T, T+1] << 2s regardless of scheduling jitter. This removes the
+    //     dependency on when (a) ran. peer_b_id = 10 (same peer as (a)).
     // -----------------------------------------------------------------------
     {
-        // peer_b_id = 10 (same peer as (a), same hash — cooldown was just set above)
+        // Serve a fresh hash 0x02 first (non-duplicate), so the next request is its
+        // FIRST re-request → re-send approved → cooldown timer set at GetTime()=T.
+        BOOST_CHECK(proc.ProcessMessage(peer_b_id, make_getdata({block_inv(0x02)})));   // serve
+        int after_serve = getdata_call_count.load();
+        BOOST_CHECK(proc.ProcessMessage(peer_b_id, make_getdata({block_inv(0x02)})));   // 1st re-request: approved
+        BOOST_CHECK_GT(getdata_call_count.load(), after_serve);  // re-send happened, cooldown now set at T
+
         int before = getdata_call_count.load();
         int score_before = peer_manager.GetMisbehaviorScore(peer_b_id);
 
-        BOOST_CHECK(proc.ProcessMessage(peer_b_id, make_getdata({block_inv(0x01)})));
+        // 2nd re-request of 0x02, adjacent statement → within [T, T+1] << 2s cooldown.
+        BOOST_CHECK(proc.ProcessMessage(peer_b_id, make_getdata({block_inv(0x02)})));
 
-        // on_getdata must NOT have fired for the cooldown-blocked hash.
-        // We sent only one item so the batch is purely cooldown-blocked.
+        // on_getdata must NOT have fired: the single-item batch is purely cooldown-blocked.
         BOOST_CHECK_EQUAL(getdata_call_count.load(), before);  // (b) re-send count unchanged
 
-        // Misbehaving must not have been called (no budget breach).
+        // Misbehaving must not have been called (cooldown skip is not a budget breach).
         BOOST_CHECK_EQUAL(peer_manager.GetMisbehaviorScore(peer_b_id), score_before);  // (b) no penalty
     }
 
@@ -518,8 +575,9 @@ BOOST_AUTO_TEST_CASE(test_partb_seed_rate_limited_resend) {
     //     (distinct hashes, each re-requested once) gets ZERO Misbehaving calls
     //     and is NOT disconnected.
     //
-    //     Budget = 16 re-sends * 4MiB = 64 MiB per 60s window.
-    //     We issue 15 distinct-hash re-requests (well under the 16-re-send limit)
+    //     Budget = RESEND_BUDGET_BLOCK_EQUIV (8) worst-case-block re-sends * 4 MiB
+    //     = 32 MiB per 60s window.
+    //     We issue 7 distinct-hash re-requests (under the 8 worst-case-block budget)
     //     using a fresh peer ID (peer 20) so the budget starts full.
     //     Each hash is re-requested only once (no cooldown issue — each has
     //     its own cooldown timer, and the timer is only set on re-send approval).
@@ -528,7 +586,7 @@ BOOST_AUTO_TEST_CASE(test_partb_seed_rate_limited_resend) {
     // -----------------------------------------------------------------------
     {
         const int peer_c = 20;
-        const int WITHIN_BUDGET_REQS = 15;  // 15 < 16 = budget capacity
+        const int WITHIN_BUDGET_REQS = 7;  // 7 < 8 = budget capacity (block-equiv)
 
         // First: serve 15 distinct hashes to populate served set.
         {
@@ -561,20 +619,20 @@ BOOST_AUTO_TEST_CASE(test_partb_seed_rate_limited_resend) {
     //     rotating distinct already-served hashes triggers a Misbehaving
     //     penalty on the batch that exceeds the budget.
     //
-    //     Budget capacity = RESEND_MAX_PER_WINDOW = 16 re-sends per window.
+    //     Budget capacity = RESEND_BUDGET_BLOCK_EQUIV = 8 worst-case-block re-sends/window.
     //     RESEND_COST_BYTES = MAX_BLOCK_SIZE = 4 MiB per re-send.
-    //     RESEND_BYTE_BUDGET_PER_WINDOW = 16 * 4 MiB = 64 MiB.
+    //     RESEND_BYTE_BUDGET_PER_WINDOW = 8 * 4 MiB = 32 MiB.
     //
     //     Strategy: serve 20 distinct hashes to peer 30 (so they're in served
-    //     set). Then re-request all 20 in a single batch. The first 16 are
-    //     approved (draining the budget), the 17th triggers budget_breached =
+    //     set). Then re-request all 20 in a single batch. The first 8 are
+    //     approved (draining the budget), the 9th triggers budget_breached =
     //     true → Misbehaving is called with a non-zero penalty.
     //
     //     We use a fresh peer (peer 30) so budget starts full.
     // -----------------------------------------------------------------------
     {
         const int peer_d = 30;
-        const int OVER_BUDGET_HASHES = 20;  // 20 > 16 (budget capacity)
+        const int OVER_BUDGET_HASHES = 20;  // 20 > 8 (budget capacity, block-equiv)
 
         // First: serve 20 distinct hashes.
         {
@@ -617,9 +675,11 @@ BOOST_AUTO_TEST_CASE(test_partb_seed_rate_limited_resend) {
     //     NOTE: the byte token bucket refills at RESEND_BYTE_BUDGET_PER_WINDOW
     //     / RESEND_BUDGET_WINDOW_SECONDS per second of elapsed time. Within the
     //     same wall-clock second all three batches arrive, so the bucket stays
-    //     drained (no meaningful refill). Each batch re-sends 16 hashes (budget
-    //     exhausted), then reaches budget_breached on the 17th, incrementing the
-    //     strike counter once per batch. After 3 batches → 3 strikes → disconnect.
+    //     drained (no meaningful refill). The first batch re-sends 8 hashes
+    //     (budget exhausted), then reaches budget_breached, incrementing the
+    //     strike counter once per batch (subsequent batches breach immediately
+    //     since the budget is already drained). After 3 batches → 3 strikes →
+    //     disconnect.
     //
     //     The second and third batches are NEW rotated hash sets (different
     //     seeds 0x40+20..0x40+39 and 0x40+40..0x40+59) to avoid the cooldown
@@ -628,7 +688,7 @@ BOOST_AUTO_TEST_CASE(test_partb_seed_rate_limited_resend) {
     // -----------------------------------------------------------------------
     {
         const int peer_e = 40;
-        const int HASHES_PER_BATCH = 20;   // > 16 (triggers breach on each batch)
+        const int HASHES_PER_BATCH = 20;   // > 8 (triggers breach on each batch)
         const int NUM_STRIKE_BATCHES = 3;  // = MAX_DEDUP_STRIKES
 
         // First: serve HASHES_PER_BATCH * NUM_STRIKE_BATCHES distinct hashes
@@ -681,8 +741,9 @@ BOOST_AUTO_TEST_CASE(test_partb_seed_rate_limited_resend) {
         // Document which lever fired: the strike counter is the primary lever here.
         // MAX_DEDUP_STRIKES = 3. Each breach batch increments strikes by 1.
         // 3 batches → strikes = 3 = MAX_DEDUP_STRIKES → disconnect.
-        // The RESEND_BACKSTOP_TOTAL_BYTES lever (2 GiB = 512 re-sends * 4MiB) would
-        // require ~512 re-sends to trip alone; with 3*16=48 re-sends we are far below it.
+        // The RESEND_BACKSTOP_TOTAL_BYTES lever (2 GiB = 512 re-sends * 4 MiB) would
+        // require ~512 re-sends to trip alone; only the FIRST batch re-sends (8, then
+        // budget drained), so we are far below the backstop — the strike lever fires.
     }
 
     // Teardown: restore g_node_context.connman to avoid leaking into other tests.

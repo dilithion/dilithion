@@ -1658,6 +1658,19 @@ void CPeerManager::OnPeerDisconnected(int peer_id)
     connection_quality.RemovePeer(peer_id);
     m_peer_bandwidth_throttle.RemovePeer(peer_id);
 
+    // dilv-dedup-livelock-fix (NEW-1): next instance of the F19/F20/F21 leak class.
+    // CleanupPeerRateLimitState was previously called ONLY from the dedup self-
+    // disconnect branch (net.cpp); the normal disconnect path (timeout / eviction /
+    // graceful) left all six dedup/re-send maps behind. Node IDs are monotonic
+    // (never reused, connman m_next_node_id), so on a long-running seed serving
+    // IBD to churning peers the maps grew unbounded = slow memory-exhaustion DoS.
+    // Wiring it here releases that state on EVERY disconnect.
+    // Lock-order safety: this runs under CConnman::cs_vNodes (DisconnectNodes →
+    // DispatchPeerDisconnected); CleanupPeerRateLimitState takes the rate-limit
+    // mutexes only, and no path takes a rate-limit mutex then cs_vNodes — no
+    // inversion (see decl comment in net.h).
+    CleanupPeerRateLimitState(peer_id);
+
     // The actual peer removal is handled by RemovePeer()
 }
 

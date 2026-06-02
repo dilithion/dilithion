@@ -100,19 +100,24 @@ static std::map<int, int> g_peer_dedup_strikes;      // Per-peer strike counter
 // hostile peer that deliberately rotates hashes to amplify re-send bandwidth (red-team MED-2).
 static const int64_t RESEND_COOLDOWN_SECONDS = 2;    // <=1 re-send per (peer,blockhash) per this window
 static const int64_t RESEND_BUDGET_WINDOW_SECONDS = 60;
-static const int RESEND_MAX_PER_WINDOW = 16;         // contract: <=16 re-sends/60s, now byte-denominated below
+// L-b: this is the NUMBER OF WORST-CASE BLOCKS that fit in the per-window byte budget,
+// i.e. a budget-derivation input — NOT a re-send COUNT cap (more smaller real blocks may
+// re-send before the byte budget binds). Named accordingly.
+// L-a: lowered 16 -> 8, halving the aggregate re-send ceiling (64 -> 32 MiB/60s).
+static const int RESEND_BUDGET_BLOCK_EQUIV = 8;
 // MED-2: bound AGGREGATE re-send BYTES, not count — a hash-rotating attacker keeps every
-// per-hash cooldown at 1 while extracting up to 16 * 4MiB = 64 MiB/60s (~8.5 Mbit/s) under a
-// count bucket. Debit the WORST-CASE block size (Consensus::MAX_BLOCK_SIZE) per re-send so the
-// token bucket caps aggregate re-send bandwidth regardless of how many distinct hashes rotate.
-// Over-counting (real DilV blocks are far smaller) only throttles SOONER — the safe direction.
+// per-hash cooldown at 1 while extracting re-send bandwidth under a plain count bucket.
+// Debit the WORST-CASE block size (Consensus::MAX_BLOCK_SIZE = 4*1024*1024 = 4 MiB) per
+// re-send so the token bucket caps aggregate re-send bandwidth regardless of how many
+// distinct hashes rotate. Over-counting (real DilV blocks are far smaller) only throttles
+// SOONER — the safe direction. Aggregate ceiling: 8 * 4 MiB = 32 MiB/60s (~4.3 Mbit/s).
 static const int64_t RESEND_COST_BYTES = static_cast<int64_t>(MAX_BLOCK_VTX_BYTES);
 static const int64_t RESEND_BYTE_BUDGET_PER_WINDOW =
-    static_cast<int64_t>(RESEND_MAX_PER_WINDOW) * RESEND_COST_BYTES;  // 64 MiB / 60s aggregate cap
+    static_cast<int64_t>(RESEND_BUDGET_BLOCK_EQUIV) * RESEND_COST_BYTES;  // 32 MiB / 60s aggregate cap
 // MED-3: this budget governs ONLY re-requests of already-served hashes. First-time block sends
 // never enter this branch, so honest deep-IBD (32 in-transit, first-time delivery) never touches
 // it; the only honest re-requests are the rare parent-recovery path — orders of magnitude under
-// 16 worst-case re-sends/60s. No honest-client throttle.
+// 8 worst-case-block re-sends/60s. No honest-client throttle.
 // MED-4: the decaying strike counter alone lets a slow-drip attacker grief forever just under the
 // disconnect threshold, so retain an INDEPENDENT non-decaying "you've cost me too much total
 // re-send bandwidth on this connection" backstop that sustained abuse eventually trips regardless
@@ -249,18 +254,13 @@ void PeriodicRateLimitCleanup() {
         }
     }
 
-    // Clean up served blocks tracking (evict entries for large maps)
+    // Clean up the per-peer dedup / re-send state.
     {
         std::lock_guard<std::mutex> lock(cs_served_blocks);
-        while (g_peer_served_blocks.size() > MAX_RATE_LIMIT_MAP_SIZE) {
-            auto it = g_peer_served_blocks.begin();
-            g_peer_dedup_strikes.erase(it->first);
-            g_peer_served_blocks.erase(it);
-        }
 
         // dilv-dedup-livelock-fix Part B (LOW-2): age out per-(peer,hash) re-send cooldown
-        // entries once the cooldown has elapsed (they carry no further meaning), drop emptied
-        // peers, and cap every per-peer re-send map at MAX_RATE_LIMIT_MAP_SIZE.
+        // entries once the cooldown has elapsed (they carry no further meaning) and drop
+        // emptied peers. This is pure staleness reclamation, not capping.
         for (auto pit = g_peer_resend_times.begin(); pit != g_peer_resend_times.end(); ) {
             auto& hashes = pit->second;
             for (auto hit = hashes.begin(); hit != hashes.end(); ) {
@@ -276,17 +276,48 @@ void PeriodicRateLimitCleanup() {
                 ++pit;
             }
         }
-        while (g_peer_resend_times.size() > MAX_RATE_LIMIT_MAP_SIZE) {
-            g_peer_resend_times.erase(g_peer_resend_times.begin());
-        }
-        while (g_peer_resend_bucket.size() > MAX_RATE_LIMIT_MAP_SIZE) {
-            g_peer_resend_bucket.erase(g_peer_resend_bucket.begin());
-        }
-        while (g_peer_dedup_last_strike.size() > MAX_RATE_LIMIT_MAP_SIZE) {
-            g_peer_dedup_last_strike.erase(g_peer_dedup_last_strike.begin());
-        }
-        while (g_peer_resend_total_bytes.size() > MAX_RATE_LIMIT_MAP_SIZE) {
-            g_peer_resend_total_bytes.erase(g_peer_resend_total_bytes.begin());
+
+        // MED-2 / C-2: ATOMIC-UNIT capping. The six per-peer maps
+        // (g_peer_served_blocks, g_peer_dedup_strikes, g_peer_resend_times,
+        // g_peer_resend_bucket, g_peer_dedup_last_strike, g_peer_resend_total_bytes)
+        // describe ONE logical per-peer record. Capping them independently
+        // (the old `while(map.size()>cap) erase(begin())` per map) could half-evict a
+        // peer — e.g. drop its strikes/served set while keeping its
+        // resend_total_bytes — which would reset the non-decaying backstop or the
+        // dedup view for a still-live abuser. Instead, pick ONE victim set of
+        // peer_ids and erase those SAME peers from ALL six maps so no peer is ever
+        // half-present.
+        //
+        // The cap is keyed off g_peer_served_blocks (the largest / canonical
+        // per-peer record); after NEW-1 wires per-disconnect cleanup, this only
+        // fires under pathological churn beyond MAX_RATE_LIMIT_MAP_SIZE live peers.
+        //
+        // Eviction order: lowest peer_id first (std::map key order). Node IDs are
+        // monotonic and never reused (connman m_next_node_id), so lowest peer_id ==
+        // oldest connection. This is NOT attacker-gameable toward evicting a victim:
+        // an attacker cannot lower their own peer_id (IDs are server-assigned on
+        // connect), and evicting the oldest connections first is the desired LRU-ish
+        // behavior. Tradeoff (documented): we evict by connection age, not last
+        // activity — a cheap, monotonic, non-gameable proxy. A true last-activity
+        // timestamp isn't maintained for all peers (g_peer_dedup_last_strike only
+        // tracks strike events), so introducing one for ordering would add state for
+        // a path that is already a rare backstop behind NEW-1.
+        if (g_peer_served_blocks.size() > MAX_RATE_LIMIT_MAP_SIZE) {
+            size_t to_evict = g_peer_served_blocks.size() - MAX_RATE_LIMIT_MAP_SIZE;
+            std::vector<int> victims;
+            victims.reserve(to_evict);
+            for (auto it = g_peer_served_blocks.begin();
+                 it != g_peer_served_blocks.end() && victims.size() < to_evict; ++it) {
+                victims.push_back(it->first);
+            }
+            for (int victim : victims) {
+                g_peer_served_blocks.erase(victim);
+                g_peer_dedup_strikes.erase(victim);
+                g_peer_resend_times.erase(victim);
+                g_peer_resend_bucket.erase(victim);
+                g_peer_dedup_last_strike.erase(victim);
+                g_peer_resend_total_bytes.erase(victim);
+            }
         }
     }
 }
@@ -1234,6 +1265,11 @@ bool CNetMessageProcessor::ProcessGetDataMessage(int peer_id, CDataStream& strea
             // dilv-dedup-livelock-fix Part B: rate-limited re-send instead of permanent starvation.
             // Decide everything under ONE cs_served_blocks lock, then do all I/O (Misbehaving,
             // DisconnectNode, on_getdata, logging) AFTER releasing it.
+            // L-c (TOCTOU): the decide→release→serve split is safe because GETDATA for a given
+            // peer is processed by the SINGLE threadMessageHandler thread (connman.cpp:186), so no
+            // concurrent GETDATA from the same peer can interleave between the decision lock release
+            // and the serve. The lock guards only against unrelated threads touching the shared maps
+            // (e.g. the periodic sweep / disconnect cleanup), not against same-peer re-entrancy.
             const int64_t now = GetTime();
             std::set<uint256> resend_set;   // duplicate hashes approved for re-send this batch
             int resend_count = 0;
@@ -1344,9 +1380,31 @@ bool CNetMessageProcessor::ProcessGetDataMessage(int peer_id, CDataStream& strea
             //     non-decaying total-re-sent-bytes backstop for slow-drip abuse under the strike
             //     threshold. Honest clients trip neither (Part A removes the storm; residual
             //     parent-recovery re-requests are orders of magnitude below both).
-            bool disconnect = (strikes >= MAX_DEDUP_STRIKES) ||
-                              (total_resent_bytes >= RESEND_BACKSTOP_TOTAL_BYTES);
+            const bool backstop_tripped = (total_resent_bytes >= RESEND_BACKSTOP_TOTAL_BYTES);
+            bool disconnect = (strikes >= MAX_DEDUP_STRIKES) || backstop_tripped;
             if (disconnect) {
+                // MED-1/C-1: a backstop trip means this connection has cost us
+                // RESEND_BACKSTOP_TOTAL_BYTES (2 GiB) of re-sent block bandwidth — far
+                // above anything an honest IBD client (or rare parent-recovery re-request)
+                // could ever incur. That is PROVEN sustained abuse, so it is ban-worthy,
+                // not merely disconnect-worthy: a bare DisconnectNode lets the attacker
+                // reconnect with a fresh peer_id (node IDs are monotonic) and a reset
+                // budget, resuming the ~32 MiB/window drip indefinitely (this also closes
+                // C-3 slow-drip). Cross the misbehavior ban threshold (BAN_THRESHOLD = 100,
+                // peers.cpp:280 / peer_scorer m_ban_threshold) in ONE shot so banman.Ban
+                // records the IP persistently (checked at connect — survives reconnect).
+                // The strike-path disconnect (fast abuse) already routes through Misbehaving
+                // on each breach above, so it accumulates toward the same threshold; here we
+                // guarantee the slow-drip backstop also bans rather than just dropping.
+                if (backstop_tripped) {
+                    if (g_verbose.load(std::memory_order_relaxed))
+                        std::cout << "[P2P] DEDUP: Peer " << peer_id << " tripped re-send byte"
+                                  << " backstop (" << total_resent_bytes << "B/"
+                                  << RESEND_BACKSTOP_TOTAL_BYTES << "B) — banning (proven"
+                                  << " sustained abuse)" << std::endl;
+                    peer_manager.Misbehaving(peer_id, CPeerManager::BAN_THRESHOLD,
+                                             MisbehaviorType::GETDATA_RATE_EXCEEDED);
+                }
                 if (g_verbose.load(std::memory_order_relaxed))
                     std::cout << "[P2P] DEDUP: Disconnecting peer " << peer_id
                               << " (strikes " << strikes << "/" << MAX_DEDUP_STRIKES

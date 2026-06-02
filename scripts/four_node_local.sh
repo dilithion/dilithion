@@ -31,6 +31,12 @@
 #   MIN_HEIGHT=20
 #   MAX_WAIT=180
 #
+# Scenarios: smoke | stress | delay | partition | dedup_ibd
+#   dedup_ibd — boots a ≥MIN_HEIGHT chain then a late-joining IBD client (Node E);
+#               asserts E completes sync AND its log is free of DEDUP-disconnect /
+#               skip-served tokens (dilv-dedup-livelock-fix regression-absence
+#               check). Run deep: `bash scripts/four_node_local.sh dedup_ibd 300`.
+#
 # Exit codes:
 #   0 — scenario passed
 #   1 — divergent (chain mismatch between nodes)
@@ -66,6 +72,7 @@ P2P_A=19444; RPC_A=19332
 P2P_B=19445; RPC_B=19333
 P2P_C=19446; RPC_C=19334
 P2P_D=19447; RPC_D=19335
+P2P_E=19448; RPC_E=19336   # late-joining IBD client (dedup_ibd scenario)
 
 # Stress scenario: Node D also mines (2-miner mainnet-topology mimic per
 # v0.1.3 PR8.3 reframe). Default smoke = single miner (Node A only).
@@ -87,7 +94,19 @@ fi
 TMPBASE="${TMPDIR:-/tmp}/four_node_$$"
 DA="$TMPBASE/nodeA"; DB="$TMPBASE/nodeB"
 DC="$TMPBASE/nodeC"; DD="$TMPBASE/nodeD"
-mkdir -p "$DA" "$DB" "$DC" "$DD"
+DE="$TMPBASE/nodeE"   # late-joining IBD client (dedup_ibd scenario only)
+mkdir -p "$DA" "$DB" "$DC" "$DD" "$DE"
+
+# dilv-dedup-livelock-fix (F-005 cookie-auth): pre-seed a deterministic
+# rpcuser/rpcpassword in each datadir's dilithion.conf BEFORE node start.
+# Without rpcuser/rpcpassword the node falls into the Bitcoin-Core .cookie model
+# (dilv-node.cpp:7088 — user "__cookie__" + random password) and rejects the
+# static `--user rpc:rpc` these helpers send, so getblockchaininfo/getconnectioncount
+# silently return nothing (auth 401). Seeding fixed creds makes RPC auth
+# deterministic for the whole harness, including Node E's IBD-progress poll.
+for d in "$DA" "$DB" "$DC" "$DD" "$DE"; do
+    printf 'rpcuser=rpc\nrpcpassword=rpc\n' > "$d/dilithion.conf"
+done
 
 cleanup() {
     set +e
@@ -95,11 +114,13 @@ cleanup() {
     [[ -n "${PID_B:-}" ]] && kill "$PID_B" 2>/dev/null
     [[ -n "${PID_C:-}" ]] && kill "$PID_C" 2>/dev/null
     [[ -n "${PID_D:-}" ]] && kill "$PID_D" 2>/dev/null
+    [[ -n "${PID_E:-}" ]] && kill "$PID_E" 2>/dev/null
     sleep 2
     [[ -n "${PID_A:-}" ]] && kill -9 "$PID_A" 2>/dev/null
     [[ -n "${PID_B:-}" ]] && kill -9 "$PID_B" 2>/dev/null
     [[ -n "${PID_C:-}" ]] && kill -9 "$PID_C" 2>/dev/null
     [[ -n "${PID_D:-}" ]] && kill -9 "$PID_D" 2>/dev/null
+    [[ -n "${PID_E:-}" ]] && kill -9 "$PID_E" 2>/dev/null
     if [[ "${PRESERVE_DATADIRS:-0}" = "1" ]]; then
         echo "PRESERVE_DATADIRS=1 — datadirs kept at $TMPBASE"
     fi
@@ -702,12 +723,76 @@ if [[ "$SCENARIO" = "delay" ]]; then
 fi
 
 # ============================================================================
+# dedup_ibd scenario: deep-tip IBD client regression
+# (dilv-dedup-livelock-fix: Part A + Part B integration smoke, F-003 §4.2)
+# Asserts a late-joining IBD client never sees DEDUP-disconnect / skip-served
+# logs and completes sync on a ≥300 block regtest chain.
+#
+# Run with: bash scripts/four_node_local.sh dedup_ibd 300
+# This is an ABSENCE check (the Part A/B fix prevents the storm, so the client
+# never re-requests). The positive "old-code-would-fail-here" deterministic
+# storm repro needs a DILITHION_DEBUG_VALIDATION_LAG_MS hook in
+# block_processing.cpp — deferred follow-up (board: dilv-ibd-lag-injection-harness),
+# NOT a v4.4.4 gate (Amendment 2 / F-008 gate decision).
+# ============================================================================
+DEDUP_IBD_FAIL=0
+if [[ "$SCENARIO" = "dedup_ibd" ]]; then
+    echo
+    echo "=== dedup_ibd: late-joining IBD client on ≥${MIN_HEIGHT} block chain ==="
+    if [[ "$MIN_HEIGHT" -lt 300 ]]; then
+        echo "  NOTE: dedup_ibd is intended for a deep chain (MIN_HEIGHT≥300);"
+        echo "        running against the current converged height $HA."
+    fi
+    echo "[E] Starting late-joining IBD client (connect only to Node A)..."
+    "$BIN" --regtest --datadir="$DE" --no-upnp --relay-only --yes \
+        --port=$P2P_E --rpcport=$RPC_E \
+        --addnode=127.0.0.1:$P2P_A \
+        >"$TMPBASE/nodeE.log" 2>&1 < /dev/null &
+    PID_E=$!
+    echo "[E] Running (PID $PID_E)"
+
+    # Poll for E to reach height >= (HA - 10) within the wait window.
+    TARGET=$(( HA - 10 ))
+    (( TARGET < 1 )) && TARGET=$HA
+    ibd_elapsed=0
+    HE=0
+    while (( ibd_elapsed < 120 )); do
+        sleep 5; ibd_elapsed=$(( ibd_elapsed + 5 ))
+        HE_NEW=$(rpc_height $RPC_E); HE=${HE_NEW:-$HE}
+        printf "  [%3ds] E=%s (target >= %s)\n" "$ibd_elapsed" "${HE:-?}" "$TARGET"
+        [[ -n "$HE" && "$HE" -ge "$TARGET" ]] && break
+    done
+
+    # Assert IBD client completed sync.
+    if [[ -z "$HE" || "$HE" -lt "$TARGET" ]]; then
+        echo "  FAIL: Node E did not complete IBD (E=${HE:-?} < $TARGET after 120s)"
+        DEDUP_IBD_FAIL=1
+    else
+        echo "  PASS: Node E synced to height $HE (target $TARGET)"
+    fi
+
+    # Assert zero dedup-disconnect / skip-all-served log tokens on the IBD client.
+    DEDUP_HITS=$(grep -c "DEDUP: Disconnecting\|Skipping GETDATA.*already served" \
+                     "$TMPBASE/nodeE.log" 2>/dev/null || true)
+    DEDUP_HITS=${DEDUP_HITS:-0}
+    if [[ "$DEDUP_HITS" -gt 0 ]] 2>/dev/null; then
+        echo "  FAIL: Node E log has $DEDUP_HITS dedup-disconnect/skip hits (pre-fix regression)"
+        DEDUP_IBD_FAIL=1
+    else
+        echo "  PASS: 0 dedup-livelock tokens in Node E log (IBD completed without seed disconnects)"
+    fi
+
+    kill "$PID_E" 2>/dev/null
+fi
+
+# ============================================================================
 # Final verdict
 # ============================================================================
 echo
 if [[ $SCENARIO_1_FAIL -eq 0 ]] && [[ $FORBIDDEN_TOKEN_GREP_FAIL -eq 0 ]] && [[ $CHAINTIPS_FAIL -eq 0 ]] \
    && [[ $STRESS_5_FAIL -eq 0 ]] && [[ $STRESS_6_FAIL -eq 0 ]] && [[ $STRESS_6B_FAIL -eq 0 ]] && [[ $STRESS_7_FAIL -eq 0 ]] \
-   && [[ $SCENARIO_2_M2_TAKEOVER_FAIL -eq 0 ]] && [[ $SCENARIO_2_RESYNC_FAIL -eq 0 ]]; then
+   && [[ $SCENARIO_2_M2_TAKEOVER_FAIL -eq 0 ]] && [[ $SCENARIO_2_RESYNC_FAIL -eq 0 ]] \
+   && [[ $DEDUP_IBD_FAIL -eq 0 ]]; then
     echo "RESULT: 4-node integration test PASSED ($SCENARIO scenario)"
     echo "  - Phase 1 (smoke): all 4 nodes lockstep on chain $HASH_A at height $HA"
     echo "  - Scenario 1 (connectivity): all ≥ 1 connection (regtest scope; full MAX_OUTBOUND requires N≥9)"
@@ -733,5 +818,6 @@ else
     echo "  Scenario 1 fail: $SCENARIO_1_FAIL"
     echo "  Scenario 4 fail (GREP): $FORBIDDEN_TOKEN_GREP_FAIL"
     echo "  Scenario 4b fail (getchaintips): $CHAINTIPS_FAIL"
+    echo "  dedup_ibd fail: $DEDUP_IBD_FAIL"
     exit 1
 fi

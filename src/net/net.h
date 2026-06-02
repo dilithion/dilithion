@@ -329,4 +329,20 @@ static constexpr uint8_t REJECT_DUPLICATE   = 0x12;
 void SendRejectMessage(int peer_id, const std::string& command, const std::string& reason,
                        uint8_t code = REJECT_INVALID);
 
+// dilv-dedup-livelock-fix (NEW-1 / F-007): leak-class cleanups for the per-peer
+// GETDATA/HEADERS rate-limit + dedup/re-send maps. Declared here so the normal
+// disconnect path (CPeerManager::OnPeerDisconnected, peers.cpp) and the periodic
+// ThreadSocketHandler sweep (connman.cpp) can call them — they were previously
+// file-local to net.cpp and so were never wired to those paths.
+//
+// LOCK ORDER (verified, dilv-dedup-livelock NEW-1): CleanupPeerRateLimitState
+// acquires cs_getdata_rate → cs_headers_rate → cs_served_blocks. It is safe to
+// call from OnPeerDisconnected (which runs under CConnman::cs_vNodes), because no
+// code path acquires any of those three rate-limit mutexes and THEN cs_vNodes:
+// the dedup branch in ProcessGetDataMessage always releases cs_served_blocks
+// before any CConnman call (DisconnectNode/PushMessage/Misbehaving). Order is
+// therefore cs_vNodes → {rate-limit mutexes}, with no inversion.
+void CleanupPeerRateLimitState(int peer_id);
+void PeriodicRateLimitCleanup();
+
 #endif // DILITHION_NET_NET_H
