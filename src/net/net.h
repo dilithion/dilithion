@@ -335,13 +335,22 @@ void SendRejectMessage(int peer_id, const std::string& command, const std::strin
 // ThreadSocketHandler sweep (connman.cpp) can call them — they were previously
 // file-local to net.cpp and so were never wired to those paths.
 //
-// LOCK ORDER (verified, dilv-dedup-livelock NEW-1): CleanupPeerRateLimitState
-// acquires cs_getdata_rate → cs_headers_rate → cs_served_blocks. It is safe to
-// call from OnPeerDisconnected (which runs under CConnman::cs_vNodes), because no
-// code path acquires any of those three rate-limit mutexes and THEN cs_vNodes:
-// the dedup branch in ProcessGetDataMessage always releases cs_served_blocks
-// before any CConnman call (DisconnectNode/PushMessage/Misbehaving). Order is
-// therefore cs_vNodes → {rate-limit mutexes}, with no inversion.
+// LOCK ORDER (dilv-dedup-livelock NEW-1 + F-009 BLOCKER-1 fix). The four relevant
+// mutex classes and their global acquisition order:
+//     cs_vNodes  →  cs_peers  →  {cs_getdata_rate, cs_headers_rate, cs_served_blocks}
+// CleanupPeerRateLimitState acquires the three rate-limit mutexes (last in the order),
+// so it is safe to call from OnPeerDisconnected even though the eviction/disconnect
+// callers hold cs_vNodes and/or cs_peers across the dispatch (AcceptConnection →
+// EvictPeersIfNeeded → DispatchPeerDisconnected → OnPeerDisconnected).
+// The ONLY way this inverts is if some path takes a rate-limit mutex and THEN cs_peers.
+// cs_peers is reached via CPeerManager::Misbehaving → GetPeer. INVARIANT (enforced):
+// no code calls Misbehaving (or otherwise acquires cs_peers) while holding any
+// rate-limit mutex — the GETDATA rate limiter (net.cpp) and the Part B dedup branch
+// both decide under the lock and penalize only after releasing it. F-009 BLOCKER-1
+// was exactly such an inversion (Misbehaving inside cs_getdata_rate) and was fixed by
+// hoisting that call out of the lock. cs_headers_rate never penalizes; cs_served_blocks
+// penalizes only after release. Do not reintroduce a Misbehaving call inside any of
+// these three scopes.
 void CleanupPeerRateLimitState(int peer_id);
 void PeriodicRateLimitCleanup();
 

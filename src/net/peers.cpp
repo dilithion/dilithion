@@ -1665,10 +1665,14 @@ void CPeerManager::OnPeerDisconnected(int peer_id)
     // (never reused, connman m_next_node_id), so on a long-running seed serving
     // IBD to churning peers the maps grew unbounded = slow memory-exhaustion DoS.
     // Wiring it here releases that state on EVERY disconnect.
-    // Lock-order safety: this runs under CConnman::cs_vNodes (DisconnectNodes →
-    // DispatchPeerDisconnected); CleanupPeerRateLimitState takes the rate-limit
-    // mutexes only, and no path takes a rate-limit mutex then cs_vNodes — no
-    // inversion (see decl comment in net.h).
+    // Lock-order safety (F-009 BLOCKER-1): this runs under the eviction/disconnect
+    // locks (cs_vNodes and/or cs_peers — e.g. EvictPeersIfNeeded holds cs_peers
+    // across DispatchPeerDisconnected). CleanupPeerRateLimitState takes only the
+    // rate-limit mutexes, which sit LAST in the global order
+    // (cs_vNodes → cs_peers → {rate-limit mutexes}). This is safe ONLY because the
+    // invariant "never call Misbehaving / acquire cs_peers while holding a rate-limit
+    // mutex" holds — F-009 found+fixed the one violation (Misbehaving inside the
+    // GETDATA rate limiter, now hoisted). See the full order note at net.h decl.
     CleanupPeerRateLimitState(peer_id);
 
     // The actual peer removal is handled by RemovePeer()

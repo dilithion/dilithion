@@ -100,7 +100,7 @@ mkdir -p "$DA" "$DB" "$DC" "$DD" "$DE"
 # dilv-dedup-livelock-fix (F-005 cookie-auth): pre-seed a deterministic
 # rpcuser/rpcpassword in each datadir's dilithion.conf BEFORE node start.
 # Without rpcuser/rpcpassword the node falls into the Bitcoin-Core .cookie model
-# (dilv-node.cpp:7088 — user "__cookie__" + random password) and rejects the
+# (the RPC-auth init in dilv-node — user "__cookie__" + random password) and rejects the
 # static `--user rpc:rpc` these helpers send, so getblockchaininfo/getconnectioncount
 # silently return nothing (auth 401). Seeding fixed creds makes RPC auth
 # deterministic for the whole harness, including Node E's IBD-progress poll.

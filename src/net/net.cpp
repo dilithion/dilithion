@@ -1146,6 +1146,7 @@ bool CNetMessageProcessor::ProcessGetDataMessage(int peer_id, CDataStream& strea
     try {
         // P2-1 FIX: Rate limiting for GETDATA messages
         // Prevents CPU exhaustion DoS via unlimited GETDATA requests
+        bool getdata_rate_breached = false;
         {
             std::lock_guard<std::mutex> lock(cs_getdata_rate);
             int64_t now = GetTime();
@@ -1161,10 +1162,21 @@ bool CNetMessageProcessor::ProcessGetDataMessage(int peer_id, CDataStream& strea
                 if (g_verbose.load(std::memory_order_relaxed))
                     std::cout << "[P2P] RATE LIMIT: Too many GETDATA from peer " << peer_id
                               << " (" << timestamps.size() << "/" << MAX_GETDATA_PER_SECOND << " per second)" << std::endl;
-                peer_manager.Misbehaving(peer_id, 2, MisbehaviorType::GETDATA_RATE_EXCEEDED);  // Reduced from 10 - IBD sync is legitimate
-                return false;
+                getdata_rate_breached = true;  // penalize AFTER releasing cs_getdata_rate (see below)
+            } else {
+                timestamps.push_back(now);
             }
-            timestamps.push_back(now);
+        }
+        // dilv-dedup-livelock-fix (F-009 BLOCKER-1): Misbehaving() takes cs_peers (via GetPeer),
+        // and the eviction/disconnect path takes cs_peers and then, via OnPeerDisconnected →
+        // CleanupPeerRateLimitState, the rate-limit mutexes. Calling Misbehaving WHILE holding
+        // cs_getdata_rate inverts that order → a reachable {cs_getdata_rate, cs_peers} AB-BA
+        // deadlock (GETDATA-storm peer + inbound-at-limit eviction). INVARIANT: never call
+        // Misbehaving (or anything that acquires cs_peers) while holding a rate-limit mutex —
+        // decide under the lock, penalize after release (the Part B dedup branch does the same).
+        if (getdata_rate_breached) {
+            peer_manager.Misbehaving(peer_id, 2, MisbehaviorType::GETDATA_RATE_EXCEEDED);  // Reduced from 10 - IBD sync is legitimate
+            return false;
         }
 
         // BUG #87 DEBUG: Log GETDATA processing
@@ -1265,6 +1277,12 @@ bool CNetMessageProcessor::ProcessGetDataMessage(int peer_id, CDataStream& strea
             // dilv-dedup-livelock-fix Part B: rate-limited re-send instead of permanent starvation.
             // Decide everything under ONE cs_served_blocks lock, then do all I/O (Misbehaving,
             // DisconnectNode, on_getdata, logging) AFTER releasing it.
+            // LOCK-ORDER INVARIANT (F-009 LOW-1): Misbehaving must stay OUTSIDE the cs_served_blocks
+            // scope below. Misbehaving→GetPeer takes cs_peers, and the disconnect path takes
+            // cs_peers then (via OnPeerDisconnected→CleanupPeerRateLimitState) cs_served_blocks;
+            // a Misbehaving call inside this lock would create a {cs_served_blocks, cs_peers} AB-BA
+            // deadlock (the same class F-009 BLOCKER-1 found+fixed for cs_getdata_rate). Do not move
+            // any Misbehaving/cs_peers-acquiring call into the locked region.
             // L-c (TOCTOU): the decide→release→serve split is safe because GETDATA for a given
             // peer is processed by the SINGLE threadMessageHandler thread (connman.cpp:186), so no
             // concurrent GETDATA from the same peer can interleave between the decision lock release
