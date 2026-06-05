@@ -2167,6 +2167,23 @@ void CIbdCoordinator::RetryTimeoutsAndStalls() {
         return;
     }
 
+    // ============ M-2 LIVENESS BACKSTOP (F-013 §M-2) ============
+    // Age out completed-height entries that got stuck on the divergent-hash no-reorg
+    // path. The dedup fix's AddBlock rejects any height in m_completed_heights; that set
+    // is otherwise cleared ONLY by Clear()/ClearAboveHeight(). On a completed height
+    // whose stored hash diverges from the IBD-expected hash with no reorg, neither fires,
+    // so the stall-recovery force-request (below, via RequestBlockFromPeer->AddBlock) is
+    // permanently refused -> no GETDATA -> silent IBD stall. Aging out the stale entry
+    // here lets the next force-request's AddBlock succeed. Reorg-safe (only DROPS flags).
+    if (g_node_context.block_tracker) {
+        int aged = g_node_context.block_tracker->RetryStaleCompleted();
+        if (aged > 0 && g_verbose.load(std::memory_order_relaxed)) {
+            std::cout << "[IBD] M-2 liveness: aged out " << aged
+                      << " stale completed-height entr" << (aged == 1 ? "y" : "ies")
+                      << " (re-requestable now)" << std::endl;
+        }
+    }
+
     // ============ HARD TIMEOUT: Remove blocks stuck too long ============
     // Use shorter timeout when close to tip (only a few blocks behind) since blocks
     // should arrive quickly. Use longer timeout during bulk IBD where validation
