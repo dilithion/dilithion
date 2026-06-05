@@ -656,6 +656,15 @@ void CConnman::ThreadSocketHandler() {
     auto last_inactivity_check = std::chrono::steady_clock::now();
     static constexpr int INACTIVITY_CHECK_INTERVAL_SECONDS = 10;
 
+    // dilv-dedup-livelock-fix (F-007): track when we last swept the rate-limit /
+    // dedup maps. PeriodicRateLimitCleanup was DEAD (no caller), so the per-peer
+    // map-size cap (MAX_RATE_LIMIT_MAP_SIZE) never ran. Wire it on the same loop as
+    // the inactivity check, gated to ~every 60s. This is belt-and-suspenders behind
+    // NEW-1 (per-disconnect cleanup): with NEW-1 the maps already shrink on every
+    // disconnect, so this sweep is a backstop against any path that leaves residue.
+    auto last_ratelimit_cleanup = std::chrono::steady_clock::now();
+    static constexpr int RATELIMIT_CLEANUP_INTERVAL_SECONDS = 60;
+
     while (!interruptNet.load()) {
         DisconnectNodes();
         SocketHandler();
@@ -666,6 +675,15 @@ void CConnman::ThreadSocketHandler() {
                 >= INACTIVITY_CHECK_INTERVAL_SECONDS) {
             InactivityCheck();
             last_inactivity_check = now;
+        }
+
+        // Sweep stale rate-limit / dedup state periodically (every 60 seconds).
+        // Lock-safe here: this is OUTSIDE the cs_vNodes scope, and
+        // PeriodicRateLimitCleanup acquires only the rate-limit mutexes.
+        if (std::chrono::duration_cast<std::chrono::seconds>(now - last_ratelimit_cleanup).count()
+                >= RATELIMIT_CLEANUP_INTERVAL_SECONDS) {
+            PeriodicRateLimitCleanup();
+            last_ratelimit_cleanup = now;
         }
     }
 

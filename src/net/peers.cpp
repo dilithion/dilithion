@@ -1710,6 +1710,23 @@ void CPeerManager::OnPeerDisconnected(int peer_id)
     connection_quality.RemovePeer(peer_id);
     m_peer_bandwidth_throttle.RemovePeer(peer_id);
 
+    // dilv-dedup-livelock-fix (NEW-1): next instance of the F19/F20/F21 leak class.
+    // CleanupPeerRateLimitState was previously called ONLY from the dedup self-
+    // disconnect branch (net.cpp); the normal disconnect path (timeout / eviction /
+    // graceful) left all six dedup/re-send maps behind. Node IDs are monotonic
+    // (never reused, connman m_next_node_id), so on a long-running seed serving
+    // IBD to churning peers the maps grew unbounded = slow memory-exhaustion DoS.
+    // Wiring it here releases that state on EVERY disconnect.
+    // Lock-order safety (F-009 BLOCKER-1): this runs under the eviction/disconnect
+    // locks (cs_vNodes and/or cs_peers — e.g. EvictPeersIfNeeded holds cs_peers
+    // across DispatchPeerDisconnected). CleanupPeerRateLimitState takes only the
+    // rate-limit mutexes, which sit LAST in the global order
+    // (cs_vNodes → cs_peers → {rate-limit mutexes}). This is safe ONLY because the
+    // invariant "never call Misbehaving / acquire cs_peers while holding a rate-limit
+    // mutex" holds — F-009 found+fixed the one violation (Misbehaving inside the
+    // GETDATA rate limiter, now hoisted). See the full order note at net.h decl.
+    CleanupPeerRateLimitState(peer_id);
+
     // The actual peer removal is handled by RemovePeer()
 }
 

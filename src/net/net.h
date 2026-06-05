@@ -329,4 +329,29 @@ static constexpr uint8_t REJECT_DUPLICATE   = 0x12;
 void SendRejectMessage(int peer_id, const std::string& command, const std::string& reason,
                        uint8_t code = REJECT_INVALID);
 
+// dilv-dedup-livelock-fix (NEW-1 / F-007): leak-class cleanups for the per-peer
+// GETDATA/HEADERS rate-limit + dedup/re-send maps. Declared here so the normal
+// disconnect path (CPeerManager::OnPeerDisconnected, peers.cpp) and the periodic
+// ThreadSocketHandler sweep (connman.cpp) can call them — they were previously
+// file-local to net.cpp and so were never wired to those paths.
+//
+// LOCK ORDER (dilv-dedup-livelock NEW-1 + F-009 BLOCKER-1 fix). The four relevant
+// mutex classes and their global acquisition order:
+//     cs_vNodes  →  cs_peers  →  {cs_getdata_rate, cs_headers_rate, cs_served_blocks}
+// CleanupPeerRateLimitState acquires the three rate-limit mutexes (last in the order),
+// so it is safe to call from OnPeerDisconnected even though the eviction/disconnect
+// callers hold cs_vNodes and/or cs_peers across the dispatch (AcceptConnection →
+// EvictPeersIfNeeded → DispatchPeerDisconnected → OnPeerDisconnected).
+// The ONLY way this inverts is if some path takes a rate-limit mutex and THEN cs_peers.
+// cs_peers is reached via CPeerManager::Misbehaving → GetPeer. INVARIANT (enforced):
+// no code calls Misbehaving (or otherwise acquires cs_peers) while holding any
+// rate-limit mutex — the GETDATA rate limiter (net.cpp) and the Part B dedup branch
+// both decide under the lock and penalize only after releasing it. F-009 BLOCKER-1
+// was exactly such an inversion (Misbehaving inside cs_getdata_rate) and was fixed by
+// hoisting that call out of the lock. cs_headers_rate never penalizes; cs_served_blocks
+// penalizes only after release. Do not reintroduce a Misbehaving call inside any of
+// these three scopes.
+void CleanupPeerRateLimitState(int peer_id);
+void PeriodicRateLimitCleanup();
+
 #endif // DILITHION_NET_NET_H
