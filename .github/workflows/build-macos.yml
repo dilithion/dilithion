@@ -93,7 +93,7 @@ jobs:
 
     - name: Upload to release (if tag)
       if: startsWith(github.ref, 'refs/tags/')
-      uses: softprops/action-gh-release@v1
+      uses: softprops/action-gh-release@v3
       with:
         files: releases/dilithion-${{ steps.get_version.outputs.version }}-mainnet-macos-${{ matrix.arch }}.tar.gz
       env:

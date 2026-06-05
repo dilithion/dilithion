@@ -1,12 +1,17 @@
-# Dilithion Testnet Setup Guide
+# Dilithion — Getting Started
 
-**Version**: 1.0
-**Date**: October 26, 2025
-**Status**: Phase 3 - Multi-Node Testing
+**Applies to:** DIL mainnet and DilV mainnet (also covers DIL testnet — `--testnet`).
+**Renamed from `TESTNET-GUIDE.md` in v4.4.1.** Procedures below apply to both
+chains; where commands differ by chain, both forms are shown. The portions of
+this guide that still read as testnet-specific are scheduled for refresh in a
+follow-up docs PR — file an issue if a section is unclear in the meantime.
 
 ## Overview
 
-This guide walks you through setting up multiple Dilithion testnet nodes for local testing. The testnet uses easier difficulty (256x) and separate network infrastructure from mainnet.
+This guide walks you through setting up Dilithion nodes — DIL (RandomX PoW) and
+DilV (VDF) — on mainnet or testnet. The Dilithion testnet uses easier difficulty
+(256x) and separate network infrastructure from mainnet; the mainnet sections
+apply by default unless `--testnet` is shown.
 
 ## Current Implementation Status
 

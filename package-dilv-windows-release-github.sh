@@ -44,10 +44,12 @@ echo "   [SUCCESS] All 8 DLLs copied successfully"
 
 # Copy launcher scripts and documentation
 echo "[4/5] Copying launcher scripts and documentation..."
-cp SETUP-DILV.bat         "${RELEASE_DIR}/" || { echo "ERROR: SETUP-DILV.bat not found."; exit 1; }
-cp START-DILV-MINING.bat  "${RELEASE_DIR}/" || { echo "ERROR: START-DILV-MINING.bat not found."; exit 1; }
-cp README-DILV-WINDOWS.txt "${RELEASE_DIR}/README.txt" || { echo "ERROR: README-DILV-WINDOWS.txt not found."; exit 1; }
-cp website/wallet.html    "${RELEASE_DIR}/" || { echo "ERROR: website/wallet.html not found."; exit 1; }
+cp SETUP-DILV.bat              "${RELEASE_DIR}/" || { echo "ERROR: SETUP-DILV.bat not found."; exit 1; }
+cp START-DILV-MINING.bat       "${RELEASE_DIR}/" || { echo "ERROR: START-DILV-MINING.bat not found."; exit 1; }
+cp START-DILV-MINER-GUI.bat    "${RELEASE_DIR}/" || { echo "ERROR: START-DILV-MINER-GUI.bat not found."; exit 1; }
+cp dilv-wallet.bat             "${RELEASE_DIR}/" || { echo "ERROR: dilv-wallet.bat not found."; exit 1; }
+cp README-DILV-WINDOWS.txt     "${RELEASE_DIR}/README.txt" || { echo "ERROR: README-DILV-WINDOWS.txt not found."; exit 1; }
+cp website/wallet.html         "${RELEASE_DIR}/" || { echo "ERROR: website/wallet.html not found."; exit 1; }
 echo "   All scripts and documentation copied successfully"
 
 # Create ZIP archive

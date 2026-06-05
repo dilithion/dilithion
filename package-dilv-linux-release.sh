@@ -59,10 +59,14 @@ chmod +x "${RELEASE_DIR}/run-node.sh"
 # Copy launcher scripts and documentation
 echo "[4/5] Copying launcher scripts and documentation..."
 cp start-dilv-mining.sh "${RELEASE_DIR}/" || { echo "ERROR: start-dilv-mining.sh not found."; exit 1; }
+cp start-dilv-miner-gui.sh "${RELEASE_DIR}/" || { echo "ERROR: start-dilv-miner-gui.sh not found."; exit 1; }
 cp setup-dilv.sh "${RELEASE_DIR}/" || { echo "ERROR: setup-dilv.sh not found."; exit 1; }
 chmod +x "${RELEASE_DIR}/start-dilv-mining.sh"
+chmod +x "${RELEASE_DIR}/start-dilv-miner-gui.sh"
 chmod +x "${RELEASE_DIR}/setup-dilv.sh"
 cp README-DILV-LINUX.txt "${RELEASE_DIR}/README.txt" || { echo "ERROR: README-DILV-LINUX.txt not found."; exit 1; }
+cp docs/GETTING-STARTED.md "${RELEASE_DIR}/GETTING-STARTED.md" || { echo "ERROR: docs/GETTING-STARTED.md not found."; exit 1; }
+cp website/wallet.html "${RELEASE_DIR}/wallet.html" || { echo "ERROR: website/wallet.html not found."; exit 1; }
 
 # Create archive
 echo "[5/5] Creating tar.gz archive..."

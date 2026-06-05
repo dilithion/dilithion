@@ -72,7 +72,7 @@ chmod +x "${RELEASE_DIR}/setup-and-start.sh"
 
 # Copy documentation and wallet
 cp README-LINUX.txt "${RELEASE_DIR}/README.txt"
-cp docs/TESTNET-GUIDE.md "${RELEASE_DIR}/TESTNET-GUIDE.md"
+cp docs/GETTING-STARTED.md "${RELEASE_DIR}/GETTING-STARTED.md"
 cp website/wallet.html "${RELEASE_DIR}/wallet.html"
 
 # Create wrapper script that sets LD_LIBRARY_PATH
