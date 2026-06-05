@@ -185,6 +185,9 @@ $RECYCLE.BIN/
 *.bak
 *.backup
 
+# Windows shell redirect artifact (2>/dev/null on Windows lands as a literal file)
+/null
+
 # Coverage
 *.gcov
 *.gcno
