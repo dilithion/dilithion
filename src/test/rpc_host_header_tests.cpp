@@ -283,25 +283,47 @@ enum class Dispatched {
 // Faithful model of the server.cpp HandleClient ordering. Returns what the
 // dispatch did and, for WalletHtmlServed, the token that would be embedded in
 // the served HTML (so the test can round-trip it through the auth path).
+//
+// C-01b (F-003): the model now carries TWO socket-level dimensions the previous
+// version lacked — `peerIP` (the KERNEL-reported socket peer, i.e. GetClientIP)
+// and `publicAPI` (the --public-api flag). The wallet-HTML branch ordering
+// mirrors server.cpp exactly: (1) --public-api => reject outright; (2) the
+// socket-peer loopback gate (IsLoopbackIP on the REAL peer, NOT the Host header)
+// => reject if non-loopback; (3) the secondary Host-header anti-rebinding gate.
+// Modelling the socket peer is what lets the test express the C-01b attack (a
+// non-loopback peer sending `Host: localhost`).
 static Dispatched SimulateDispatch(const HostValidator& hv,
                                    bool hostValidatorReady,
                                    SessionTokenStore& tokens,
                                    bool authConfigured,
                                    const std::string& request,
                                    int64_t now,
-                                   std::string& servedTokenOut) {
+                                   std::string& servedTokenOut,
+                                   const std::string& peerIP = "127.0.0.1",
+                                   bool publicAPI = false) {
     servedTokenOut.clear();
 
-    // --- GATE 1 (server.cpp:1094): FAIL-CLOSED Host allowlist, FIRST. ---
+    // --- GATE 1 (server.cpp:1109): FAIL-CLOSED Host allowlist, FIRST. ---
     if (!hostValidatorReady || !hv.IsRequestHostAllowed(request)) {
         return Dispatched::HostRejected;
     }
 
     // --- GET /miner (skipped: irrelevant to token surface) ---
 
-    // --- GET / or GET /wallet (server.cpp:1134): token-minting wallet HTML. ---
+    // --- GET / or GET /wallet (server.cpp:1150): token-minting wallet HTML. ---
     if (request.find("GET /wallet") == 0 || request.find("GET / HTTP") == 0) {
-        // C-01: loopback-Host ONLY, regardless of the RPC/REST allowlist.
+        // C-01b safety net (server.cpp): wallet UI disabled entirely under
+        // --public-api, regardless of socket peer.
+        if (publicAPI) {
+            return Dispatched::WalletHtmlRejected;
+        }
+        // C-01b ORIGIN decision (server.cpp): require a LOOPBACK SOCKET PEER.
+        // This is the load-bearing gate — it consults the kernel-reported peer,
+        // NOT the Host header. A remote peer sending `Host: localhost` fails here.
+        if (!HostValidator::IsLoopbackIP(peerIP)) {
+            return Dispatched::WalletHtmlRejected;
+        }
+        // C-01 (secondary): Host-header anti-rebinding gate, loopback-Host only.
         if (!hostValidatorReady || !hv.IsRequestLoopbackHost(request)) {
             return Dispatched::WalletHtmlRejected;
         }
@@ -439,6 +461,95 @@ static void TestHandleClientIntegration() {
         // The store must never have minted a token for any non-loopback request:
         // only the single loopback serve above minted -> exactly 1 live token.
         CHECK(tokens.Size() == 1);
+    }
+
+    // ---- C-01b REGRESSION (F-003): the loopback ORIGIN decision rests on the ----
+    // ---- SOCKET PEER, never the Host header. A remote peer spoofing          ----
+    // ---- `Host: localhost` must NOT get the wallet page or a token; and the  ----
+    // ---- --public-api safety net rejects even a loopback peer.               ----
+    {
+        HostValidator hv;
+        // Default desktop allowlist (loopback names always allowed) — the
+        // attacker's spoofed `Host: localhost` PASSES both the general Host gate
+        // and the secondary loopback-Host gate, exactly as on a real node. The
+        // ONLY thing that stops the attack is the socket-peer check.
+        hv.Configure(8332, {});
+        SessionTokenStore tokens(/*ttl=*/3600);
+        std::string tok;
+
+        // (a) THE C-01b ATTACK: a NON-LOOPBACK socket peer (a remote attacker)
+        //     sends `Host: localhost`. Host gates pass; socket-peer gate REJECTS.
+        //     No wallet page, no token minted.
+        Dispatched d = SimulateDispatch(hv, true, tokens, true,
+            MakeRequest("GET", "/wallet", "localhost:8332"), now, tok,
+            /*peerIP=*/"203.0.113.7", /*publicAPI=*/false);
+        CHECK(d == Dispatched::WalletHtmlRejected);
+        CHECK(tok.empty());
+
+        // Same attack with `Host: 127.0.0.1` from the same remote peer.
+        d = SimulateDispatch(hv, true, tokens, true,
+            MakeRequest("GET", "/", "127.0.0.1:8332"), now, tok,
+            /*peerIP=*/"203.0.113.7", /*publicAPI=*/false);
+        CHECK(d == Dispatched::WalletHtmlRejected);
+        CHECK(tok.empty());
+
+        // (b) THE --public-api SAFETY NET: even a LEGIT LOOPBACK peer is rejected
+        //     when publicAPI is true (wallet UI disabled outright). No token.
+        d = SimulateDispatch(hv, true, tokens, true,
+            MakeRequest("GET", "/wallet", "localhost:8332"), now, tok,
+            /*peerIP=*/"127.0.0.1", /*publicAPI=*/true);
+        CHECK(d == Dispatched::WalletHtmlRejected);
+        CHECK(tok.empty());
+
+        // (c) THE LEGIT CASE: loopback socket peer, NON-public-api, loopback Host
+        //     -> served + token round-trips through the auth path.
+        d = SimulateDispatch(hv, true, tokens, true,
+            MakeRequest("GET", "/wallet", "localhost:8332"), now, tok,
+            /*peerIP=*/"127.0.0.1", /*publicAPI=*/false);
+        CHECK(d == Dispatched::WalletHtmlServed);
+        CHECK(!tok.empty());
+        CHECK(SimulateTokenAuth(tokens, "__token__", tok, now));
+
+        // No token was minted for either attack or the safety-net rejection:
+        // only the single legit serve in (c) minted -> exactly 1 live token.
+        CHECK(tokens.Size() == 1);
+    }
+
+    // ---- C-01b: IsLoopbackIP direct coverage (IP-LITERAL classifier, NOT a ----
+    // ---- Host-header parser; accepts no names; default-deny).              ----
+    {
+        // IPv4 loopback /8 — the WHOLE block, not just .1.
+        CHECK(HostValidator::IsLoopbackIP("127.0.0.1"));
+        CHECK(HostValidator::IsLoopbackIP("127.1.2.3"));
+        CHECK(HostValidator::IsLoopbackIP("127.255.255.254"));
+        CHECK(HostValidator::IsLoopbackIP("127.0.0.0"));
+        // IPv6 loopback (canonical + fully-expanded + bracketed + zone id).
+        CHECK(HostValidator::IsLoopbackIP("::1"));
+        CHECK(HostValidator::IsLoopbackIP("0:0:0:0:0:0:0:1"));
+        CHECK(HostValidator::IsLoopbackIP("[::1]"));
+        CHECK(HostValidator::IsLoopbackIP("::1%lo0"));
+        // IPv4-mapped loopback textual forms (defense in depth).
+        CHECK(HostValidator::IsLoopbackIP("::ffff:127.0.0.1"));
+        CHECK(HostValidator::IsLoopbackIP("::ffff:127.1.2.3"));
+        // NON-loopback — must all be rejected (default-deny).
+        CHECK(!HostValidator::IsLoopbackIP("203.0.113.7"));
+        CHECK(!HostValidator::IsLoopbackIP("128.0.0.1"));   // adjacent to 127/8
+        CHECK(!HostValidator::IsLoopbackIP("126.255.255.255"));
+        CHECK(!HostValidator::IsLoopbackIP("10.0.0.1"));
+        CHECK(!HostValidator::IsLoopbackIP("::ffff:203.0.113.7"));
+        CHECK(!HostValidator::IsLoopbackIP("2001:db8::1"));
+        // CRITICAL: the NAME "localhost" is a Host token, NOT an IP literal —
+        // IsLoopbackIP must NOT accept it (that is IsLoopbackHost's job, and the
+        // Host header must never be the origin basis).
+        CHECK(!HostValidator::IsLoopbackIP("localhost"));
+        // Malformed / empty / sentinel -> default-deny.
+        CHECK(!HostValidator::IsLoopbackIP(""));
+        CHECK(!HostValidator::IsLoopbackIP("unknown"));     // failed getpeername
+        CHECK(!HostValidator::IsLoopbackIP("127.0.0"));     // too few octets
+        CHECK(!HostValidator::IsLoopbackIP("127.0.0.1.5")); // too many octets
+        CHECK(!HostValidator::IsLoopbackIP("127.0.0.256")); // octet out of range
+        CHECK(!HostValidator::IsLoopbackIP("127.0.0.1:8332")); // a peer IP carries no port here
+        CHECK(!HostValidator::IsLoopbackIP("127.0.0.x"));   // non-numeric
     }
 
     // ---- H-01 REGRESSION: validator-not-ready => FAIL-CLOSED (reject all). ----

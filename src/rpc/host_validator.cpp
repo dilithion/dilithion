@@ -248,6 +248,79 @@ bool HostValidator::IsRequestLoopbackHost(const std::string& rawRequest) const {
     return IsLoopbackHost(host);
 }
 
+// wallet-rpc-login-restore C-01b: classify a SOCKET-PEER IP literal (from
+// getpeername / GetClientIP) as loopback. Unlike IsLoopbackHost, this takes NO
+// Host header and accepts NO names — only numeric IP literals. The peer address
+// is kernel-reported and cannot be spoofed by a remote client, so it is the
+// correct basis for the "is this request loopback-origin" decision on the
+// token-minting wallet path. Default-deny: anything not recognised as loopback
+// returns false (including "unknown" from a failed getpeername).
+//
+// Accepted forms:
+//   - 127.0.0.0/8        : any 127.x.x.x (the whole loopback /8, not just .1)
+//   - ::1                : IPv6 loopback (canonical and fully-expanded spellings)
+//   - ::ffff:127.x.x.x   : IPv4-mapped loopback in textual form (defense in depth;
+//                          GetClientIP already unwraps these to dotted 127.x, but
+//                          accept the literal form too so the classifier is correct
+//                          regardless of the caller's unwrapping behaviour)
+bool HostValidator::IsLoopbackIP(const std::string& ip) {
+    if (ip.empty()) return false;
+    std::string s = ToLower(Trim(ip));
+    // Strip surrounding IPv6 brackets if a caller passed them.
+    if (s.size() >= 2 && s.front() == '[' && s.back() == ']') {
+        s = s.substr(1, s.size() - 2);
+    }
+    // Strip an IPv6 zone id (%eth0) if present.
+    size_t pct = s.find('%');
+    if (pct != std::string::npos) s = s.substr(0, pct);
+    if (s.empty()) return false;
+
+    // IPv6 loopback (canonical + fully-expanded). CanonicalizeIPv6 also collapses
+    // the IPv4-mapped-loopback spellings (::ffff:127.0.0.1, ::ffff:7f00:1, ...) to
+    // "::1", so this single compare covers those literal forms too.
+    if (s.find(':') != std::string::npos) {
+        std::string canon = CanonicalizeIPv6(s);
+        if (canon == "::1") return true;
+        // IPv4-mapped loopback for the general 127.x range (e.g. ::ffff:127.1.2.3)
+        // that CanonicalizeIPv6 does not enumerate: peel the mapped IPv4 tail.
+        const std::string mapped = "::ffff:";
+        if (s.compare(0, mapped.size(), mapped) == 0) {
+            std::string tail = s.substr(mapped.size());
+            // Only treat as loopback if the tail is a dotted-quad in 127.0.0.0/8.
+            if (tail.find('.') != std::string::npos) return IsLoopbackIP(tail);
+        }
+        return false;
+    }
+
+    // IPv4 dotted-quad: loopback is the entire 127.0.0.0/8 block.
+    // Parse the first octet and require it to be exactly 127, with a well-formed
+    // 4-octet a.b.c.d shape (each octet 0..255). Default-deny on any malformation.
+    int octets[4] = {0, 0, 0, 0};
+    int idx = 0;
+    size_t i = 0;
+    while (i < s.size()) {
+        if (idx >= 4) return false;            // too many octets
+        size_t start = i;
+        int val = 0;
+        size_t digits = 0;
+        while (i < s.size() && s[i] >= '0' && s[i] <= '9') {
+            val = val * 10 + (s[i] - '0');
+            if (val > 255) return false;        // octet out of range
+            ++i; ++digits;
+        }
+        if (digits == 0 || digits > 3) return false;  // empty/oversized octet
+        (void)start;
+        octets[idx++] = val;
+        if (i < s.size()) {
+            if (s[i] != '.') return false;      // unexpected char
+            ++i;                                 // consume '.'
+            if (i == s.size()) return false;     // trailing dot
+        }
+    }
+    if (idx != 4) return false;                 // not exactly 4 octets
+    return octets[0] == 127;                    // 127.0.0.0/8
+}
+
 // ---------------------------------------------------------------------------
 // SessionTokenStore
 // ---------------------------------------------------------------------------

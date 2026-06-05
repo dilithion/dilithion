@@ -108,6 +108,22 @@ public:
     static bool IsLoopbackHost(const std::string& canonicalHost);
 
     /**
+     * True iff @p ip is a LOOPBACK IP **literal** — i.e. an address in
+     * 127.0.0.0/8, ::1, or an IPv4-mapped loopback (::ffff:127.x.x.x).
+     *
+     * CRITICAL — this is an IP-LITERAL classifier, NOT a Host-header parser. It
+     * is meant to be fed the KERNEL-reported socket peer (getpeername /
+     * GetClientIP), never a client-supplied Host header. The Host header is
+     * attacker-controlled on a --public-api (all-interfaces) bind; the socket
+     * peer is not. The token-minting wallet-HTML origin decision MUST rest on
+     * this predicate applied to the real peer, never on IsLoopbackHost (which
+     * trusts the header). The literal name "localhost" is deliberately NOT
+     * accepted here — a peer address is always a numeric IP, never a name.
+     * (wallet-rpc-login-restore C-01b.)
+     */
+    static bool IsLoopbackIP(const std::string& ip);
+
+    /**
      * End-to-end LOOPBACK check on a raw HTTP request: parse the Host header and
      * confirm it is a loopback host (127.0.0.1 / ::1 / localhost) AND (if a port
      * was present) the port matched. Any parse failure returns false

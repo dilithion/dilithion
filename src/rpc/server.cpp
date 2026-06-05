@@ -528,9 +528,17 @@ bool CRPCServer::Start() {
             first = false;
         }
         std::cout << std::endl;
-        std::cout << "[RPC] Wallet UI (GET / and GET /wallet) is served on LOOPBACK "
-                     "Host ONLY (127.0.0.1/localhost), regardless of --rpcallowhost."
-                  << std::endl;
+        if (m_publicAPI) {
+            std::cout << "[RPC] Wallet UI (GET / and GET /wallet) is DISABLED on this "
+                         "--public-api node (no page, no admin-token minting). "
+                         "SSH-tunnel to a loopback RPC to use the wallet."
+                      << std::endl;
+        } else {
+            std::cout << "[RPC] Wallet UI (GET / and GET /wallet) is served to LOOPBACK "
+                         "SOCKET PEERS ONLY (127.0.0.0/8, ::1); the Host header is not "
+                         "trusted for this decision."
+                      << std::endl;
+        }
         if (m_publicAPI && m_rpcAllowHosts.empty()) {
             std::cout << "[RPC] WARNING: --public-api with no --rpcallowhost: only "
                          "loopback Host headers are accepted for RPC/REST. Remote "
@@ -1149,16 +1157,85 @@ void CRPCServer::HandleClient(int clientSocket) {
     // Serve web wallet at GET /wallet or GET /wallet.html (or GET /).
     if (request.find("GET /wallet") == 0 || request.find("GET / HTTP") == 0) {
         // ====================================================================
+        // C-01b (F-003) — HARD SAFETY NET: the wallet UI is a desktop affordance,
+        // not a seed feature. On a --public-api node (all-interfaces bind) it is
+        // DISABLED ENTIRELY — no page, no token minting — REGARDLESS of socket
+        // peer. This structurally removes the entire remote-admin-token class on
+        // network-bound nodes (belt-and-suspenders with the socket-peer gate
+        // below). Operators who need the wallet on such a node SSH-tunnel to a
+        // loopback RPC. Checked FIRST so a public-API node never even classifies
+        // the peer.
+        // ====================================================================
+        if (m_publicAPI) {
+            if (m_logger) {
+                m_logger->LogSecurityEvent("WALLET_HTML_REJECTED", clientIP, "",
+                    "Wallet UI disabled on a --public-api node (token-minting page "
+                    "not served on a network-bound bind)");
+            }
+            const std::string body =
+                "{\"error\":\"Forbidden: the wallet UI is disabled on a public-API node. "
+                "SSH-tunnel to a loopback RPC to use the wallet.\",\"code\":-32600}";
+            std::ostringstream oss;
+            oss << "HTTP/1.1 403 Forbidden\r\n"
+                << "Content-Type: application/json\r\n"
+                << "Content-Length: " << body.size() << "\r\n"
+                << "Connection: close\r\n"
+                << "X-Content-Type-Options: nosniff\r\n"
+                << "X-Frame-Options: DENY\r\n"
+                << "\r\n"
+                << body;
+            std::string resp_str = oss.str();
+            send_response_and_cleanup(resp_str);
+            return;
+        }
+
+        // ====================================================================
+        // C-01b (F-003) — the ORIGIN decision rests on the KERNEL-REPORTED SOCKET
+        // PEER, never on the Host header. The wallet HTML mints an ADMIN-bearing
+        // session token; it MUST be served ONLY to a genuine loopback origin.
+        //
+        // The previous fold (C-01/F-002) gated on IsRequestLoopbackHost, which
+        // parses the **Host header** — attacker-controlled on a --public-api
+        // (all-interfaces) bind. A remote attacker sending `Host: localhost`
+        // defeated that gate and scraped a remote ROLE_ADMIN token. The fix:
+        // require the REAL peer (clientIP, from getpeername at GetClientIP above)
+        // to be a loopback IP literal (127.0.0.0/8 / ::1 / IPv4-mapped loopback)
+        // via IsLoopbackIP — which takes NO header and accepts NO names.
+        //
+        // Defense-in-depth: we ALSO keep the Host gate (IsRequestLoopbackHost)
+        // for anti-rebinding, but the loopback ORIGIN decision is the socket
+        // peer. Both must pass; either failing rejects, fail-closed if the
+        // validator is unready.
+        // ====================================================================
+        if (!rpc::HostValidator::IsLoopbackIP(clientIP)) {
+            if (m_logger) {
+                m_logger->LogSecurityEvent("WALLET_HTML_REJECTED", clientIP, "",
+                    "Wallet HTML (token-minting) requested from a NON-LOOPBACK socket "
+                    "peer; served to loopback peers only (Host header is not trusted "
+                    "for this decision)");
+            }
+            const std::string body =
+                "{\"error\":\"Forbidden: the wallet UI is served to loopback connections "
+                "only. Use an SSH tunnel for remote access.\",\"code\":-32600}";
+            std::ostringstream oss;
+            oss << "HTTP/1.1 403 Forbidden\r\n"
+                << "Content-Type: application/json\r\n"
+                << "Content-Length: " << body.size() << "\r\n"
+                << "Connection: close\r\n"
+                << "X-Content-Type-Options: nosniff\r\n"
+                << "X-Frame-Options: DENY\r\n"
+                << "\r\n"
+                << body;
+            std::string resp_str = oss.str();
+            send_response_and_cleanup(resp_str);
+            return;
+        }
+
+        // ====================================================================
         // C-01 (F-002): the wallet HTML mints an ADMIN-bearing session token.
-        // It MUST be served ONLY to a LOOPBACK Host — ALWAYS, regardless of
-        // --public-api / --rpcallowhost / --externalip. The general Host gate
-        // above may have allowlisted a non-loopback Host for RPC/REST (e.g. a
-        // seed's own external IP), but the token-minting page must never be
-        // served to that remote origin, or a remote client could scrape the
-        // admin token and call sendtoaddress/dumpprivkey. The session-token
-        // login is a same-origin desktop affordance; it has no business firing
-        // for a remote REST client. This is a SEPARATE, stricter check than the
-        // RPC/REST allowlist — loopback-only, fail-closed if validator unready.
+        // The Host header is ALSO checked (anti-DNS-rebinding) — but this is now
+        // SECONDARY to the socket-peer gate above, which is the load-bearing
+        // loopback-origin assertion. Fail-closed if validator unready.
         // ====================================================================
         if (!m_hostValidatorReady || !m_hostValidator.IsRequestLoopbackHost(request)) {
             if (m_logger) {
