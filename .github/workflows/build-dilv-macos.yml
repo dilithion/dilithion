@@ -82,6 +82,53 @@ jobs:
         chmod +x package-dilv-macos-release.sh
         ./package-dilv-macos-release.sh
 
+    - name: Clean-room smoke test (BLOCKING)
+      # Run the JUST-PACKAGED binary and prove it is self-contained. The macOS
+      # runner is NOT a clean machine (Homebrew is installed), so the real
+      # isolation proof is the otool dependency check: every non-system dylib
+      # the binary links MUST be bundled under the package's lib/ (the packager
+      # rewrites refs to @executable_path/lib/<name>). We also actually launch
+      # the binary. This gate blocks the upload steps below on failure.
+      env:
+        VERSION: ${{ steps.get_version.outputs.version }}
+        ARCH: ${{ matrix.arch }}
+      run: |
+        set -e
+        RELEASE_NAME="dilv-${VERSION}-mainnet-macos-${ARCH}"
+        PKG="releases/${RELEASE_NAME}"
+        BIN="${PKG}/dilv-node"
+        # Manifest assertion: key files present.
+        for f in "${BIN}" "${PKG}/lib" "${PKG}/README.txt"; do
+          [ -e "$f" ] || { echo "CLEAN-ROOM FAIL: missing $f in package"; exit 1; }
+        done
+        # Strip quarantine so a fresh download would launch.
+        xattr -dr com.apple.quarantine "${PKG}" || true
+        # Every non-system dylib (not under /usr/lib or /System) must be bundled.
+        echo "otool -L dilv-node:"
+        otool -L "${BIN}"
+        FAIL=0
+        while read -r dep; do
+          case "$dep" in
+            /usr/lib/*|/System/*|@executable_path/*|@loader_path/*|@rpath/*) ;;
+            "") ;;
+            *)
+              base=$(basename "$dep")
+              if [ ! -f "${PKG}/lib/${base}" ]; then
+                echo "CLEAN-ROOM FAIL: non-system dylib not bundled: $dep"
+                FAIL=1
+              fi
+              ;;
+          esac
+        done < <(otool -L "${BIN}" | tail -n +2 | awk '{print $1}')
+        [ "$FAIL" -eq 0 ] || exit 1
+        # Must actually start (prints usage banner; --help/--version exit non-zero by design).
+        # macOS lacks GNU `timeout`; use a perl alarm watchdog (always present).
+        run_guarded() { perl -e 'alarm shift; exec @ARGV' 20 "$@"; }
+        out=$(run_guarded "${BIN}" --version 2>&1 || run_guarded "${BIN}" --help 2>&1 || true)
+        echo "$out" | head -3
+        echo "$out" | grep -qiE "dilithion|dilv|version|usage" || { echo "CLEAN-ROOM FAIL: binary did not start"; exit 1; }
+        echo "CLEAN-ROOM PASS"
+
     - name: Upload artifact
       uses: actions/upload-artifact@v7
       with:

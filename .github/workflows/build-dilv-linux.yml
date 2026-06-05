@@ -119,6 +119,38 @@ jobs:
         done
         echo "All required libraries bundled."
 
+    - name: Clean-room smoke test (BLOCKING)
+      # Run the JUST-PACKAGED tarball inside a pristine ubuntu:22.04 container
+      # that has NONE of the runtime deps installed. Proves the package actually
+      # STARTS using only its bundled libs — a binary can pass the file-present
+      # checks above yet still fail to launch (wrong lib version / bad rpath /
+      # broken wrapper). This gate blocks the upload steps below on failure.
+      env:
+        VERSION: ${{ steps.get_version.outputs.version }}
+      run: |
+        RELEASE_NAME="dilv-${VERSION}-mainnet-linux-x64"
+        docker run --rm -v "$PWD/releases:/r:ro" ubuntu:22.04 bash -c '
+          set -e
+          RELEASE_NAME="'"${RELEASE_NAME}"'"
+          cd /tmp && tar xzf "/r/${RELEASE_NAME}.tar.gz" && cd "${RELEASE_NAME}"
+          # Manifest assertion: key files must be present in the package.
+          for f in dilv-node run-node.sh lib; do
+            [ -e "$f" ] || { echo "CLEAN-ROOM FAIL: missing $f in package"; exit 1; }
+          done
+          # Sanity: prove the clean box lacks the bundled libs system-wide.
+          ! ldconfig -p | grep -qE "libleveldb|libminiupnpc|libsnappy" || echo "warn: clean box unexpectedly has bundled libs"
+          export LD_LIBRARY_PATH="$PWD/lib"
+          # Must resolve every dependency using the bundled libs.
+          if ldd ./dilv-node | grep -q "not found"; then
+            echo "CLEAN-ROOM FAIL: unresolved deps"; ldd ./dilv-node | grep "not found"; exit 1
+          fi
+          # Must actually start (prints usage banner; --help/--version exit non-zero by design).
+          out=$(timeout 20 ./dilv-node --version 2>&1 || timeout 20 ./dilv-node --help 2>&1 || true)
+          echo "$out" | head -3
+          echo "$out" | grep -qiE "dilithion|dilv|version|usage" || { echo "CLEAN-ROOM FAIL: binary did not start"; exit 1; }
+          echo "CLEAN-ROOM PASS"
+        '
+
     - name: Upload artifact
       uses: actions/upload-artifact@v7
       with:

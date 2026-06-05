@@ -65,6 +65,53 @@ jobs:
         chmod +x package-dilv-windows-release-github.sh
         ./package-dilv-windows-release-github.sh
 
+    - name: Clean-room smoke test (BLOCKING)
+      # Prove the packaged .exe actually RUNS using only bundled DLLs, and that
+      # every non-system DLL it imports is bundled. The windows-latest runner is
+      # NOT a clean machine (MSYS2/mingw DLLs are on PATH), so the real isolation
+      # proof is the PE-import completeness check via objdump: any non-system DLL
+      # that is NOT shipped in the package would silently load from MSYS2 here but
+      # be MISSING on a user's machine. We also launch the exe from the package
+      # dir (Windows resolves the application directory first, so bundled DLLs
+      # win). This gate blocks the upload steps below on failure.
+      shell: msys2 {0}
+      env:
+        VERSION: ${{ steps.get_version.outputs.version }}
+      run: |
+        set -e
+        RELEASE_NAME="dilv-${VERSION}-mainnet-windows-x64"
+        PKG="releases/${RELEASE_NAME}"
+        BIN="dilv-node.exe"
+        # Manifest assertion: exe + a couple of key DLLs present.
+        for f in "${BIN}" libstdc++-6.dll libssl-3-x64.dll; do
+          [ -f "${PKG}/${f}" ] || { echo "CLEAN-ROOM FAIL: missing ${f} in package"; exit 1; }
+        done
+        # System DLL allowlist (case-insensitive). Anything imported but not on
+        # this list MUST be bundled in the package, else it fails on user machines.
+        SYS_DLLS=" kernel32.dll user32.dll advapi32.dll ws2_32.dll msvcrt.dll shell32.dll bcrypt.dll dbghelp.dll iphlpapi.dll ntdll.dll gdi32.dll ole32.dll oleaut32.dll shlwapi.dll crypt32.dll secur32.dll winmm.dll setupapi.dll version.dll userenv.dll psapi.dll wininet.dll dnsapi.dll mswsock.dll rpcrt4.dll comdlg32.dll imm32.dll powrprof.dll "
+        FAIL=0
+        echo "PE imports for ${BIN}:"
+        objdump -p "${PKG}/${BIN}" | grep -i 'DLL Name' | awk '{print $3}' | while read -r dll; do echo "  $dll"; done
+        for dll in $(objdump -p "${PKG}/${BIN}" | grep -i 'DLL Name' | awk '{print $3}'); do
+          lc=$(echo "$dll" | tr 'A-Z' 'a-z')
+          case "$SYS_DLLS" in
+            *" $lc "*) ;;  # system DLL, fine
+            *)
+              if [ ! -f "${PKG}/${dll}" ]; then
+                echo "CLEAN-ROOM FAIL: imported DLL not bundled and not system: $dll"
+                FAIL=1
+              fi
+              ;;
+          esac
+        done
+        [ "$FAIL" -eq 0 ] || exit 1
+        # Must actually start (prints usage banner; --help/--version exit non-zero by design).
+        cd "${PKG}"
+        out=$(timeout 20 ./"${BIN}" --version 2>&1 || timeout 20 ./"${BIN}" --help 2>&1 || true)
+        echo "$out" | head -3
+        echo "$out" | grep -qiE "dilithion|dilv|version|usage" || { echo "CLEAN-ROOM FAIL: exe did not start"; exit 1; }
+        echo "CLEAN-ROOM PASS"
+
     - name: Upload artifact
       uses: actions/upload-artifact@v7
       with:
