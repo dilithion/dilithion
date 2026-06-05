@@ -7024,7 +7024,15 @@ load_genesis_block:  // Bug #29: Label for automatic retry after blockchain wipe
         std::string rpcuser = config_parser.GetString("rpcuser", "");
         std::string rpcpassword = config_parser.GetString("rpcpassword", "");
         std::string rpc_permissions_file = config.datadir + "/rpc_permissions.json";
-        
+
+        // M-03 (F-002): reject the reserved __token__ / __cookie__ usernames.
+        if (rpcuser == "__token__" || rpcuser == "__cookie__") {
+            std::cerr << "ERROR: rpcuser '" << rpcuser << "' is a reserved username "
+                      << "(used internally for session-token / cookie auth). "
+                      << "Choose a different rpcuser. Aborting startup." << std::endl;
+            return 1;
+        }
+
         if (!rpcuser.empty() && !rpcpassword.empty()) {
             // CVE-2026-RPC-AUTH: wire both InitializePermissions AND RPCAuth so
             // the auth gate at server.cpp:1105 actually runs. Abort on failure.
@@ -7168,15 +7176,13 @@ load_genesis_block:  // Bug #29: Label for automatic retry after blockchain wipe
         rpc_server.SetSessionAuthCredentials(rpcuser, rpcpassword);
 
         // wallet-rpc-login-restore: populate the anti-DNS-rebinding Host allowlist
-        // (loopback always allowed by the validator; add operator hosts + own
-        // external IP under --public-api so existing remote REST clients work).
+        // for RPC/REST with ONLY operator-explicit --rpcallowhost entries.
+        // C-01 (F-002): do NOT auto-add the node's own --externalip — that turned
+        // the wallet-HTML token mint into remote admin-token issuance. Loopback is
+        // always allowed by the validator; the wallet-HTML/token path is loopback
+        // only regardless of this allowlist (see server.cpp GET /wallet).
         for (const auto& h : config.rpc_allow_hosts) {
             rpc_server.AddRpcAllowHost(h);
-        }
-        if (config.public_api && !config.external_ip.empty()) {
-            rpc_server.AddRpcAllowHost(config.external_ip);
-            std::cout << "  [RPC] --public-api: allowing own external IP in Host "
-                         "allowlist: " << config.external_ip << std::endl;
         }
 
         // Phase 1: Initialize request logging

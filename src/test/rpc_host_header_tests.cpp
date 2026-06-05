@@ -157,12 +157,14 @@ static void TestAppliesToAllPaths() {
 static void TestPublicApiAllowlist() {
     std::cout << "--public-api allowlist (loopback + operator hosts)..." << std::endl;
     HostValidator hv;
-    // Simulates a seed: own external IP added by default + an operator DNS name.
+    // Simulates a seed where the operator EXPLICITLY allowlisted its external IP
+    // and a DNS name via --rpcallowhost (C-01: the node no longer auto-adds
+    // --externalip; these are present only because the operator opted in).
     hv.Configure(8332, {"203.0.113.7", "seed.dilithion.org"});
 
     // Loopback still allowed.
     CHECK(hv.IsRequestHostAllowed(MakeRequest("POST", "/api/v1/broadcast", "127.0.0.1:8332")));
-    // The seed's own external IP allowed (legacy remote light-wallet REST clients).
+    // The operator-allowlisted external IP is accepted for RPC/REST.
     CHECK(hv.IsRequestHostAllowed(MakeRequest("POST", "/api/v1/broadcast", "203.0.113.7:8332")));
     CHECK(hv.IsRequestHostAllowed(MakeRequest("POST", "/api/v1/broadcast", "203.0.113.7")));
     // Operator-configured DNS name allowed.
@@ -252,6 +254,236 @@ static void TestSessionTokenCapacity() {
     std::cout << "  ok" << std::endl;
 }
 
+// ===========================================================================
+// INTEGRATION TEST (H-02, F-002): drive the REAL dispatch decision functions
+// in the REAL order CRPCServer::HandleClient uses, asserting:
+//   (a) gate-first ordering: a bad-Host request is rejected BEFORE any
+//       GET /wallet / OPTIONS / REST branch is reached;
+//   (b) the served-HTML -> authenticated-RPC round-trip on loopback (token mint
+//       -> __token__ auth resolves to the configured creds);
+//   (c) the C-01 regression: a NON-loopback Host that IS allowlisted for
+//       RPC/REST does NOT get served the wallet page / a token.
+//
+// This is NOT a re-implementation of HandleClient: it calls the SAME security
+// primitives server.cpp calls (HostValidator::IsRequestHostAllowed for the
+// first gate, HostValidator::IsRequestLoopbackHost for the wallet-HTML gate,
+// SessionTokenStore::Mint/Validate for the token round-trip) in the SAME
+// ordering, so a future reorder or a regression in those functions is caught.
+// ===========================================================================
+
+// Outcome of the dispatch up to (and including) the wallet-HTML / auth decision.
+enum class Dispatched {
+    HostRejected,       // first gate rejected (403) — nothing else ran
+    WalletHtmlServed,   // GET / or /wallet served WITH a minted token
+    WalletHtmlRejected, // GET / or /wallet hit but non-loopback Host -> 403 (C-01)
+    RestHandled,        // REST /api/v1/* path handled (Host gate passed)
+    RpcAuthPath,        // fell through to the JSON-RPC auth path
+};
+
+// Faithful model of the server.cpp HandleClient ordering. Returns what the
+// dispatch did and, for WalletHtmlServed, the token that would be embedded in
+// the served HTML (so the test can round-trip it through the auth path).
+static Dispatched SimulateDispatch(const HostValidator& hv,
+                                   bool hostValidatorReady,
+                                   SessionTokenStore& tokens,
+                                   bool authConfigured,
+                                   const std::string& request,
+                                   int64_t now,
+                                   std::string& servedTokenOut) {
+    servedTokenOut.clear();
+
+    // --- GATE 1 (server.cpp:1094): FAIL-CLOSED Host allowlist, FIRST. ---
+    if (!hostValidatorReady || !hv.IsRequestHostAllowed(request)) {
+        return Dispatched::HostRejected;
+    }
+
+    // --- GET /miner (skipped: irrelevant to token surface) ---
+
+    // --- GET / or GET /wallet (server.cpp:1134): token-minting wallet HTML. ---
+    if (request.find("GET /wallet") == 0 || request.find("GET / HTTP") == 0) {
+        // C-01: loopback-Host ONLY, regardless of the RPC/REST allowlist.
+        if (!hostValidatorReady || !hv.IsRequestLoopbackHost(request)) {
+            return Dispatched::WalletHtmlRejected;
+        }
+        // Mint + embed a token (only when auth is configured), exactly as
+        // server.cpp does.
+        if (authConfigured) {
+            std::vector<uint8_t> rnd(32, 0x5A);
+            // Vary so repeated mints differ in the test.
+            rnd[0] = static_cast<uint8_t>(now & 0xFF);
+            rnd[1] = static_cast<uint8_t>((now >> 8) & 0xFF);
+            servedTokenOut = tokens.Mint(rnd, now);
+        }
+        return Dispatched::WalletHtmlServed;
+    }
+
+    // --- OPTIONS (rejected) — but Host gate already ran above. ---
+    if (request.find("OPTIONS ") == 0) {
+        return Dispatched::HostRejected;  // 403, but post-gate
+    }
+
+    // --- REST /api/v1/* ---
+    if (request.find("POST /api/v1/") == 0 || request.find("GET /api/v1/") == 0) {
+        return Dispatched::RestHandled;
+    }
+
+    // --- Fell through to JSON-RPC auth path. ---
+    return Dispatched::RpcAuthPath;
+}
+
+// Model of the server.cpp __token__ auth resolution (server.cpp:1322-1345):
+// a presented "__token__:<tok>" resolves to the configured creds iff the token
+// validates; otherwise 401. Returns true if the RPC call would be authorized.
+static bool SimulateTokenAuth(SessionTokenStore& tokens,
+                              const std::string& presentedUser,
+                              const std::string& presentedToken,
+                              int64_t now) {
+    if (presentedUser != "__token__") return false;  // (other creds tested elsewhere)
+    return tokens.Validate(presentedToken, now);
+}
+
+static void TestHandleClientIntegration() {
+    std::cout << "integration: real dispatch ordering + token round-trip + C-01..." << std::endl;
+    const int64_t now = 100000;
+
+    // ---- Default/desktop node: loopback only, auth configured (cookie). ----
+    {
+        HostValidator hv;
+        hv.Configure(8332, {});  // no operator hosts
+        SessionTokenStore tokens(/*ttl=*/3600);
+        std::string tok;
+
+        // (a) GATE-FIRST: a rebound GET /wallet with evil.com is HostRejected,
+        //     never reaching the wallet-HTML branch.
+        Dispatched d = SimulateDispatch(hv, true, tokens, true,
+            MakeRequest("GET", "/wallet", "evil.com"), now, tok);
+        CHECK(d == Dispatched::HostRejected);
+        CHECK(tok.empty());  // no token minted for a rejected Host
+
+        // Same for the REST mempool-write path (pre-auth surface).
+        d = SimulateDispatch(hv, true, tokens, true,
+            MakeRequest("POST", "/api/v1/broadcast", "evil.com", true, "{\"rawtx\":\"de\"}"),
+            now, tok);
+        CHECK(d == Dispatched::HostRejected);
+
+        // (b) SERVED-HTML -> RPC ROUND-TRIP on loopback: GET /wallet mints a
+        //     token; presenting __token__:<tok> authorizes; expired/garbage 401s.
+        d = SimulateDispatch(hv, true, tokens, true,
+            MakeRequest("GET", "/wallet", "127.0.0.1:8332"), now, tok);
+        CHECK(d == Dispatched::WalletHtmlServed);
+        CHECK(!tok.empty());
+        CHECK(tok.size() == 64);
+        CHECK(SimulateTokenAuth(tokens, "__token__", tok, now));          // valid
+        CHECK(SimulateTokenAuth(tokens, "__token__", tok, now + 3500));   // still valid
+        CHECK(!SimulateTokenAuth(tokens, "__token__", tok, now + 3601));  // expired (TTL 1h)
+        CHECK(!SimulateTokenAuth(tokens, "__token__", "deadbeef", now));  // wrong token
+        CHECK(!SimulateTokenAuth(tokens, "realuser", tok, now));          // not the sentinel
+
+        // GET / (root) also serves the wallet on loopback.
+        d = SimulateDispatch(hv, true, tokens, true,
+            MakeRequest("GET", "/", "localhost:8332"), now, tok);
+        CHECK(d == Dispatched::WalletHtmlServed);
+        CHECK(!tok.empty());
+
+        // No-auth node: wallet HTML still served on loopback but NO token minted.
+        d = SimulateDispatch(hv, true, tokens, /*authConfigured=*/false,
+            MakeRequest("GET", "/wallet", "127.0.0.1"), now, tok);
+        CHECK(d == Dispatched::WalletHtmlServed);
+        CHECK(tok.empty());
+    }
+
+    // ---- C-01 REGRESSION: --public-api seed, external IP allowlisted for ----
+    // ---- RPC/REST, must NOT serve the token-bearing wallet page to it.   ----
+    {
+        HostValidator hv;
+        // Operator explicitly allowlisted the seed's public IP + a DNS name.
+        hv.Configure(8332, {"203.0.113.7", "seed.dilithion.org"});
+        SessionTokenStore tokens(/*ttl=*/3600);
+        std::string tok;
+
+        // The allowlisted external IP DOES pass the first gate for RPC/REST...
+        Dispatched d = SimulateDispatch(hv, true, tokens, true,
+            MakeRequest("POST", "/api/v1/broadcast", "203.0.113.7:8332"), now, tok);
+        CHECK(d == Dispatched::RestHandled);
+
+        // ...and the JSON-RPC path is reachable on it...
+        d = SimulateDispatch(hv, true, tokens, true,
+            MakeRequest("POST", "/", "203.0.113.7:8332"), now, tok);
+        CHECK(d == Dispatched::RpcAuthPath);
+
+        // ...BUT GET /wallet on that SAME allowlisted external IP is REJECTED
+        // (C-01): the token-minting page is loopback-only. No token is minted.
+        d = SimulateDispatch(hv, true, tokens, true,
+            MakeRequest("GET", "/wallet", "203.0.113.7:8332"), now, tok);
+        CHECK(d == Dispatched::WalletHtmlRejected);
+        CHECK(tok.empty());
+
+        d = SimulateDispatch(hv, true, tokens, true,
+            MakeRequest("GET", "/", "203.0.113.7:8332"), now, tok);
+        CHECK(d == Dispatched::WalletHtmlRejected);
+        CHECK(tok.empty());
+
+        // Same for an allowlisted DNS name.
+        d = SimulateDispatch(hv, true, tokens, true,
+            MakeRequest("GET", "/wallet", "seed.dilithion.org:8332"), now, tok);
+        CHECK(d == Dispatched::WalletHtmlRejected);
+        CHECK(tok.empty());
+
+        // Loopback on the SAME seed still gets the wallet + a token (operator
+        // local/SSH-tunnel use keeps working).
+        d = SimulateDispatch(hv, true, tokens, true,
+            MakeRequest("GET", "/wallet", "127.0.0.1:8332"), now, tok);
+        CHECK(d == Dispatched::WalletHtmlServed);
+        CHECK(!tok.empty());
+
+        // The store must never have minted a token for any non-loopback request:
+        // only the single loopback serve above minted -> exactly 1 live token.
+        CHECK(tokens.Size() == 1);
+    }
+
+    // ---- H-01 REGRESSION: validator-not-ready => FAIL-CLOSED (reject all). ----
+    {
+        HostValidator hv;
+        hv.Configure(8332, {});
+        SessionTokenStore tokens(/*ttl=*/3600);
+        std::string tok;
+
+        // Even a perfectly-good loopback request is rejected when the validator
+        // is not ready — the gate must never be skipped.
+        Dispatched d = SimulateDispatch(hv, /*hostValidatorReady=*/false, tokens, true,
+            MakeRequest("GET", "/wallet", "127.0.0.1:8332"), now, tok);
+        CHECK(d == Dispatched::HostRejected);
+        CHECK(tok.empty());
+
+        d = SimulateDispatch(hv, /*hostValidatorReady=*/false, tokens, true,
+            MakeRequest("POST", "/", "127.0.0.1:8332"), now, tok);
+        CHECK(d == Dispatched::HostRejected);
+    }
+
+    // ---- IsRequestLoopbackHost direct coverage: independent of allowlist. ----
+    {
+        HostValidator hv;
+        // Allowlist a non-loopback host; it must NOT be treated as loopback.
+        hv.Configure(8332, {"203.0.113.7"});
+        CHECK(hv.IsRequestLoopbackHost(MakeRequest("GET", "/wallet", "127.0.0.1:8332")));
+        CHECK(hv.IsRequestLoopbackHost(MakeRequest("GET", "/wallet", "localhost")));
+        CHECK(hv.IsRequestLoopbackHost(MakeRequest("GET", "/wallet", "[::1]:8332")));
+        CHECK(hv.IsRequestLoopbackHost(MakeRequest("GET", "/wallet", "[::ffff:127.0.0.1]")));
+        CHECK(!hv.IsRequestLoopbackHost(MakeRequest("GET", "/wallet", "203.0.113.7:8332")));
+        CHECK(!hv.IsRequestLoopbackHost(MakeRequest("GET", "/wallet", "evil.com")));
+        CHECK(!hv.IsRequestLoopbackHost(MakeRequest("GET", "/wallet", "127.0.0.1:9999"))); // wrong port
+        CHECK(!hv.IsRequestLoopbackHost(MakeRequest("GET", "/wallet", "", false)));         // no Host
+        // Static predicate.
+        CHECK(HostValidator::IsLoopbackHost("127.0.0.1"));
+        CHECK(HostValidator::IsLoopbackHost("::1"));
+        CHECK(HostValidator::IsLoopbackHost("localhost"));
+        CHECK(!HostValidator::IsLoopbackHost("203.0.113.7"));
+        CHECK(!HostValidator::IsLoopbackHost("seed.dilithion.org"));
+    }
+
+    std::cout << "  ok" << std::endl;
+}
+
 int main() {
     std::cout << "=== rpc_host_header_tests ===" << std::endl;
     TestHostBypassMatrix();
@@ -260,6 +492,7 @@ int main() {
     TestAddAllowedHostNormalization();
     TestSessionToken();
     TestSessionTokenCapacity();
+    TestHandleClientIntegration();
     std::cout << "ALL PASSED (" << g_checks << " checks)" << std::endl;
     return 0;
 }

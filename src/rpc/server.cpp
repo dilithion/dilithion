@@ -511,27 +511,34 @@ bool CRPCServer::Start() {
     }
     std::cout << "[RPC] SECURITY: For remote access, use SSH tunneling" << std::endl;
 
-    // wallet-rpc-login-restore: configure the anti-DNS-rebinding Host allowlist.
-    // Loopback (127.0.0.1 / ::1 / localhost) is always allowed. Operator-set
-    // --rpcallowhost entries (+ on --public-api the node's own external IP/host,
-    // registered by the node at startup) are added so legitimate remote
-    // light-wallet REST clients keep working. This is checked as the FIRST gate
-    // in HandleClient, strictly above the wallet-HTML/OPTIONS/REST branches.
+    // wallet-rpc-login-restore: configure the anti-DNS-rebinding Host allowlist
+    // for RPC/REST. Loopback (127.0.0.1 / ::1 / localhost) is always allowed.
+    // ONLY operator-explicit --rpcallowhost entries are added (C-01: the node's
+    // own --externalip is NOT auto-added). This allowlist governs RPC/REST only;
+    // the token-minting wallet-HTML path (GET / and GET /wallet) is served on
+    // LOOPBACK Host ONLY, independent of this allowlist. Checked as the FIRST
+    // gate in HandleClient, strictly above the wallet-HTML/OPTIONS/REST branches.
     m_hostValidator.Configure(static_cast<uint16_t>(m_port), m_rpcAllowHosts);
     m_hostValidatorReady = true;
     {
-        std::cout << "[RPC] Host-header allowlist active (anti-DNS-rebinding): ";
+        std::cout << "[RPC] Host-header allowlist active (anti-DNS-rebinding, RPC/REST): ";
         bool first = true;
         for (const auto& h : m_hostValidator.AllowedHosts()) {
             std::cout << (first ? "" : ", ") << h;
             first = false;
         }
         std::cout << std::endl;
+        std::cout << "[RPC] Wallet UI (GET / and GET /wallet) is served on LOOPBACK "
+                     "Host ONLY (127.0.0.1/localhost), regardless of --rpcallowhost."
+                  << std::endl;
         if (m_publicAPI && m_rpcAllowHosts.empty()) {
             std::cout << "[RPC] WARNING: --public-api with no --rpcallowhost: only "
-                         "loopback Host headers are accepted. Remote light-wallet REST "
-                         "clients that send Host: <seed-ip/name> will be rejected. Set "
-                         "--rpcallowhost=<this node's public IP or DNS name> to allow them."
+                         "loopback Host headers are accepted for RPC/REST. Remote "
+                         "light-wallet REST clients that send Host: <seed-ip/name> "
+                         "will be rejected. To allow them, set --rpcallowhost=<this "
+                         "node's public IP or DNS name> EXPLICITLY (the node no longer "
+                         "auto-allows its --externalip). This grants RPC/REST only — "
+                         "the admin-token wallet UI stays loopback-only."
                       << std::endl;
         }
     }
@@ -1091,10 +1098,20 @@ void CRPCServer::HandleClient(int clientSocket) {
     // Host is rejected with 403. Mirrors geth --http.vhosts. Loopback names are
     // always allowed; --public-api seeds add operator --rpcallowhost entries.
     // ========================================================================
-    if (m_hostValidatorReady && !m_hostValidator.IsRequestHostAllowed(request)) {
+    // H-01 (F-002): FAIL-CLOSED. If the validator is not yet configured
+    // (m_hostValidatorReady == false), REJECT rather than skip the gate. The
+    // ready flag must never be a reason to *bypass* the anti-rebinding check on
+    // this fund-drain surface — an un-configured validator denies all requests.
+    // In production the flag is always true by the time worker threads accept
+    // requests (Configure() runs before thread spawn in Start()), so this is a
+    // no-op there; the point is to remove the open-by-omission failure mode so a
+    // future reorder of Start() cannot silently disable rebinding protection.
+    if (!m_hostValidatorReady || !m_hostValidator.IsRequestHostAllowed(request)) {
         if (m_logger) {
             m_logger->LogSecurityEvent("HOST_REJECTED", clientIP, "",
-                "Host header not in allowlist (possible DNS rebinding)");
+                m_hostValidatorReady
+                    ? "Host header not in allowlist (possible DNS rebinding)"
+                    : "Host validator not ready (fail-closed reject)");
         }
         const std::string body =
             "{\"error\":\"Forbidden: Host header not allowed (DNS-rebinding protection). "
@@ -1129,9 +1146,42 @@ void CRPCServer::HandleClient(int clientSocket) {
         return;
     }
 
-    // Serve web wallet at GET /wallet or GET /wallet.html
-    // (Host gate above already confirmed a same-origin loopback/allowlisted Host.)
+    // Serve web wallet at GET /wallet or GET /wallet.html (or GET /).
     if (request.find("GET /wallet") == 0 || request.find("GET / HTTP") == 0) {
+        // ====================================================================
+        // C-01 (F-002): the wallet HTML mints an ADMIN-bearing session token.
+        // It MUST be served ONLY to a LOOPBACK Host — ALWAYS, regardless of
+        // --public-api / --rpcallowhost / --externalip. The general Host gate
+        // above may have allowlisted a non-loopback Host for RPC/REST (e.g. a
+        // seed's own external IP), but the token-minting page must never be
+        // served to that remote origin, or a remote client could scrape the
+        // admin token and call sendtoaddress/dumpprivkey. The session-token
+        // login is a same-origin desktop affordance; it has no business firing
+        // for a remote REST client. This is a SEPARATE, stricter check than the
+        // RPC/REST allowlist — loopback-only, fail-closed if validator unready.
+        // ====================================================================
+        if (!m_hostValidatorReady || !m_hostValidator.IsRequestLoopbackHost(request)) {
+            if (m_logger) {
+                m_logger->LogSecurityEvent("WALLET_HTML_REJECTED", clientIP, "",
+                    "Wallet HTML (token-minting) requested with non-loopback Host; "
+                    "served loopback-only regardless of --rpcallowhost");
+            }
+            const std::string body =
+                "{\"error\":\"Forbidden: the wallet UI is served on loopback only "
+                "(127.0.0.1/localhost). Use an SSH tunnel for remote access.\",\"code\":-32600}";
+            std::ostringstream oss;
+            oss << "HTTP/1.1 403 Forbidden\r\n"
+                << "Content-Type: application/json\r\n"
+                << "Content-Length: " << body.size() << "\r\n"
+                << "Connection: close\r\n"
+                << "X-Content-Type-Options: nosniff\r\n"
+                << "X-Frame-Options: DENY\r\n"
+                << "\r\n"
+                << body;
+            std::string resp_str = oss.str();
+            send_response_and_cleanup(resp_str);
+            return;
+        }
         // wallet-rpc-login-restore: mint a fresh same-origin session token and
         // inject it into the served HTML, replacing the hardcoded rpc:rpc creds.
         // The token is a REAL credential validated server-side on each RPC call

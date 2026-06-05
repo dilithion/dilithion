@@ -95,6 +95,28 @@ public:
      */
     bool IsRequestHostAllowed(const std::string& rawRequest) const;
 
+    /**
+     * True iff @p canonicalHost (already lowercased + port-stripped + IPv6
+     * de-bracketed) is a LOOPBACK host — i.e. 127.0.0.1, ::1, or localhost.
+     *
+     * This is INDEPENDENT of the operator allowlist: even on a --public-api
+     * seed that allowlists its own external IP / a DNS name for RPC+REST, those
+     * non-loopback hosts are NOT loopback. Used to gate the token-minting
+     * wallet-HTML serving so an admin-bearing page is never served to a remote
+     * (but RPC-allowlisted) origin. (wallet-rpc-login-restore C-01.)
+     */
+    static bool IsLoopbackHost(const std::string& canonicalHost);
+
+    /**
+     * End-to-end LOOPBACK check on a raw HTTP request: parse the Host header and
+     * confirm it is a loopback host (127.0.0.1 / ::1 / localhost) AND (if a port
+     * was present) the port matched. Any parse failure returns false
+     * (default-deny). This is the SSoT gate for serving the token-bearing wallet
+     * HTML — it must pass REGARDLESS of --public-api / --rpcallowhost / the
+     * general allowlist. (wallet-rpc-login-restore C-01.)
+     */
+    bool IsRequestLoopbackHost(const std::string& rawRequest) const;
+
     /** For diagnostics/tests: the current allowlist (lowercased). */
     std::set<std::string> AllowedHosts() const;
 
@@ -121,10 +143,12 @@ private:
  */
 class SessionTokenStore {
 public:
-    // Default TTL: 12h. Long enough for a wallet session, short enough that a
-    // leaked token does not live for the process lifetime. Each page load mints
-    // a fresh token, so practical exposure is per-session.
-    static constexpr int64_t kDefaultTtlSeconds = 12 * 60 * 60;
+    // Default TTL: 1h (M-02, F-002). The token is a pure bearer credential not
+    // bound to client IP/UA, so a shorter window bounds the blast radius of a
+    // leaked token. Each wallet page load mints a fresh token (rotation), so an
+    // active desktop session self-heals well within an hour; a reload re-mints.
+    // (Previously 12h — shortened to reduce the leaked-token exposure window.)
+    static constexpr int64_t kDefaultTtlSeconds = 60 * 60;
     // Bound the store so an attacker who can trigger page loads cannot grow it
     // without limit. Oldest entries are pruned first.
     static constexpr size_t kMaxTokens = 512;

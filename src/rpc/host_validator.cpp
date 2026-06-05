@@ -33,11 +33,16 @@ static bool IsAllDigits(const std::string& s) {
 }
 
 // Canonicalize an IPv6 numeric address (already de-bracketed, lowercased) so
-// the various spellings of loopback collapse to "::1". Only loopback forms are
-// canonicalized here; any other IPv6 is returned lowercased unchanged (and will
-// only match if explicitly allowlisted). This deliberately covers the bypass
-// matrix forms [::1], [0:0:0:0:0:0:0:1], and the IPv4-mapped loopback
-// ::ffff:127.0.0.1 (which is loopback semantically).
+// COMMON spellings of loopback collapse to "::1". Only the loopback forms listed
+// below are canonicalized; any other IPv6 is returned lowercased unchanged (and
+// will only match if explicitly allowlisted).
+//
+// L-01 (F-002): this is NOT an exhaustive IPv6 canonicalizer. Spellings NOT
+// listed here (e.g. the hex IPv4-mapped form ::ffff:7f00:1, or other zero-run
+// compressions) are returned unchanged and therefore REJECTED (fail-closed —
+// over-restrictive, never over-permissive). That is safe: an un-canonicalized
+// loopback spelling is denied, not allowed. We canonicalize the forms a browser
+// actually emits as a same-origin Host (decimal ::1 / dotted IPv4-mapped).
 static std::string CanonicalizeIPv6(const std::string& v6) {
     std::string s = v6;
     // Strip a zone id (%eth0) if present.
@@ -46,8 +51,13 @@ static std::string CanonicalizeIPv6(const std::string& v6) {
 
     // Fully-expanded loopback.
     if (s == "0:0:0:0:0:0:0:1") return "::1";
-    // IPv4-mapped loopback: ::ffff:127.0.0.1 (and a couple of equivalent spellings).
-    if (s == "::ffff:127.0.0.1" || s == "0:0:0:0:0:ffff:127.0.0.1") return "::1";
+    // IPv4-mapped loopback (dotted form): ::ffff:127.0.0.1 and equivalents,
+    // plus the hex-encoded IPv4-mapped loopback ::ffff:7f00:1 / 7f00:0001.
+    if (s == "::ffff:127.0.0.1" || s == "0:0:0:0:0:ffff:127.0.0.1" ||
+        s == "::ffff:7f00:1" || s == "::ffff:7f00:0001" ||
+        s == "0:0:0:0:0:ffff:7f00:1" || s == "0:0:0:0:0:ffff:7f00:0001") {
+        return "::1";
+    }
     return s;
 }
 
@@ -217,6 +227,25 @@ bool HostValidator::IsRequestHostAllowed(const std::string& rawRequest) const {
     if (r != ParseResult::Ok) return false;     // default-deny on any parse failure
     if (!portMatched) return false;              // present-but-wrong port -> reject
     return IsHostAllowed(host);
+}
+
+// wallet-rpc-login-restore C-01: loopback predicate, independent of the operator
+// allowlist. ParseHostHeader already canonicalizes the various loopback
+// spellings ([::1], [0:0:0:0:0:0:0:1], ::ffff:127.0.0.1, localhost.) to one of
+// these three tokens, so an exact compare here covers the bypass matrix.
+bool HostValidator::IsLoopbackHost(const std::string& canonicalHost) {
+    return canonicalHost == "127.0.0.1" ||
+           canonicalHost == "::1" ||
+           canonicalHost == "localhost";
+}
+
+bool HostValidator::IsRequestLoopbackHost(const std::string& rawRequest) const {
+    std::string host;
+    bool portMatched = false;
+    ParseResult r = ParseHostHeader(rawRequest, host, portMatched);
+    if (r != ParseResult::Ok) return false;     // default-deny on any parse failure
+    if (!portMatched) return false;              // present-but-wrong port -> reject
+    return IsLoopbackHost(host);
 }
 
 // ---------------------------------------------------------------------------

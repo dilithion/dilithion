@@ -7130,6 +7130,18 @@ load_genesis_block:  // Bug #29: Label for automatic retry after blockchain wipe
         std::string rpcpassword = config_parser.GetString("rpcpassword", "");
         std::string rpc_permissions_file = config.datadir + "/rpc_permissions.json";
 
+        // M-03 (F-002): __token__ and __cookie__ are RESERVED usernames on the
+        // auth surface — __token__ is the session-token sentinel (server.cpp) and
+        // __cookie__ is the cookie-auth user. Reject them at config time so an
+        // operator cannot configure a real rpcuser that collides with the
+        // sentinel branch (which would hijack/lock-out their login).
+        if (rpcuser == "__token__" || rpcuser == "__cookie__") {
+            std::cerr << "ERROR: rpcuser '" << rpcuser << "' is a reserved username "
+                      << "(used internally for session-token / cookie auth). "
+                      << "Choose a different rpcuser. Aborting startup." << std::endl;
+            return 1;
+        }
+
         if (!rpcuser.empty() && !rpcpassword.empty()) {
             // CVE-2026-RPC-AUTH: previously only InitializePermissions was called.
             // The auth gate at server.cpp checks RPCAuth::IsAuthConfigured(),
@@ -7287,18 +7299,38 @@ load_genesis_block:  // Bug #29: Label for automatic retry after blockchain wipe
         // whichever auth branch ran above (configured / public-api auto / cookie).
         rpc_server.SetSessionAuthCredentials(rpcuser, rpcpassword);
 
-        // wallet-rpc-login-restore: populate the anti-DNS-rebinding Host allowlist.
-        // Loopback is always allowed by the validator itself; here we add operator
-        // --rpcallowhost / rpcallowhost= entries, plus — under --public-api — the
-        // node's own external IP by default so EXISTING remote light-wallet REST
-        // clients (which send Host: <seed-ip>) keep working after upgrade.
+        // wallet-rpc-login-restore: populate the anti-DNS-rebinding Host allowlist
+        // for RPC/REST. Loopback is ALWAYS allowed by the validator itself; here
+        // we add ONLY operator-explicit --rpcallowhost / rpcallowhost= entries.
+        //
+        // C-01 (F-002): we DELIBERATELY do NOT auto-add the node's own
+        // --externalip. Auto-allowing the public IP is the line that converts
+        // "operator opt-in" into "default remote exposure" — and combined with
+        // the wallet-HTML token mint it issued an admin token to any remote
+        // client that knew the seed IP. A --public-api operator who genuinely
+        // wants remote light-wallet REST on the raw IP must list it explicitly
+        // (--rpcallowhost=<ip>); even then it only governs RPC/REST and NEVER
+        // the loopback-only wallet-HTML/token path (see server.cpp GET /wallet).
         for (const auto& h : config.rpc_allow_hosts) {
+            // L-03 (F-002): a bare (unbracketed) IPv6 literal with a trailing
+            // ":port" is silently mis-parsed by the allowlist (the port is not
+            // stripped, so a dead entry is inserted that never matches a real
+            // request). Warn the operator to use the bracketless+portless form.
+            if (h.find("::") != std::string::npos && h.find('[') == std::string::npos) {
+                size_t lastColon = h.rfind(':');
+                if (lastColon != std::string::npos && lastColon + 1 < h.size()) {
+                    bool tail_digits = true;
+                    for (size_t i = lastColon + 1; i < h.size(); ++i)
+                        if (h[i] < '0' || h[i] > '9') { tail_digits = false; break; }
+                    if (tail_digits) {
+                        std::cerr << "WARNING: --rpcallowhost='" << h << "' looks like a "
+                                  << "bare IPv6 literal with a port. Pass IPv6 hosts "
+                                  << "bracketless AND portless (e.g. 2001:db8::5) or this "
+                                  << "entry will never match a request." << std::endl;
+                    }
+                }
+            }
             rpc_server.AddRpcAllowHost(h);
-        }
-        if (config.public_api && !config.external_ip.empty()) {
-            rpc_server.AddRpcAllowHost(config.external_ip);
-            std::cout << "  [RPC] --public-api: allowing own external IP in Host "
-                         "allowlist: " << config.external_ip << std::endl;
         }
 
         // Phase 1: Initialize request logging
