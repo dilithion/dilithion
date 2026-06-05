@@ -107,9 +107,11 @@ jobs:
         [ "$FAIL" -eq 0 ] || exit 1
         # Must actually start (prints usage banner; --help/--version exit non-zero by design).
         cd "${PKG}"
-        out=$(timeout 20 ./"${BIN}" --version 2>&1 || timeout 20 ./"${BIN}" --help 2>&1 || true)
+        out=$(timeout 20 ./"${BIN}" --help 2>&1 || true)
         echo "$out" | head -3
-        echo "$out" | grep -qiE "dilithion|dilv|version|usage" || { echo "CLEAN-ROOM FAIL: exe did not start"; exit 1; }
+        # Assert on the post-main() banner only the RUNNING exe prints; a "loading shared
+        # libraries"/path error echoes the exe name (contains "dilv") and must NOT count as start.
+        echo "$out" | grep -q "Quantum-Resistant VDF Payment Chain" || { echo "CLEAN-ROOM FAIL: exe did not start (no post-main banner)"; exit 1; }
         echo "CLEAN-ROOM PASS"
 
     - name: Upload artifact

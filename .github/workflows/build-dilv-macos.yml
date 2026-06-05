@@ -124,9 +124,11 @@ jobs:
         # Must actually start (prints usage banner; --help/--version exit non-zero by design).
         # macOS lacks GNU `timeout`; use a perl alarm watchdog (always present).
         run_guarded() { perl -e 'alarm shift; exec @ARGV' 20 "$@"; }
-        out=$(run_guarded "${BIN}" --version 2>&1 || run_guarded "${BIN}" --help 2>&1 || true)
+        out=$(run_guarded "${BIN}" --help 2>&1 || true)
         echo "$out" | head -3
-        echo "$out" | grep -qiE "dilithion|dilv|version|usage" || { echo "CLEAN-ROOM FAIL: binary did not start"; exit 1; }
+        # Assert on the post-main() banner only the RUNNING binary prints; a dyld error echoes
+        # the binary path (contains "dilv") to stderr before main and must NOT count as start.
+        echo "$out" | grep -q "Quantum-Resistant VDF Payment Chain" || { echo "CLEAN-ROOM FAIL: binary did not start (no post-main banner)"; exit 1; }
         echo "CLEAN-ROOM PASS"
 
     - name: Upload artifact

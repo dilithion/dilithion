@@ -144,10 +144,15 @@ jobs:
           if ldd ./dilv-node | grep -q "not found"; then
             echo "CLEAN-ROOM FAIL: unresolved deps"; ldd ./dilv-node | grep "not found"; exit 1
           fi
-          # Must actually start (prints usage banner; --help/--version exit non-zero by design).
-          out=$(timeout 20 ./dilv-node --version 2>&1 || timeout 20 ./dilv-node --help 2>&1 || true)
+          # Must actually start VIA THE REAL run-node.sh WRAPPER (unset LD_LIBRARY_PATH so the
+          # wrapper's own lib-path setup is what's tested). Assert on the post-main() banner
+          # string only the RUNNING binary prints — a loader error echoes the binary PATH
+          # (contains "dilv") to stderr BEFORE main, so matching the name would false-pass a
+          # binary that never started. "Quantum-Resistant VDF Payment Chain" is printed by
+          # PrintUsage() after main, so it cannot appear in a pre-main loader error.
+          out=$(env -u LD_LIBRARY_PATH timeout 20 ./run-node.sh --help 2>&1 || true)
           echo "$out" | head -3
-          echo "$out" | grep -qiE "dilithion|dilv|version|usage" || { echo "CLEAN-ROOM FAIL: binary did not start"; exit 1; }
+          echo "$out" | grep -q "Quantum-Resistant VDF Payment Chain" || { echo "CLEAN-ROOM FAIL: binary did not start (no post-main banner)"; exit 1; }
           echo "CLEAN-ROOM PASS"
         '
 
