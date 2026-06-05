@@ -191,7 +191,8 @@ CRPCServer::CRPCServer(uint16_t port)
       m_blockchain(nullptr), m_utxo_set(nullptr), m_chainstate(nullptr),
       m_serverSocket(INVALID_SOCKET), m_permissions(nullptr), m_logger(nullptr),
       m_ssl_wrapper(nullptr), m_ssl_enabled(false), m_websocket_server(nullptr),
-      m_restAPI(std::make_unique<CRestAPI>()), m_publicAPI(false)
+      m_restAPI(std::make_unique<CRestAPI>()), m_publicAPI(false),
+      m_sessionTokens(std::make_unique<rpc::SessionTokenStore>())
 {
     // Register RPC handlers - Wallet information
     m_handlers["getnewaddress"] = [this](const std::string& p) { return RPC_GetNewAddress(p); };
@@ -509,6 +510,31 @@ bool CRPCServer::Start() {
         std::cout << "[RPC] Server bound to 127.0.0.1:" << m_port << " (localhost only)" << std::endl;
     }
     std::cout << "[RPC] SECURITY: For remote access, use SSH tunneling" << std::endl;
+
+    // wallet-rpc-login-restore: configure the anti-DNS-rebinding Host allowlist.
+    // Loopback (127.0.0.1 / ::1 / localhost) is always allowed. Operator-set
+    // --rpcallowhost entries (+ on --public-api the node's own external IP/host,
+    // registered by the node at startup) are added so legitimate remote
+    // light-wallet REST clients keep working. This is checked as the FIRST gate
+    // in HandleClient, strictly above the wallet-HTML/OPTIONS/REST branches.
+    m_hostValidator.Configure(static_cast<uint16_t>(m_port), m_rpcAllowHosts);
+    m_hostValidatorReady = true;
+    {
+        std::cout << "[RPC] Host-header allowlist active (anti-DNS-rebinding): ";
+        bool first = true;
+        for (const auto& h : m_hostValidator.AllowedHosts()) {
+            std::cout << (first ? "" : ", ") << h;
+            first = false;
+        }
+        std::cout << std::endl;
+        if (m_publicAPI && m_rpcAllowHosts.empty()) {
+            std::cout << "[RPC] WARNING: --public-api with no --rpcallowhost: only "
+                         "loopback Host headers are accepted. Remote light-wallet REST "
+                         "clients that send Host: <seed-ip/name> will be rejected. Set "
+                         "--rpcallowhost=<this node's public IP or DNS name> to allow them."
+                      << std::endl;
+        }
+    }
 
     // Initialize REST API with component references
     if (m_restAPI) {
@@ -1051,6 +1077,42 @@ void CRPCServer::HandleClient(int clientSocket) {
     buffer.push_back('\0');
     std::string request(buffer.data());
 
+    // ========================================================================
+    // wallet-rpc-login-restore — ANTI-DNS-REBINDING HOST-HEADER ALLOWLIST.
+    //
+    // ORDERING INVARIANT (F-001 BLOCKER-1): this MUST be the first dispatch
+    // check, strictly ABOVE the GET /miner, GET / & GET /wallet, OPTIONS, and
+    // REST /api/v1/* branches below — every one of which otherwise serves a
+    // response with no Host check (REST even bypasses auth+CSRF). A DNS-rebound
+    // page (evil.com -> 127.0.0.1) is blocked here before it can read the
+    // token-bearing wallet HTML or POST /api/v1/broadcast into the mempool.
+    //
+    // Default-deny: a missing / empty / duplicate / wrong-port / non-allowlisted
+    // Host is rejected with 403. Mirrors geth --http.vhosts. Loopback names are
+    // always allowed; --public-api seeds add operator --rpcallowhost entries.
+    // ========================================================================
+    if (m_hostValidatorReady && !m_hostValidator.IsRequestHostAllowed(request)) {
+        if (m_logger) {
+            m_logger->LogSecurityEvent("HOST_REJECTED", clientIP, "",
+                "Host header not in allowlist (possible DNS rebinding)");
+        }
+        const std::string body =
+            "{\"error\":\"Forbidden: Host header not allowed (DNS-rebinding protection). "
+            "Connect via 127.0.0.1/localhost or configure --rpcallowhost.\",\"code\":-32600}";
+        std::ostringstream oss;
+        oss << "HTTP/1.1 403 Forbidden\r\n"
+            << "Content-Type: application/json\r\n"
+            << "Content-Length: " << body.size() << "\r\n"
+            << "Connection: close\r\n"
+            << "X-Content-Type-Options: nosniff\r\n"
+            << "X-Frame-Options: DENY\r\n"
+            << "\r\n"
+            << body;
+        std::string resp_str = oss.str();
+        send_response_and_cleanup(resp_str);
+        return;
+    }
+
     // Serve miner dashboard at GET /miner
     if (request.find("GET /miner") == 0) {
         const std::string& miner_html = GetMinerHTML();
@@ -1068,14 +1130,54 @@ void CRPCServer::HandleClient(int clientSocket) {
     }
 
     // Serve web wallet at GET /wallet or GET /wallet.html
+    // (Host gate above already confirmed a same-origin loopback/allowlisted Host.)
     if (request.find("GET /wallet") == 0 || request.find("GET / HTTP") == 0) {
-        const std::string& wallet_html = GetWalletHTML();
+        // wallet-rpc-login-restore: mint a fresh same-origin session token and
+        // inject it into the served HTML, replacing the hardcoded rpc:rpc creds.
+        // The token is a REAL credential validated server-side on each RPC call
+        // (see the auth block below). Rotated per page load; bound to this
+        // process via m_sessionTokens. Only injected when auth is configured
+        // (cookie/rpcuser model) AND we captured the real creds to resolve to.
+        std::string wallet_html = GetWalletHTML();
+        if (RPCAuth::IsAuthConfigured() && !m_sessionAuthPass.empty() && m_sessionTokens) {
+            extern bool GetStrongRandBytes(uint8_t* buf, size_t len);
+            std::vector<uint8_t> tok_bytes(32);
+            std::string token;
+            if (GetStrongRandBytes(tok_bytes.data(), tok_bytes.size())) {
+                token = m_sessionTokens->Mint(tok_bytes, static_cast<int64_t>(time(nullptr)));
+            }
+            // Replace the placeholder regardless: if minting failed, the empty
+            // string leaves the wallet to fall back to manual credentials rather
+            // than shipping a guessable default.
+            const std::string placeholder = "__DILITHION_RPC_SESSION_TOKEN__";
+            size_t ph = wallet_html.find(placeholder);
+            if (ph != std::string::npos) {
+                wallet_html.replace(ph, placeholder.size(), token);
+            }
+        } else {
+            // No auth configured (or creds not captured): blank the placeholder
+            // so the literal sentinel never leaks into the page.
+            const std::string placeholder = "__DILITHION_RPC_SESSION_TOKEN__";
+            size_t ph = wallet_html.find(placeholder);
+            if (ph != std::string::npos) wallet_html.replace(ph, placeholder.size(), "");
+        }
+
         std::ostringstream response;
         response << "HTTP/1.1 200 OK\r\n"
                  << "Content-Type: text/html; charset=utf-8\r\n"
                  << "Content-Length: " << wallet_html.length() << "\r\n"
                  << "Connection: close\r\n"
-                 << "Cache-Control: no-cache\r\n"
+                 // wallet-rpc-login-restore: the page now embeds a session token,
+                 // so harden it against framing / referrer / cache leaks.
+                 << "Cache-Control: no-store, no-cache, must-revalidate\r\n"
+                 << "Pragma: no-cache\r\n"
+                 << "X-Frame-Options: DENY\r\n"
+                 << "X-Content-Type-Options: nosniff\r\n"
+                 << "Referrer-Policy: no-referrer\r\n"
+                 << "Content-Security-Policy: default-src 'self'; "
+                    "script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; "
+                    "img-src 'self' data:; connect-src 'self'; "
+                    "frame-ancestors 'none'; base-uri 'none'; form-action 'none'\r\n"
                  << "\r\n"
                  << wallet_html;
         std::string resp_str = response.str();
@@ -1207,6 +1309,39 @@ void CRPCServer::HandleClient(int clientSocket) {
             std::string response = BuildHTTPUnauthorized();
             send_response_and_cleanup(response);
             return;
+        }
+
+        // wallet-rpc-login-restore: same-origin session-token credential.
+        // The bundled wallet sends Authorization: Basic base64("__token__:<tok>").
+        // If the username is the sentinel and the token validates server-side
+        // (constant-time, TTL-bounded), substitute the REAL configured
+        // credentials and let the rest of the auth path (cache, PBKDF2,
+        // permissions) run UNCHANGED. The token is a credential ALIAS, never a
+        // skip-auth bypass — defense in depth from F-001 HIGH-2 is preserved:
+        // sendtoaddress/dumpprivkey still flow through RPCAuth + permissions.
+        if (username == "__token__") {
+            bool tokenOk = false;
+            if (m_sessionTokens && !m_sessionAuthPass.empty()) {
+                tokenOk = m_sessionTokens->Validate(password,
+                                                    static_cast<int64_t>(time(nullptr)));
+            }
+            if (!tokenOk) {
+                // Invalid/expired session token. Treat exactly like bad creds:
+                // record the failure and return 401. Never log the token value.
+                m_rateLimiter.RecordAuthFailure(clientIP);
+                if (m_logger) {
+                    m_logger->LogSecurityEvent("AUTH_FAILURE", clientIP, "__token__",
+                        "Invalid or expired session token");
+                }
+                std::string response = BuildHTTPUnauthorized();
+                send_response_and_cleanup(response);
+                return;
+            }
+            // Resolve to the real configured credentials. Downstream auth +
+            // permissions validate these — the token is never the auth secret
+            // for the credential store itself.
+            username = m_sessionAuthUser;
+            password = m_sessionAuthPass;
         }
 
         // v4.4.2 NYC socket-leak fix: short-TTL credential cache. Sustained

@@ -564,6 +564,7 @@ struct NodeConfig {
     int max_connections = 0;         // --maxconnections: Maximum peer connections (0 = default 125)
     int max_connections_per_ip = 2;  // --max-connections-per-ip: Max inbound per IP (default 2, range 1-64)
     int attestation_rate_limit = 1;  // --attestation-rate-limit: Max attestations per /24 subnet per day (Sybil defense)
+    std::vector<std::string> rpc_allow_hosts;  // --rpcallowhost: extra allowed Host headers (anti-DNS-rebinding allowlist)
     // use_new_peerman field removed in v4.3.4 cut Block 8 with the --usenewpeerman
     // flag retirement (port::CPeerManager class deleted in Block 7; flag was a no-op
     // since Block 7).
@@ -750,6 +751,12 @@ struct NodeConfig {
                 // Public REST API: bind to 0.0.0.0 for light wallet access (seed nodes only)
                 public_api = true;
             }
+            else if (arg.find("--rpcallowhost=") == 0) {
+                // wallet-rpc-login-restore: anti-DNS-rebinding Host allowlist.
+                // Repeatable. Loopback is always allowed implicitly.
+                std::string h = arg.substr(15);
+                if (!h.empty()) rpc_allow_hosts.push_back(h);
+            }
             else if (arg == "--upnp") {
                 // Enable UPnP automatic port mapping
                 upnp_enabled = true;
@@ -853,6 +860,11 @@ struct NodeConfig {
         std::cout << "                          Add --yes to skip the confirmation prompt." << std::endl;
         std::cout << "  --relay-only          Relay-only mode: skip wallet (for seed nodes)" << std::endl;
         std::cout << "  --public-api          Enable public REST API for light wallets (seed nodes)" << std::endl;
+        std::cout << "  --rpcallowhost=<host> Allow this Host header on the RPC/HTTP server" << std::endl;
+        std::cout << "                          (anti-DNS-rebinding allowlist; repeatable)." << std::endl;
+        std::cout << "                          Loopback is always allowed. Under --public-api" << std::endl;
+        std::cout << "                          the node's own external IP is allowed by default;" << std::endl;
+        std::cout << "                          add DNS names of remote clients here." << std::endl;
         std::cout << "  --upnp                Enable automatic port mapping (UPnP)" << std::endl;
         std::cout << "  --no-upnp             Disable UPnP (don't prompt)" << std::endl;
         std::cout << "  --externalip=<ip>     Your public IP (for manual port forwarding)" << std::endl;
@@ -2010,6 +2022,12 @@ int main(int argc, char* argv[]) {
         }
     }
     
+    // wallet-rpc-login-restore: merge conf-file rpcallowhost entries with CLI
+    // --rpcallowhost (anti-DNS-rebinding allowlist; loopback always allowed).
+    for (const auto& h : config_parser.GetList("rpcallowhost")) {
+        if (!h.empty()) config.rpc_allow_hosts.push_back(h);
+    }
+
     // Add nodes from config file (append to command-line nodes)
     std::vector<std::string> conf_addnodes = config_parser.GetList("addnode");
     for (const auto& node : conf_addnodes) {
@@ -7142,6 +7160,23 @@ load_genesis_block:  // Bug #29: Label for automatic retry after blockchain wipe
             }
             std::cout << "  [AUTH] RPC cookie authentication enabled (credentials in "
                       << cookie_path << ")" << std::endl;
+        }
+
+        // wallet-rpc-login-restore: register the REAL configured credentials so a
+        // valid same-origin session token resolves to them and runs through the
+        // existing RPCAuth + permissions path (token = credential alias).
+        rpc_server.SetSessionAuthCredentials(rpcuser, rpcpassword);
+
+        // wallet-rpc-login-restore: populate the anti-DNS-rebinding Host allowlist
+        // (loopback always allowed by the validator; add operator hosts + own
+        // external IP under --public-api so existing remote REST clients work).
+        for (const auto& h : config.rpc_allow_hosts) {
+            rpc_server.AddRpcAllowHost(h);
+        }
+        if (config.public_api && !config.external_ip.empty()) {
+            rpc_server.AddRpcAllowHost(config.external_ip);
+            std::cout << "  [RPC] --public-api: allowing own external IP in Host "
+                         "allowlist: " << config.external_ip << std::endl;
         }
 
         // Phase 1: Initialize request logging

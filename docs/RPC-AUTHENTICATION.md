@@ -493,6 +493,85 @@ bool valid = RPCAuth::AuthenticateRequest(username, password);
 
 ---
 
+## Anti-DNS-Rebinding Host-Header Allowlist (v4.4.4+)
+
+The RPC/HTTP server enforces a **Host-header allowlist** as the FIRST check on
+every request, before any path dispatch (wallet HTML, OPTIONS, REST `/api/v1/*`,
+or JSON-RPC). This mirrors `geth --http.vhosts` and is the canonical defense
+against DNS-rebinding attacks (Geth-2018 account-drain, Sia-2019 seed-theft):
+a malicious web page that rebinds its DNS name to `127.0.0.1` is rejected because
+the browser still sends `Host: evil.com`, which is not in the allowlist.
+
+**Default policy (desktop / mining node, no `--public-api`):** only loopback Host
+headers are accepted — `127.0.0.1`, `[::1]`, `localhost` (with or without the
+correct `:port`). Everything else is rejected with `403 Forbidden`.
+
+**`--public-api` policy (seed nodes):** loopback PLUS:
+- any host you add with `--rpcallowhost=<host>` (repeatable; also `rpcallowhost=`
+  in `dilithion.conf`), AND
+- the node's own external IP **by default** when `--externalip=<ip>` is set, so
+  existing remote light-wallet REST clients (which send `Host: <seed-ip>`) keep
+  working after upgrade.
+
+> **Migration note:** if you run a `--public-api` seed and your remote clients
+> connect using a **DNS name** (not the raw IP), add it explicitly:
+> `--rpcallowhost=seed.example.org`. A `--public-api` node with NO `--rpcallowhost`
+> and no `--externalip` accepts only loopback Host headers and will reject remote
+> clients — the node prints a WARNING at startup in that case.
+
+The Host parser does an **exact host-token match** (port stripped, IPv6 brackets
+removed, case-insensitive) — NOT a substring search. Rejected forms include
+absent/empty Host (default-deny), duplicate Host headers (smuggling), wrong port,
+and suffix tricks such as `localhost.evil.com` / `127.0.0.1.evil.com` / `localhostX`.
+
+**Residual (documented, matches the geth `--http.vhosts` residual):** a raw-IP
+literal (`127.0.0.1`) is, by design, always allowed. A non-browser local process
+(curl, a script, a malicious process already on the box) can therefore reach the
+RPC server with `Host: 127.0.0.1`. This is acceptable because it is outside the
+browser-DNS-rebinding threat model (such a process can already open a loopback
+socket directly); the allowlist defends specifically against a victim's browser
+being weaponized via rebinding.
+
+## Same-origin wallet login (node-injected session token)
+
+When the bundled web wallet is **served by the node** (`GET /` or `GET /wallet`),
+the node mints a fresh, short-lived, server-validated **session token** and
+injects it into the page (`<meta name="dilithion-rpc-token">`). The wallet uses
+this token as its RPC credential (`Authorization: Basic base64("__token__:<tok>")`)
+instead of any hardcoded username/password — so a default node (cookie auth) logs
+in with **no credential paste required**.
+
+Security properties:
+- The token is a **real credential**, validated server-side (constant-time) on
+  every fund-capable call. It is NOT the CSRF header (which accepts any value).
+- A valid token resolves server-side to the configured cookie/`rpcuser`
+  credentials and runs through the **existing** `RPCAuth` + permissions path —
+  it never bypasses auth (`sendtoaddress` / `dumpprivkey` stay protected).
+- Short-lived (12h TTL) and **rotated on every page load**; bound to the node
+  process. The token is held in browser memory only — never written to
+  `localStorage`, never logged.
+- The token-bearing page is served with `X-Frame-Options: DENY`, a restrictive
+  `Content-Security-Policy` (`frame-ancestors 'none'`), `Referrer-Policy:
+  no-referrer`, and `Cache-Control: no-store` to prevent framing / referrer /
+  cache leakage of the token.
+
+**Opening `wallet.html` directly from disk** (not served by a node) leaves the
+token placeholder unfilled; the wallet then falls back to the manual
+`rpcuser`/`rpcpassword` fields (in-memory only — no guessable `rpc:rpc` default).
+
+## Credential model summary
+
+| Mode | Server credential | Wallet login |
+|------|-------------------|--------------|
+| Default node | random `.cookie` (`__cookie__:<hex>`) | node-injected session token |
+| `rpcuser`/`rpcpassword` set | your configured creds | session token (served) or manual entry |
+| `--public-api` (seed) | auto-generated `dilithion:<hex>` (in `dilithion.conf`) | session token (served) or manual entry |
+
+There is **no guessable static credential** anywhere in this model. The old
+`rpc:rpc` default has been removed from the bundled wallet client.
+
+---
+
 ## References
 
 - **HTTP Basic Auth:** RFC 7617

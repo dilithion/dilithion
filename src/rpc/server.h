@@ -13,6 +13,7 @@
 #include <rpc/ssl_wrapper.h>
 #include <rpc/websocket.h>
 #include <rpc/rest_api.h>
+#include <rpc/host_validator.h>
 
 // Forward declarations
 namespace x402 { class CFacilitator; }
@@ -196,6 +197,21 @@ private:
     // Phase 5: REST API for light wallets
     std::unique_ptr<CRestAPI> m_restAPI;
     bool m_publicAPI{false};  // --public-api flag: bind to 0.0.0.0 instead of 127.0.0.1
+
+    // wallet-rpc-login-restore: anti-DNS-rebinding Host-header allowlist.
+    // Configured at Start() from m_port + operator --rpcallowhost entries.
+    // Checked as the FIRST gate in HandleClient, above wallet-HTML/OPTIONS/REST.
+    rpc::HostValidator m_hostValidator;
+    bool m_hostValidatorReady{false};
+    std::vector<std::string> m_rpcAllowHosts;  // operator-configured extra hosts
+
+    // wallet-rpc-login-restore: same-origin session token store. The node mints
+    // a fresh token into the served wallet HTML; the wallet uses it as its RPC
+    // credential. A valid token maps to the configured cookie credentials and
+    // runs through the EXISTING RPCAuth + permissions path (no skip-auth).
+    std::unique_ptr<rpc::SessionTokenStore> m_sessionTokens;
+    std::string m_sessionAuthUser;  // real configured user the token resolves to
+    std::string m_sessionAuthPass;  // real configured pass the token resolves to
 
     // Seed attestation (Phase 2+3): only active on seed nodes (--relay-only + DilV)
     Attestation::CSeedAttestationKey* m_seedAttestationKey{nullptr};
@@ -578,6 +594,27 @@ public:
      * SECURITY: Only enable on seed nodes, not home mining nodes.
      */
     void SetPublicAPI(bool publicAPI) { m_publicAPI = publicAPI; }
+
+    /**
+     * wallet-rpc-login-restore: register an operator-configured allowed Host for
+     * the anti-DNS-rebinding allowlist (--rpcallowhost / rpcallowhost= conf).
+     * Loopback (127.0.0.1 / ::1 / localhost) is always allowed implicitly.
+     * On a --public-api node the node's own external IP/host should also be
+     * registered here so existing remote light-wallet REST clients keep working.
+     */
+    void AddRpcAllowHost(const std::string& host) { m_rpcAllowHosts.push_back(host); }
+
+    /**
+     * wallet-rpc-login-restore: register the REAL configured RPC credentials
+     * that a valid same-origin session token resolves to server-side. Called at
+     * startup with the same user/pass passed to RPCAuth::InitializeAuth so the
+     * token flows through the EXISTING auth + permissions path (defense in depth:
+     * the token is a credential alias, never a skip-auth bypass).
+     */
+    void SetSessionAuthCredentials(const std::string& user, const std::string& pass) {
+        m_sessionAuthUser = user;
+        m_sessionAuthPass = pass;
+    }
 
     /**
      * Register seed attestation components (Phase 2+3).
