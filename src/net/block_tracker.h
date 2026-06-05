@@ -49,6 +49,7 @@ public:
     static constexpr int MAX_PER_PEER = 128;           ///< Maximum in-flight blocks per peer
     static constexpr int MAX_TOTAL = 256;              ///< Maximum total in-flight blocks
     static constexpr int TIMEOUT_SECONDS = 120;        ///< Seconds before block times out
+    static constexpr int COMPLETED_HEIGHT_TTL_SECONDS = 120; ///< M-2: age out stuck completed heights after this (F-013 §M-2)
 
     CBlockTracker() = default;
 
@@ -366,7 +367,45 @@ public:
      */
     void MarkCompleted(int height) {
         std::lock_guard<std::mutex> lock(m_mutex);
-        m_completed_heights.insert(height);
+        // Record insert time so a stuck entry can be aged out (M-2 liveness backstop).
+        // Use insert (not operator[]=) so an existing entry keeps its ORIGINAL insert
+        // time -- re-marking a still-completed height must not refresh its age and
+        // postpone the age-out backstop indefinitely.
+        m_completed_heights.emplace(height, std::chrono::steady_clock::now());
+    }
+
+    /**
+     * @brief M-2 LIVENESS BACKSTOP: age out stale completed-height entries.
+     *
+     * A completed height is normally cleared by Clear() (reset) or ClearAboveHeight()
+     * (reorg). On the narrow divergent-hash-at-same-height-WITHOUT-reorg path
+     * (F-013 §M-2) neither fires, so AddBlock's completed-height reject (line 86)
+     * would permanently refuse the stall-recovery force-request and stall IBD silently.
+     * This method clears completed entries older than COMPLETED_HEIGHT_TTL_SECONDS so the
+     * next force-request's AddBlock succeeds and a GETDATA is pushed -- liveness restored.
+     * Called on the existing RetryTimeoutsAndStalls cadence (ibd_coordinator.cpp).
+     *
+     * Reorg-safe: this only DROPS completed flags; it never re-fetches, never touches
+     * m_heights, and is a strict superset of the existing ClearAboveHeight semantics
+     * (which still clears the same set above a fork point).
+     *
+     * @param ttl_seconds Entries older than this are cleared (default COMPLETED_HEIGHT_TTL_SECONDS)
+     * @return number of stale completed entries cleared
+     */
+    int RetryStaleCompleted(int ttl_seconds = COMPLETED_HEIGHT_TTL_SECONDS) {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        int cleared = 0;
+        auto now = std::chrono::steady_clock::now();
+        auto ttl = std::chrono::seconds(ttl_seconds);
+        for (auto it = m_completed_heights.begin(); it != m_completed_heights.end();) {
+            if (now - it->second > ttl) {
+                it = m_completed_heights.erase(it);
+                ++cleared;
+            } else {
+                ++it;
+            }
+        }
+        return cleared;
     }
 
     /**
@@ -421,7 +460,7 @@ public:
 
         // Also clear completed heights above fork_point
         for (auto it = m_completed_heights.begin(); it != m_completed_heights.end();) {
-            if (*it > fork_point) {
+            if (it->first > fork_point) {
                 it = m_completed_heights.erase(it);
             } else {
                 ++it;
@@ -451,8 +490,14 @@ private:
     //   corrected line numbers from initial PR10.2 commit). Don't.
     mutable std::mutex m_mutex;
 
-    // Heights that are already in DB (no need to request)
-    std::set<int> m_completed_heights;
+    // Heights that are already in DB (no need to request).
+    // M-2 LIVENESS FIX (F-013 §M-2): each completed height carries its insert time so
+    // RetryStaleCompleted() can age out an entry that got stuck on the divergent-hash
+    // no-reorg path (a completed height whose stored hash != IBD-expected hash, with no
+    // reorg/ClearAboveHeight ever firing). Without this, AddBlock's completed-height
+    // reject (line 86) permanently refuses the force-request at ibd_coordinator.cpp:2135,
+    // pushing no GETDATA -> silent IBD stall with no timeout that ever clears the entry.
+    std::map<int, std::chrono::steady_clock::time_point> m_completed_heights;
 
     // Per-height state
     struct BlockInfo {

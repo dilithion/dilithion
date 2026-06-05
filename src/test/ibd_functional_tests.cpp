@@ -281,6 +281,91 @@ BOOST_AUTO_TEST_CASE(test_clear_above_height_reenables_completed_refetch_after_r
     g_node_context.block_tracker = std::move(old_tracker);
 }
 
+BOOST_AUTO_TEST_CASE(test_completed_height_ages_out_on_divergent_hash_no_reorg) {
+    // M-2 LIVENESS regression (F-013 §M-2, mission m2-liveness).
+    //
+    // THE BUG: the dedup fix's AddBlock rejects any height in m_completed_heights. That
+    // set is cleared ONLY by Clear() (reset) and ClearAboveHeight() (reorg). On the
+    // narrow divergent-hash-at-same-height-WITHOUT-reorg path, a completed height gets
+    // stuck:
+    //   - DB re-process (ibd_coordinator.cpp:2090) keys on the IBD-EXPECTED hash and
+    //     MISSES because the stored block's hash diverges from it (a fork at that height);
+    //   - GetTrackingAge(next) returns -1 (it consults m_heights only, NOT
+    //     m_completed_heights, block_tracker.h:345-351), so the stall-recovery branch
+    //     takes the FORCE-REQUEST path (ibd_coordinator.cpp:2132-2140);
+    //   - that path calls RequestBlockFromPeer -> AddBlock, which returns FALSE
+    //     (completed-height reject) -> no GETDATA pushed -> SILENT STALL.
+    //   No reorg => ClearAboveHeight never fires => the entry is stuck FOREVER. The old
+    //   ~1s re-request escape valve was removed and nothing replaced it for this path.
+    //
+    // THE FIX (option (a) — coarse age-out): MarkCompleted timestamps each entry, and the
+    // existing RetryTimeoutsAndStalls cadence calls RetryStaleCompleted() to drop entries
+    // older than the TTL. Once aged out, the next force-request's AddBlock SUCCEEDS and a
+    // GETDATA flows -> liveness restored. Option (b) was rejected: making GetTrackingAge
+    // consult m_completed_heights would change which branch is taken but the re-request at
+    // :2135 would STILL hit AddBlock's completed-height reject -> still no GETDATA, unless
+    // a force-clear is ALSO added -- which is exactly this age-out, just triggered
+    // elsewhere. (a) is self-contained in CBlockTracker + one call site and reorg-safe.
+    //
+    // RED on HEAD / GREEN after fix: the divergent-completed height is REFUSED by
+    // RequestBlockFromPeer (the stuck condition) and STAYS refused forever on HEAD --
+    // there is no API that clears it without a reorg. After the fix, RetryStaleCompleted()
+    // ages it out and the height becomes re-requestable. (This test references the new
+    // RetryStaleCompleted backstop, which does not exist on HEAD; see the mission report
+    // for the HEAD-compatible probe used to demonstrate the red state.)
+    CPeerManager peer_manager("");
+    CBlockFetcher fetcher(&peer_manager);
+
+    auto block_tracker = std::make_unique<CBlockTracker>();
+    auto old_tracker = std::move(g_node_context.block_tracker);
+    g_node_context.block_tracker = std::move(block_tracker);
+
+    const int H = 200;
+    // IBD-expected (header-canonical) hash for height H.
+    uint256 expected_hash; expected_hash.data[0] = 0xEE;
+    // The block actually stored/completed at height H is a DIVERGENT fork block: its hash
+    // differs from expected_hash. This is the M-2 precondition (fork at same height, no reorg).
+    uint256 divergent_hash; divergent_hash.data[0] = 0xDD;
+    const NodeId peer_id = 1;
+
+    // 1. Height H is MarkCompleted (orphan-with-data path: MarkCompleted(parent+1)).
+    //    The stored block diverges from the IBD-expected hash, and NO reorg occurs, so
+    //    ClearAboveHeight is never called.
+    g_node_context.block_tracker->MarkCompleted(H);
+    BOOST_CHECK(g_node_context.block_tracker->IsTracked(H));
+
+    // 2. STUCK STATE: the stall-recovery force-request for the IBD-expected hash is
+    //    REFUSED because H is completed (AddBlock completed-height reject). No GETDATA.
+    BOOST_CHECK(!fetcher.RequestBlockFromPeer(peer_id, H, expected_hash));
+    BOOST_CHECK_EQUAL(fetcher.GetInFlightCount(), 0);
+
+    // 3. No reorg fires. With a NON-zero TTL the entry is NOT yet stale, so the backstop
+    //    leaves it in place and the height is STILL refused -- proving the age-out is
+    //    time-gated and does not prematurely re-enable a freshly-completed height.
+    int aged_now = g_node_context.block_tracker->RetryStaleCompleted(/*ttl_seconds=*/3600);
+    BOOST_CHECK_EQUAL(aged_now, 0);
+    BOOST_CHECK(g_node_context.block_tracker->IsTracked(H));
+    BOOST_CHECK(!fetcher.RequestBlockFromPeer(peer_id, H, expected_hash));
+
+    // 4. THE FIX / THE RE-ENABLE: once the entry ages past the TTL (ttl=0 forces immediate
+    //    expiry of the already-inserted entry), RetryStaleCompleted clears it. The height
+    //    is no longer completed, so the force-request SUCCEEDS and a GETDATA would flow.
+    int aged = g_node_context.block_tracker->RetryStaleCompleted(/*ttl_seconds=*/0);
+    BOOST_CHECK_EQUAL(aged, 1);
+    BOOST_CHECK(!g_node_context.block_tracker->IsTracked(H));   // completed flag aged out
+    BOOST_CHECK(fetcher.RequestBlockFromPeer(peer_id, H, expected_hash));  // re-requestable!
+    BOOST_CHECK_EQUAL(fetcher.GetInFlightCount(), 1);
+    BOOST_CHECK(fetcher.IsHeightInFlight(H));
+
+    // 5. REORG-SAFETY is unaffected: ClearAboveHeight still clears the (now in-flight)
+    //    height above a fork point, same as before the age-out change.
+    fetcher.ClearAboveHeight(H - 1);
+    BOOST_CHECK(!fetcher.IsHeightInFlight(H));
+    BOOST_CHECK_EQUAL(fetcher.GetInFlightCount(), 0);
+
+    g_node_context.block_tracker = std::move(old_tracker);
+}
+
 BOOST_AUTO_TEST_CASE(test_headers_manager_basic) {
     // Test basic headers manager functionality
     if (!Dilithion::g_chainParams)
