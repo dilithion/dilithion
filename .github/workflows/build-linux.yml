@@ -108,6 +108,43 @@ jobs:
         done
         echo "All required libraries bundled."
 
+    - name: Clean-room smoke test (BLOCKING)
+      # Run the JUST-PACKAGED tarball inside a pristine ubuntu:22.04 container
+      # that has NONE of the runtime deps installed. Proves the package actually
+      # STARTS using only its bundled libs — a binary can pass the file-present
+      # checks above yet still fail to launch (wrong lib version / bad rpath /
+      # broken wrapper). This gate blocks the upload steps below on failure.
+      env:
+        VERSION: ${{ steps.get_version.outputs.version }}
+      run: |
+        RELEASE_NAME="dilithion-${VERSION}-mainnet-linux-x64"
+        docker run --rm -v "$PWD/releases:/r:ro" ubuntu:22.04 bash -c '
+          set -e
+          RELEASE_NAME="'"${RELEASE_NAME}"'"
+          cd /tmp && tar xzf "/r/${RELEASE_NAME}.tar.gz" && cd "${RELEASE_NAME}"
+          # Manifest assertion: key files must be present in the package.
+          for f in dilithion-node run-node.sh lib; do
+            [ -e "$f" ] || { echo "CLEAN-ROOM FAIL: missing $f in package"; exit 1; }
+          done
+          # Sanity: prove the clean box lacks the bundled libs system-wide.
+          ! ldconfig -p | grep -qE "libleveldb|libminiupnpc|libsnappy" || echo "warn: clean box unexpectedly has bundled libs"
+          export LD_LIBRARY_PATH="$PWD/lib"
+          # Must resolve every dependency using the bundled libs.
+          if ldd ./dilithion-node | grep -q "not found"; then
+            echo "CLEAN-ROOM FAIL: unresolved deps"; ldd ./dilithion-node | grep "not found"; exit 1
+          fi
+          # Must actually start VIA THE REAL run-node.sh WRAPPER (unset LD_LIBRARY_PATH so the
+          # wrapper's own lib-path setup is what's tested). Assert on the post-main() banner
+          # string only the RUNNING binary prints — a loader/dyld error echoes the binary PATH
+          # (contains "dilithion"/"version") to stderr BEFORE main, so matching the name/path
+          # would false-pass a binary that never started. "Post-Quantum Cryptocurrency" is
+          # printed by PrintUsage() after main, so it cannot appear in a pre-main loader error.
+          out=$(env -u LD_LIBRARY_PATH timeout 20 ./run-node.sh --help 2>&1 || true)
+          echo "$out" | head -3
+          echo "$out" | grep -q "Post-Quantum Cryptocurrency" || { echo "CLEAN-ROOM FAIL: binary did not start (no post-main banner)"; exit 1; }
+          echo "CLEAN-ROOM PASS"
+        '
+
     - name: Upload artifact
       uses: actions/upload-artifact@v7
       with:
