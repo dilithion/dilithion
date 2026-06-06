@@ -568,6 +568,7 @@ struct NodeConfig {
     int max_connections = 0;         // --maxconnections: Maximum peer connections (0 = default 125)
     int max_connections_per_ip = 2;  // --max-connections-per-ip: Max inbound per IP (default 2, range 1-64)
     int attestation_rate_limit = 1;  // --attestation-rate-limit: Max attestations per /24 subnet per day
+    std::vector<std::string> rpc_allow_hosts;  // --rpcallowhost: extra allowed Host headers (anti-DNS-rebinding allowlist)
     bool shared_heat = true;         // Phase 3b: shared cluster heat (default ON)
     // use_new_peerman field removed in v4.3.4 cut Block 8 with the --usenewpeerman
     // flag retirement (port::CPeerManager class deleted in Block 7; flag was a no-op
@@ -758,6 +759,15 @@ struct NodeConfig {
                 // Public REST API: bind to 0.0.0.0 for light wallet access (seed nodes only)
                 public_api = true;
             }
+            else if (arg.find("--rpcallowhost=") == 0) {
+                // wallet-rpc-login-restore: add an allowed Host header to the
+                // anti-DNS-rebinding allowlist. Repeatable. Loopback
+                // (127.0.0.1/::1/localhost) is always allowed implicitly; use
+                // this to allow a node's public IP / DNS name so remote
+                // light-wallet REST clients keep working under --public-api.
+                std::string h = arg.substr(15);
+                if (!h.empty()) rpc_allow_hosts.push_back(h);
+            }
             else if (arg == "--no-shared-heat") {
                 // Disable Phase 3b shared cluster heat penalty
                 shared_heat = false;
@@ -875,6 +885,12 @@ struct NodeConfig {
         std::cout << "                          Add --yes to skip the confirmation prompt." << std::endl;
         std::cout << "  --relay-only          Relay-only mode: skip wallet (for seed nodes)" << std::endl;
         std::cout << "  --public-api          Enable public REST API for light wallets (seed nodes)" << std::endl;
+        std::cout << "  --rpcallowhost=<host> Allow this Host header on the RPC/HTTP server" << std::endl;
+        std::cout << "                          (anti-DNS-rebinding allowlist; repeatable)." << std::endl;
+        std::cout << "                          Loopback (127.0.0.1/::1/localhost) is always" << std::endl;
+        std::cout << "                          allowed. Under --public-api, remote REST/RPC clients" << std::endl;
+        std::cout << "                          must be added here EXPLICITLY (by IP or DNS name) —" << std::endl;
+        std::cout << "                          the node's own external IP is NOT auto-allowed." << std::endl;
         std::cout << "  --no-shared-heat      Disable shared cluster heat penalty" << std::endl;
         std::cout << "  --upnp                Enable automatic port mapping (UPnP)" << std::endl;
         std::cout << "  --no-upnp             Disable UPnP (don't prompt)" << std::endl;
@@ -2093,6 +2109,12 @@ int main(int argc, char* argv[]) {
     // Verbose mode (only if not set via command-line)
     if (!config.verbose) {
         config.verbose = config_parser.GetBool("verbose", false);
+
+        // wallet-rpc-login-restore: merge conf-file rpcallowhost entries with CLI
+        // --rpcallowhost. CLI entries already populated config.rpc_allow_hosts.
+        for (const auto& h : config_parser.GetList("rpcallowhost")) {
+            if (!h.empty()) config.rpc_allow_hosts.push_back(h);
+        }
     }
 
     // Set global verbose flag for debug output
@@ -7108,6 +7130,18 @@ load_genesis_block:  // Bug #29: Label for automatic retry after blockchain wipe
         std::string rpcpassword = config_parser.GetString("rpcpassword", "");
         std::string rpc_permissions_file = config.datadir + "/rpc_permissions.json";
 
+        // M-03 (F-002): __token__ and __cookie__ are RESERVED usernames on the
+        // auth surface — __token__ is the session-token sentinel (server.cpp) and
+        // __cookie__ is the cookie-auth user. Reject them at config time so an
+        // operator cannot configure a real rpcuser that collides with the
+        // sentinel branch (which would hijack/lock-out their login).
+        if (rpcuser == "__token__" || rpcuser == "__cookie__") {
+            std::cerr << "ERROR: rpcuser '" << rpcuser << "' is a reserved username "
+                      << "(used internally for session-token / cookie auth). "
+                      << "Choose a different rpcuser. Aborting startup." << std::endl;
+            return 1;
+        }
+
         if (!rpcuser.empty() && !rpcpassword.empty()) {
             // CVE-2026-RPC-AUTH: previously only InitializePermissions was called.
             // The auth gate at server.cpp checks RPCAuth::IsAuthConfigured(),
@@ -7256,6 +7290,47 @@ load_genesis_block:  // Bug #29: Label for automatic retry after blockchain wipe
             }
             std::cout << "  [AUTH] RPC cookie authentication enabled (credentials in "
                       << cookie_path << ")" << std::endl;
+        }
+
+        // wallet-rpc-login-restore: register the REAL configured credentials so a
+        // valid same-origin session token can resolve to them and run through the
+        // existing RPCAuth + permissions path (token = credential alias, never a
+        // skip-auth bypass). rpcuser/rpcpassword now hold the final creds from
+        // whichever auth branch ran above (configured / public-api auto / cookie).
+        rpc_server.SetSessionAuthCredentials(rpcuser, rpcpassword);
+
+        // wallet-rpc-login-restore: populate the anti-DNS-rebinding Host allowlist
+        // for RPC/REST. Loopback is ALWAYS allowed by the validator itself; here
+        // we add ONLY operator-explicit --rpcallowhost / rpcallowhost= entries.
+        //
+        // C-01 (F-002): we DELIBERATELY do NOT auto-add the node's own
+        // --externalip. Auto-allowing the public IP is the line that converts
+        // "operator opt-in" into "default remote exposure" — and combined with
+        // the wallet-HTML token mint it issued an admin token to any remote
+        // client that knew the seed IP. A --public-api operator who genuinely
+        // wants remote light-wallet REST on the raw IP must list it explicitly
+        // (--rpcallowhost=<ip>); even then it only governs RPC/REST and NEVER
+        // the loopback-only wallet-HTML/token path (see server.cpp GET /wallet).
+        for (const auto& h : config.rpc_allow_hosts) {
+            // L-03 (F-002): a bare (unbracketed) IPv6 literal with a trailing
+            // ":port" is silently mis-parsed by the allowlist (the port is not
+            // stripped, so a dead entry is inserted that never matches a real
+            // request). Warn the operator to use the bracketless+portless form.
+            if (h.find("::") != std::string::npos && h.find('[') == std::string::npos) {
+                size_t lastColon = h.rfind(':');
+                if (lastColon != std::string::npos && lastColon + 1 < h.size()) {
+                    bool tail_digits = true;
+                    for (size_t i = lastColon + 1; i < h.size(); ++i)
+                        if (h[i] < '0' || h[i] > '9') { tail_digits = false; break; }
+                    if (tail_digits) {
+                        std::cerr << "WARNING: --rpcallowhost='" << h << "' looks like a "
+                                  << "bare IPv6 literal with a port. Pass IPv6 hosts "
+                                  << "bracketless AND portless (e.g. 2001:db8::5) or this "
+                                  << "entry will never match a request." << std::endl;
+                    }
+                }
+            }
+            rpc_server.AddRpcAllowHost(h);
         }
 
         // Phase 1: Initialize request logging

@@ -15,6 +15,14 @@ inline const std::string& GetWalletHTML() {
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <!-- wallet-rpc-login-restore: same-origin RPC session token.
+         When this page is served BY a Dilithion node, the node replaces the
+         placeholder below with a freshly-minted, server-validated session token.
+         The wallet uses it as its RPC credential (replacing the old rpc:rpc).
+         If the file is opened directly (not served by a node), the placeholder
+         stays as the literal sentinel and the wallet falls back to the
+         user-supplied rpcuser/rpcpassword fields. -->
+    <meta name="dilithion-rpc-token" content="__DILITHION_RPC_SESSION_TOKEN__">
     <title>Dilithion Web Wallet</title>
     <link rel="icon" type="image/x-icon" href="favicon.ico">
     <!-- PWA -->
@@ -1888,12 +1896,12 @@ inline const std::string& GetWalletHTML() {
                     <small style="color: var(--text-muted); font-size: 0.75rem;">DIL: 8332, DilV: 9332, Testnet: 18332</small>
                 </div>
                 <div class="form-group">
-                    <label class="form-label">RPC Username</label>
-                    <input type="text" class="form-input" id="rpcUser" value="rpc" placeholder="Default: rpc">
+                    <label class="form-label">RPC Username <small style="color: var(--text-muted); font-weight: normal;">(only if not served by your node)</small></label>
+                    <input type="text" class="form-input" id="rpcUser" value="" placeholder="from dilithion.conf / .cookie" autocomplete="off">
                 </div>
                 <div class="form-group">
                     <label class="form-label">RPC Password</label>
-                    <input type="password" class="form-input" id="rpcPass" value="rpc" placeholder="Default: rpc">
+                    <input type="password" class="form-input" id="rpcPass" value="" placeholder="from dilithion.conf / .cookie" autocomplete="off">
                 </div>
                 <button class="btn btn-primary" onclick="saveSettings()">Save & Connect</button>
             </div>
@@ -2187,9 +2195,27 @@ inline const std::string& GetWalletHTML() {
         let rpcConfig = {
             host: '127.0.0.1',
             port: 8332,  // Mainnet RPC port (testnet: 18332)
-            user: 'rpc',
-            pass: 'rpc'
+            user: '',    // wallet-rpc-login-restore: no guessable default (was 'rpc')
+            pass: ''     // populated only via manual override when not served by a node
         };
+
+        // wallet-rpc-login-restore: same-origin RPC session token.
+        // When this page is served BY a Dilithion node, the node injects a fresh
+        // server-validated token into the <meta name="dilithion-rpc-token"> tag.
+        // We use it as the RPC credential (Authorization: Basic __token__:<tok>)
+        // INSTEAD of a username/password. This is the supported same-origin login
+        // path on a default node — no credential paste required. The token is
+        // held in memory only (never localStorage) and re-read on each call so a
+        // freshly-served page always uses the latest minted token.
+        function getSessionToken() {
+            const m = document.querySelector('meta[name="dilithion-rpc-token"]');
+            if (!m) return '';
+            const v = (m.getAttribute('content') || '').trim();
+            // The literal sentinel means the page was NOT served by a node
+            // (opened from disk) — no token available, fall back to manual creds.
+            if (!v || v === '__DILITHION_RPC_SESSION_TOKEN__') return '';
+            return v;
+        }
 
         // Active chain: 'dil' or 'dilv'
         let activeChain = 'dil';  // Always start on DIL
@@ -2235,7 +2261,10 @@ inline const std::string& GetWalletHTML() {
             // Switch RPC port and reconnect
             rpcConfig.port = chainPorts[chain];
             document.getElementById('rpcPort').value = rpcConfig.port;
-            localStorage.setItem('dilithionWalletConfig', JSON.stringify(rpcConfig));
+            // wallet-rpc-login-restore: persist host/port ONLY — never credentials.
+            localStorage.setItem('dilithionWalletConfig', JSON.stringify({
+                host: rpcConfig.host, port: rpcConfig.port
+            }));
             // Update chain ID for transaction signing (DIL=1, DilV=2)
             if (txBuilder) txBuilder.chainId = chain === 'dilv' ? 2 : 1;
             // Update connection manager chain for API routing
@@ -2359,20 +2388,22 @@ inline const std::string& GetWalletHTML() {
         }
 
         // Load saved settings
+        // wallet-rpc-login-restore: only host/port are persisted. RPC credentials
+        // are NEVER written to localStorage (MED-1): on a node-served page the
+        // session token supplies auth; for a from-disk page the user re-enters
+        // manual creds each session (in-memory only).
         function loadSettings() {
             const saved = localStorage.getItem('dilithionWalletConfig');
             if (saved) {
                 try {
-                    rpcConfig = JSON.parse(saved);
+                    const savedCfg = JSON.parse(saved);
+                    rpcConfig.host = savedCfg.host || rpcConfig.host;
+                    rpcConfig.port = savedCfg.port || rpcConfig.port;
                     // Prefer per-chain port for current activeChain over the last-saved port
                     if (chainPorts[activeChain]) rpcConfig.port = chainPorts[activeChain];
                     document.getElementById('rpcHost').value = rpcConfig.host;
                     document.getElementById('rpcPort').value = rpcConfig.port;
-                    document.getElementById('rpcUser').value = rpcConfig.user || 'rpc';
-                    document.getElementById('rpcPass').value = rpcConfig.pass || 'rpc';
-                    // Ensure defaults are set even for old saved configs
-                    if (!rpcConfig.user) rpcConfig.user = 'rpc';
-                    if (!rpcConfig.pass) rpcConfig.pass = 'rpc';
+                    // Do NOT restore user/pass from storage — no guessable defaults.
                 } catch(e) {}
             }
         }
@@ -2381,11 +2412,15 @@ inline const std::string& GetWalletHTML() {
         function saveSettings() {
             rpcConfig.host = document.getElementById('rpcHost').value;
             rpcConfig.port = parseInt(document.getElementById('rpcPort').value);
+            // Manual-override credentials are kept in memory only (not persisted).
             rpcConfig.user = document.getElementById('rpcUser').value;
             rpcConfig.pass = document.getElementById('rpcPass').value;
             chainPorts[activeChain] = rpcConfig.port;
             localStorage.setItem('dilithionChainPorts', JSON.stringify(chainPorts));
-            localStorage.setItem('dilithionWalletConfig', JSON.stringify(rpcConfig));
+            // wallet-rpc-login-restore: persist host/port ONLY — never credentials.
+            localStorage.setItem('dilithionWalletConfig', JSON.stringify({
+                host: rpcConfig.host, port: rpcConfig.port
+            }));
             showNotification('Settings saved. Connecting...', 'info');
             connect();
         }
@@ -2429,10 +2464,18 @@ inline const std::string& GetWalletHTML() {
             const url = `http://${rpcConfig.host}:${rpcConfig.port}/`;
             const headers = {
                 'Content-Type': 'application/json',
-                'X-Dilithion-RPC': '1'  // Required for CSRF protection
+                'X-Dilithion-RPC': '1'  // Required for CSRF protection (presence-only)
             };
 
-            if (rpcConfig.user && rpcConfig.pass) {
+            // wallet-rpc-login-restore: prefer the node-injected same-origin
+            // session token. It is a REAL server-validated credential — the node
+            // maps "__token__:<token>" to the configured cookie/rpcuser creds and
+            // runs the existing auth + permissions path. Falls back to manual
+            // rpcuser/rpcpassword only when the page was not served by a node.
+            const sessionToken = getSessionToken();
+            if (sessionToken) {
+                headers['Authorization'] = 'Basic ' + btoa('__token__:' + sessionToken);
+            } else if (rpcConfig.user && rpcConfig.pass) {
                 headers['Authorization'] = 'Basic ' + btoa(rpcConfig.user + ':' + rpcConfig.pass);
             }
 

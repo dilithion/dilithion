@@ -493,6 +493,131 @@ bool valid = RPCAuth::AuthenticateRequest(username, password);
 
 ---
 
+## Anti-DNS-Rebinding Host-Header Allowlist (v4.4.4+)
+
+The RPC/HTTP server enforces a **Host-header allowlist** as the FIRST check on
+every request, before any path dispatch (wallet HTML, OPTIONS, REST `/api/v1/*`,
+or JSON-RPC). This mirrors `geth --http.vhosts` and is the canonical defense
+against DNS-rebinding attacks (Geth-2018 account-drain, Sia-2019 seed-theft):
+a malicious web page that rebinds its DNS name to `127.0.0.1` is rejected because
+the browser still sends `Host: evil.com`, which is not in the allowlist.
+
+**Default policy (desktop / mining node, no `--public-api`):** only loopback Host
+headers are accepted — `127.0.0.1`, `[::1]`, `localhost` (with or without the
+correct `:port`). Everything else is rejected with `403 Forbidden`.
+
+**`--public-api` policy (seed nodes), RPC/REST surface:** loopback PLUS any host
+you add **explicitly** with `--rpcallowhost=<host>` (repeatable; also
+`rpcallowhost=` in `dilithion.conf`).
+
+> **The node does NOT auto-allow its own `--externalip`.** (Security hardening,
+> F-002 C-01.) Auto-allowing the public IP converted an operator opt-in into a
+> default remote exposure, and — combined with the token-minting wallet page —
+> issued an admin session token to any remote client that knew the seed IP. A
+> `--public-api` operator who genuinely wants remote light-wallet REST on the raw
+> IP must now list it explicitly: `--rpcallowhost=<this node's public IP>`. If
+> your remote clients connect by **DNS name**, add that instead:
+> `--rpcallowhost=seed.example.org`. A `--public-api` node with NO
+> `--rpcallowhost` accepts only loopback Host headers for RPC/REST and prints a
+> WARNING at startup.
+
+**The token-minting wallet UI is ALWAYS loopback-only.** `GET /` and
+`GET /wallet` (which serve the admin-token-bearing wallet HTML) are served ONLY
+to a loopback Host (`127.0.0.1` / `localhost` / `[::1]`), **regardless of
+`--public-api` / `--rpcallowhost` / `--externalip`**. Even a host you allowlist
+for RPC/REST will receive `403 Forbidden` on `GET /wallet`. Remote operators must
+reach the wallet UI over an SSH tunnel (`ssh -L 8332:127.0.0.1:8332 ...`). This
+is a separate, stricter gate than the RPC/REST allowlist — the session-token
+login is a same-origin desktop affordance, never a seed feature.
+
+The Host parser does an **exact host-token match** (port stripped, IPv6 brackets
+removed, case-insensitive) — NOT a substring search. Rejected forms include
+absent/empty Host (default-deny), duplicate Host headers (smuggling), wrong port,
+and suffix tricks such as `localhost.evil.com` / `127.0.0.1.evil.com` / `localhostX`.
+
+**Residual — raw-IP literal (documented, matches the geth `--http.vhosts`
+residual):** a raw-IP literal (`127.0.0.1`) is, by design, always allowed. A
+non-browser local process (curl, a script, a malicious process already on the
+box) can therefore reach the RPC server with `Host: 127.0.0.1`. This is
+acceptable because it is outside the browser-DNS-rebinding threat model (such a
+process can already open a loopback socket directly); the allowlist defends
+specifically against a victim's browser being weaponized via rebinding.
+
+**Residual — `localhost` name allowlisting (M-01, matches geth's
+`--http.vhosts localhost` residual):** the *name* `localhost` is accepted, not
+only the literal `127.0.0.1`. A non-browser middlebox / dev proxy that rewrites
+the `Host` header to `localhost` would pass the gate. Browsers send the *origin*
+hostname as `Host`, so a rebinding payload cannot set `Host: localhost` for an
+off-origin page — the residual is confined to local tooling that deliberately
+rewrites Host, which is outside the rebinding threat model. (To run strictly
+IP-only, an operator can front the node with a proxy that rejects the `localhost`
+name; the node defaults to accepting it for desktop ergonomics.)
+
+**Residual — IPv6 loopback canonicalization is not exhaustive (L-01):** common
+loopback spellings (`::1`, fully-expanded `0:0:...:1`, dotted IPv4-mapped
+`::ffff:127.0.0.1`, hex IPv4-mapped `::ffff:7f00:1`) canonicalize to `::1` and
+are accepted. Any *other* IPv6 spelling of loopback is **rejected**
+(fail-closed / over-restrictive, never over-permissive) — a denied loopback
+spelling is safe; a wrongly-accepted one would not be.
+
+## Same-origin wallet login (node-injected session token)
+
+When the bundled web wallet is **served by the node** (`GET /` or `GET /wallet`),
+the node mints a fresh, short-lived, server-validated **session token** and
+injects it into the page (`<meta name="dilithion-rpc-token">`). The wallet uses
+this token as its RPC credential (`Authorization: Basic base64("__token__:<tok>")`)
+instead of any hardcoded username/password — so a default node (cookie auth) logs
+in with **no credential paste required**.
+
+Security properties:
+- The token is a **real credential**, validated server-side (constant-time) on
+  every fund-capable call. It is NOT the CSRF header (which accepts any value).
+- A valid token resolves server-side to the configured cookie/`rpcuser`
+  credentials and runs through the **existing** `RPCAuth` + permissions path —
+  it never bypasses auth (`sendtoaddress` / `dumpprivkey` stay protected).
+- Short-lived (**1h TTL**, F-002 M-02) and **rotated on every page load**; bound
+  to the node process. The token is held in browser memory only — never written
+  to `localStorage`, never logged. The short TTL bounds the exposure of a leaked
+  token (it is a pure bearer credential, not bound to client IP/UA); an active
+  desktop session self-heals because each page load re-mints.
+- Served **loopback-only** (F-002 C-01): the token-minting `GET /` / `GET /wallet`
+  page is never served to a non-loopback Host, even one allowlisted for RPC/REST.
+- The token-bearing page is served with `X-Frame-Options: DENY`, a restrictive
+  `Content-Security-Policy` (`frame-ancestors 'none'`), `Referrer-Policy:
+  no-referrer`, and `Cache-Control: no-store` to prevent framing / referrer /
+  cache leakage of the token.
+
+**Reserved usernames (M-03):** `__token__` (session-token sentinel) and
+`__cookie__` (cookie-auth user) are reserved on the auth surface. Configuring
+`rpcuser=__token__` or `rpcuser=__cookie__` is rejected at startup (the node
+aborts) so an operator cannot create a username that collides with the internal
+sentinel branches.
+
+**Residual — CSP `'unsafe-inline'` (L-02, tracked):** the served wallet HTML uses
+inline `<script>`, so its CSP retains `script-src 'self' 'unsafe-inline'`. The
+page now embeds a session token in the DOM, making it the highest-value XSS
+target on the node. Tracked follow-up: move the wallet JS to an external `'self'`
+file so the inline allowance can be dropped. Mitigations already in place:
+loopback-only serving (no remote XSS vector), `no-store` caching, and the token
+living only in browser memory.
+
+**Opening `wallet.html` directly from disk** (not served by a node) leaves the
+token placeholder unfilled; the wallet then falls back to the manual
+`rpcuser`/`rpcpassword` fields (in-memory only — no guessable `rpc:rpc` default).
+
+## Credential model summary
+
+| Mode | Server credential | Wallet login |
+|------|-------------------|--------------|
+| Default node | random `.cookie` (`__cookie__:<hex>`) | node-injected session token |
+| `rpcuser`/`rpcpassword` set | your configured creds | session token (served) or manual entry |
+| `--public-api` (seed) | auto-generated `dilithion:<hex>` (in `dilithion.conf`) | session token (served) or manual entry |
+
+There is **no guessable static credential** anywhere in this model. The old
+`rpc:rpc` default has been removed from the bundled wallet client.
+
+---
+
 ## References
 
 - **HTTP Basic Auth:** RFC 7617
