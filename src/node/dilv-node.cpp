@@ -862,9 +862,10 @@ struct NodeConfig {
         std::cout << "  --public-api          Enable public REST API for light wallets (seed nodes)" << std::endl;
         std::cout << "  --rpcallowhost=<host> Allow this Host header on the RPC/HTTP server" << std::endl;
         std::cout << "                          (anti-DNS-rebinding allowlist; repeatable)." << std::endl;
-        std::cout << "                          Loopback is always allowed. Under --public-api" << std::endl;
-        std::cout << "                          the node's own external IP is allowed by default;" << std::endl;
-        std::cout << "                          add DNS names of remote clients here." << std::endl;
+        std::cout << "                          Loopback is always allowed. Under --public-api," << std::endl;
+        std::cout << "                          remote REST/RPC clients must be added here EXPLICITLY" << std::endl;
+        std::cout << "                          (by IP or DNS name) — the node's own external IP is" << std::endl;
+        std::cout << "                          NOT auto-allowed." << std::endl;
         std::cout << "  --upnp                Enable automatic port mapping (UPnP)" << std::endl;
         std::cout << "  --no-upnp             Disable UPnP (don't prompt)" << std::endl;
         std::cout << "  --externalip=<ip>     Your public IP (for manual port forwarding)" << std::endl;

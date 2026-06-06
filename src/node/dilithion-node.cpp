@@ -888,9 +888,9 @@ struct NodeConfig {
         std::cout << "  --rpcallowhost=<host> Allow this Host header on the RPC/HTTP server" << std::endl;
         std::cout << "                          (anti-DNS-rebinding allowlist; repeatable)." << std::endl;
         std::cout << "                          Loopback (127.0.0.1/::1/localhost) is always" << std::endl;
-        std::cout << "                          allowed. MIGRATION: under --public-api the node's" << std::endl;
-        std::cout << "                          own external IP is allowed by default, but remote" << std::endl;
-        std::cout << "                          clients using a DNS name must be added here." << std::endl;
+        std::cout << "                          allowed. Under --public-api, remote REST/RPC clients" << std::endl;
+        std::cout << "                          must be added here EXPLICITLY (by IP or DNS name) —" << std::endl;
+        std::cout << "                          the node's own external IP is NOT auto-allowed." << std::endl;
         std::cout << "  --no-shared-heat      Disable shared cluster heat penalty" << std::endl;
         std::cout << "  --upnp                Enable automatic port mapping (UPnP)" << std::endl;
         std::cout << "  --no-upnp             Disable UPnP (don't prompt)" << std::endl;
