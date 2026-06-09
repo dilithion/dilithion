@@ -11,6 +11,13 @@
          stays as the literal sentinel and the wallet falls back to the
          user-supplied rpcuser/rpcpassword fields. -->
     <meta name="dilithion-rpc-token" content="__DILITHION_RPC_SESSION_TOKEN__">
+    <!-- dilv-node-wallet-csp-origin: when served BY a node, the node replaces
+         this placeholder with its chain ("dil" or "dilv") so the wallet's chain
+         identity (units, and chainId for tx signing) is AUTHORITATIVE rather
+         than guessed from the RPC port — correct even on a custom --rpcport. If
+         opened from disk / not served by a node, the sentinel stays and the
+         wallet falls back to deriving the chain from the origin port. -->
+    <meta name="dilithion-chain" content="__DILITHION_CHAIN__">
     <title>Dilithion Web Wallet</title>
     <link rel="icon" type="image/x-icon" href="favicon.ico">
     <!-- PWA -->
@@ -2227,20 +2234,34 @@
         // ("Connection failed"). Returns null for opened-from-disk (file:) and
         // for the remotely-hosted wallet (https, no port) so those paths keep
         // their existing cross-origin / light-mode behaviour untouched.
+        // dilv-node-wallet-csp-origin: the node injects its chain ("dil"/"dilv")
+        // into the dilithion-chain meta when it serves the page; '' if opened
+        // from disk or the sentinel survived (not node-served). This is the node's
+        // authoritative answer and is preferred over guessing from the RPC port.
+        function getServedChainHint() {
+            const m = document.querySelector('meta[name="dilithion-chain"]');
+            if (!m) return '';
+            const v = (m.getAttribute('content') || '').trim();
+            return (v === 'dil' || v === 'dilv') ? v : '';
+        }
         function detectServedOrigin() {
             const loc = window.location;
             const isLoopback = loc.hostname === '127.0.0.1' || loc.hostname === 'localhost';
             if (loc.protocol !== 'http:' || !isLoopback || !loc.port) return null;
             const port = parseInt(loc.port, 10);
+            const chainHint = getServedChainHint();
             const knownNodePort = (port === chainPorts.dil || port === chainPorts.dilv ||
                 port === 8332 || port === 9332 || port === 18332 || port === 19332);
-            // Only treat as node-served when it's a recognised node RPC port OR
-            // the page carries a node-injected session token — avoids hijacking
-            // an unrelated local dev server that happens to run on loopback.
-            if (!knownNodePort && !getSessionToken()) return null;
-            // Map the origin port to a chain: DilV = 9332 / 19332 (or a custom
-            // chainPorts.dilv); everything else (8332/18332/custom) is DIL.
-            const chain = (port === chainPorts.dilv || port === 9332 || port === 19332) ? 'dilv' : 'dil';
+            // Treat as node-served when it's a recognised node RPC port, or the
+            // page carries a node-injected session token / chain hint — avoids
+            // hijacking an unrelated local dev server on loopback while still
+            // covering a node running on a custom --rpcport.
+            if (!knownNodePort && !getSessionToken() && !chainHint) return null;
+            // Chain identity: trust the node's authoritative hint when present;
+            // otherwise map the origin port (DilV = 9332 / 19332 / a custom
+            // chainPorts.dilv; everything else is DIL).
+            const chain = chainHint ||
+                ((port === chainPorts.dilv || port === 9332 || port === 19332) ? 'dilv' : 'dil');
             return { host: loc.hostname, port: port, chain: chain };
         }
         const servedOrigin = detectServedOrigin();
