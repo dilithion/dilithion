@@ -2263,7 +2263,12 @@
             // would block. Requires that sibling node to be running.
             if (servedOrigin) {
                 const targetPort = chainPorts[chain] || (chain === 'dilv' ? 9332 : 8332);
-                if (targetPort !== servedOrigin.port) {
+                // Defence-in-depth: targetPort derives from chainPorts (localStorage-
+                // sourced), so range-check it before using it as a navigation sink.
+                // Host is always this page's own loopback hostname, so navigation
+                // can only ever target another loopback port — never a remote origin.
+                if (Number.isInteger(targetPort) && targetPort > 0 && targetPort <= 65535 &&
+                    targetPort !== servedOrigin.port) {
                     window.location.href = window.location.protocol + '//' +
                         window.location.hostname + ':' + targetPort + '/';
                     return;
