@@ -136,6 +136,113 @@ static std::vector<uint8_t> out_default_or(const std::vector<uint8_t>& a) {
     return r;
 }
 
+// Read a little-endian uint32 at an absolute byte offset.
+static uint32_t GetU32(const std::vector<uint8_t>& b, size_t off) {
+    uint32_t x = 0;
+    if (off + 4 <= b.size()) std::memcpy(&x, b.data() + off, 4);
+    return x;
+}
+static void SetU32(std::vector<uint8_t>& b, size_t off, uint32_t x) {
+    if (off + 4 <= b.size()) std::memcpy(b.data() + off, &x, 4);
+}
+
+// ---------------------------------------------------------------------------
+// MEDIUM-1 helper: recompute the OUTER file-integrity HMAC over a (possibly
+// mutated) v7 wallet image so that Load() passes its file-HMAC check and the
+// per-RECORD MAC verification becomes the only remaining authenticity gate.
+//
+// Mirrors CWallet::SaveUnlocked exactly for the encrypted case: the HMAC key is
+// the first 32 bytes of the master-key salt (16 bytes here, zero-padded to 32),
+// and the HMAC covers [file-HMAC salt 32][body...] = everything from offset
+// HEADER_LEN onward. The master-key salt is in-file plaintext, so an attacker
+// who strips a per-record MAC can trivially repair this outer HMAC — which is
+// exactly why the per-record MAC is the real defense and must be enforced.
+//
+// v7 file layout (encrypted):
+//   [0]  magic            8
+//   [8]  version u32      4
+//   [12] flags u32        4
+//   [16] file-HMAC       32   (HEADER_LEN = 48)
+//   [48] file-HMAC salt  32
+//   [80] master-key block: cryptedLen u32 | ct | mkSalt 16 | mkIV 16 |
+//                          derivMethod u32 | iters u32 | macLen u32 | mac
+//   ... (mnemonic, HD-master, keys, ...)
+// ---------------------------------------------------------------------------
+static const size_t LP7_HEADER_LEN  = 48;   // magic+version+flags+HMAC
+static const size_t LP7_MKSALT_OFF  = 80 + 4;  // after [file-salt 32][cryptedLen u32]; +cryptedLen
+
+static bool RecomputeFileHMAC(std::vector<uint8_t>& file) {
+    if (file.size() < LP7_HEADER_LEN + WALLET_FILE_SALT_SIZE) return false;
+    // master-key salt sits at offset 80 + 4 + cryptedKeyLen
+    uint32_t cryptedKeyLen = GetU32(file, 80);
+    size_t mkSaltOff = 80 + 4 + cryptedKeyLen;
+    if (mkSaltOff + WALLET_CRYPTO_SALT_SIZE > file.size()) return false;
+
+    std::vector<uint8_t> hmac_key(32, 0);
+    std::memcpy(hmac_key.data(), file.data() + mkSaltOff,
+                std::min<size_t>(32, WALLET_CRYPTO_SALT_SIZE));
+
+    const uint8_t* body = file.data() + LP7_HEADER_LEN;
+    size_t body_len = file.size() - LP7_HEADER_LEN;
+    std::vector<uint8_t> hmac(WALLET_FILE_HMAC_SIZE);
+    HMAC_SHA3_256(hmac_key.data(), hmac_key.size(), body, body_len, hmac.data());
+    std::memcpy(file.data() + 16, hmac.data(), WALLET_FILE_HMAC_SIZE);
+    return true;
+}
+
+// Strip the MASTER-KEY MAC from a v7 image: locate the macLen field, set it to
+// 0, and drop the trailing MAC bytes. Returns false if the layout doesn't match.
+static bool StripMasterKeyMAC(std::vector<uint8_t>& file) {
+    if (file.size() < 80 + 4) return false;
+    uint32_t cryptedKeyLen = GetU32(file, 80);
+    // macLen field offset: 80 + 4(cryptedLen) + cryptedKeyLen + 16(mkSalt)
+    //                      + 16(mkIV) + 4(derivMethod) + 4(iters)
+    size_t macLenOff = 80 + 4 + cryptedKeyLen + 16 + 16 + 4 + 4;
+    if (macLenOff + 4 > file.size()) return false;
+    uint32_t macLen = GetU32(file, macLenOff);
+    if (macLen == 0 || macLen > 64) return false;            // expect a present MAC
+    if (macLenOff + 4 + macLen > file.size()) return false;
+    // Drop the MAC bytes and zero the length.
+    file.erase(file.begin() + macLenOff + 4,
+               file.begin() + macLenOff + 4 + macLen);
+    SetU32(file, macLenOff, 0);
+    return true;
+}
+
+// Strip a PER-ADDRESS key MAC from a v7 image. The on-disk per-address key
+// record (SaveUnlocked) is:
+//   [addr 21][pubKey 1952][cryptedLen u32][ct][iv 16][macLen u32][mac]
+// We locate the record by its 21-byte address, then walk to the macLen field and
+// drop the 64 MAC bytes. Unlike stripping the master-key MAC, this leaves
+// masterKey.IsValid() TRUE, so Load()'s outer-HMAC key selection (which keys on
+// the master-key salt only for valid master keys) is unchanged — isolating the
+// PER-RECORD MAC verify as the sole remaining gate.
+static bool StripPerAddressKeyMAC(std::vector<uint8_t>& file,
+                                  const std::vector<uint8_t>& addr21) {
+    if (addr21.size() < 21) return false;
+    // Find the address bytes (search past the header/master/HD region).
+    for (size_t i = 0; i + 21 <= file.size(); ++i) {
+        if (std::memcmp(file.data() + i, addr21.data(), 21) != 0) continue;
+        // Candidate record start at i. Layout: [addr 21][pubKey 1952]
+        //   [cryptedLen u32][ct][iv 16][macLen u32][mac]
+        size_t off = i + 21 + DILITHIUM_PUBLICKEY_SIZE;
+        if (off + 4 > file.size()) continue;
+        uint32_t cryptedLen = GetU32(file, off);
+        if (cryptedLen == 0 || cryptedLen > 8192) continue;  // sanity / wrong match
+        size_t macLenOff = off + 4 + cryptedLen + 16;        // after ct + iv16
+        if (macLenOff + 4 > file.size()) continue;
+        uint32_t macLen = GetU32(file, macLenOff);
+        if (macLen != 64) continue;                          // a v7 per-address MAC is 64B
+        if (macLenOff + 4 + macLen > file.size()) continue;
+        // Found it — drop the MAC bytes and zero the length.
+        file.erase(file.begin() + macLenOff + 4,
+                   file.begin() + macLenOff + 4 + macLen);
+        SetU32(file, macLenOff, 0);
+        return true;
+    }
+    return false;
+}
+
 // ---------------------------------------------------------------------------
 // Legacy v6 plaintext-seed encrypted-wallet builder.
 //
@@ -539,12 +646,215 @@ static void Test_AuthTamper() {
     std::remove(path.c_str());
 }
 
+// ---------------------------------------------------------------------------
+// Test 4 — MEDIUM-1: ISOLATING per-record MAC test (HIGH-1 regression guard)
+//
+// The TAMPER A/B tests are satisfied by the OUTER file-HMAC alone — they would
+// pass even if every per-record MAC check were deleted. This test isolates the
+// per-record MAC path: it strips the master-key MAC AND repairs the outer
+// file-HMAC (keyed with the in-file plaintext master-key salt), so Load()'s
+// integrity check passes and the only remaining authenticity gate is the
+// per-record MAC verify. Asserting the wallet refuses to unlock proves the v7
+// empty-MAC rejection on the MASTER KEY is live.
+//
+// This test FAILS without the HIGH-1 fix (a stripped master-key MAC makes
+// IsLegacy() true → MAC verify skipped → root secret decrypts unauthenticated →
+// Unlock succeeds) and PASSES with it (load/verify reject the empty MAC).
+// ---------------------------------------------------------------------------
+static void Test_PerRecordMACIsolation() {
+    std::cout << COLOR_BLUE "\n[Test 4] Per-record MAC isolation (MEDIUM-1 / HIGH-1 guard)\n" COLOR_RESET;
+
+    const std::string path = "lp7_macstrip_wallet.dat";
+    const std::string pass = "M@cStr1p!Test#88";
+    std::remove(path.c_str());
+
+    // Clean v7 encrypted wallet WITH a per-address (non-HD) spending key. We add
+    // the key BEFORE encryption so EncryptWallet migrates it into mapCryptedKeys
+    // with a per-record MAC and writes it to disk — giving us a per-address key
+    // record to isolate. Capture its 21-byte address by diffing GetAddresses.
+    std::string mnemonic;
+    std::vector<uint8_t> importedAddr21;
+    {
+        CWallet w;
+        w.SetWalletFile(path);
+        CHECK(w.GenerateHDWallet(mnemonic), "Generated HD wallet");
+        std::vector<CDilithiumAddress> before = w.GetAddresses();
+        CHECK(w.GenerateNewKey(), "Added a non-HD spending key (pre-encryption)");
+        std::vector<CDilithiumAddress> after = w.GetAddresses();
+        // The new address is the one in `after` not in `before`.
+        for (const auto& a : after) {
+            bool seen = false;
+            for (const auto& b : before) {
+                if (a.GetData() == b.GetData()) { seen = true; break; }
+            }
+            if (!seen) { importedAddr21 = a.GetData(); importedAddr21.resize(21, 0); break; }
+        }
+        CHECK(importedAddr21.size() == 21, "Captured the new spending key's 21-byte address");
+        CHECK(w.EncryptWallet(pass), "Encrypted → v7 (per-address key → mapCryptedKeys + MAC)");
+        CHECK(w.Lock(), "Locked");
+        CHECK(w.Save(path), "Saved v7 wallet");
+    }
+    CHECK(FileVersion(path) == WALLET_FILE_VERSION_7, "Wallet is v7");
+
+    std::vector<uint8_t> clean = ReadFileBytes(path);
+    CHECK(!clean.empty(), "Read v7 wallet bytes");
+
+    // POSITIVE CONTROL: recompute the outer file-HMAC over the UNMODIFIED image.
+    // This proves RecomputeFileHMAC is faithful — so any rejection in the strip
+    // cases below comes from the per-record MAC gate, not a broken outer HMAC.
+    {
+        std::vector<uint8_t> repaired = clean;
+        CHECK(RecomputeFileHMAC(repaired), "POSITIVE CONTROL: recomputed outer file-HMAC");
+        CHECK(repaired == clean,
+              "POSITIVE CONTROL: recomputed HMAC matches the writer's HMAC (helper is faithful)");
+        CHECK(WriteFileBytes(path, repaired), "Wrote HMAC-recomputed (unmodified) wallet");
+        CWallet w;
+        w.SetWalletFile(path);
+        bool loaded = w.Load(path);
+        bool unlocked = loaded && w.Unlock(pass);
+        CHECK(unlocked, "POSITIVE CONTROL: unmodified+rehmac'd wallet still unlocks (no false reject)");
+    }
+
+    // ISOLATING CASE 1 (the load-bearing HIGH-1 guard) — PER-ADDRESS KEY.
+    // Strip the per-address key's MAC, then REPAIR the outer file-HMAC so Load()
+    // passes. Stripping a per-address MAC keeps masterKey.IsValid() TRUE, so
+    // Load's outer-HMAC key is unchanged and the per-record MAC verify is the ONLY
+    // remaining gate. Without the HIGH-1 fix, IsLegacy() becomes true → verify
+    // skipped → the spending key decrypts unauthenticated and unlock SUCCEEDS.
+    // With the fix, load/verify reject the empty MAC. This assertion is the one
+    // that flips between fixed/unfixed.
+    {
+        std::vector<uint8_t> bad = clean;
+        bool stripped = StripPerAddressKeyMAC(bad, importedAddr21);
+        CHECK(stripped, "Stripped PER-ADDRESS key MAC (macLen→0, 64 bytes dropped)");
+        CHECK(RecomputeFileHMAC(bad),
+              "Repaired outer file-HMAC over the stripped image (forgeable: salt is in-file)");
+        CHECK(WriteFileBytes(path, bad), "Wrote per-address stripped-MAC, valid-outer-HMAC wallet");
+
+        CWallet w;
+        w.SetWalletFile(path);
+        bool loaded = w.Load(path);
+        bool unlocked = loaded && w.Unlock(pass);
+        CHECK(!unlocked,
+              "ISOLATING (per-address): v7 spending key with stripped MAC is REJECTED (HIGH-1 closed)");
+    }
+
+    // ISOLATING CASE 2 — MASTER KEY. Strip the master-key MAC and repair the outer
+    // HMAC. The fix rejects a v7 master key with an empty MAC at the load gate
+    // (and at the unlock verify-gate as defense-in-depth). Must not unlock.
+    {
+        std::vector<uint8_t> bad = clean;
+        bool stripped = StripMasterKeyMAC(bad);
+        CHECK(stripped, "Stripped MASTER-KEY MAC (macLen→0, 64 bytes dropped)");
+        CHECK(RecomputeFileHMAC(bad),
+              "Repaired outer file-HMAC over the master-stripped image");
+        CHECK(WriteFileBytes(path, bad), "Wrote master stripped-MAC, valid-outer-HMAC wallet");
+
+        CWallet w;
+        w.SetWalletFile(path);
+        bool loaded = w.Load(path);
+        bool unlocked = loaded && w.Unlock(pass);
+        CHECK(!unlocked,
+              "ISOLATING (master): v7 master key with stripped MAC is REJECTED (HIGH-1 closed)");
+    }
+
+    std::remove(path.c_str());
+}
+
+// ---------------------------------------------------------------------------
+// Test 5 — MEDIUM-2: atomic-rename crash-window invariant (S-002, real windows)
+//
+// The interrupted-migration test in Test 2 disables autosave, so it models
+// "SaveUnlocked was never called" — NOT "SaveUnlocked was interrupted
+// mid-rewrite". SaveUnlocked is temp-write+fsync → atomic rename over the
+// original (the original is never truncated), so the only crash windows are:
+//   (A) crash AFTER temp-write+fsync but BEFORE rename → on disk: original
+//       intact + an orphan ".tmp"; recovery opens the intact OLD wallet.
+//   (B) crash AFTER rename → on disk: the complete NEW wallet, no temp.
+// This test reconstructs each on-disk state from REAL saved images and asserts
+// the wallet is never corrupt/lost (old-or-new, always intact).
+// ---------------------------------------------------------------------------
+static void Test_AtomicRenameCrashWindow() {
+    std::cout << COLOR_BLUE "\n[Test 5] Atomic-rename crash window (MEDIUM-2 / S-002)\n" COLOR_RESET;
+
+    const std::string path = "lp7_atomic_wallet.dat";
+    const std::string pass = "At0mic!Rename#99";
+    std::remove(path.c_str());
+    std::remove((path + ".tmp").c_str());
+
+    // --- Produce a real OLD on-disk image (v7 encrypted wallet, version 1). ---
+    std::string mnemonic;
+    {
+        CWallet w;
+        w.SetWalletFile(path);
+        CHECK(w.GenerateHDWallet(mnemonic), "Generated HD wallet");
+        CHECK(w.EncryptWallet(pass), "Encrypted → v7");
+        CHECK(w.Lock(), "Locked");
+        CHECK(w.Save(path), "Saved OLD image");
+    }
+    std::vector<uint8_t> oldImage = ReadFileBytes(path);
+    CHECK(!oldImage.empty() && FileVersion(path) == WALLET_FILE_VERSION_7, "OLD image is a valid v7 wallet");
+
+    // --- Produce a real NEW on-disk image (re-save: a second valid v7 image). ---
+    // Re-saving the same wallet yields a byte-different but equally-valid image
+    // (fresh random IVs/salt), which stands in for "the rewrite the migration
+    // would have produced". This is the content the rename moves into place.
+    std::vector<uint8_t> newImage;
+    {
+        CWallet w;
+        w.SetWalletFile(path);
+        CHECK(w.Load(path), "Reloaded wallet to produce NEW image");
+        CHECK(w.Unlock(pass), "Unlocked");
+        CHECK(w.Save(path), "Saved NEW image (atomic rewrite)");
+        newImage = ReadFileBytes(path);
+    }
+    CHECK(!newImage.empty() && FileVersion(path) == WALLET_FILE_VERSION_7, "NEW image is a valid v7 wallet");
+    CHECK(oldImage != newImage, "OLD and NEW images differ (fresh IVs/salt — distinguishable)");
+
+    // --- WINDOW A: crash AFTER temp-write+fsync, BEFORE rename. ---
+    // On-disk state: original (OLD) intact + orphan ".tmp" (the unfinished NEW).
+    // The wallet path still holds the OLD image; the orphan temp must NOT prevent
+    // a clean open of the intact OLD wallet (no data loss, no corruption).
+    {
+        CHECK(WriteFileBytes(path, oldImage), "WINDOW A: restored OLD image at the wallet path");
+        CHECK(WriteFileBytes(path + ".tmp", newImage), "WINDOW A: left an orphan .tmp (unfinished rename)");
+        CWallet w;
+        w.SetWalletFile(path);
+        bool loaded = w.Load(path);
+        bool unlocked = loaded && w.Unlock(pass);
+        CHECK(unlocked, "WINDOW A: intact OLD wallet opens despite orphan temp (no loss)");
+        std::string m;
+        CHECK(loaded && w.ExportMnemonic(m) && m == mnemonic,
+              "WINDOW A: OLD wallet's mnemonic is fully recoverable");
+        std::remove((path + ".tmp").c_str());
+    }
+
+    // --- WINDOW B: crash AFTER rename completed. ---
+    // On-disk state: the wallet path holds the complete NEW image, no temp.
+    {
+        CHECK(WriteFileBytes(path, newImage), "WINDOW B: NEW image is in place (rename completed)");
+        CWallet w;
+        w.SetWalletFile(path);
+        bool loaded = w.Load(path);
+        bool unlocked = loaded && w.Unlock(pass);
+        CHECK(unlocked, "WINDOW B: complete NEW wallet opens cleanly");
+        std::string m;
+        CHECK(loaded && w.ExportMnemonic(m) && m == mnemonic,
+              "WINDOW B: NEW wallet's mnemonic is fully recoverable (same seed)");
+    }
+
+    std::remove(path.c_str());
+    std::remove((path + ".tmp").c_str());
+}
+
 int main() {
     std::cout << COLOR_BLUE "==== LP-7 wallet encryption-at-rest tests ====" COLOR_RESET "\n";
 
     Test_Secrecy();
     Test_Migration();
     Test_AuthTamper();
+    Test_PerRecordMACIsolation();
+    Test_AtomicRenameCrashWindow();
 
     std::cout << "\n=============================================\n";
     std::cout << "PASSED: " << g_pass << "   FAILED: " << g_fail << "\n";

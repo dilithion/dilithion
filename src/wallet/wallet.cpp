@@ -322,6 +322,16 @@ bool CWallet::GetKeyUnlocked(const CDilithiumAddress& address, CKey& keyOut) con
 
     // FIX-008 (CRYPT-007): Verify MAC before decryption (prevents padding oracle)
     // For legacy keys without MAC, skip verification
+    // LP-7 (HIGH-1 / S-004 / A-007): on a v7 wallet a per-address spending key
+    // MUST carry a non-empty MAC. An empty MAC would make IsLegacy() true and
+    // skip the verify below — re-opening the MAC downgrade on a spending key. The
+    // v7 load path already rejects an empty per-address MAC; this is a
+    // zero-false-positive defense-in-depth gate at the verify boundary. v3-v6
+    // keys keep the legacy unauthenticated path for migration.
+    if (m_loadedFileVersion >= WALLET_FILE_VERSION_7 && encKey.vchMAC.empty()) {
+        memory_cleanse(masterKeyVec.data(), masterKeyVec.size());
+        return false;  // v7 spending key with no MAC — refuse to decrypt unauthenticated
+    }
     if (!encKey.IsLegacy()) {
         if (!crypter.VerifyMAC(encKey.vchCryptedKey, encKey.vchMAC)) {
             memory_cleanse(masterKeyVec.data(), masterKeyVec.size());
@@ -1152,6 +1162,16 @@ bool CWallet::Unlock(const std::string& passphrase, int64_t timeout) {
     // v3-v6 used the legacy AES-keyed HMAC; v7 uses the separately-derived MAC
     // key. Select the keying by the loaded version so pre-v7 wallets still unlock
     // (and can then migrate).
+    // LP-7 (HIGH-1 / S-004 / A-007): on a v7 wallet the master-key MAC is
+    // mandatory. An empty MAC here would make IsLegacy() true and skip the
+    // verify below — re-opening the encrypt-then-MAC downgrade on the root
+    // secret. The v7 load path already rejects an empty master MAC, so this is a
+    // zero-false-positive defense-in-depth gate at the verify boundary.
+    if (m_loadedFileVersion >= WALLET_FILE_VERSION_7 && masterKey.vchMAC.empty()) {
+        nUnlockFailedAttempts++;
+        nLastFailedUnlock = std::chrono::steady_clock::now();
+        return false;  // v7 master key with no MAC — refuse to decrypt unauthenticated
+    }
     if (!masterKey.IsLegacy()) {
         bool legacyKeying = (m_loadedFileVersion != 0 && m_loadedFileVersion < WALLET_FILE_VERSION_7);
         if (!crypter.VerifyMAC(masterKey.vchCryptedKey, masterKey.vchMAC, legacyKeying)) {
@@ -1748,6 +1768,17 @@ bool CWallet::Load(const std::string& filename) {
             temp_masterKey.vchMAC.clear();
         }
 
+        // LP-7 (HIGH-1 / S-004 / A-007): a v7 wallet MUST carry a non-empty
+        // master-key MAC. The v7 writer always populates it (wallet.cpp), so an
+        // empty/absent MAC on a v7 file means the MAC was stripped — reject it as
+        // corrupt rather than silently falling back to the unauthenticated
+        // "legacy" path (which would re-open the encrypt-then-MAC downgrade on the
+        // root secret). The legacy unauthenticated path is preserved ONLY for
+        // genuine v3-v6 files being read for migration.
+        if (version >= WALLET_FILE_VERSION_7 && temp_masterKey.vchMAC.empty()) {
+            return false;  // v7 master key with stripped/absent MAC — reject as tampered
+        }
+
         // Wallet starts locked (encryption status determined by masterKey.IsValid())
         temp_fWalletUnlocked = false;
     }
@@ -2033,6 +2064,15 @@ bool CWallet::Load(const std::string& filename) {
                     encKey.vchMAC.resize(macLen);
                     file.read(reinterpret_cast<char*>(encKey.vchMAC.data()), macLen);
                     if (!file.good()) return false;  // SEC-001: Check I/O error
+                }
+                // LP-7 (HIGH-1 / S-004 / A-007): a v7 wallet MUST carry a
+                // non-empty MAC on every per-address spending key. The v7 writer
+                // always populates it, so macLen==0 on a v7 file means the MAC was
+                // stripped — reject as tampered rather than loading it as an
+                // unauthenticated "legacy" key (which would re-open the MAC
+                // downgrade on a spending key). v3-v6 keys keep the legacy path.
+                if (version >= WALLET_FILE_VERSION_7 && encKey.vchMAC.empty()) {
+                    return false;  // v7 per-address key with stripped/absent MAC — reject
                 }
             } else {
                 // Legacy v1/v2: try to read macLen, seek back if not present
