@@ -131,6 +131,7 @@ ChainParams ChainParams::Mainnet() {
     params.vdfActivationHeight = 999999999;   // Disabled until fork is scheduled
     params.vdfExclusiveHeight  = 999999999;
     params.vdfIterations       = 5'000'000;   // ~44s fast, ~110s slow (fairness via minBlockTime)
+    params.vdfProofEnforcementHeight = 999999999;  // LP-10: DIL is RandomX (no VDF) — OFF
 
     // VDF Distribution: "lowest output wins" (disabled until fork is scheduled)
     params.vdfLotteryActivationHeight = 999999999;
@@ -338,6 +339,7 @@ ChainParams ChainParams::Testnet() {
     params.vdfActivationHeight = 0;
     params.vdfExclusiveHeight  = 0;            // VDF-only from genesis (like DilV)
     params.vdfIterations       = 500000;       // 500K iterations (~4-8s, matches DilV)
+    params.vdfProofEnforcementHeight = 999999999;  // LP-10: PLACEHOLDER sentinel — OFF until Will sets activation height
 
     // VDF Distribution: "lowest output wins" — reset MVP testing
     params.vdfLotteryActivationHeight = 0;     // Active from genesis for MVP testing
@@ -495,6 +497,11 @@ ChainParams ChainParams::DilV() {
     params.vdfActivationHeight = 0;
     params.vdfExclusiveHeight  = 0;            // No RandomX blocks ever accepted
     params.vdfIterations       = 500000;       // 500K iterations (~4-8s compute time)
+    // LP-10 (CRITICAL/incident): Wesolowski-proof + MIK-signature enforcement on
+    // the connect path. PLACEHOLDER sentinel = OFF. Will sets the real activation
+    // height at deploy — MUST be strictly above the current live DilV tip so the
+    // existing chain is grandfathered and activation cannot reject it.
+    params.vdfProofEnforcementHeight = 999999999;  // TODO(deploy): set above live tip
 
     // VDF Distribution: active from genesis
     params.vdfLotteryActivationHeight = 0;
@@ -736,6 +743,7 @@ ChainParams ChainParams::Regtest() {
     params.vdfIterations = 50000;
     params.vdfLotteryGracePeriod = 3;  // 3s grace
     params.blockTime = 3;              // 3s target
+    params.vdfProofEnforcementHeight = 999999999;  // LP-10: OFF by default; tests set explicitly
 
     // Phase 6 PR6.1: mapBlockIndex cap — regtest uses a SMALL cap (1000)
     // so cap-saturation tests can exercise eviction without flooding 500K+

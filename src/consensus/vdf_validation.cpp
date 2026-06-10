@@ -196,6 +196,133 @@ bool CheckVDFProof(
 }
 
 // ---------------------------------------------------------------------------
+// CheckVDFProofConnect  (LP-10 — activation-gated connect-path wrapper)
+// ---------------------------------------------------------------------------
+
+bool CheckVDFProofConnect(
+    const CBlock& block,
+    int height,
+    const uint256& prevHash,
+    std::string& error)
+{
+    // Activation gate: below the enforcement height, grandfather the block.
+    // The existing chain is NEVER retroactively re-verified.
+    int enforcementHeight = Dilithion::g_chainParams ?
+        Dilithion::g_chainParams->vdfProofEnforcementHeight : 999999999;
+    if (height < enforcementHeight) {
+        return true;
+    }
+
+    // Only VDF blocks carry a Wesolowski proof. RandomX blocks are validated
+    // by CheckProofOfWork / CheckProofOfWorkDFMP and are unaffected here.
+    if (!block.IsVDFBlock()) {
+        return true;
+    }
+
+    uint64_t vdfIterations = Dilithion::g_chainParams ?
+        Dilithion::g_chainParams->vdfIterations : 0;
+
+    return CheckVDFProof(block, height, prevHash, vdfIterations, error);
+}
+
+// ---------------------------------------------------------------------------
+// CheckVDFBlockMIKSignature  (LP-10 / subsumes LP-8 — coinbase MIK signature)
+// ---------------------------------------------------------------------------
+//
+// Mirrors the proven MIK-signature path in CheckProofOfWorkDFMP
+// (src/consensus/pow.cpp:245-322), which is SKIPPED for VDF blocks because
+// CheckProofOfWorkDFMP early-returns true for block.IsVDFBlock(). Restores the
+// signature verification for VDF blocks, activation-gated identically to the
+// VDF proof.
+
+bool CheckVDFBlockMIKSignature(
+    const CBlock& block,
+    int height,
+    std::string& error)
+{
+    // Activation gate: below enforcement height, grandfather.
+    int enforcementHeight = Dilithion::g_chainParams ?
+        Dilithion::g_chainParams->vdfProofEnforcementHeight : 999999999;
+    if (height < enforcementHeight) {
+        return true;
+    }
+
+    // Only applies to VDF blocks. (RandomX blocks have their MIK signature
+    // verified inside CheckProofOfWorkDFMP.)
+    if (!block.IsVDFBlock()) {
+        return true;
+    }
+
+    // Genesis predates any mining identity.
+    if (height == 0) {
+        return true;
+    }
+
+    // Deserialize the coinbase.
+    CBlockValidator validator;
+    std::vector<CTransactionRef> txs;
+    std::string deserErr;
+    if (!validator.DeserializeBlockTransactions(block, txs, deserErr) || txs.empty()) {
+        error = "CheckVDFBlockMIKSignature: failed to deserialize coinbase: " + deserErr;
+        return false;
+    }
+
+    const CTransaction& coinbase = *txs[0];
+    if (!coinbase.IsCoinBase() || coinbase.vin.empty()) {
+        error = "CheckVDFBlockMIKSignature: first transaction is not a valid coinbase";
+        return false;
+    }
+
+    // Parse MIK from coinbase scriptSig.
+    DFMP::CMIKScriptData mikData;
+    if (!DFMP::ParseMIKFromScriptSig(coinbase.vin[0].scriptSig, mikData)) {
+        error = "CheckVDFBlockMIKSignature: missing or malformed MIK data in coinbase at height "
+                + std::to_string(height);
+        return false;
+    }
+
+    // Resolve the pubkey for signature verification.
+    DFMP::Identity identity;
+    std::vector<uint8_t> pubkey;
+
+    if (mikData.isRegistration) {
+        // Registration: pubkey embedded in coinbase. Verify identity derivation.
+        pubkey = mikData.pubkey;
+        DFMP::Identity derived = DFMP::DeriveIdentityFromMIK(pubkey);
+        if (derived != mikData.identity) {
+            error = "CheckVDFBlockMIKSignature: MIK identity mismatch (derived "
+                    + derived.GetHex() + " != claimed " + mikData.identity.GetHex()
+                    + ") at height " + std::to_string(height);
+            return false;
+        }
+        identity = mikData.identity;
+    } else {
+        // Reference: look up the stored pubkey from the identity DB.
+        identity = mikData.identity;
+
+        if (DFMP::g_identityDb == nullptr ||
+            !DFMP::g_identityDb->GetMIKPubKey(identity, pubkey)) {
+            // Reorg-safe: pubkey not resolvable (identity DB missing/incomplete
+            // during multi-block reorg undo). Cannot verify -> do not false-reject.
+            // Same posture as CheckDNAHashEquality and the DFMP assume-valid path.
+            return true;
+        }
+    }
+
+    // Verify the Dilithium MIK signature over
+    // SHA3-256(prevBlockHash || height || timestamp || identity).
+    if (!DFMP::VerifyMIKSignature(pubkey, mikData.signature,
+                                   block.hashPrevBlock, height, block.nTime,
+                                   identity)) {
+        error = "CheckVDFBlockMIKSignature: invalid MIK signature for identity "
+                + identity.GetHex() + " at height " + std::to_string(height);
+        return false;
+    }
+
+    return true;
+}
+
+// ---------------------------------------------------------------------------
 // CheckVDFCooldown  (consensus-enforced cooldown — hard fork)
 // ---------------------------------------------------------------------------
 
