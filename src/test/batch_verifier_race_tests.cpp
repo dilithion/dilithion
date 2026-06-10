@@ -28,12 +28,31 @@
 // (make TSAN=1 batch_verifier_race_tests) to additionally flag the data race
 // on the control and confirm clean on the fix.
 //
+// ONE SOURCE, BOTH VARIANTS (A-010 evidence is auditable, not a separate file):
+// this file compiles against EITHER verifier from the same source via a
+// compile-time switch, so the control-red and fix-green come from identical
+// harness logic:
+//   - default build  → fixed verifier (src/consensus/signature_batch_verifier.*),
+//                       session API: `make batch_verifier_race_tests`  → PASS.
+//   - -DPREFIX_API    → frozen pre-fix verifier
+//                       (src/test/lp5_control/signature_batch_verifier_prefix.*,
+//                       a verbatim copy of commit bb933d53), sessionless API:
+//                       `make batch_verifier_race_control`            → HANG.
+// The only thing PREFIX_API changes below is which header is included and the
+// BeginBatch/Add/Wait call shape; the load pattern, oracle, and assertions are
+// byte-identical across both variants. The HANG on the control is the proof that
+// a PASS on the fix is discriminating (the harness is not a no-op).
+//
 // The harness drives CSignatureBatchVerifier directly (not the full RPC stack)
 // because the race lives entirely in the verifier's per-batch state; this keeps
 // the proof minimal and deterministic while reproducing the exact concurrent
 // BeginBatch/Add/Wait load shape the RPC worker pool produces.
 
-#include <consensus/signature_batch_verifier.h>
+#ifdef PREFIX_API
+#include "lp5_control/signature_batch_verifier_prefix.h"  // frozen pre-fix control
+#else
+#include <consensus/signature_batch_verifier.h>           // the fixed verifier
+#endif
 
 #include <atomic>
 #include <cstdint>
@@ -167,14 +186,27 @@ int main() {
                 if (!OracleVerify(t)) { oracle_ok = false; break; }
             }
 
-            // Batch verifier verdict — the path under test.
+            // Batch verifier verdict — the path under test. The call shape is
+            // the ONLY thing that differs between control and fix (A-010): the
+            // pre-fix verifier has a sessionless BeginBatch/Add/Wait, the fixed
+            // verifier threads a per-batch session through all three.
+            std::string err;
+            bool batch_ok;
+#ifdef PREFIX_API
+            g_signature_verifier->BeginBatch();
+            for (size_t i = 0; i < batch.size(); ++i) {
+                g_signature_verifier->Add(batch[i].sig, batch[i].msg,
+                                          batch[i].pub, i);
+            }
+            batch_ok = g_signature_verifier->Wait(err);
+#else
             auto session = g_signature_verifier->BeginBatch();
             for (size_t i = 0; i < batch.size(); ++i) {
                 g_signature_verifier->Add(session, batch[i].sig, batch[i].msg,
                                           batch[i].pub, i);
             }
-            std::string err;
-            bool batch_ok = g_signature_verifier->Wait(session, err);
+            batch_ok = g_signature_verifier->Wait(session, err);
+#endif
 
             total_batches.fetch_add(1);
             if (batch_ok != oracle_ok) {

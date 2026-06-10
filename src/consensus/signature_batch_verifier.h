@@ -16,7 +16,14 @@
  * Solution: Verify signatures in parallel using a thread pool.
  * With 4 workers, a block with 1000 signatures takes ~500-750ms instead.
  *
- * Architecture (based on Bitcoin Core's CCheckQueue):
+ * Architecture (based on Bitcoin Core's CCheckQueue / CCheckQueueControl):
+ *   Upstream reference: bitcoin/bitcoin src/checkqueue.h
+ *   (CCheckQueue<T> = the shared worker pool + CV batch driver;
+ *    CCheckQueueControl<T> = the RAII control object that owns ONE batch for its
+ *    scope and calls Wait() in its destructor so no batch is ever abandoned
+ *    un-waited). The CBatchSession + CBatchSessionGuard pair below mirrors that
+ *    split; pin the exact upstream commit here if a byte-level equivalence audit
+ *    is ever required.
  * - Main thread collects signature verification tasks
  * - Worker threads verify signatures in parallel
  * - Results aggregated - any failure fails the batch
@@ -206,6 +213,58 @@ private:
     // been moved into CBatchSession so that each in-flight batch owns its own
     // state. The verifier object now holds ONLY the shared worker pool +
     // queue, which is concurrency-safe to share across batches.
+};
+
+/**
+ * CBatchSessionGuard - RAII guard restoring upstream CCheckQueueControl's
+ * structural guarantee that a batch is never abandoned un-Wait()-ed.
+ *
+ * The port's ownership model (shared_ptr<CBatchSession>) is UAF-safe even if a
+ * caller drops its handle while tasks drain (every queued task keeps the session
+ * alive), so a missed Wait() is a correctness-clean *waste* (work runs, verdict
+ * discarded), not a crash. But upstream's RAII control object made an abandoned
+ * batch impossible by construction. This guard restores that: declare it once
+ * after BeginBatch(); its destructor drains the session via Wait() on EVERY exit
+ * path (early return, exception) unless the caller already consumed the result
+ * with WaitResult()/release(). This bounds latency and prevents a future edit
+ * from leaking queued work between BeginBatch() and the final Wait().
+ *
+ * Upstream reference: bitcoin/bitcoin src/checkqueue.h (CCheckQueueControl dtor).
+ */
+class CBatchSessionGuard {
+public:
+    CBatchSessionGuard(CSignatureBatchVerifier* verifier,
+                       std::shared_ptr<CBatchSession> session)
+        : m_verifier(verifier), m_session(std::move(session)) {}
+
+    // Non-copyable, non-movable (scoped to one BatchVerifyScripts call).
+    CBatchSessionGuard(const CBatchSessionGuard&) = delete;
+    CBatchSessionGuard& operator=(const CBatchSessionGuard&) = delete;
+
+    /**
+     * Wait for the session and consume the verdict. After this returns the guard
+     * will NOT drain again in its destructor (the batch is already complete).
+     */
+    bool WaitResult(std::string& error) {
+        m_waited = true;
+        return m_verifier->Wait(m_session, error);
+    }
+
+    const std::shared_ptr<CBatchSession>& session() const { return m_session; }
+
+    ~CBatchSessionGuard() {
+        // If the caller never consumed the result (early return / exception),
+        // drain the queued tasks so they don't run against an abandoned session.
+        if (!m_waited && m_verifier && m_session) {
+            std::string drain_error;
+            m_verifier->Wait(m_session, drain_error);
+        }
+    }
+
+private:
+    CSignatureBatchVerifier* m_verifier;
+    std::shared_ptr<CBatchSession> m_session;
+    bool m_waited{false};
 };
 
 /**
