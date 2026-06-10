@@ -561,6 +561,7 @@ struct NodeConfig {
     bool upnp_prompted = false;     // True if user was already prompted or used explicit flag
     std::string external_ip = "";   // --externalip: Manual external IP (for manual port forwarding)
     bool public_api = false;        // --public-api: Enable public REST API for light wallets (seed nodes only)
+    bool generate_seed_key = false; // --generate-seed-key: LP-13 — explicitly permit minting a NEW seed attestation consensus key when none exists (first-time provision only; otherwise fail loud)
     int max_connections = 0;         // --maxconnections: Maximum peer connections (0 = default 125)
     int max_connections_per_ip = 2;  // --max-connections-per-ip: Max inbound per IP (default 2, range 1-64)
     int attestation_rate_limit = 1;  // --attestation-rate-limit: Max attestations per /24 subnet per day (Sybil defense)
@@ -751,6 +752,12 @@ struct NodeConfig {
                 // Public REST API: bind to 0.0.0.0 for light wallet access (seed nodes only)
                 public_api = true;
             }
+            else if (arg == "--generate-seed-key") {
+                // LP-13: explicit opt-in to mint a NEW seed attestation consensus
+                // key if none exists. Without this flag a missing key fails loud
+                // instead of silently minting an unrecognized signing key.
+                generate_seed_key = true;
+            }
             else if (arg.find("--rpcallowhost=") == 0) {
                 // wallet-rpc-login-restore: anti-DNS-rebinding Host allowlist.
                 // Repeatable. Loopback is always allowed implicitly.
@@ -860,6 +867,9 @@ struct NodeConfig {
         std::cout << "                          Add --yes to skip the confirmation prompt." << std::endl;
         std::cout << "  --relay-only          Relay-only mode: skip wallet (for seed nodes)" << std::endl;
         std::cout << "  --public-api          Enable public REST API for light wallets (seed nodes)" << std::endl;
+        std::cout << "  --generate-seed-key   Permit minting a NEW seed attestation key if none exists" << std::endl;
+        std::cout << "                          (first-time provision only; otherwise the node fails loud)." << std::endl;
+        std::cout << "                          Set " << Attestation::SEED_KEY_PASSPHRASE_ENV << " to encrypt it at rest." << std::endl;
         std::cout << "  --rpcallowhost=<host> Allow this Host header on the RPC/HTTP server" << std::endl;
         std::cout << "                          (anti-DNS-rebinding allowlist; repeatable)." << std::endl;
         std::cout << "                          Loopback is always allowed. Under --public-api," << std::endl;
@@ -6846,8 +6856,9 @@ load_genesis_block:  // Bug #29: Label for automatic retry after blockchain wipe
                           << " datacenter ASNs)" << std::endl;
             }
 
-            // Load or generate attestation key
-            if (seedAttestKey.LoadOrGenerate(dataDir)) {
+            // Load or generate attestation key (LP-13: minting gated behind
+            // --generate-seed-key so a reprovisioned seed fails loud).
+            if (seedAttestKey.LoadOrGenerate(dataDir, config.generate_seed_key)) {
                 // Determine seed ID by matching our IP against known seed IPs
                 // For now, use a simple index. In production, compare external IP.
                 int seedId = -1;

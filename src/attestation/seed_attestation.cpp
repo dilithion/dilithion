@@ -4,9 +4,10 @@
 #include <attestation/seed_attestation.h>
 #include <crypto/sha3.h>
 #include <util/strencodings.h>
-#include <wallet/crypter.h>  // For memory_cleanse()
+#include <wallet/crypter.h>  // For memory_cleanse() + CCrypter/DeriveKey (LP-13 encrypt-at-rest)
 
 #include <algorithm>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <iostream>
@@ -22,6 +23,8 @@
 #include <arpa/inet.h>
 #include <unistd.h>
 #include <netdb.h>
+#include <sys/stat.h>   // LP-13: chmod/fchmod for 0600 key file perms
+#include <fcntl.h>
 #endif
 
 // Dilithium3 reference implementation
@@ -41,7 +44,45 @@ namespace Attestation {
 
 // File format magic and version
 static constexpr uint32_t KEY_FILE_MAGIC = 0x444C4154;  // "DLAT" (Dilithion Attestation)
-static constexpr uint8_t KEY_FILE_VERSION = 1;
+// v1: plaintext private key (legacy — still readable for backward-compat migration)
+// v2 (LP-13): private key encrypted at rest (AES-256-CBC, PBKDF2-SHA3, encrypt-then-MAC)
+static constexpr uint8_t KEY_FILE_VERSION_V1 = 1;
+static constexpr uint8_t KEY_FILE_VERSION_V2 = 2;
+
+// LP-13 v2 on-disk sizes (bytes)
+static constexpr size_t SEED_KEY_SALT_SIZE = 16;  // PBKDF2 salt (== WALLET_CRYPTO_SALT_SIZE)
+static constexpr size_t SEED_KEY_IV_SIZE   = 16;  // AES-CBC IV     (== WALLET_CRYPTO_IV_SIZE)
+static constexpr size_t SEED_KEY_MAC_SIZE  = 64;  // HMAC-SHA3-512  (encrypt-then-MAC)
+
+// LP-13: PBKDF2 rounds for the seed-key passphrase. Reuse the wallet constant
+// for a single hardened KDF cost across the codebase.
+static constexpr unsigned int SEED_KEY_PBKDF2_ROUNDS = WALLET_CRYPTO_PBKDF2_ROUNDS;
+
+// ============================================================================
+// LP-13 helpers
+// ============================================================================
+
+// Read the operator passphrase from the environment. Empty => not configured
+// (Save falls back to legacy v1 plaintext; Load cannot decrypt a v2 file).
+static std::string GetSeedKeyPassphrase() {
+    const char* env = std::getenv(Attestation::SEED_KEY_PASSPHRASE_ENV);
+    if (env == nullptr) return std::string();
+    return std::string(env);
+}
+
+// Restrict a key file to owner read/write only. POSIX: chmod 0600. Windows:
+// best-effort no-op (NTFS confines the per-user profile data dir; documented).
+static void RestrictKeyFilePerms(const std::string& path) {
+#ifndef _WIN32
+    // 0600 = owner rw, no group/other. Failure is logged but non-fatal: the
+    // secret is still written; an operator on an exotic FS can harden manually.
+    if (chmod(path.c_str(), S_IRUSR | S_IWUSR) != 0) {
+        std::cerr << "[Attestation] WARNING: could not chmod 0600 key file: " << path << std::endl;
+    }
+#else
+    (void)path;  // Windows: relies on NTFS ACL of the user profile data dir.
+#endif
+}
 
 // ============================================================================
 // CSeedAttestationKey
@@ -73,84 +114,278 @@ bool CSeedAttestationKey::Generate() {
 
 bool CSeedAttestationKey::Load(const std::string& dataDir) {
     std::string path = dataDir + "/" + SEED_KEY_FILENAME;
+    // Read the whole file up front so v2 length/format checks are robust against
+    // truncation, and so we never leave a half-read secret in memory on error.
     std::ifstream file(path, std::ios::binary);
     if (!file.is_open()) {
         return false;
     }
+    std::vector<uint8_t> buf((std::istreambuf_iterator<char>(file)),
+                              std::istreambuf_iterator<char>());
+    file.close();
 
-    // Read and verify magic
+    // magic(4) + version(1) header
+    if (buf.size() < 5) {
+        std::cerr << "[Attestation] Key file too short" << std::endl;
+        return false;
+    }
+
     uint32_t magic = 0;
-    file.read(reinterpret_cast<char*>(&magic), 4);
+    std::memcpy(&magic, buf.data(), 4);
     if (magic != KEY_FILE_MAGIC) {
         std::cerr << "[Attestation] Invalid key file magic" << std::endl;
         return false;
     }
 
-    // Read and verify version
-    uint8_t version = 0;
-    file.read(reinterpret_cast<char*>(&version), 1);
-    if (version != KEY_FILE_VERSION) {
-        std::cerr << "[Attestation] Unsupported key file version: " << (int)version << std::endl;
-        return false;
+    uint8_t version = buf[4];
+    size_t off = 5;
+
+    if (version == KEY_FILE_VERSION_V1) {
+        // Legacy plaintext format (backward compat for un-migrated seeds):
+        //   magic(4) version(1) pubkey(1952) privkey(4032)
+        if (buf.size() < off + DFMP::MIK_PUBKEY_SIZE + DFMP::MIK_PRIVKEY_SIZE) {
+            std::cerr << "[Attestation] v1 key file truncated" << std::endl;
+            return false;
+        }
+        m_pubkey.assign(buf.begin() + off, buf.begin() + off + DFMP::MIK_PUBKEY_SIZE);
+        off += DFMP::MIK_PUBKEY_SIZE;
+        m_privkey.assign(buf.begin() + off, buf.begin() + off + DFMP::MIK_PRIVKEY_SIZE);
+        // Wipe the plaintext private key out of the read buffer.
+        memory_cleanse(buf.data() + off, DFMP::MIK_PRIVKEY_SIZE);
+        std::cout << "[Attestation] Loaded seed attestation key (v1 plaintext): "
+                  << GetPubKeyHex().substr(0, 16) << "..." << std::endl;
+        std::cerr << "[Attestation] NOTE: key file is unencrypted (v1). Set "
+                  << SEED_KEY_PASSPHRASE_ENV << " to re-save it encrypted (v2)." << std::endl;
+        return true;
     }
 
-    // Read public key
-    m_pubkey.resize(DFMP::MIK_PUBKEY_SIZE);
-    file.read(reinterpret_cast<char*>(m_pubkey.data()), DFMP::MIK_PUBKEY_SIZE);
+    if (version == KEY_FILE_VERSION_V2) {
+        // LP-13 encrypted format:
+        //   magic(4) version(1) pubkey(1952) salt(16) iv(16) mac(64)
+        //   ctlen(4 LE) ciphertext(ctlen)
+        size_t headerEnd = off + DFMP::MIK_PUBKEY_SIZE + SEED_KEY_SALT_SIZE +
+                           SEED_KEY_IV_SIZE + SEED_KEY_MAC_SIZE + 4;
+        if (buf.size() < headerEnd) {
+            std::cerr << "[Attestation] v2 key file truncated (header)" << std::endl;
+            return false;
+        }
 
-    // Read private key
-    m_privkey.resize(DFMP::MIK_PRIVKEY_SIZE);
-    file.read(reinterpret_cast<char*>(m_privkey.data()), DFMP::MIK_PRIVKEY_SIZE);
+        m_pubkey.assign(buf.begin() + off, buf.begin() + off + DFMP::MIK_PUBKEY_SIZE);
+        off += DFMP::MIK_PUBKEY_SIZE;
 
-    if (!file.good()) {
-        std::cerr << "[Attestation] Key file read error" << std::endl;
-        Clear();
-        return false;
+        std::vector<uint8_t> salt(buf.begin() + off, buf.begin() + off + SEED_KEY_SALT_SIZE);
+        off += SEED_KEY_SALT_SIZE;
+        std::vector<uint8_t> iv(buf.begin() + off, buf.begin() + off + SEED_KEY_IV_SIZE);
+        off += SEED_KEY_IV_SIZE;
+        std::vector<uint8_t> mac(buf.begin() + off, buf.begin() + off + SEED_KEY_MAC_SIZE);
+        off += SEED_KEY_MAC_SIZE;
+
+        uint32_t ctlen = static_cast<uint32_t>(buf[off]) |
+                         (static_cast<uint32_t>(buf[off + 1]) << 8) |
+                         (static_cast<uint32_t>(buf[off + 2]) << 16) |
+                         (static_cast<uint32_t>(buf[off + 3]) << 24);
+        off += 4;
+
+        if (buf.size() != off + ctlen || ctlen == 0 || (ctlen % 16) != 0) {
+            std::cerr << "[Attestation] v2 key file truncated or malformed ciphertext" << std::endl;
+            return false;
+        }
+        std::vector<uint8_t> ciphertext(buf.begin() + off, buf.begin() + off + ctlen);
+
+        std::string passphrase = GetSeedKeyPassphrase();
+        if (passphrase.empty()) {
+            std::cerr << "[Attestation] ERROR: key file is encrypted (v2) but "
+                      << SEED_KEY_PASSPHRASE_ENV << " is not set. Cannot decrypt." << std::endl;
+            Clear();
+            return false;
+        }
+
+        // Derive AES key from passphrase + salt, then encrypt-then-MAC verify.
+        std::vector<uint8_t> aesKey;
+        if (!DeriveKey(passphrase, salt, SEED_KEY_PBKDF2_ROUNDS, aesKey)) {
+            std::cerr << "[Attestation] ERROR: key derivation failed" << std::endl;
+            memory_cleanse(&passphrase[0], passphrase.size());
+            Clear();
+            return false;
+        }
+        memory_cleanse(&passphrase[0], passphrase.size());
+
+        CCrypter crypter;
+        if (!crypter.SetKey(aesKey, iv)) {
+            std::cerr << "[Attestation] ERROR: failed to set decryption key" << std::endl;
+            memory_cleanse(aesKey.data(), aesKey.size());
+            Clear();
+            return false;
+        }
+        memory_cleanse(aesKey.data(), aesKey.size());
+
+        // Verify MAC BEFORE decrypt (prevents padding-oracle / tamper). A wrong
+        // passphrase yields a different derived key => MAC mismatch => reject.
+        if (!crypter.VerifyMAC(ciphertext, mac)) {
+            std::cerr << "[Attestation] ERROR: key file MAC verification failed "
+                      << "(wrong passphrase or tampered/corrupt file)." << std::endl;
+            Clear();
+            return false;
+        }
+
+        std::vector<uint8_t> plain;
+        if (!crypter.Decrypt(ciphertext, plain) || plain.size() != DFMP::MIK_PRIVKEY_SIZE) {
+            std::cerr << "[Attestation] ERROR: key file decryption failed" << std::endl;
+            if (!plain.empty()) memory_cleanse(plain.data(), plain.size());
+            Clear();
+            return false;
+        }
+        m_privkey.assign(plain.begin(), plain.end());
+        memory_cleanse(plain.data(), plain.size());
+
+        std::cout << "[Attestation] Loaded seed attestation key (v2 encrypted): "
+                  << GetPubKeyHex().substr(0, 16) << "..." << std::endl;
+        return true;
     }
 
-    std::cout << "[Attestation] Loaded seed attestation key: " << GetPubKeyHex().substr(0, 16) << "..." << std::endl;
-    return true;
+    std::cerr << "[Attestation] Unsupported key file version: " << (int)version << std::endl;
+    return false;
 }
 
 bool CSeedAttestationKey::Save(const std::string& dataDir) const {
     if (!IsValid()) return false;
 
     std::string path = dataDir + "/" + SEED_KEY_FILENAME;
+
+    // LP-13: assemble the full serialized blob in memory first, then write it
+    // in one shot. This lets us harden file permissions BEFORE any secret bytes
+    // hit the disk (POSIX: create with 0600), avoiding a world-readable window.
+    std::vector<uint8_t> out;
+    auto putU32 = [&out](uint32_t v) {
+        out.push_back(static_cast<uint8_t>(v & 0xff));
+        out.push_back(static_cast<uint8_t>((v >> 8) & 0xff));
+        out.push_back(static_cast<uint8_t>((v >> 16) & 0xff));
+        out.push_back(static_cast<uint8_t>((v >> 24) & 0xff));
+    };
+
+    // magic(4, native order to match Load's memcpy) + version(1)
+    uint32_t magic = KEY_FILE_MAGIC;
+    const uint8_t* magicBytes = reinterpret_cast<const uint8_t*>(&magic);
+    out.insert(out.end(), magicBytes, magicBytes + 4);
+
+    std::string passphrase = GetSeedKeyPassphrase();
+    bool encrypt = !passphrase.empty();
+
+    if (!encrypt) {
+        // ---- Legacy v1 plaintext (no passphrase configured) ----
+        out.push_back(KEY_FILE_VERSION_V1);
+        out.insert(out.end(), m_pubkey.begin(), m_pubkey.end());
+        out.insert(out.end(), m_privkey.begin(), m_privkey.end());
+        std::cerr << "[Attestation] WARNING: " << SEED_KEY_PASSPHRASE_ENV
+                  << " not set — writing UNENCRYPTED (v1) key file. Set it to "
+                     "encrypt the consensus signing key at rest." << std::endl;
+    } else {
+        // ---- LP-13 v2 encrypted: AES-256-CBC, PBKDF2-SHA3, encrypt-then-MAC ----
+        std::vector<uint8_t> salt, iv;
+        if (!GenerateSalt(salt) || !GenerateIV(iv)) {
+            std::cerr << "[Attestation] ERROR: failed to generate salt/IV" << std::endl;
+            memory_cleanse(&passphrase[0], passphrase.size());
+            return false;
+        }
+
+        std::vector<uint8_t> aesKey;
+        if (!DeriveKey(passphrase, salt, SEED_KEY_PBKDF2_ROUNDS, aesKey)) {
+            std::cerr << "[Attestation] ERROR: key derivation failed" << std::endl;
+            memory_cleanse(&passphrase[0], passphrase.size());
+            return false;
+        }
+        memory_cleanse(&passphrase[0], passphrase.size());
+
+        CCrypter crypter;
+        if (!crypter.SetKey(aesKey, iv)) {
+            std::cerr << "[Attestation] ERROR: failed to set encryption key" << std::endl;
+            memory_cleanse(aesKey.data(), aesKey.size());
+            return false;
+        }
+        memory_cleanse(aesKey.data(), aesKey.size());
+
+        std::vector<uint8_t> ciphertext, mac;
+        if (!crypter.Encrypt(m_privkey, ciphertext) ||
+            !crypter.ComputeMAC(ciphertext, mac)) {
+            std::cerr << "[Attestation] ERROR: encryption/MAC failed" << std::endl;
+            return false;
+        }
+
+        // magic(4) version(1) pubkey(1952) salt(16) iv(16) mac(64) ctlen(4) ct
+        out.push_back(KEY_FILE_VERSION_V2);
+        out.insert(out.end(), m_pubkey.begin(), m_pubkey.end());
+        out.insert(out.end(), salt.begin(), salt.end());
+        out.insert(out.end(), iv.begin(), iv.end());
+        out.insert(out.end(), mac.begin(), mac.end());
+        putU32(static_cast<uint32_t>(ciphertext.size()));
+        out.insert(out.end(), ciphertext.begin(), ciphertext.end());
+    }
+
+#ifndef _WIN32
+    // POSIX: create the file with 0600 from the outset (no world-readable
+    // window between create and chmod). open() honors the mode on creation.
+    int fd = ::open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, S_IRUSR | S_IWUSR);
+    if (fd < 0) {
+        std::cerr << "[Attestation] Failed to open key file for writing: " << path << std::endl;
+        if (encrypt) memory_cleanse(out.data(), out.size());
+        return false;
+    }
+    size_t written = 0;
+    bool writeOk = true;
+    while (written < out.size()) {
+        ssize_t n = ::write(fd, out.data() + written, out.size() - written);
+        if (n <= 0) { writeOk = false; break; }
+        written += static_cast<size_t>(n);
+    }
+    ::close(fd);
+    // Belt-and-braces: re-assert 0600 in case a pre-existing file kept old perms.
+    RestrictKeyFilePerms(path);
+    if (!writeOk) {
+        std::cerr << "[Attestation] Key file write error" << std::endl;
+        return false;
+    }
+#else
     std::ofstream file(path, std::ios::binary | std::ios::trunc);
     if (!file.is_open()) {
         std::cerr << "[Attestation] Failed to open key file for writing: " << path << std::endl;
         return false;
     }
-
-    // Write magic
-    uint32_t magic = KEY_FILE_MAGIC;
-    file.write(reinterpret_cast<const char*>(&magic), 4);
-
-    // Write version
-    uint8_t version = KEY_FILE_VERSION;
-    file.write(reinterpret_cast<const char*>(&version), 1);
-
-    // Write public key
-    file.write(reinterpret_cast<const char*>(m_pubkey.data()), m_pubkey.size());
-
-    // Write private key
-    file.write(reinterpret_cast<const char*>(m_privkey.data()), m_privkey.size());
-
-    if (!file.good()) {
+    file.write(reinterpret_cast<const char*>(out.data()), out.size());
+    bool writeOk = file.good();
+    file.close();
+    RestrictKeyFilePerms(path);  // best-effort no-op on Windows (NTFS ACL governs)
+    if (!writeOk) {
         std::cerr << "[Attestation] Key file write error" << std::endl;
         return false;
     }
+#endif
 
-    std::cout << "[Attestation] Saved seed attestation key to: " << path << std::endl;
+    std::cout << "[Attestation] Saved seed attestation key to: " << path
+              << (encrypt ? " (v2 encrypted)" : " (v1 plaintext)") << std::endl;
     return true;
 }
 
-bool CSeedAttestationKey::LoadOrGenerate(const std::string& dataDir) {
+bool CSeedAttestationKey::LoadOrGenerate(const std::string& dataDir, bool allowGenerate) {
     if (Load(dataDir)) {
         return true;
     }
 
-    std::cout << "[Attestation] No existing attestation key found, generating new keypair..." << std::endl;
+    // LP-13: a missing/unreadable key file must NOT silently mint a fresh
+    // consensus signing key on a production seed. Auto-mint is gated behind the
+    // explicit --generate-seed-key operator flag (allowGenerate).
+    if (!allowGenerate) {
+        std::cerr << "[Attestation] FATAL: no usable seed attestation key at "
+                  << dataDir << "/" << SEED_KEY_FILENAME
+                  << " and --generate-seed-key was NOT given. Refusing to mint a"
+                     " new consensus signing key. If this is a first-time"
+                     " provision, restart with --generate-seed-key; if the key"
+                     " was expected to exist, investigate (wrong data dir,"
+                     " missing/encrypted file, or unset "
+                  << SEED_KEY_PASSPHRASE_ENV << ")." << std::endl;
+        return false;
+    }
+
+    std::cout << "[Attestation] No existing attestation key found, generating new keypair (--generate-seed-key)..." << std::endl;
     if (!Generate()) {
         std::cerr << "[Attestation] Failed to generate attestation keypair" << std::endl;
         return false;

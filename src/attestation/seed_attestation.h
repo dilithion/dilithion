@@ -69,6 +69,12 @@ constexpr size_t ATTESTATION_ENTRY_SIZE = 1 + 4 + DFMP::MIK_SIGNATURE_SIZE;
 /** Seed attestation key file name (stored in data directory) */
 constexpr const char* SEED_KEY_FILENAME = "seed_attestation_key.dat";
 
+/** LP-13: Env var supplying the operator passphrase used to encrypt the seed
+ *  attestation private key at rest. When set, Save() writes the v2 encrypted
+ *  format and Load() requires it to decrypt v2 files. When unset, the legacy
+ *  v1 plaintext format is used (backward compatible). NEVER hardcode a value. */
+constexpr const char* SEED_KEY_PASSPHRASE_ENV = "DILITHION_SEED_KEY_PASSPHRASE";
+
 // ============================================================================
 // SEED ATTESTATION KEY
 // ============================================================================
@@ -103,6 +109,14 @@ public:
 
     /**
      * Save keypair to file in data directory.
+     *
+     * LP-13: The file is written with owner-only permissions (POSIX 0600;
+     * Windows best-effort — NTFS already confines the user profile dir).
+     * If the env var DILITHION_SEED_KEY_PASSPHRASE is set, the private key is
+     * encrypted at rest (AES-256-CBC, PBKDF2-SHA3, encrypt-then-MAC) in the v2
+     * file format. If absent, the legacy v1 plaintext format is written so
+     * existing un-passphrased operators are not silently broken.
+     *
      * @param dataDir Path to data directory
      * @return true on success
      */
@@ -110,10 +124,18 @@ public:
 
     /**
      * Load or generate: tries Load first, generates + saves if not found.
+     *
+     * LP-13: Auto-minting a fresh consensus key is gated behind allowGenerate.
+     * On a production seed a missing key file with allowGenerate=false FAILS
+     * LOUD (returns false) instead of silently minting an unrecognized key.
+     *
      * @param dataDir Path to data directory
+     * @param allowGenerate If false and no key file exists, fail loudly instead
+     *        of generating a new keypair. Set true via the --generate-seed-key
+     *        operator flag for first-time key provisioning.
      * @return true on success
      */
-    bool LoadOrGenerate(const std::string& dataDir);
+    bool LoadOrGenerate(const std::string& dataDir, bool allowGenerate = false);
 
     /**
      * Sign an attestation message.
