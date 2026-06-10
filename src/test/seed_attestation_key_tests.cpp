@@ -254,6 +254,32 @@ static void TestAutoMintGate() {
     CHECK(k3.GetPubKey() == k2.GetPubKey(), "loaded key matches minted key");
 }
 
+// LP-13 MEDIUM-1: the v1 (un-passphrased) Save path holds the plaintext private
+// key in a transient `out` buffer; the fix cleanses it on every return via
+// CleanseSeedKeyBuffer. This test proves the cleanse primitive actually zeroes
+// the buffer. Mutation self-check: deleting the memory_cleanse inside
+// CleanseSeedKeyBuffer leaves the non-zero bytes intact and fails this test.
+static void TestSecretBufferCleansed() {
+    std::cout << "[Test] transient key buffer is cleansed (MEDIUM-1)" << std::endl;
+
+    // Fill a buffer the size of a v1 blob (magic+ver+pubkey+privkey) with a
+    // recognizable non-zero pattern, as if it held a real plaintext key.
+    const size_t n = 5 + DFMP::MIK_PUBKEY_SIZE + DFMP::MIK_PRIVKEY_SIZE;
+    std::vector<uint8_t> buf(n, 0xAB);
+
+    CleanseSeedKeyBuffer(buf);
+
+    CHECK(buf.size() == n, "buffer size unchanged after cleanse");
+    bool allZero = true;
+    for (uint8_t b : buf) { if (b != 0) { allZero = false; break; } }
+    CHECK(allZero, "every byte of the secret buffer is zeroed");
+
+    // Empty-buffer path must be a safe no-op (Save's early returns hit this).
+    std::vector<uint8_t> empty;
+    CleanseSeedKeyBuffer(empty);
+    CHECK(empty.empty(), "cleanse of empty buffer is a safe no-op");
+}
+
 #ifndef _WIN32
 static void TestPosixPerms() {
     std::cout << "[Test] POSIX key file is 0600 (AC1)" << std::endl;
@@ -290,6 +316,7 @@ int main() {
     TestTruncatedAndEmptyMac();
     TestV1BackwardCompat();
     TestAutoMintGate();
+    TestSecretBufferCleansed();
 #ifndef _WIN32
     TestPosixPerms();
 #endif

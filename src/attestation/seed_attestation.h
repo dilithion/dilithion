@@ -79,6 +79,11 @@ constexpr const char* SEED_KEY_PASSPHRASE_ENV = "DILITHION_SEED_KEY_PASSPHRASE";
 // SEED ATTESTATION KEY
 // ============================================================================
 
+/** LP-13: securely zero a transient buffer that may hold plaintext key bytes
+ *  (used by CSeedAttestationKey::Save on every exit path). Declared here so the
+ *  test suite can verify the wipe; not intended for general use. */
+void CleanseSeedKeyBuffer(std::vector<uint8_t>& buf);
+
 /**
  * Seed node's Dilithium3 keypair for signing attestations.
  *

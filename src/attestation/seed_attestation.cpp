@@ -7,6 +7,7 @@
 #include <wallet/crypter.h>  // For memory_cleanse() + CCrypter/DeriveKey (LP-13 encrypt-at-rest)
 
 #include <algorithm>
+#include <cerrno>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
@@ -247,6 +248,14 @@ bool CSeedAttestationKey::Load(const std::string& dataDir) {
     return false;
 }
 
+// LP-13 MEDIUM-1: zero a transient buffer that may hold the plaintext private
+// key on the v1 Save path. Exposed (declared in the header) so the test suite
+// can assert the wipe actually happens — deleting the memory_cleanse below is
+// the mutation the cleanse test is designed to catch.
+void CleanseSeedKeyBuffer(std::vector<uint8_t>& buf) {
+    if (!buf.empty()) memory_cleanse(buf.data(), buf.size());
+}
+
 bool CSeedAttestationKey::Save(const std::string& dataDir) const {
     if (!IsValid()) return false;
 
@@ -271,6 +280,18 @@ bool CSeedAttestationKey::Save(const std::string& dataDir) const {
     std::string passphrase = GetSeedKeyPassphrase();
     bool encrypt = !passphrase.empty();
 
+    // LP-13 MEDIUM-1: on the v1 (default, un-passphrased) path `out` holds the
+    // plaintext Dilithium3 private key; on the v2 path it holds only ciphertext.
+    // Cleanse `out` UNCONDITIONALLY before every return so the plaintext key is
+    // never left in freed heap (cleansing the non-secret v2 buffer is harmless).
+    // The actual wipe lives in CleanseSeedKeyBuffer (a test seam — see
+    // seed_attestation_key_tests.cpp); this lambda is the single exit gate for
+    // all returns past this point.
+    auto finish = [&out](bool ok) -> bool {
+        CleanseSeedKeyBuffer(out);
+        return ok;
+    };
+
     if (!encrypt) {
         // ---- Legacy v1 plaintext (no passphrase configured) ----
         out.push_back(KEY_FILE_VERSION_V1);
@@ -285,14 +306,14 @@ bool CSeedAttestationKey::Save(const std::string& dataDir) const {
         if (!GenerateSalt(salt) || !GenerateIV(iv)) {
             std::cerr << "[Attestation] ERROR: failed to generate salt/IV" << std::endl;
             memory_cleanse(&passphrase[0], passphrase.size());
-            return false;
+            return finish(false);
         }
 
         std::vector<uint8_t> aesKey;
         if (!DeriveKey(passphrase, salt, SEED_KEY_PBKDF2_ROUNDS, aesKey)) {
             std::cerr << "[Attestation] ERROR: key derivation failed" << std::endl;
             memory_cleanse(&passphrase[0], passphrase.size());
-            return false;
+            return finish(false);
         }
         memory_cleanse(&passphrase[0], passphrase.size());
 
@@ -300,15 +321,22 @@ bool CSeedAttestationKey::Save(const std::string& dataDir) const {
         if (!crypter.SetKey(aesKey, iv)) {
             std::cerr << "[Attestation] ERROR: failed to set encryption key" << std::endl;
             memory_cleanse(aesKey.data(), aesKey.size());
-            return false;
+            return finish(false);
         }
         memory_cleanse(aesKey.data(), aesKey.size());
 
+        // LP-13 LOW-1: ComputeMAC keys the HMAC with the SAME 32-byte AES key
+        // (no separate k_mac). This is a DELIBERATE reuse of the audited wallet
+        // CCrypter construction (encrypt-then-MAC, MAC verified BEFORE decrypt at
+        // Load → no padding-oracle surface), not an oversight. AES-256-CBC and
+        // HMAC-SHA3-512 are independent constructions with no known cross-protocol
+        // interaction under shared keying, so this is no weaker than the wallet's
+        // at-rest format. Documented here so it is not re-litigated in review.
         std::vector<uint8_t> ciphertext, mac;
         if (!crypter.Encrypt(m_privkey, ciphertext) ||
             !crypter.ComputeMAC(ciphertext, mac)) {
             std::cerr << "[Attestation] ERROR: encryption/MAC failed" << std::endl;
-            return false;
+            return finish(false);
         }
 
         // magic(4) version(1) pubkey(1952) salt(16) iv(16) mac(64) ctlen(4) ct
@@ -327,8 +355,17 @@ bool CSeedAttestationKey::Save(const std::string& dataDir) const {
     int fd = ::open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, S_IRUSR | S_IWUSR);
     if (fd < 0) {
         std::cerr << "[Attestation] Failed to open key file for writing: " << path << std::endl;
-        if (encrypt) memory_cleanse(out.data(), out.size());
-        return false;
+        return finish(false);
+    }
+    // LP-13 LOW-2: O_TRUNC does NOT reset the mode of a PRE-EXISTING file, so a
+    // stale 0644 file would hold fresh secret bytes between ::write and the
+    // post-write chmod. fchmod the open fd to 0600 BEFORE writing any secret,
+    // closing that microsecond window (the open-with-mode above only covers the
+    // freshly-created case). Non-fatal on failure — the post-write re-assert below
+    // and the warning in RestrictKeyFilePerms still apply.
+    if (::fchmod(fd, S_IRUSR | S_IWUSR) != 0) {
+        std::cerr << "[Attestation] WARNING: fchmod 0600 on key file failed (errno "
+                  << errno << "); proceeding, will re-assert perms after write." << std::endl;
     }
     size_t written = 0;
     bool writeOk = true;
@@ -342,13 +379,13 @@ bool CSeedAttestationKey::Save(const std::string& dataDir) const {
     RestrictKeyFilePerms(path);
     if (!writeOk) {
         std::cerr << "[Attestation] Key file write error" << std::endl;
-        return false;
+        return finish(false);
     }
 #else
     std::ofstream file(path, std::ios::binary | std::ios::trunc);
     if (!file.is_open()) {
         std::cerr << "[Attestation] Failed to open key file for writing: " << path << std::endl;
-        return false;
+        return finish(false);
     }
     file.write(reinterpret_cast<const char*>(out.data()), out.size());
     bool writeOk = file.good();
@@ -356,13 +393,13 @@ bool CSeedAttestationKey::Save(const std::string& dataDir) const {
     RestrictKeyFilePerms(path);  // best-effort no-op on Windows (NTFS ACL governs)
     if (!writeOk) {
         std::cerr << "[Attestation] Key file write error" << std::endl;
-        return false;
+        return finish(false);
     }
 #endif
 
     std::cout << "[Attestation] Saved seed attestation key to: " << path
               << (encrypt ? " (v2 encrypted)" : " (v1 plaintext)") << std::endl;
-    return true;
+    return finish(true);
 }
 
 bool CSeedAttestationKey::LoadOrGenerate(const std::string& dataDir, bool allowGenerate) {
