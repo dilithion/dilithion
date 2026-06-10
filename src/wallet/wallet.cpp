@@ -283,6 +283,39 @@ bool CWallet::HasKey(const CDilithiumAddress& address) const {
     return mapCryptedKeys.find(address) != mapCryptedKeys.end();
 }
 
+// LP-7 (HIGH-2): the ONE authenticated-decrypt gate shared by all five at-rest
+// record types. See the declaration in wallet.h for the full policy contract.
+// Returns true iff the caller may proceed to decrypt `ciphertext`.
+bool CWallet::VerifyRecordMAC(CCrypter& crypter,
+                             const std::vector<uint8_t>& ciphertext,
+                             const std::vector<uint8_t>& mac) const {
+    const bool isV7 = (m_loadedFileVersion >= WALLET_FILE_VERSION_7);
+
+    if (mac.empty()) {
+        // v7: an empty MAC is a corrupt/stripped record — refuse to decrypt the
+        // secret unauthenticated. pre-v7: this is the genuine legacy record that
+        // never carried a MAC — allow the (unauthenticated) legacy decrypt so the
+        // wallet loads and can be migrated to v7.
+        return !isV7;
+    }
+
+    // MAC present — verify it BEFORE the caller decrypts, with the keying that
+    // matches the on-disk version: legacy AES-keyed HMAC for v3-v6, separated
+    // MAC key for v7. (m_loadedFileVersion == 0 means a freshly-created in-memory
+    // wallet whose records this build wrote with the default separated keying.)
+    const bool legacyKeying =
+        (m_loadedFileVersion != 0 && m_loadedFileVersion < WALLET_FILE_VERSION_7);
+    return crypter.VerifyMAC(ciphertext, mac, legacyKeying);
+}
+
+// LP-7 (HIGH-2): the ONE MAC-compute helper for writes / re-MAC. Always v7
+// separated keying — new and migrated records are written ONLY at v7.
+bool CWallet::ComputeRecordMAC(CCrypter& crypter,
+                              const std::vector<uint8_t>& ciphertext,
+                              std::vector<uint8_t>& macOut) const {
+    return crypter.ComputeMAC(ciphertext, macOut /*default = separated v7 keying*/);
+}
+
 // Public GetKey - acquires lock
 bool CWallet::GetKey(const CDilithiumAddress& address, CKey& keyOut) const {
     std::lock_guard<std::mutex> lock(cs_wallet);
@@ -320,23 +353,16 @@ bool CWallet::GetKeyUnlocked(const CDilithiumAddress& address, CKey& keyOut) con
         return false;
     }
 
-    // FIX-008 (CRYPT-007): Verify MAC before decryption (prevents padding oracle)
-    // For legacy keys without MAC, skip verification
-    // LP-7 (HIGH-1 / S-004 / A-007): on a v7 wallet a per-address spending key
-    // MUST carry a non-empty MAC. An empty MAC would make IsLegacy() true and
-    // skip the verify below — re-opening the MAC downgrade on a spending key. The
-    // v7 load path already rejects an empty per-address MAC; this is a
-    // zero-false-positive defense-in-depth gate at the verify boundary. v3-v6
-    // keys keep the legacy unauthenticated path for migration.
-    if (m_loadedFileVersion >= WALLET_FILE_VERSION_7 && encKey.vchMAC.empty()) {
+    // LP-7 (HIGH-2): authenticate-before-decrypt via the ONE centralized gate.
+    // This is the per-address spending-key consumer that round-2 found left on
+    // the default (separated) keying while the other four paths were version-
+    // keyed — making legacy v3-v6 per-address keys (which carry a non-empty
+    // legacy-AES-keyed MAC) fail verification and become unspendable. Routing
+    // through VerifyRecordMAC fixes the keying selection AND the empty-MAC policy
+    // in one place so this can never drift from the other four record types.
+    if (!VerifyRecordMAC(crypter, encKey.vchCryptedKey, encKey.vchMAC)) {
         memory_cleanse(masterKeyVec.data(), masterKeyVec.size());
-        return false;  // v7 spending key with no MAC — refuse to decrypt unauthenticated
-    }
-    if (!encKey.IsLegacy()) {
-        if (!crypter.VerifyMAC(encKey.vchCryptedKey, encKey.vchMAC)) {
-            memory_cleanse(masterKeyVec.data(), masterKeyVec.size());
-            return false;  // MAC verification failed - corrupted or tampered key
-        }
+        return false;  // empty MAC on v7, or MAC verification failed — refuse
     }
 
     std::vector<uint8_t> decryptedPrivKey;
@@ -1156,30 +1182,15 @@ bool CWallet::Unlock(const std::string& passphrase, int64_t timeout) {
         return false;
     }
 
-    // FIX-008 (CRYPT-007): Verify MAC before decryption (prevents padding oracle)
-    // For legacy keys without MAC, skip verification.
-    // LP-7: the master-key MAC keying depends on the on-disk format version —
-    // v3-v6 used the legacy AES-keyed HMAC; v7 uses the separately-derived MAC
-    // key. Select the keying by the loaded version so pre-v7 wallets still unlock
-    // (and can then migrate).
-    // LP-7 (HIGH-1 / S-004 / A-007): on a v7 wallet the master-key MAC is
-    // mandatory. An empty MAC here would make IsLegacy() true and skip the
-    // verify below — re-opening the encrypt-then-MAC downgrade on the root
-    // secret. The v7 load path already rejects an empty master MAC, so this is a
-    // zero-false-positive defense-in-depth gate at the verify boundary.
-    if (m_loadedFileVersion >= WALLET_FILE_VERSION_7 && masterKey.vchMAC.empty()) {
+    // LP-7 (HIGH-2): authenticate-before-decrypt via the ONE centralized gate.
+    // Master-key consumer. The gate handles both the v7-empty-MAC rejection and
+    // the version-keyed verify; on any failure we still record a failed-unlock
+    // attempt (WL-011) since a tampered/empty MAC is indistinguishable from a
+    // wrong passphrase from the user's perspective.
+    if (!VerifyRecordMAC(crypter, masterKey.vchCryptedKey, masterKey.vchMAC)) {
         nUnlockFailedAttempts++;
         nLastFailedUnlock = std::chrono::steady_clock::now();
-        return false;  // v7 master key with no MAC — refuse to decrypt unauthenticated
-    }
-    if (!masterKey.IsLegacy()) {
-        bool legacyKeying = (m_loadedFileVersion != 0 && m_loadedFileVersion < WALLET_FILE_VERSION_7);
-        if (!crypter.VerifyMAC(masterKey.vchCryptedKey, masterKey.vchMAC, legacyKeying)) {
-            // WL-011 FIX: Track failed unlock attempt
-            nUnlockFailedAttempts++;
-            nLastFailedUnlock = std::chrono::steady_clock::now();
-            return false;  // MAC verification failed - wrong passphrase or tampered data
-        }
+        return false;  // empty MAC on v7, or MAC verification failed
     }
 
     std::vector<uint8_t> decryptedKey;
@@ -1238,7 +1249,7 @@ bool CWallet::Unlock(const std::string& passphrase, int64_t timeout) {
         // the new (default) separated keying. Snapshot for rollback symmetry.
         std::vector<uint8_t> snap_masterMAC = masterKey.vchMAC;
         std::vector<uint8_t> newMasterMAC;
-        bool macOk = crypter.ComputeMAC(masterKey.vchCryptedKey, newMasterMAC /*default=separated*/);
+        bool macOk = ComputeRecordMAC(crypter, masterKey.vchCryptedKey, newMasterMAC);
         if (macOk) {
             masterKey.vchMAC = newMasterMAC;
         }
@@ -1835,6 +1846,14 @@ bool CWallet::Load(const std::string& filename) {
                 file.read(reinterpret_cast<char*>(&mnMacLen), sizeof(mnMacLen));
                 if (!file.good()) return false;
                 if (mnMacLen > 64) return false;  // HMAC-SHA3-512 is 64 bytes
+                // LP-7 (HIGH-2 item 3, load-symmetry): on a v7 ENCRYPTED wallet a
+                // present mnemonic ciphertext MUST carry a non-empty MAC (it was
+                // master-key-encrypted-then-MAC'd). An empty MAC here is corrupt —
+                // reject at load to match master/per-address/HD-master. (An
+                // UNencrypted v7 wallet legitimately writes mnMacLen==0 because the
+                // mnemonic is under the obfuscation key, so only enforce when the
+                // master key is valid.)
+                if (mnMacLen == 0 && temp_masterKey.IsValid()) return false;
                 if (mnMacLen > 0) {
                     temp_vchMnemonicMAC.resize(mnMacLen);
                     file.read(reinterpret_cast<char*>(temp_vchMnemonicMAC.data()), mnMacLen);
@@ -2251,6 +2270,17 @@ bool CWallet::Load(const std::string& filename) {
             if (file.good() && version >= WALLET_FILE_VERSION_7) {
                 uint32_t mikMacLen = 0;
                 file.read(reinterpret_cast<char*>(&mikMacLen), sizeof(mikMacLen));
+                if (mikMacLen > 64) return false;  // HMAC-SHA3-512 is 64 bytes
+                // LP-7 (HIGH-2 item 3, load-symmetry): a v7 ENCRYPTED wallet that
+                // carries an encrypted MIK private key MUST carry its MAC — an
+                // empty MAC on that record is corrupt; reject at load to match the
+                // other records. (Unencrypted wallets / no-MIK files write
+                // mikMacLen==0 legitimately, so only enforce when both an encrypted
+                // MIK privkey is present AND the wallet master key is valid.)
+                if (mikMacLen == 0 && temp_masterKey.IsValid() &&
+                    !temp_vchEncryptedMIKPrivKey.empty()) {
+                    return false;
+                }
                 if (file.good() && mikMacLen > 0 && mikMacLen <= 64) {
                     temp_vchMIKPrivKeyMAC.resize(mikMacLen);
                     file.read(reinterpret_cast<char*>(temp_vchMIKPrivKeyMAC.data()), mikMacLen);
@@ -5153,6 +5183,10 @@ bool CWallet::MigrateToEncryptedSeedV7Unlocked() {
     std::vector<uint8_t> snap_vchMIKPrivKeyMAC_all = vchMIKPrivKeyMAC;
     std::vector<uint8_t> snap_vchMIKPrivKeyIV_all(vchMIKPrivKeyIV.begin(), vchMIKPrivKeyIV.end());
     std::vector<uint8_t> snap_vchMIKPubKey = vchMIKPubKey;
+    // LP-7 (HIGH-2): per-address spending keys are re-MAC'd in Step 2c so the
+    // migrated v7 file carries v7-keyed (not legacy-AES-keyed) per-address MACs.
+    // Snapshot the whole map so a later failure restores the legacy MACs.
+    std::map<CDilithiumAddress, CEncryptedKey> snap_mapCryptedKeys = mapCryptedKeys;
 
     auto rollback = [&]() {
         hdMasterKey = snap_hdMasterKey;
@@ -5170,6 +5204,7 @@ bool CWallet::MigrateToEncryptedSeedV7Unlocked() {
         vchMIKPrivKeyMAC = snap_vchMIKPrivKeyMAC_all;
         vchMIKPrivKeyIV.assign(snap_vchMIKPrivKeyIV_all.begin(), snap_vchMIKPrivKeyIV_all.end());
         vchMIKPubKey = snap_vchMIKPubKey;
+        mapCryptedKeys = snap_mapCryptedKeys;
     };
 
     // --- Step 1: recover + re-encrypt the mnemonic under the master key ---
@@ -5267,6 +5302,45 @@ bool CWallet::MigrateToEncryptedSeedV7Unlocked() {
             m_mikIdentity = DFMP::Identity();
             m_mik.reset();
         }
+    }
+
+    // --- Step 2c: re-MAC every per-address spending key under v7 keying ---
+    // LP-7 (HIGH-2): a pre-LP-7 build computed per-address MACs with the legacy
+    // AES-keyed HMAC (or, for a v3-v6 key that predates the MAC, with no MAC at
+    // all). Once this file is marked v7, GetKey verifies per-address MACs with the
+    // SEPARATED keying — so the legacy-keyed / empty MACs would mismatch and the
+    // keys would become unspendable in a file that claims to be v7. Recompute each
+    // MAC with v7 separated keying now (the encrypt-then-MAC tag is over the
+    // ciphertext, which migration does NOT change, so no decrypt is needed — we
+    // re-key the crypter with each key's own IV and recompute). The master key in
+    // vMasterKey is the same key these were encrypted under.
+    {
+        std::vector<uint8_t> mkVec(vMasterKey.data_ptr(),
+                                   vMasterKey.data_ptr() + vMasterKey.size());
+        for (auto& kv : mapCryptedKeys) {
+            CEncryptedKey& ek = kv.second;
+            if (ek.vchCryptedKey.empty() || ek.vchIV.size() != WALLET_CRYPTO_IV_SIZE) {
+                // Malformed entry — cannot re-MAC safely. Abort rather than write a
+                // v7 file with a per-address key that can't be authenticated.
+                memory_cleanse(mkVec.data(), mkVec.size());
+                rollback();
+                return false;
+            }
+            CCrypter keyCrypter;
+            if (!keyCrypter.SetKey(mkVec, ek.vchIV)) {
+                memory_cleanse(mkVec.data(), mkVec.size());
+                rollback();
+                return false;
+            }
+            std::vector<uint8_t> newMAC;
+            if (!ComputeRecordMAC(keyCrypter, ek.vchCryptedKey, newMAC)) {
+                memory_cleanse(mkVec.data(), mkVec.size());
+                rollback();
+                return false;
+            }
+            ek.vchMAC = newMAC;
+        }
+        memory_cleanse(mkVec.data(), mkVec.size());
     }
 
     // --- Step 3: atomic v7 rewrite. SaveUnlocked never truncates the original. ---
@@ -5409,20 +5483,13 @@ bool CWallet::DecryptHDMasterKey(CHDExtendedKey& decrypted) const {
         return false;
     }
 
-    // LP-7 (S-004): verify the MAC BEFORE decrypting (authenticated-before-decrypt).
-    // v7 records carry a non-empty MAC; an empty MAC on a v7 wallet is rejected.
-    // Legacy v3-v6 records never had an HD-master MAC, so we only enforce the MAC
-    // when one is present (it always is for v7), selecting the keying by version.
-    if (!vchHDMasterKeyMAC.empty()) {
-        bool legacyKeying = (m_loadedFileVersion != 0 && m_loadedFileVersion < WALLET_FILE_VERSION_7);
-        if (!crypter.VerifyMAC(vchEncryptedHDMasterKey, vchHDMasterKeyMAC, legacyKeying)) {
-            memory_cleanse(vMasterKeyVec.data(), vMasterKeyVec.size());
-            return false;  // Tampered or wrong key
-        }
-    } else if (m_loadedFileVersion >= WALLET_FILE_VERSION_7) {
-        // A v7 wallet MUST carry a MAC on the HD-master record.
+    // LP-7 (HIGH-2): authenticate-before-decrypt via the ONE centralized gate.
+    // HD-master-seed consumer. Empty MAC on a v7 wallet is rejected; legacy v3-v6
+    // records (no HD-master MAC) take the unauthenticated legacy path; a present
+    // MAC is verified with the version-correct keying.
+    if (!VerifyRecordMAC(crypter, vchEncryptedHDMasterKey, vchHDMasterKeyMAC)) {
         memory_cleanse(vMasterKeyVec.data(), vMasterKeyVec.size());
-        return false;
+        return false;  // empty MAC on v7, or MAC verification failed
     }
 
     std::vector<uint8_t> decrypted_data;
@@ -5562,20 +5629,13 @@ bool CWallet::DecryptMnemonic(std::string& mnemonic) const {
             return false;
         }
 
-        // LP-7 (wallet-Inv-2 / S-004): authenticate BEFORE decrypt.
-        // - v7 wallet: a non-empty, valid MAC is REQUIRED (empty MAC rejected).
-        // - legacy v3-v6 encrypted mnemonic had no MAC: verify only if present,
-        //   selecting the legacy AES-keyed HMAC.
-        if (!vchMnemonicMAC.empty()) {
-            bool legacyKeying = (m_loadedFileVersion != 0 && m_loadedFileVersion < WALLET_FILE_VERSION_7);
-            if (!crypter.VerifyMAC(vchEncryptedMnemonic, vchMnemonicMAC, legacyKeying)) {
-                memory_cleanse(vMasterKeyVec.data(), vMasterKeyVec.size());
-                return false;  // Tampered or wrong key
-            }
-        } else if (m_loadedFileVersion >= WALLET_FILE_VERSION_7) {
-            // v7 wallet with a master-key-encrypted mnemonic MUST carry a MAC.
+        // LP-7 (HIGH-2): authenticate-before-decrypt via the ONE centralized gate.
+        // Mnemonic consumer. Empty MAC on a v7 wallet is rejected; legacy v3-v6
+        // (no mnemonic MAC) takes the unauthenticated legacy path; a present MAC
+        // is verified with the version-correct keying.
+        if (!VerifyRecordMAC(crypter, vchEncryptedMnemonic, vchMnemonicMAC)) {
             memory_cleanse(vMasterKeyVec.data(), vMasterKeyVec.size());
-            return false;
+            return false;  // empty MAC on v7, or MAC verification failed
         }
 
         if (!crypter.Decrypt(vchEncryptedMnemonic, decrypted)) {
@@ -5742,18 +5802,12 @@ bool CWallet::DecryptMIKPrivKey(std::vector<uint8_t, SecureAllocator<uint8_t>>& 
         return false;
     }
 
-    // LP-7 (wallet-Inv-2 / S-004): authenticate BEFORE decrypt.
-    // v7 requires a non-empty valid MAC; legacy v3-v6 MIK records had none, so
-    // verify only when present (legacy keying for pre-v7 files).
-    if (!vchMIKPrivKeyMAC.empty()) {
-        bool legacyKeying = (m_loadedFileVersion != 0 && m_loadedFileVersion < WALLET_FILE_VERSION_7);
-        if (!crypter.VerifyMAC(vchEncryptedMIKPrivKey, vchMIKPrivKeyMAC, legacyKeying)) {
-            std::cerr << "[WALLET] DecryptMIKPrivKey: MAC verification failed" << std::endl;
-            memory_cleanse(vMasterKeyVec.data(), vMasterKeyVec.size());
-            return false;
-        }
-    } else if (m_loadedFileVersion >= WALLET_FILE_VERSION_7) {
-        std::cerr << "[WALLET] DecryptMIKPrivKey: missing MAC on v7 wallet" << std::endl;
+    // LP-7 (HIGH-2): authenticate-before-decrypt via the ONE centralized gate.
+    // MIK-private-key consumer. Empty MAC on a v7 wallet is rejected; legacy v3-v6
+    // (no MIK MAC) takes the unauthenticated legacy path; a present MAC is
+    // verified with the version-correct keying.
+    if (!VerifyRecordMAC(crypter, vchEncryptedMIKPrivKey, vchMIKPrivKeyMAC)) {
+        std::cerr << "[WALLET] DecryptMIKPrivKey: MAC verification failed or missing on v7 wallet" << std::endl;
         memory_cleanse(vMasterKeyVec.data(), vMasterKeyVec.size());
         return false;
     }

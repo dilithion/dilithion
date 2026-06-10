@@ -297,6 +297,37 @@ private:
     // fully-written temp file into place; the original is never truncated).
     bool MigrateToEncryptedSeedV7Unlocked();
 
+    // LP-7 (HIGH-2): CENTRALIZED authenticated-decrypt gate for ALL five at-rest
+    // encrypted record types (master key, per-address spending keys, HD-master
+    // seed, mnemonic, MIK private key). Every decrypt path MUST route its MAC
+    // check through this one helper so the version-keyed selection + empty-MAC
+    // policy cannot be applied to four-of-five and missed on the fifth (the exact
+    // shape of round-1 HIGH-1 and round-2 HIGH-2). Single source of truth for the
+    // policy:
+    //   (a) keying: v3-v6 records were MAC'd with the legacy AES-keyed HMAC; v7
+    //       records use the separately-derived MAC key. Selected by the on-disk
+    //       version (m_loadedFileVersion).
+    //   (b) empty-MAC: on a v7 wallet an empty MAC is CORRUPT — reject (no
+    //       unauthenticated decrypt of a root secret). On a pre-v7 wallet an
+    //       empty MAC is the genuine legacy record — allow the unauthenticated
+    //       decrypt so the wallet loads and can migrate.
+    //   (c) verify-before-decrypt: when a MAC is present it is verified with the
+    //       version-correct keying BEFORE the caller decrypts.
+    // Returns true iff the caller may proceed to decrypt. `crypter` must already
+    // have SetKey() called (same key the ciphertext was encrypted under).
+    // Assumes caller holds cs_wallet.
+    bool VerifyRecordMAC(CCrypter& crypter,
+                         const std::vector<uint8_t>& ciphertext,
+                         const std::vector<uint8_t>& mac) const;
+
+    // LP-7 (HIGH-2): CENTRALIZED MAC computation for WRITES / re-MAC. Always uses
+    // the v7 separated-key HMAC — new and migrated records are written ONLY at v7.
+    // Routing all writes through here keeps write-keying in lockstep with the
+    // read policy above. `crypter` must already have SetKey() called.
+    bool ComputeRecordMAC(CCrypter& crypter,
+                          const std::vector<uint8_t>& ciphertext,
+                          std::vector<uint8_t>& macOut) const;
+
     // UTXO set reference for balance validation in callbacks
     class CUTXOSet* m_utxo_set_ref{nullptr};
 

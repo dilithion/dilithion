@@ -429,6 +429,315 @@ static bool BuildLegacyV6Wallet(const std::string& path,
 }
 
 // ---------------------------------------------------------------------------
+// Legacy v6 builder WITH a per-address spending key carrying a LEGACY-keyed MAC.
+//
+// HIGH-2 regression scaffold. Reproduces the exact pre-LP-7 v6 on-disk shape of
+// a wallet that holds ONE encrypted per-address spending key whose MAC was
+// computed with the LEGACY AES-keyed HMAC (AES key == HMAC key) — the keying
+// every pre-LP-7 build used before key separation was introduced. On the
+// unfixed binary, GetKey verifies this MAC with the SEPARATED keying (the :336
+// default), so it mismatches and the key is unspendable. On the fixed binary the
+// version-keyed gate selects legacy keying for v6 and the key is spendable; and
+// migration re-MACs it under v7 keying so it stays spendable post-migration.
+//
+// Builds on the v6 layout from BuildLegacyV6Wallet but sets numCryptedKeys=1 and
+// emits one per-address key record:
+//   [addr 21][pubKey 1952][cryptedLen u32][ct][iv 16][macLen u32][mac 64]
+// ---------------------------------------------------------------------------
+struct LegacyV6KeyResult {
+    std::vector<uint8_t> seed;
+    std::vector<uint8_t> chaincode;
+    std::string mnemonic;
+    std::vector<uint8_t> defaultAddr;   // 21-byte default (HD) address
+    CDilithiumAddress    perAddr;       // address of the imported per-address key
+    std::vector<uint8_t> perAddrPriv;   // its plaintext private key (for spend assertion)
+};
+
+static bool BuildLegacyV6WalletWithPerAddressKey(const std::string& path,
+                                                 const std::string& passphrase,
+                                                 LegacyV6KeyResult& out) {
+    std::string scratch = path + ".scratch";
+    std::remove(scratch.c_str());
+
+    std::string mnemonic;
+    std::vector<uint8_t> defAddr;
+    {
+        CWallet w;
+        w.SetWalletFile(scratch);
+        if (!w.GenerateHDWallet(mnemonic)) return false;
+        std::vector<CDilithiumAddress> addrs = w.GetAddresses();
+        if (addrs.empty()) return false;
+        defAddr = w.GetAddresses().front().GetData();
+    }
+    std::remove(scratch.c_str());
+
+    std::vector<uint8_t> seed, chaincode;
+    if (!DeriveSeedChaincode(mnemonic, seed, chaincode)) return false;
+
+    CHDExtendedKey master;
+    {
+        uint8_t bip39seed[64];
+        if (!CMnemonic::ToSeed(mnemonic, "", bip39seed)) return false;
+        DeriveMaster(bip39seed, master);
+        memory_cleanse(bip39seed, 64);
+    }
+
+    // Encrypted master key block (legacy AES-keyed MAC so v<7 Unlock passes).
+    std::vector<uint8_t> vMasterKeyPlain(WALLET_CRYPTO_KEY_SIZE);
+    if (!GetStrongRandBytes(vMasterKeyPlain.data(), WALLET_CRYPTO_KEY_SIZE)) return false;
+    std::vector<uint8_t> mkSalt;
+    if (!GenerateSalt(mkSalt)) return false;
+    std::vector<uint8_t> derivedKey;
+    if (!DeriveKey(passphrase, mkSalt, WALLET_CRYPTO_PBKDF2_ROUNDS, derivedKey)) return false;
+    std::vector<uint8_t> mkIV;
+    if (!GenerateIV(mkIV)) return false;
+    CCrypter mkCrypter;
+    if (!mkCrypter.SetKey(derivedKey, mkIV)) return false;
+    std::vector<uint8_t> mkCipher;
+    if (!mkCrypter.Encrypt(vMasterKeyPlain, mkCipher)) return false;
+    std::vector<uint8_t> mkMAC;
+    if (!mkCrypter.ComputeMAC(mkCipher, mkMAC, /*useLegacyKeying=*/true)) return false;
+
+    // Legacy obfuscated mnemonic (key = HKDF(seed,"mnemonic")).
+    std::vector<uint8_t> obfKey(WALLET_CRYPTO_KEY_SIZE);
+    {
+        std::vector<uint8_t> hdSeed(master.seed, master.seed + 32);
+        DeriveEncryptionKey(hdSeed, "mnemonic", obfKey);
+        memory_cleanse(hdSeed.data(), hdSeed.size());
+    }
+    std::vector<uint8_t> mnIV;
+    if (!GenerateIV(mnIV)) return false;
+    CCrypter mnCrypter;
+    if (!mnCrypter.SetKey(obfKey, mnIV)) return false;
+    std::vector<uint8_t> mnemonicBytes(mnemonic.begin(), mnemonic.end());
+    std::vector<uint8_t> mnCipher;
+    if (!mnCrypter.Encrypt(mnemonicBytes, mnCipher)) return false;
+
+    // --- The per-address spending key: real keypair, encrypted under the master
+    //     key with its own IV, MAC'd with LEGACY keying. ---
+    CKey perKey;
+    if (!WalletCrypto::GenerateKeyPair(perKey)) return false;
+    CDilithiumAddress perAddr(perKey.vchPubKey);  // same derivation Load uses
+    std::vector<uint8_t> keyIV;
+    if (!GenerateIV(keyIV)) return false;
+    CCrypter keyCrypter;
+    if (!keyCrypter.SetKey(vMasterKeyPlain, keyIV)) return false;
+    std::vector<uint8_t> keyCipher;
+    if (!keyCrypter.Encrypt(perKey.vchPrivKey, keyCipher)) return false;
+    std::vector<uint8_t> keyMAC;
+    // LEGACY keying — this is the crux: a pre-LP-7 build wrote per-address MACs
+    // keyed with the AES key, NOT the separated MAC key.
+    if (!keyCrypter.ComputeMAC(keyCipher, keyMAC, /*useLegacyKeying=*/true)) return false;
+
+    // --- Assemble the body. ---
+    std::vector<uint8_t> hmacSalt(WALLET_FILE_SALT_SIZE);
+    if (!GetStrongRandBytes(hmacSalt.data(), hmacSalt.size())) return false;
+
+    std::vector<uint8_t> body;
+    PutBytes(body, hmacSalt);
+
+    // master key block
+    PutU32(body, static_cast<uint32_t>(mkCipher.size()));
+    PutBytes(body, mkCipher);
+    PutBytes(body, mkSalt);
+    PutBytes(body, mkIV);
+    PutU32(body, 0u);
+    PutU32(body, WALLET_CRYPTO_PBKDF2_ROUNDS);
+    PutU32(body, static_cast<uint32_t>(mkMAC.size()));
+    PutBytes(body, mkMAC);
+
+    // HD block (v6): mnemonic + PLAINTEXT seed (the bug shape)
+    PutU32(body, static_cast<uint32_t>(mnCipher.size()));
+    PutBytes(body, mnCipher);
+    PutBytes(body, mnIV);
+    PutBytes(body, master.seed, 32);
+    PutBytes(body, master.chaincode, 32);
+    PutU32(body, master.depth);
+    PutU32(body, master.fingerprint);
+    PutU32(body, master.child_index);
+    body.push_back(0);                     // encrypted_flag = 0
+
+    // HD chain state + 0 path mappings
+    PutU32(body, 0u);
+    PutU32(body, 0u);
+    PutU32(body, 0u);
+    PutU32(body, 0u);                      // numPaths = 0
+
+    // keys — ONE encrypted per-address key
+    PutU32(body, 1u);                      // numCryptedKeys = 1
+    PutBytes(body, out_default_or(perAddr.GetData()));     // [addr 21]
+    PutBytes(body, perKey.vchPubKey);                      // [pubKey 1952]
+    PutU32(body, static_cast<uint32_t>(keyCipher.size())); // [cryptedLen]
+    PutBytes(body, keyCipher);                             // [ct]
+    PutBytes(body, keyIV);                                 // [iv 16]
+    PutU32(body, static_cast<uint32_t>(keyMAC.size()));    // [macLen = 64]
+    PutBytes(body, keyMAC);                                // [mac]
+
+    // default address (HD default)
+    body.push_back(1);
+    PutBytes(body, out_default_or(defAddr));
+
+    // transactions — 0
+    PutU32(body, 0u);
+    // best block
+    std::vector<uint8_t> bestHash(32, 0);
+    PutBytes(body, bestHash);
+    int32_t bestHeight = -1;
+    PutBytes(body, reinterpret_cast<const uint8_t*>(&bestHeight), sizeof(bestHeight));
+    // MIK — none
+    body.push_back(0);
+    // sent tx — 0
+    PutU32(body, 0u);
+
+    // file integrity HMAC (key = first 32 bytes of mk salt)
+    std::vector<uint8_t> hmacKey(32, 0);
+    std::memcpy(hmacKey.data(), mkSalt.data(), std::min<size_t>(32, mkSalt.size()));
+    std::vector<uint8_t> fileHMAC(32);
+    HMAC_SHA3_256(hmacKey.data(), hmacKey.size(), body.data(), body.size(), fileHMAC.data());
+
+    std::vector<uint8_t> file;
+    file.insert(file.end(), WALLET_FILE_MAGIC_V6, WALLET_FILE_MAGIC_V6 + 8);
+    PutU32(file, WALLET_FILE_VERSION_6);
+    uint32_t flags = 0x01 | 0x02;
+    PutU32(file, flags);
+    PutBytes(file, fileHMAC);
+    PutBytes(file, body);
+
+    out.seed = seed;
+    out.chaincode = chaincode;
+    out.mnemonic = mnemonic;
+    out.defaultAddr = defAddr;
+    out.perAddr = perAddr;
+    out.perAddrPriv.assign(perKey.vchPrivKey.begin(), perKey.vchPrivKey.end());
+
+    memory_cleanse(vMasterKeyPlain.data(), vMasterKeyPlain.size());
+    memory_cleanse(derivedKey.data(), derivedKey.size());
+    memory_cleanse(obfKey.data(), obfKey.size());
+
+    return WriteFileBytes(path, file);
+}
+
+// ---------------------------------------------------------------------------
+// Legacy v6 NON-HD builder with ONE legacy-MAC'd per-address key.
+//
+// Isolates the RAW v6 GetKey path (manifestation 1 of HIGH-2): a NON-HD
+// encrypted wallet has no plaintext HD seed, so loading it does NOT set the
+// seed-migration flag and Unlock does NOT migrate — m_loadedFileVersion stays 6
+// when GetKey runs. This exercises the version-keyed selection in isolation
+// (legacyKeying==true for v6) without any in-memory migration masking it. On the
+// unfixed binary GetKey verifies the legacy-keyed MAC with separated keying →
+// fails → the key is unspendable on a wallet that never migrates.
+//
+// Non-HD encrypted v6 layout (matches SaveUnlocked for is_hd_wallet=false):
+//   [Magic 8][Version u32][Flags=0x01][HMAC 32][salt 32]
+//   <master key block>
+//   <numCryptedKeys u32 = 1><addr 21><pubKey 1952><cryptedLen u32><ct><iv 16>
+//     <macLen u32 = 64><mac>
+//   <hasDefault u8><addr 21><numTxs u32 = 0><bestHash 32><bestHeight i32>
+//   <hasMIK u8 = 0><numSentTx u32 = 0>
+// ---------------------------------------------------------------------------
+struct LegacyV6NonHDResult {
+    CDilithiumAddress    perAddr;
+    std::vector<uint8_t> perAddrPriv;
+};
+
+static bool BuildLegacyV6NonHDWalletWithKey(const std::string& path,
+                                            const std::string& passphrase,
+                                            LegacyV6NonHDResult& out) {
+    // Encrypted master key block (legacy AES-keyed MAC).
+    std::vector<uint8_t> vMasterKeyPlain(WALLET_CRYPTO_KEY_SIZE);
+    if (!GetStrongRandBytes(vMasterKeyPlain.data(), WALLET_CRYPTO_KEY_SIZE)) return false;
+    std::vector<uint8_t> mkSalt;
+    if (!GenerateSalt(mkSalt)) return false;
+    std::vector<uint8_t> derivedKey;
+    if (!DeriveKey(passphrase, mkSalt, WALLET_CRYPTO_PBKDF2_ROUNDS, derivedKey)) return false;
+    std::vector<uint8_t> mkIV;
+    if (!GenerateIV(mkIV)) return false;
+    CCrypter mkCrypter;
+    if (!mkCrypter.SetKey(derivedKey, mkIV)) return false;
+    std::vector<uint8_t> mkCipher;
+    if (!mkCrypter.Encrypt(vMasterKeyPlain, mkCipher)) return false;
+    std::vector<uint8_t> mkMAC;
+    if (!mkCrypter.ComputeMAC(mkCipher, mkMAC, /*useLegacyKeying=*/true)) return false;
+
+    // Per-address spending key: real keypair, encrypted under the master key,
+    // MAC'd with LEGACY keying.
+    CKey perKey;
+    if (!WalletCrypto::GenerateKeyPair(perKey)) return false;
+    CDilithiumAddress perAddr(perKey.vchPubKey);
+    std::vector<uint8_t> keyIV;
+    if (!GenerateIV(keyIV)) return false;
+    CCrypter keyCrypter;
+    if (!keyCrypter.SetKey(vMasterKeyPlain, keyIV)) return false;
+    std::vector<uint8_t> keyCipher;
+    if (!keyCrypter.Encrypt(perKey.vchPrivKey, keyCipher)) return false;
+    std::vector<uint8_t> keyMAC;
+    if (!keyCrypter.ComputeMAC(keyCipher, keyMAC, /*useLegacyKeying=*/true)) return false;
+
+    std::vector<uint8_t> hmacSalt(WALLET_FILE_SALT_SIZE);
+    if (!GetStrongRandBytes(hmacSalt.data(), hmacSalt.size())) return false;
+
+    std::vector<uint8_t> body;
+    PutBytes(body, hmacSalt);
+
+    // master key block
+    PutU32(body, static_cast<uint32_t>(mkCipher.size()));
+    PutBytes(body, mkCipher);
+    PutBytes(body, mkSalt);
+    PutBytes(body, mkIV);
+    PutU32(body, 0u);
+    PutU32(body, WALLET_CRYPTO_PBKDF2_ROUNDS);
+    PutU32(body, static_cast<uint32_t>(mkMAC.size()));
+    PutBytes(body, mkMAC);
+
+    // keys — ONE encrypted per-address key (no HD block; flags has no 0x02)
+    PutU32(body, 1u);
+    PutBytes(body, out_default_or(perAddr.GetData()));
+    PutBytes(body, perKey.vchPubKey);
+    PutU32(body, static_cast<uint32_t>(keyCipher.size()));
+    PutBytes(body, keyCipher);
+    PutBytes(body, keyIV);
+    PutU32(body, static_cast<uint32_t>(keyMAC.size()));
+    PutBytes(body, keyMAC);
+
+    // default address = the per-address key
+    body.push_back(1);
+    PutBytes(body, out_default_or(perAddr.GetData()));
+    // transactions — 0
+    PutU32(body, 0u);
+    // best block
+    std::vector<uint8_t> bestHash(32, 0);
+    PutBytes(body, bestHash);
+    int32_t bestHeight = -1;
+    PutBytes(body, reinterpret_cast<const uint8_t*>(&bestHeight), sizeof(bestHeight));
+    // MIK — none
+    body.push_back(0);
+    // sent tx — 0
+    PutU32(body, 0u);
+
+    std::vector<uint8_t> hmacKey(32, 0);
+    std::memcpy(hmacKey.data(), mkSalt.data(), std::min<size_t>(32, mkSalt.size()));
+    std::vector<uint8_t> fileHMAC(32);
+    HMAC_SHA3_256(hmacKey.data(), hmacKey.size(), body.data(), body.size(), fileHMAC.data());
+
+    std::vector<uint8_t> file;
+    file.insert(file.end(), WALLET_FILE_MAGIC_V6, WALLET_FILE_MAGIC_V6 + 8);
+    PutU32(file, WALLET_FILE_VERSION_6);
+    uint32_t flags = 0x01;   // encrypted, NOT HD
+    PutU32(file, flags);
+    PutBytes(file, fileHMAC);
+    PutBytes(file, body);
+
+    out.perAddr = perAddr;
+    out.perAddrPriv.assign(perKey.vchPrivKey.begin(), perKey.vchPrivKey.end());
+
+    memory_cleanse(vMasterKeyPlain.data(), vMasterKeyPlain.size());
+    memory_cleanse(derivedKey.data(), derivedKey.size());
+
+    return WriteFileBytes(path, file);
+}
+
+// ---------------------------------------------------------------------------
 // Test 1 — secrecy regression + negative control
 // ---------------------------------------------------------------------------
 static void Test_Secrecy() {
@@ -847,6 +1156,130 @@ static void Test_AtomicRenameCrashWindow() {
     std::remove((path + ".tmp").c_str());
 }
 
+// ---------------------------------------------------------------------------
+// Test 6 — HIGH-2: legacy per-address spending key is SPENDABLE (direct read
+// AND after migration).
+//
+// Builds a genuine legacy v6 encrypted wallet that carries ONE per-address
+// spending key whose MAC was written with the LEGACY AES-keyed HMAC. The round-2
+// finding: the per-address GetKey verify (wallet.cpp:336) used the SEPARATED
+// keying unconditionally while the other four decrypt paths were version-keyed,
+// so this legacy key's MAC mismatches → GetKey fails → funds unspendable, both on
+// direct read and baked into the migrated v7 file (no per-address re-MAC loop).
+//
+// This test MUST FAIL on commit b7534b1c (key unspendable) and PASS after the
+// fold (centralized version-keyed VerifyRecordMAC + per-address re-MAC in
+// migration). The load-bearing assertions are the two "spendable" checks.
+// ---------------------------------------------------------------------------
+static void Test_LegacyPerAddressKey() {
+    std::cout << COLOR_BLUE "\n[Test 6] Legacy per-address spending key spendable (HIGH-2)\n" COLOR_RESET;
+
+    const std::string path = "lp7_legacy_peraddr_wallet.dat";
+    const std::string pass = "Leg@cyKey!Spend#2026";
+    std::remove(path.c_str());
+
+    LegacyV6KeyResult legacy;
+    bool built = BuildLegacyV6WalletWithPerAddressKey(path, pass, legacy);
+    CHECK(built, "Built legacy v6 wallet WITH a legacy-MAC'd per-address key");
+    if (!built) { std::remove(path.c_str()); return; }
+
+    CHECK(FileVersion(path) == WALLET_FILE_VERSION_6, "Legacy file is v6");
+    CHECK(legacy.perAddrPriv.size() == DILITHIUM_SECRETKEY_SIZE,
+          "Captured the per-address plaintext private key");
+
+    // --- (A) DIRECT LEGACY READ: the per-address key must be SPENDABLE without
+    //         any migration. Load with autosave OFF so we exercise the raw v6
+    //         read path (m_loadedFileVersion == 6) before any rewrite. ---
+    {
+        CWallet w;
+        bool loaded = w.Load(path);   // no SetWalletFile → autosave off → no rewrite
+        CHECK(loaded, "Loaded legacy v6 wallet (autosave off, no migration)");
+        CHECK(loaded && w.Unlock(pass), "Unlocked legacy v6 wallet");
+
+        CKey recovered;
+        bool got = loaded && w.GetKey(legacy.perAddr, recovered);
+        CHECK(got, "DIRECT READ: GetKey succeeds on the legacy-MAC'd per-address key");
+        CHECK(got && recovered.vchPrivKey.size() == DILITHIUM_SECRETKEY_SIZE &&
+              std::vector<uint8_t>(recovered.vchPrivKey.begin(), recovered.vchPrivKey.end())
+                  == legacy.perAddrPriv,
+              "DIRECT READ (LOAD-BEARING): decrypted private key matches — key is SPENDABLE");
+        // Confirm still v6 on disk (no rewrite happened).
+        CHECK(FileVersion(path) == WALLET_FILE_VERSION_6,
+              "DIRECT READ: file untouched (still v6, autosave off)");
+    }
+
+    // --- (B) AFTER MIGRATION: load with autosave ON → unlock triggers the atomic
+    //         v7 rewrite (incl. the per-address re-MAC loop). The same key must
+    //         remain spendable, and the re-MAC must persist to disk. ---
+    {
+        CWallet w;
+        w.SetWalletFile(path);  // autosave on
+        CHECK(w.Load(path), "Loaded legacy v6 wallet (autosave on)");
+        CHECK(w.Unlock(pass), "Unlocked → triggers atomic migration to v7");
+        CHECK(FileVersion(path) == WALLET_FILE_VERSION_7, "File migrated to v7");
+
+        CKey recovered;
+        bool got = w.GetKey(legacy.perAddr, recovered);
+        CHECK(got, "POST-MIGRATION (in memory): GetKey still succeeds");
+        CHECK(got && std::vector<uint8_t>(recovered.vchPrivKey.begin(), recovered.vchPrivKey.end())
+                  == legacy.perAddrPriv,
+              "POST-MIGRATION (LOAD-BEARING): key still SPENDABLE in the migrating instance");
+    }
+
+    // --- (C) RELOAD the migrated v7 file fresh: the per-address key must be
+    //         spendable from the on-disk v7 record (proves the re-MAC was
+    //         written, not just held in memory). ---
+    {
+        CWallet w;
+        w.SetWalletFile(path);
+        CHECK(w.Load(path), "Reloaded migrated v7 wallet from disk");
+        CHECK(FileVersion(path) == WALLET_FILE_VERSION_7, "Reloaded file is v7");
+        CHECK(w.Unlock(pass), "Migrated v7 wallet unlocks");
+
+        CKey recovered;
+        bool got = w.GetKey(legacy.perAddr, recovered);
+        CHECK(got, "RELOADED v7: GetKey succeeds on the re-MAC'd per-address key");
+        CHECK(got && std::vector<uint8_t>(recovered.vchPrivKey.begin(), recovered.vchPrivKey.end())
+                  == legacy.perAddrPriv,
+              "RELOADED v7 (LOAD-BEARING): on-disk v7 per-address key is SPENDABLE (re-MAC persisted)");
+    }
+
+    std::remove(path.c_str());
+
+    // --- (D) RAW v6 READ, NO MIGRATION (manifestation 1, isolated). A NON-HD
+    //         encrypted v6 wallet never sets the seed-migration flag, so Unlock
+    //         does NOT migrate and m_loadedFileVersion stays 6 when GetKey runs.
+    //         This drives the per-address VerifyRecordMAC with legacyKeying==true
+    //         in isolation (no in-memory migration to mask it). On the unfixed
+    //         binary the legacy-keyed MAC is verified with separated keying →
+    //         GetKey fails → the key is unspendable on a wallet that never
+    //         migrates. ---
+    {
+        const std::string nhpath = "lp7_legacy_peraddr_nonhd.dat";
+        std::remove(nhpath.c_str());
+        LegacyV6NonHDResult nh;
+        bool nbuilt = BuildLegacyV6NonHDWalletWithKey(nhpath, pass, nh);
+        CHECK(nbuilt, "Built legacy v6 NON-HD wallet with a legacy-MAC'd per-address key");
+        if (nbuilt) {
+            CWallet w;
+            bool loaded = w.Load(nhpath);   // autosave off
+            CHECK(loaded, "Loaded non-HD legacy v6 wallet");
+            CHECK(loaded && w.Unlock(pass), "Unlocked non-HD legacy v6 wallet (NO migration)");
+            // File must still be v6 — proves migration did not run.
+            CHECK(FileVersion(nhpath) == WALLET_FILE_VERSION_6,
+                  "RAW v6: file still v6 after unlock (no migration ran)");
+
+            CKey recovered;
+            bool got = loaded && w.GetKey(nh.perAddr, recovered);
+            CHECK(got, "RAW v6: GetKey succeeds while m_loadedFileVersion==6");
+            CHECK(got && std::vector<uint8_t>(recovered.vchPrivKey.begin(), recovered.vchPrivKey.end())
+                      == nh.perAddrPriv,
+                  "RAW v6 (LOAD-BEARING): legacy-keyed per-address key SPENDABLE on un-migrated v6 wallet");
+        }
+        std::remove(nhpath.c_str());
+    }
+}
+
 int main() {
     std::cout << COLOR_BLUE "==== LP-7 wallet encryption-at-rest tests ====" COLOR_RESET "\n";
 
@@ -855,6 +1288,7 @@ int main() {
     Test_AuthTamper();
     Test_PerRecordMACIsolation();
     Test_AtomicRenameCrashWindow();
+    Test_LegacyPerAddressKey();
 
     std::cout << "\n=============================================\n";
     std::cout << "PASSED: " << g_pass << "   FAILED: " << g_fail << "\n";
