@@ -235,6 +235,14 @@ class CWallet {
     // CID 1675307 FIX: Friend declaration to allow recovery functions to use unlocked methods
     friend class CWalletRecovery;
 
+    // LP-7 (red-team LOW-1 hardening test): grants the encryption-at-rest test
+    // suite access to construct the otherwise-unreachable "scrubbed-seed but
+    // m_loadedFileVersion still v6" window and drive the private SaveUnlocked()
+    // writer directly, to prove the fail-closed guard in the legacy-v6 HD-master
+    // branch refuses to persist a zeroed seed. Test-only; no production code path
+    // can reach this state (Unlock promotes the version atomically under cs_wallet).
+    friend struct LP7FailClosedTester;
+
 private:
     // Key storage
     std::map<CDilithiumAddress, CKey> mapKeys;              // Unencrypted keys (when wallet not encrypted)

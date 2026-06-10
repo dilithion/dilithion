@@ -2874,6 +2874,25 @@ bool CWallet::SaveUnlocked(const std::string& filename) const {
             // at v7. Writing v7 here instead (with fHDMasterKeyEncrypted==false) is
             // exactly round-4 BLOCKER-1: it would mint a v7-labelled plaintext-seed
             // file that permanently disarms migration. (Mirrors the pre-LP-7 writer.)
+            //
+            // FAIL-CLOSED GUARD (red-team LOW-1 hardening): the legacy-v6 layout
+            // carries the seed in the FIXED plaintext slots written just below. If
+            // fHDMasterKeyEncrypted is true at this point, the in-memory seed/chaincode
+            // have already been scrubbed (memory_cleanse) by EncryptHDMasterKey — so
+            // these slots would persist 32+32 ZERO bytes, corrupting the wallet
+            // irrecoverably. By construction this combination is impossible (Unlock
+            // promotes m_loadedFileVersion to v7 atomically under cs_wallet the instant
+            // it scrubs, so writeLegacyV6 is never true while encrypted), but we refuse
+            // here as belt-and-suspenders so the corruption is structurally impossible
+            // even if a future refactor introduces a scrub-without-promote caller. This
+            // mirrors the refuse-on-empty-ciphertext guard in the encrypted branch below.
+            if (fHDMasterKeyEncrypted) {
+                std::cerr << "[Wallet] CRITICAL: refusing legacy-v6 save of an encrypted "
+                             "HD wallet — the plaintext seed slots have been scrubbed and "
+                             "writing them would corrupt the wallet (version promotion to "
+                             "v7 must precede any save of an encrypted seed)" << std::endl;
+                return false;
+            }
             file.write(reinterpret_cast<const char*>(hdMasterKey.seed), 32);
             if (!file.good()) return false;
             file.write(reinterpret_cast<const char*>(hdMasterKey.chaincode), 32);

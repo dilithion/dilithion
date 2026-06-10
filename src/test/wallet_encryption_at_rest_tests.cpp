@@ -1042,6 +1042,107 @@ static void Test_Migration() {
 }
 
 // ---------------------------------------------------------------------------
+// Test 2b — fail-closed guard on the scrubbed-seed / legacy-v6 corruption window
+// (red-team LOW-1 hardening). A `friend struct` (declared in wallet.h) so the
+// test can construct the otherwise-unreachable window state and drive the
+// PRIVATE SaveUnlocked() writer directly.
+//
+// THE WINDOW: after a migration scrubs+encrypts the in-memory seed
+// (fHDMasterKeyEncrypted=true, memory_cleanse'd seed/chaincode slots) but BEFORE
+// m_loadedFileVersion is promoted to v7, the legacy-v6 writer path
+// (writeLegacyV6 == true) would write the now-ZEROED fixed seed/chaincode slots
+// → a structurally corrupt, unrecoverable wallet. In production Unlock promotes
+// the version atomically under cs_wallet the instant it scrubs, so this state is
+// never observable to any saver — but we harden the writer to fail-closed so the
+// corruption is structurally impossible even under a future refactor.
+// ---------------------------------------------------------------------------
+struct LP7FailClosedTester {
+    // Force the in-memory wallet into the window: encrypted-flag set + seed slots
+    // scrubbed (exactly what EncryptHDMasterKey leaves behind) while
+    // m_loadedFileVersion stays at v6. Returns true if the wallet looked like a
+    // loaded legacy-v6 HD wallet to begin with (precondition for the window).
+    static bool EnterScrubbedV6Window(CWallet& w) {
+        if (!w.fIsHDWallet) return false;
+        if (w.m_loadedFileVersion != WALLET_FILE_VERSION_6) return false;
+        // Model EncryptHDMasterKey's post-state: ciphertext present, slots scrubbed.
+        w.vchEncryptedHDMasterKey.assign(48, 0xAB);          // non-empty ciphertext
+        w.vchHDMasterKeyMAC.assign(32, 0xCD);                // non-empty MAC
+        w.vchHDMasterKeyIV.assign(WALLET_CRYPTO_IV_SIZE, 0xEF);
+        memory_cleanse(w.hdMasterKey.seed, 32);              // seed now ZEROED
+        memory_cleanse(w.hdMasterKey.chaincode, 32);         // chaincode now ZEROED
+        w.fHDMasterKeyEncrypted = true;
+        // m_loadedFileVersion deliberately LEFT at v6 → writeLegacyV6 == true.
+        return true;
+    }
+
+    // Drive the private writer the public Save() path reaches (Save() just locks
+    // cs_wallet then calls SaveUnlocked). Calling SaveUnlocked directly here is
+    // equivalent for this single-threaded test and avoids re-locking.
+    static bool ForceSave(CWallet& w, const std::string& path) {
+        return w.SaveUnlocked(path);
+    }
+
+    static uint32_t LoadedVersion(const CWallet& w) { return w.m_loadedFileVersion; }
+    static bool IsHDEncrypted(const CWallet& w) { return w.fHDMasterKeyEncrypted; }
+};
+
+static void Test_FailClosedScrubbedV6Window() {
+    std::cout << COLOR_BLUE "\n[Test 2b] Fail-closed guard: scrubbed-seed / legacy-v6 window (LOW-1)\n" COLOR_RESET;
+
+    const std::string path = "lp7_failclosed_wallet.dat";
+    const std::string savePath = "lp7_failclosed_save.dat";
+    const std::string pass = "FailClosed!Me#2026";
+    std::remove(path.c_str());
+    std::remove(savePath.c_str());
+
+    LegacyV6Result legacy;
+    bool built = BuildLegacyV6Wallet(path, pass, legacy);
+    CHECK(built, "Built legacy v6 plaintext-seed encrypted wallet");
+    if (!built) { std::remove(path.c_str()); return; }
+
+    // Load autosave-OFF so m_loadedFileVersion stays at v6 (no SetWalletFile()).
+    CWallet w;
+    CHECK(w.Load(path), "Loaded legacy v6 wallet (autosave off)");
+    CHECK(LP7FailClosedTester::LoadedVersion(w) == WALLET_FILE_VERSION_6,
+          "Loaded version is v6 (writeLegacyV6 would be true on save)");
+    CHECK(!LP7FailClosedTester::IsHDEncrypted(w),
+          "Post-load: HD master not yet flagged encrypted (plaintext-seed legacy)");
+
+    // Construct the corruption window: scrub the seed + set the encrypted flag,
+    // leaving the version at v6 (exactly the transient migration state).
+    CHECK(LP7FailClosedTester::EnterScrubbedV6Window(w),
+          "Entered scrubbed-seed / v6 window (fHDMasterKeyEncrypted=true, seed zeroed)");
+    CHECK(LP7FailClosedTester::IsHDEncrypted(w) &&
+          LP7FailClosedTester::LoadedVersion(w) == WALLET_FILE_VERSION_6,
+          "Window invariant holds: encrypted-in-memory AND m_loadedFileVersion still v6");
+
+    // Force a save to a SEPARATE path. With the fail-closed guard this must FAIL
+    // and write nothing. Without the guard, the legacy-v6 writer emits a v6 file
+    // whose fixed seed/chaincode slots are 64 zero bytes → corrupt wallet.
+    std::remove(savePath.c_str());
+    bool saved = LP7FailClosedTester::ForceSave(w, savePath);
+    CHECK(!saved, "FAIL-CLOSED: SaveUnlocked REFUSED to persist the scrubbed-seed v6 wallet");
+
+    // The atomic writer renames only on success; on a refusal the destination must
+    // not exist at all (no corrupt artifact, no zeroed-seed file left behind).
+    std::vector<uint8_t> savedBytes = ReadFileBytes(savePath);
+    CHECK(savedBytes.empty(),
+          "FAIL-CLOSED: no wallet file was written at the destination (no corrupt artifact)");
+
+    // Defensive cross-check: even if a future regression let a byte slip through,
+    // a v6 file with the seed scrubbed would carry 64 consecutive zero bytes in the
+    // HD-master slots. Assert no such all-zero seed block was persisted.
+    if (!savedBytes.empty()) {
+        std::vector<uint8_t> zero64(64, 0);
+        CHECK(!Contains(savedBytes, zero64.data(), zero64.size()),
+              "FAIL-CLOSED: no zeroed 64-byte seed/chaincode block persisted to disk");
+    }
+
+    std::remove(path.c_str());
+    std::remove(savePath.c_str());
+}
+
+// ---------------------------------------------------------------------------
 // Test 3 — auth-tamper rejection
 // ---------------------------------------------------------------------------
 static void Test_AuthTamper() {
@@ -1722,6 +1823,7 @@ int main() {
 
     Test_Secrecy();
     Test_Migration();
+    Test_FailClosedScrubbedV6Window();
     Test_AuthTamper();
     Test_PerRecordMACIsolation();
     Test_AtomicRenameCrashWindow();
