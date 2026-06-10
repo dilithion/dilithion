@@ -286,6 +286,58 @@ bool CWallet::HasKey(const CDilithiumAddress& address) const {
 // LP-7 (HIGH-2): the ONE authenticated-decrypt gate shared by all five at-rest
 // record types. See the declaration in wallet.h for the full policy contract.
 // Returns true iff the caller may proceed to decrypt `ciphertext`.
+//
+// =====================================================================================
+// LP-7 (round 3, MEDIUM-1): EXHAUSTIVE AT-REST RECORD MAC-CONSUMER ENUMERATION
+// -------------------------------------------------------------------------------------
+// Every per-record at-rest MAC verify/compute in the wallet MUST route through
+// VerifyRecordMAC (reads) or ComputeRecordMAC (writes) so the keying selection is
+// version-correct in exactly ONE place. The complete census (grep the wallet for
+// `\.VerifyMAC(` / `\.ComputeMAC(`):
+//
+//   VERIFY (read-before-decrypt) — all 6 route through VerifyRecordMAC:
+//     1. per-address spending key   wallet.cpp  GetKeyUnlocked        -> VerifyRecordMAC
+//     2. master key                 wallet.cpp  Unlock                -> VerifyRecordMAC
+//     3. HD-master seed             wallet.cpp  DecryptHDMasterKey    -> VerifyRecordMAC
+//     4. mnemonic                   wallet.cpp  DecryptMnemonic       -> VerifyRecordMAC
+//     5. MIK private key            wallet.cpp  DecryptMIKPrivKey     -> VerifyRecordMAC
+//     6. master key (passphrase rotation)  wallet.cpp  ChangePassphrase
+//                                                                     -> VerifyRecordMAC
+//        (this was the MEDIUM-1 bypass: it open-coded crypter.VerifyMAC with default
+//         v7 keying and bricked passphrase change on loaded legacy v3-v6 wallets;
+//         now routed.)
+//
+//   COMPUTE (write / re-MAC) — all route through ComputeRecordMAC:
+//     a. master key (EncryptWallet)          -> ComputeRecordMAC
+//     b. per-address key (EncryptWallet)     -> ComputeRecordMAC
+//     c. master key re-MAC (Unlock migration)-> ComputeRecordMAC
+//     d. per-address re-MAC (migration Step 2c) -> ComputeRecordMAC
+//     e. master key (ChangePassphrase write) -> ComputeRecordMAC
+//     f. HD-master seed (EncryptHDMasterKey) -> ComputeRecordMAC
+//     g. mnemonic (EncryptMnemonic, encrypted branch) -> ComputeRecordMAC
+//     h. MIK private key (EncryptMIKPrivKey) -> ComputeRecordMAC
+//     i. ChangePassphrase legacy->v7 record re-MAC (per-address, HD-master,
+//        mnemonic, MIK) -> ReMACAllRecordsToV7Unlocked -> ComputeRecordMAC
+//        (MEDIUM-1 fix: ChangePassphrase re-saves at v7, so every NON-master record
+//         on a loaded legacy wallet must be re-MAC'd to separated keying too — not
+//         just the master key — or it fails VerifyRecordMAC on the next load.)
+//
+//   The ONLY direct crypter.VerifyMAC / crypter.ComputeMAC calls remaining are the two
+//   inside VerifyRecordMAC / ComputeRecordMAC themselves (the implementations).
+//
+//   LEGITIMATELY NOT routed (different mechanism, by design):
+//     - The whole-file integrity HMAC (wallet.cpp Load/SaveUnlocked, HMAC_SHA3_256 over
+//       [salt||data], keyed off the master-key salt). This is a file-level integrity
+//       seal, NOT a per-record authenticated-decrypt MAC — it has no version-keyed
+//       legacy/separated split and must not flow through the per-record helper.
+//     - Obfuscation-keyed crypter.Decrypt paths on UNencrypted wallets (mnemonic/MIK
+//       else-branches): by-design-unauthenticated obfuscation, no MAC is written or
+//       checked (the write side clears the MAC), so there is nothing to route.
+//
+//   INVARIANT: there are ZERO at-rest record MAC verify/compute sites that bypass the
+//   central helper. If you add a new at-rest encrypted record, its MAC verify/compute
+//   MUST go through VerifyRecordMAC/ComputeRecordMAC — extend this census.
+// =====================================================================================
 bool CWallet::VerifyRecordMAC(CCrypter& crypter,
                              const std::vector<uint8_t>& ciphertext,
                              const std::vector<uint8_t>& mac) const {
@@ -314,6 +366,60 @@ bool CWallet::ComputeRecordMAC(CCrypter& crypter,
                               const std::vector<uint8_t>& ciphertext,
                               std::vector<uint8_t>& macOut) const {
     return crypter.ComputeMAC(ciphertext, macOut /*default = separated v7 keying*/);
+}
+
+// LP-7 (round 3, MEDIUM-1): re-MAC every present at-rest record with v7 separated
+// keying. See the declaration in wallet.h for the full rationale. Caller holds
+// cs_wallet. On false, the caller MUST treat in-memory state as inconsistent and
+// roll back (do not save). A pure re-MAC: the ciphertext is unchanged, so no decrypt
+// of the secret is performed.
+bool CWallet::ReMACAllRecordsToV7Unlocked(const std::vector<uint8_t>& vMasterKeyPlain) {
+    // Re-MAC each per-address spending key (same logic as migration Step 2c).
+    for (auto& kv : mapCryptedKeys) {
+        CEncryptedKey& ek = kv.second;
+        if (ek.vchCryptedKey.empty() || ek.vchIV.size() != WALLET_CRYPTO_IV_SIZE) {
+            return false;  // malformed — cannot authenticate; abort rather than mis-MAC
+        }
+        CCrypter c;
+        if (!c.SetKey(vMasterKeyPlain, ek.vchIV)) return false;
+        std::vector<uint8_t> newMAC;
+        if (!ComputeRecordMAC(c, ek.vchCryptedKey, newMAC)) return false;
+        ek.vchMAC = newMAC;
+    }
+
+    // Re-MAC the encrypted HD-master seed, if present.
+    if (fHDMasterKeyEncrypted && !vchEncryptedHDMasterKey.empty()) {
+        if (vchHDMasterKeyIV.size() != WALLET_CRYPTO_IV_SIZE) return false;
+        CCrypter c;
+        if (!c.SetKey(vMasterKeyPlain, vchHDMasterKeyIV)) return false;
+        std::vector<uint8_t> newMAC;
+        if (!ComputeRecordMAC(c, vchEncryptedHDMasterKey, newMAC)) return false;
+        vchHDMasterKeyMAC = newMAC;
+    }
+
+    // Re-MAC the encrypted mnemonic, if present (encrypted-wallet branch only —
+    // an obfuscation-keyed unencrypted mnemonic carries no MAC and never reaches here
+    // because masterKey.IsValid() gates ChangePassphrase).
+    if (!vchEncryptedMnemonic.empty() && !vchMnemonicMAC.empty()) {
+        if (vchMnemonicIV.size() != WALLET_CRYPTO_IV_SIZE) return false;
+        CCrypter c;
+        if (!c.SetKey(vMasterKeyPlain, vchMnemonicIV)) return false;
+        std::vector<uint8_t> newMAC;
+        if (!ComputeRecordMAC(c, vchEncryptedMnemonic, newMAC)) return false;
+        vchMnemonicMAC = newMAC;
+    }
+
+    // Re-MAC the encrypted MIK private key, if present.
+    if (!vchEncryptedMIKPrivKey.empty() && !vchMIKPrivKeyMAC.empty()) {
+        if (vchMIKPrivKeyIV.size() != WALLET_CRYPTO_IV_SIZE) return false;
+        CCrypter c;
+        if (!c.SetKey(vMasterKeyPlain, vchMIKPrivKeyIV)) return false;
+        std::vector<uint8_t> newMAC;
+        if (!ComputeRecordMAC(c, vchEncryptedMIKPrivKey, newMAC)) return false;
+        vchMIKPrivKeyMAC = newMAC;
+    }
+
+    return true;
 }
 
 // Public GetKey - acquires lock
@@ -1344,8 +1450,9 @@ bool CWallet::EncryptWallet(const std::string& passphrase) {
         return false;
     }
 
-    // FIX-008 (CRYPT-007): Compute MAC for authenticated encryption
-    if (!masterCrypter.ComputeMAC(masterKey.vchCryptedKey, masterKey.vchMAC)) {
+    // FIX-008 (CRYPT-007): Compute MAC for authenticated encryption (master key).
+    // LP-7 (round 3): route through ComputeRecordMAC — at-rest record, always v7.
+    if (!ComputeRecordMAC(masterCrypter, masterKey.vchCryptedKey, masterKey.vchMAC)) {
         memory_cleanse(vMasterKeyPlain.data(), vMasterKeyPlain.size());
         memory_cleanse(derivedKey.data(), derivedKey.size());
         return false;
@@ -1383,8 +1490,9 @@ bool CWallet::EncryptWallet(const std::string& passphrase) {
             return false;
         }
 
-        // FIX-008 (CRYPT-007): Compute MAC for authenticated encryption
-        if (!keyCrypter.ComputeMAC(encKey.vchCryptedKey, encKey.vchMAC)) {
+        // FIX-008 (CRYPT-007): Compute MAC for authenticated encryption (per-address key).
+        // LP-7 (round 3): route through ComputeRecordMAC — at-rest record, always v7.
+        if (!ComputeRecordMAC(keyCrypter, encKey.vchCryptedKey, encKey.vchMAC)) {
             memory_cleanse(vMasterKeyPlain.data(), vMasterKeyPlain.size());
             memory_cleanse(derivedKey.data(), derivedKey.size());
             return false;
@@ -1533,13 +1641,19 @@ bool CWallet::ChangePassphrase(const std::string& passphraseOld,
         return false;
     }
 
-    // FIX-008 (CRYPT-007): Verify MAC before decryption (prevents padding oracle)
-    // For legacy keys without MAC, skip verification
-    if (!masterKey.IsLegacy()) {
-        if (!crypterOld.VerifyMAC(masterKey.vchCryptedKey, masterKey.vchMAC)) {
-            memory_cleanse(derivedKeyOld.data(), derivedKeyOld.size());
-            return false;  // MAC verification failed - wrong passphrase or tampered data
-        }
+    // FIX-008 (CRYPT-007): Verify MAC before decryption (prevents padding oracle).
+    // LP-7 (MEDIUM-1, round 3): route through the central VerifyRecordMAC gate so the
+    // keying selection matches the LOADED file version, exactly like the five read
+    // paths. The previous open-coded `crypterOld.VerifyMAC(...)` used the default
+    // separated (v7) keying unconditionally; on a loaded legacy v3-v6 wallet whose
+    // master MAC is legacy-AES-keyed (and non-empty, so IsLegacy()==false), that
+    // mismatched the on-disk MAC and made ChangePassphrase reject the CORRECT
+    // passphrase — permanently bricking passphrase rotation for non-HD legacy
+    // wallets (which never migrate). VerifyRecordMAC also subsumes the empty-MAC
+    // pre-v7 case, so the IsLegacy() special-case is no longer needed.
+    if (!VerifyRecordMAC(crypterOld, masterKey.vchCryptedKey, masterKey.vchMAC)) {
+        memory_cleanse(derivedKeyOld.data(), derivedKeyOld.size());
+        return false;  // MAC verification failed - wrong passphrase or tampered data
     }
 
     std::vector<uint8_t> vMasterKeyPlain;
@@ -1590,9 +1704,13 @@ bool CWallet::ChangePassphrase(const std::string& passphraseOld,
         return false;
     }
 
-    // FIX-008 (CRYPT-007): Compute MAC for authenticated encryption
+    // FIX-008 (CRYPT-007): Compute MAC for authenticated encryption.
+    // LP-7 (round 3): route through ComputeRecordMAC so every at-rest record MAC
+    // *compute* also flows through the central helper. The rewrite is always v7, so
+    // this is semantically identical to the prior open-coded call (separated keying)
+    // — but it keeps the "zero bypass" invariant true for compute as well as verify.
     std::vector<uint8_t> newMAC;
-    if (!crypterNew.ComputeMAC(newCryptedKey, newMAC)) {
+    if (!ComputeRecordMAC(crypterNew, newCryptedKey, newMAC)) {
         memory_cleanse(derivedKeyOld.data(), derivedKeyOld.size());
         memory_cleanse(derivedKeyNew.data(), derivedKeyNew.size());
         memory_cleanse(vMasterKeyPlain.data(), vMasterKeyPlain.size());
@@ -1611,6 +1729,53 @@ bool CWallet::ChangePassphrase(const std::string& passphraseOld,
     masterKey.vchMAC = newMAC;  // FIX-008: Store MAC
     masterKey.vchIV = newIV;
 
+    // LP-7 (round 3, MEDIUM-1): a successful ChangePassphrase ALWAYS re-saves the
+    // file at v7 (SaveUnlocked writes DILWLT07). When the loaded file was a legacy
+    // v3-v6 wallet, its NON-master records (per-address keys, HD-master, mnemonic,
+    // MIK) still carry legacy-AES-keyed MACs in memory. If we re-saved as v7 without
+    // re-MACing them, they would fail VerifyRecordMAC (separated keying) on the next
+    // load — re-opening exactly the HIGH-2 / MEDIUM-1 keying-mismatch class (the
+    // master key alone was re-MAC'd above; the rest were missed). The Unlock path
+    // handles this via MigrateToEncryptedSeedV7Unlocked, but ChangePassphrase is
+    // reachable WITHOUT a prior unlock (the RPC calls it directly), and a non-HD
+    // legacy wallet never arms that migration. Re-MAC all records here, then advance
+    // m_loadedFileVersion so subsequent verifies in this instance also use v7 keying.
+    const uint32_t prevLoadedVersion = m_loadedFileVersion;
+    bool didReMAC = false;
+    // Snapshot non-master record MACs for rollback symmetry.
+    std::vector<std::pair<CDilithiumAddress, std::vector<uint8_t>>> snapPerAddrMAC;
+    std::vector<uint8_t> snapHDMAC = vchHDMasterKeyMAC;
+    std::vector<uint8_t> snapMnemonicMAC = vchMnemonicMAC;
+    std::vector<uint8_t> snapMIKMAC = vchMIKPrivKeyMAC;
+    if (m_loadedFileVersion != 0 && m_loadedFileVersion < WALLET_FILE_VERSION_7) {
+        for (const auto& kv : mapCryptedKeys) {
+            snapPerAddrMAC.emplace_back(kv.first, kv.second.vchMAC);
+        }
+        if (!ReMACAllRecordsToV7Unlocked(vMasterKeyPlain)) {
+            // Restore master key + any partially-rewritten record MACs; leave the
+            // on-disk legacy file untouched.
+            masterKey.vchCryptedKey = oldCryptedKey;
+            masterKey.vchSalt = oldSalt;
+            masterKey.vchMAC = oldMAC;
+            masterKey.vchIV = oldIV;
+            for (auto& s : snapPerAddrMAC) {
+                auto it = mapCryptedKeys.find(s.first);
+                if (it != mapCryptedKeys.end()) it->second.vchMAC = s.second;
+            }
+            vchHDMasterKeyMAC = snapHDMAC;
+            vchMnemonicMAC = snapMnemonicMAC;
+            vchMIKPrivKeyMAC = snapMIKMAC;
+            memory_cleanse(derivedKeyOld.data(), derivedKeyOld.size());
+            memory_cleanse(derivedKeyNew.data(), derivedKeyNew.size());
+            memory_cleanse(vMasterKeyPlain.data(), vMasterKeyPlain.size());
+            std::cerr << "[Wallet] LP-7: ChangePassphrase aborted — could not re-MAC a "
+                         "legacy record to v7; passphrase unchanged, file untouched" << std::endl;
+            return false;
+        }
+        m_loadedFileVersion = WALLET_FILE_VERSION_7;
+        didReMAC = true;
+    }
+
     // Wipe sensitive data
     memory_cleanse(derivedKeyOld.data(), derivedKeyOld.size());
     memory_cleanse(derivedKeyNew.data(), derivedKeyNew.size());
@@ -1625,11 +1790,23 @@ bool CWallet::ChangePassphrase(const std::string& passphraseOld,
             std::this_thread::sleep_for(std::chrono::milliseconds(500));
             if (!SaveUnlocked()) {
                 std::cerr << "[Wallet] CRITICAL: Retry failed. Reverting passphrase change." << std::endl;
-                // Revert so in-memory state matches what's on disk
+                // Revert so in-memory state matches what's on disk (legacy file).
                 masterKey.vchCryptedKey = oldCryptedKey;
                 masterKey.vchSalt = oldSalt;
                 masterKey.vchMAC = oldMAC;
                 masterKey.vchIV = oldIV;
+                if (didReMAC) {
+                    // Restore the legacy-keyed record MACs and the loaded version so
+                    // in-memory state matches the untouched on-disk legacy file.
+                    for (auto& s : snapPerAddrMAC) {
+                        auto it = mapCryptedKeys.find(s.first);
+                        if (it != mapCryptedKeys.end()) it->second.vchMAC = s.second;
+                    }
+                    vchHDMasterKeyMAC = snapHDMAC;
+                    vchMnemonicMAC = snapMnemonicMAC;
+                    vchMIKPrivKeyMAC = snapMIKMAC;
+                    m_loadedFileVersion = prevLoadedVersion;
+                }
                 memory_cleanse(vMasterKeyPlain.data(), vMasterKeyPlain.size());
                 return false;
             }
@@ -5410,8 +5587,9 @@ bool CWallet::EncryptHDMasterKey() {
 
     // LP-7 (wallet-Inv-2): authenticate the ciphertext (encrypt-then-MAC) with a
     // separately-derived MAC key (key separation, default keying).
+    // LP-7 (round 3): route through ComputeRecordMAC — at-rest HD-master record, always v7.
     std::vector<uint8_t> mac;
-    if (!crypter.ComputeMAC(encrypted, mac)) {
+    if (!ComputeRecordMAC(crypter, encrypted, mac)) {
         memory_cleanse(vMasterKeyVec.data(), vMasterKeyVec.size());
         memory_cleanse(masterKeyData.data(), masterKeyData.size());
         memory_cleanse(encrypted.data(), encrypted.size());
@@ -5547,7 +5725,8 @@ bool CWallet::EncryptMnemonic(const std::string& mnemonic) {
         }
 
         // LP-7 (wallet-Inv-2): authenticate the mnemonic ciphertext (encrypt-then-MAC)
-        if (!crypter.ComputeMAC(vchEncryptedMnemonic, vchMnemonicMAC)) {
+        // LP-7 (round 3): route through ComputeRecordMAC — at-rest mnemonic record, always v7.
+        if (!ComputeRecordMAC(crypter, vchEncryptedMnemonic, vchMnemonicMAC)) {
             memory_cleanse(vMasterKeyVec.data(), vMasterKeyVec.size());
             memory_cleanse(mnemonicBytes.data(), mnemonicBytes.size());
             return false;
@@ -5763,7 +5942,8 @@ bool CWallet::EncryptMIKPrivKey() {
     }
 
     // LP-7 (wallet-Inv-2): authenticate the MIK ciphertext (encrypt-then-MAC)
-    if (!crypter.ComputeMAC(vchEncryptedMIKPrivKey, vchMIKPrivKeyMAC)) {
+    // LP-7 (round 3): route through ComputeRecordMAC — at-rest MIK record, always v7.
+    if (!ComputeRecordMAC(crypter, vchEncryptedMIKPrivKey, vchMIKPrivKeyMAC)) {
         memory_cleanse(vMasterKeyVec.data(), vMasterKeyVec.size());
         memory_cleanse(plaintext.data(), plaintext.size());
         return false;

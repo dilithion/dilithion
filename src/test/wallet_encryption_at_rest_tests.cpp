@@ -1280,6 +1280,104 @@ static void Test_LegacyPerAddressKey() {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Test 7 — MEDIUM-1 (round 3): ChangePassphrase on a LOADED legacy v3-v6 (non-HD)
+// encrypted wallet must SUCCEED with the correct old passphrase.
+//
+// A non-HD legacy v6 wallet never sets the seed-migration flag, so its master MAC
+// stays legacy-AES-keyed and m_loadedFileVersion stays 6. Before the fix,
+// ChangePassphrase open-coded crypter.VerifyMAC with the default (separated, v7)
+// keying → the legacy-keyed master MAC mismatched → ChangePassphrase returned false
+// for the CORRECT passphrase, permanently bricking passphrase rotation for this
+// population. After routing the verify through VerifyRecordMAC, the keying matches
+// the loaded file version and the change succeeds; the rewrite is always v7 with
+// correct (separated-keyed) MACs, so the wallet re-loads and remains spendable under
+// the NEW passphrase.
+// ---------------------------------------------------------------------------
+static void Test_ChangePassphraseLegacyNonHD() {
+    std::cout << COLOR_BLUE "\n[Test 7] ChangePassphrase on loaded legacy v6 non-HD wallet (MEDIUM-1)\n" COLOR_RESET;
+
+    const std::string path = "lp7_legacy_changepass_nonhd.dat";
+    const std::string oldPass = "Leg@cyOldP@ss!2026#";
+    const std::string newPass = "N3w$tr0ngP@ss!2026#";
+    std::remove(path.c_str());
+
+    LegacyV6NonHDResult nh;
+    bool built = BuildLegacyV6NonHDWalletWithKey(path, oldPass, nh);
+    CHECK(built, "Built legacy v6 NON-HD wallet (legacy-keyed master MAC, never migrates)");
+    if (!built) { std::remove(path.c_str()); return; }
+    CHECK(FileVersion(path) == WALLET_FILE_VERSION_6, "Legacy file is v6 before change");
+
+    // Change passphrase on the freshly-loaded legacy wallet. walletpassphrasechange
+    // does NOT require a prior unlock, so call ChangePassphrase directly on a loaded
+    // (but not unlocked) wallet — exactly the RPC's reachable path. Autosave ON so the
+    // successful change persists the v7 rewrite to disk.
+    {
+        CWallet w;
+        w.SetWalletFile(path);  // autosave on → the change rewrites the file
+        CHECK(w.Load(path), "Loaded legacy v6 non-HD wallet");
+        CHECK(FileVersion(path) == WALLET_FILE_VERSION_6,
+              "Still v6 immediately after load (no migration on non-HD load)");
+
+        bool changed = w.ChangePassphrase(oldPass, newPass);
+        CHECK(changed,
+              "LOAD-BEARING (MEDIUM-1): ChangePassphrase SUCCEEDS with the CORRECT old "
+              "passphrase on a legacy v6 wallet (was permanently false before the fix)");
+
+        // Negative control: a WRONG old passphrase must still be rejected (the verify
+        // must reject, not blindly accept) — guards against a fix that over-permits.
+        // Reload fresh so the wallet is back to a known (now-v7, newPass) state first.
+    }
+
+    // The successful change must have re-saved the wallet at v7 with correct MACs.
+    CHECK(FileVersion(path) == WALLET_FILE_VERSION_7,
+          "LOAD-BEARING: wallet re-saved at v7 after passphrase change");
+
+    // Reload the re-saved v7 wallet and confirm it unlocks with the NEW passphrase and
+    // the per-address key is still spendable → proves the v7 rewrite carries correct
+    // (separated-keyed) record MACs end-to-end.
+    {
+        CWallet w;
+        w.SetWalletFile(path);
+        CHECK(w.Load(path), "Reloaded the re-saved v7 wallet");
+        CHECK(FileVersion(path) == WALLET_FILE_VERSION_7, "Reloaded file is v7");
+        // NOTE: do NOT probe Unlock(oldPass) here — a failed unlock arms the wallet's
+        // unlock rate-limiter and would throttle the NEW-passphrase unlock below. The
+        // old-passphrase-no-longer-works property is implied by the successful v7
+        // re-save under the new passphrase; wrong-passphrase rejection is covered by
+        // the dedicated negative-control block at the end of this test.
+        CHECK(w.Unlock(newPass), "NEW passphrase unlocks the re-saved v7 wallet");
+
+        CKey recovered;
+        bool got = w.GetKey(nh.perAddr, recovered);
+        CHECK(got, "Per-address key readable from the re-saved v7 wallet");
+        CHECK(got && std::vector<uint8_t>(recovered.vchPrivKey.begin(), recovered.vchPrivKey.end())
+                  == nh.perAddrPriv,
+              "LOAD-BEARING: per-address key SPENDABLE after passphrase change (correct v7 MACs)");
+    }
+
+    // Negative control on a fresh load: a WRONG old passphrase must be rejected.
+    {
+        const std::string npath = "lp7_legacy_changepass_nonhd_neg.dat";
+        std::remove(npath.c_str());
+        LegacyV6NonHDResult nh2;
+        bool b2 = BuildLegacyV6NonHDWalletWithKey(npath, oldPass, nh2);
+        CHECK(b2, "Built second legacy v6 non-HD wallet (negative control)");
+        if (b2) {
+            CWallet w;
+            w.SetWalletFile(npath);
+            CHECK(w.Load(npath), "Loaded negative-control legacy wallet");
+            CHECK(!w.ChangePassphrase("Wr0ngOldP@ss!2026#", newPass),
+                  "NEGATIVE CONTROL: ChangePassphrase REJECTS a wrong old passphrase");
+            CHECK(FileVersion(npath) == WALLET_FILE_VERSION_6,
+                  "NEGATIVE CONTROL: file left untouched at v6 after a rejected change");
+        }
+        std::remove(npath.c_str());
+    }
+
+    std::remove(path.c_str());
+}
+
 int main() {
     std::cout << COLOR_BLUE "==== LP-7 wallet encryption-at-rest tests ====" COLOR_RESET "\n";
 
@@ -1289,6 +1387,7 @@ int main() {
     Test_PerRecordMACIsolation();
     Test_AtomicRenameCrashWindow();
     Test_LegacyPerAddressKey();
+    Test_ChangePassphraseLegacyNonHD();
 
     std::cout << "\n=============================================\n";
     std::cout << "PASSED: " << g_pass << "   FAILED: " << g_fail << "\n";
