@@ -1289,6 +1289,22 @@ void CRPCServer::HandleClient(int clientSocket) {
             if (ph != std::string::npos) wallet_html.replace(ph, placeholder.size(), "");
         }
 
+        // dilv-node-wallet-csp-origin: tell the page which chain this node serves
+        // ("dil"/"dilv") so the wallet's chain identity — units and the chainId
+        // used for tx signing (DIL=1/DilV=2) — is authoritative rather than
+        // guessed from the RPC port. Correct even on a custom --rpcport. Served
+        // from this node's own ChainParams; same DILV discriminator used by the
+        // swap RPCs. If the page is opened from disk the sentinel survives and
+        // the client falls back to deriving the chain from its origin port.
+        {
+            const std::string chain_ph = "__DILITHION_CHAIN__";
+            size_t cp = wallet_html.find(chain_ph);
+            if (cp != std::string::npos) {
+                wallet_html.replace(cp, chain_ph.size(),
+                    Dilithion::g_chainParams->IsDilV() ? "dilv" : "dil");
+            }
+        }
+
         std::ostringstream response;
         response << "HTTP/1.1 200 OK\r\n"
                  << "Content-Type: text/html; charset=utf-8\r\n"

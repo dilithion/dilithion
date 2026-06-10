@@ -23,6 +23,13 @@ inline const std::string& GetWalletHTML() {
          stays as the literal sentinel and the wallet falls back to the
          user-supplied rpcuser/rpcpassword fields. -->
     <meta name="dilithion-rpc-token" content="__DILITHION_RPC_SESSION_TOKEN__">
+    <!-- dilv-node-wallet-csp-origin: when served BY a node, the node replaces
+         this placeholder with its chain ("dil" or "dilv") so the wallet's chain
+         identity (units, and chainId for tx signing) is AUTHORITATIVE rather
+         than guessed from the RPC port — correct even on a custom --rpcport. If
+         opened from disk / not served by a node, the sentinel stays and the
+         wallet falls back to deriving the chain from the origin port. -->
+    <meta name="dilithion-chain" content="__DILITHION_CHAIN__">
     <title>Dilithion Web Wallet</title>
     <link rel="icon" type="image/x-icon" href="favicon.ico">
     <!-- PWA -->
@@ -2229,8 +2236,77 @@ inline const std::string& GetWalletHTML() {
         } catch(e) {}
         const chainUnits = { dil: 'DIL', dilv: 'DilV' };
 
+        // dilv-node-wallet-csp-origin: When this page is served BY a node, its
+        // own origin (host:port) IS that node's RPC endpoint, and the served
+        // page's CSP `connect-src 'self'` means it can ONLY fetch its own
+        // origin. The DIL node serves on :8332, the DilV node on :9332 — two
+        // different origins. So the chain/port MUST be derived from the serving
+        // origin, not the hardcoded DIL default; otherwise the DilV node's
+        // wallet (:9332) boots pointed at :8332 and every request is CSP-blocked
+        // ("Connection failed"). Returns null for opened-from-disk (file:) and
+        // for the remotely-hosted wallet (https, no port) so those paths keep
+        // their existing cross-origin / light-mode behaviour untouched.
+        // dilv-node-wallet-csp-origin: the node injects its chain ("dil"/"dilv")
+        // into the dilithion-chain meta when it serves the page; '' if opened
+        // from disk or the sentinel survived (not node-served). This is the node's
+        // authoritative answer and is preferred over guessing from the RPC port.
+        function getServedChainHint() {
+            const m = document.querySelector('meta[name="dilithion-chain"]');
+            if (!m) return '';
+            const v = (m.getAttribute('content') || '').trim();
+            return (v === 'dil' || v === 'dilv') ? v : '';
+        }
+        function detectServedOrigin() {
+            const loc = window.location;
+            const isLoopback = loc.hostname === '127.0.0.1' || loc.hostname === 'localhost';
+            if (loc.protocol !== 'http:' || !isLoopback || !loc.port) return null;
+            const port = parseInt(loc.port, 10);
+            const chainHint = getServedChainHint();
+            const knownNodePort = (port === chainPorts.dil || port === chainPorts.dilv ||
+                port === 8332 || port === 9332 || port === 18332 || port === 19332);
+            // Treat as node-served when it's a recognised node RPC port, or the
+            // page carries a node-injected session token / chain hint — avoids
+            // hijacking an unrelated local dev server on loopback while still
+            // covering a node running on a custom --rpcport.
+            if (!knownNodePort && !getSessionToken() && !chainHint) return null;
+            // Chain identity: trust the node's authoritative hint when present;
+            // otherwise map the origin port (DilV = 9332 / 19332 / a custom
+            // chainPorts.dilv; everything else is DIL).
+            const chain = chainHint ||
+                ((port === chainPorts.dilv || port === 9332 || port === 19332) ? 'dilv' : 'dil');
+            return { host: loc.hostname, port: port, chain: chain };
+        }
+        const servedOrigin = detectServedOrigin();
+        if (servedOrigin) {
+            // The serving origin is authoritative for a node-served page.
+            activeChain = servedOrigin.chain;
+            rpcConfig.host = servedOrigin.host;
+            rpcConfig.port = servedOrigin.port;
+            chainPorts[servedOrigin.chain] = servedOrigin.port;
+        }
+
         function switchChain(chain) {
             if (chain === activeChain) return;
+            // dilv-node-wallet-csp-origin: on a node-served page each chain lives
+            // at a different origin (DIL :8332 / DilV :9332) and CSP
+            // `connect-src 'self'` forbids reaching the other port from this
+            // page. So switching chains here means NAVIGATING to the sibling
+            // node's own wallet page (which boots on its chain via
+            // detectServedOrigin), not an in-page cross-origin fetch the browser
+            // would block. Requires that sibling node to be running.
+            if (servedOrigin) {
+                const targetPort = chainPorts[chain] || (chain === 'dilv' ? 9332 : 8332);
+                // Defence-in-depth: targetPort derives from chainPorts (localStorage-
+                // sourced), so range-check it before using it as a navigation sink.
+                // Host is always this page's own loopback hostname, so navigation
+                // can only ever target another loopback port — never a remote origin.
+                if (Number.isInteger(targetPort) && targetPort > 0 && targetPort <= 65535 &&
+                    targetPort !== servedOrigin.port) {
+                    window.location.href = window.location.protocol + '//' +
+                        window.location.hostname + ':' + targetPort + '/';
+                    return;
+                }
+            }
             activeChain = chain;
             const myGen = ++chainSwitchGen;  // Capture generation for stale detection
             localStorage.setItem('dilithionActiveChain', chain);
@@ -2379,7 +2455,10 @@ inline const std::string& GetWalletHTML() {
                     el.textContent = 'DilV';
                 });
                 document.title = 'DilV Web Wallet';
-                rpcConfig.port = 9332;
+                // dilv-node-wallet-csp-origin: use the resolved DilV port (a
+                // node-served page already set this from its origin; a custom
+                // chainPorts.dilv is honoured) instead of hardcoding 9332.
+                rpcConfig.port = chainPorts.dilv || 9332;
 
                 // Update connection manager chain
                 if (connectionManager) connectionManager.setChain('dilv');
@@ -2393,6 +2472,20 @@ inline const std::string& GetWalletHTML() {
         // session token supplies auth; for a from-disk page the user re-enters
         // manual creds each session (in-memory only).
         function loadSettings() {
+            // dilv-node-wallet-csp-origin: a node-served page MUST talk to its
+            // own origin (CSP connect-src 'self'); never let a stale saved
+            // host/port pull it cross-origin. The origin was already applied
+            // above — here we just sync the Settings inputs and skip the
+            // localStorage host/port override entirely.
+            if (servedOrigin) {
+                rpcConfig.host = servedOrigin.host;
+                rpcConfig.port = servedOrigin.port;
+                const hostEl = document.getElementById('rpcHost');
+                const portEl = document.getElementById('rpcPort');
+                if (hostEl) hostEl.value = rpcConfig.host;
+                if (portEl) portEl.value = rpcConfig.port;
+                return;
+            }
             const saved = localStorage.getItem('dilithionWalletConfig');
             if (saved) {
                 try {
