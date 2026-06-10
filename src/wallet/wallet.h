@@ -43,6 +43,16 @@ static const uint32_t WALLET_FILE_VERSION_5 = 5;
 // v6: Added sent transaction history persistence (mapSentTx)
 static const char WALLET_FILE_MAGIC_V6[] = "DILWLT06";
 static const uint32_t WALLET_FILE_VERSION_6 = 6;
+// LP-7 (wallet-Inv-5/4/2): encryption-at-rest fix.
+//   - HD master seed+chaincode stored as a VARIABLE-LENGTH AES-CBC+PKCS7
+//     ciphertext (not the fixed 32+32 plaintext slots) when encrypted.
+//   - Mnemonic / HD-master / MIK ciphertext records each carry an HMAC
+//     (encrypt-then-MAC), verified before decrypt; empty MAC rejected on v7.
+//   - HMAC keyed with a SEPARATELY-derived MAC key (key separation).
+// One-way: encrypted wallets are written ONLY at v7; legacy plaintext-seed
+// wallets are read for migration and rewritten at v7 on next unlock.
+static const char WALLET_FILE_MAGIC_V7[] = "DILWLT07";
+static const uint32_t WALLET_FILE_VERSION_7 = 7;
 static const size_t WALLET_FILE_HMAC_SIZE = 32;    // HMAC-SHA3-256 output
 static const size_t WALLET_FILE_SALT_SIZE = 32;    // Salt for HMAC
 static const size_t WALLET_FILE_HEADER_SIZE = 8 + 4 + 4 + 32 + 32;  // Magic + Version + Flags + HMAC + Salt = 80 bytes
@@ -269,6 +279,24 @@ private:
     std::string m_walletFile;  // Current wallet file path
     bool m_autoSave;           // Auto-save after changes
 
+    // LP-7: on-disk format version the wallet was loaded from (0 if never loaded
+    // / freshly created in memory). v3-v6 records used legacy AES-keyed HMAC and a
+    // plaintext HD seed; v7 uses key-separated HMAC and a variable-length encrypted
+    // HD seed. Used to (a) verify legacy MACs with the correct keying, and (b)
+    // detect a legacy plaintext-seed encrypted wallet that needs migration on unlock.
+    uint32_t m_loadedFileVersion{0};
+    // LP-7: set true at load when an encrypted wallet was read in a pre-v7 format
+    // with a plaintext HD seed at rest (the bug condition). Triggers atomic
+    // re-encryption + v7 rewrite on the next successful unlock.
+    bool m_fNeedsSeedMigration{false};
+
+    // LP-7 migration helper (assumes caller holds cs_wallet, wallet unlocked).
+    // Re-encrypts the plaintext HD seed + mnemonic under the master key and
+    // rewrites the wallet file at v7 atomically (via SaveUnlocked). Leaves the
+    // original file byte-identical on any failure (SaveUnlocked only renames a
+    // fully-written temp file into place; the original is never truncated).
+    bool MigrateToEncryptedSeedV7Unlocked();
+
     // UTXO set reference for balance validation in callbacks
     class CUTXOSet* m_utxo_set_ref{nullptr};
 
@@ -312,10 +340,18 @@ private:
 
     bool fIsHDWallet;                          // Is this an HD wallet?
     std::vector<uint8_t> vchEncryptedMnemonic; // Encrypted BIP39 mnemonic (already encrypted, can use normal allocator)
+    std::vector<uint8_t> vchMnemonicMAC;       // LP-7 (wallet-Inv-2): HMAC over the mnemonic ciphertext (v7+)
     // FIX-009: Use SecureAllocator for IVs to prevent leakage
     std::vector<uint8_t, SecureAllocator<uint8_t>> vchMnemonicIV;        // IV for mnemonic encryption
     CHDExtendedKey hdMasterKey;                // Master extended key (encrypted in memory)
     bool fHDMasterKeyEncrypted;                // Is master key encrypted?
+    // LP-7 (wallet-Inv-5): variable-length AES-CBC+PKCS7 ciphertext of the
+    // 64-byte seed+chaincode. Non-empty ONLY when fHDMasterKeyEncrypted is true
+    // and the wallet was written/migrated at v7. When set, the in-memory
+    // hdMasterKey.seed/chaincode hold THIS ciphertext (not plaintext) at rest,
+    // and the variable-length blob is what is persisted (NOT the fixed 32+32 slots).
+    std::vector<uint8_t> vchEncryptedHDMasterKey;
+    std::vector<uint8_t> vchHDMasterKeyMAC;    // LP-7 (wallet-Inv-2): HMAC over the HD-master ciphertext (v7+)
     // FIX-009: Use SecureAllocator for IVs to prevent leakage
     std::vector<uint8_t, SecureAllocator<uint8_t>> vchHDMasterKeyIV;     // IV for master key encryption
     // WL-010 FIX: Cache decrypted HD master key when wallet unlocked for performance
@@ -342,6 +378,9 @@ private:
 
     /** Encrypted MIK private key (when wallet is encrypted) */
     std::vector<uint8_t> vchEncryptedMIKPrivKey;
+
+    /** LP-7 (wallet-Inv-2): HMAC over the MIK private-key ciphertext (v7+) */
+    std::vector<uint8_t> vchMIKPrivKeyMAC;
 
     /** IV for MIK private key encryption */
     std::vector<uint8_t, SecureAllocator<uint8_t>> vchMIKPrivKeyIV;

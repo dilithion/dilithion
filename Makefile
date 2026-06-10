@@ -541,6 +541,12 @@ wallet_persistence_tests: $(CORE_OBJECTS) $(OBJ_DIR)/test/wallet_persistence_tes
 	@echo "$(COLOR_BLUE)[LINK]$(COLOR_RESET) $@"
 	@$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS) $(LIBS)
 
+# LP-7: wallet encryption-at-rest fix tests (secrecy regression + negative control,
+# migration round-trip + interrupted migration, auth-tamper rejection).
+wallet_encryption_at_rest_tests: $(CORE_OBJECTS) $(OBJ_DIR)/test/wallet_encryption_at_rest_tests.o $(DILITHIUM_OBJECTS) $(CHIAVDF_OBJECTS)
+	@echo "$(COLOR_BLUE)[LINK]$(COLOR_RESET) $@"
+	@$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS) $(LIBS)
+
 test_iv_reuse_detection: $(CORE_OBJECTS) $(OBJ_DIR)/test/test_iv_reuse_detection.o $(DILITHIUM_OBJECTS) $(CHIAVDF_OBJECTS)
 	@echo "$(COLOR_BLUE)[LINK]$(COLOR_RESET) $@"
 	@$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS) $(LIBS)
