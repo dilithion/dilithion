@@ -189,14 +189,20 @@ void CSignatureBatchVerifier::WorkerThread() {
             // worker dequeues each task exactly once, and Add() incremented before
             // enqueue. A zero here would mean a double-dequeue / double-decrement
             // regression, which would otherwise wrap size_t and hang Wait()
-            // forever (silent validator-thread DoS). Catch it loudly under test
-            // instead. The load is under complete_mutex so it is consistent with
-            // the fetch_sub that follows.
-            assert(session->pending_count.load() > 0 &&
-                   "CBatchSession pending_count underflow (double-decrement?)");
-            size_t remaining = session->pending_count.fetch_sub(1) - 1;
-            if (remaining == 0) {
-                session->complete_cv.notify_all();
+            // forever (silent validator-thread DoS). Guard the decrement so the
+            // underflow protection holds in release builds (NDEBUG) too, not just
+            // debug: if the count is already zero, log loudly and skip the
+            // fetch_sub rather than wrapping size_t. The load is under
+            // complete_mutex so it is consistent with the fetch_sub that follows.
+            if (session->pending_count.load() == 0) {
+                assert(false && "CBatchSession pending_count underflow (double-decrement?)");
+                std::cerr << "[SignatureVerifier] ERROR: pending_count underflow "
+                             "(double-decrement?) - skipping decrement" << std::endl;
+            } else {
+                size_t remaining = session->pending_count.fetch_sub(1) - 1;
+                if (remaining == 0) {
+                    session->complete_cv.notify_all();
+                }
             }
         }
     }
