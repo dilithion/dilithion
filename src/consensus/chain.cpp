@@ -1691,6 +1691,78 @@ bool CChainState::ConnectTip(CBlockIndex* pindex, const CBlock& block, bool skip
         }
     }
 
+    // ====================================================================
+    // LP-4: MERKLE-ROOT DEFENSE-IN-DEPTH (CVE-2012-2459, restore D1)
+    // ====================================================================
+    // Recompute the merkle root from this block's own transactions and
+    // compare it to the header-committed hashMerkleRoot (which PoW binds).
+    // This is the principled, mechanism-independent guard against the
+    // CVE-2012-2459 merkle-malleability attack: a forged block keeps a valid
+    // header but supplies a DIFFERENT block.vtx that reproduces the same root
+    // via last-node duplication. The orphan arrival path already does this
+    // (block_processing.cpp:1115); the tip-connect path historically did not,
+    // leaving CVE closure to rest INCIDENTALLY on ApplyBlock's UTXO double-
+    // spend catch. Restoring D1 here makes the defense refactor-proof (e.g.
+    // survives any future assume-valid / UTXO-skip fast path).
+    //
+    // UNCONDITIONAL by design: runs for ALL ConnectTip calls, including
+    // skipValidation=true reorg reconnects, with NO assume-valid exemption.
+    // Both checks are structural properties of the block's own bytes and are
+    // idempotent on valid blocks (recomputed root == committed root bit-for-
+    // bit, and a well-formed block has no duplicate txids), so this is PURELY
+    // ADDITIVE and rejects nothing currently accepted. It only adds a cheap,
+    // side-effect-free rejection point ahead of UTXO application.
+    //
+    // Mirrors the orphan-path defense (block_processing.cpp:1115/1127): the
+    // recompute (D1) catches mutations that alter the root (tampered/reordered/
+    // truncated txs), while the duplicate-tx check (D2) catches the specific
+    // CVE-2012-2459 last-node-duplication shape, whose forged tx list
+    // reproduces an IDENTICAL root by construction and therefore slips past D1
+    // alone. Without D2 here, that shape would be caught only INCIDENTALLY by
+    // ApplyBlock's intra-block double-spend detection — the exact UTXO-layer
+    // dependence this defense-in-depth restore is meant to remove.
+    {
+        CBlockValidator validator;
+        std::vector<CTransactionRef> merkleTxs;
+        std::string merkleError;
+
+        if (!validator.DeserializeBlockTransactions(block, merkleTxs, merkleError)) {
+            std::cerr << "[Chain] ERROR: Block " << pindex->nHeight
+                      << " REJECTED: failed to deserialize transactions for merkle check" << std::endl;
+            std::cerr << "[Chain] " << merkleError << std::endl;
+
+            pindex->nStatus |= CBlockIndex::BLOCK_FAILED_VALID;
+            if (pdb != nullptr) {
+                pdb->WriteBlockIndex(blockHash, *pindex);
+            }
+            return false;
+        }
+
+        if (!validator.VerifyMerkleRoot(block, merkleTxs, merkleError)) {
+            std::cerr << "[Chain] ERROR: Block " << pindex->nHeight
+                      << " REJECTED: merkle root mismatch (CVE-2012-2459 defense)" << std::endl;
+            std::cerr << "[Chain] " << merkleError << std::endl;
+
+            pindex->nStatus |= CBlockIndex::BLOCK_FAILED_VALID;
+            if (pdb != nullptr) {
+                pdb->WriteBlockIndex(blockHash, *pindex);
+            }
+            return false;
+        }
+
+        if (!validator.CheckNoDuplicateTransactions(merkleTxs, merkleError)) {
+            std::cerr << "[Chain] ERROR: Block " << pindex->nHeight
+                      << " REJECTED: duplicate transactions (CVE-2012-2459 defense)" << std::endl;
+            std::cerr << "[Chain] " << merkleError << std::endl;
+
+            pindex->nStatus |= CBlockIndex::BLOCK_FAILED_VALID;
+            if (pdb != nullptr) {
+                pdb->WriteBlockIndex(blockHash, *pindex);
+            }
+            return false;
+        }
+    }
+
     // Step 1: Update UTXO set (CS-004)
     if (pUTXOSet != nullptr) {
         if (!pUTXOSet->ApplyBlock(block, pindex->nHeight, blockHash)) {
