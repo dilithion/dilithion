@@ -2660,6 +2660,41 @@ bool CWallet::Save(const std::string& filename) const {
 }
 
 // Private SaveUnlocked() method - assumes caller already holds cs_wallet lock
+// ============================================================================
+// LP-7 READER/WRITER VERSION-GATE SYMMETRY TABLE (authoritative)
+// ----------------------------------------------------------------------------
+// This writer (SaveUnlocked) emits ONLY v6 ("DILWLT06", writeLegacyV6==true) or
+// v7 ("DILWLT07"). The matching reader is CWallet::Load. EVERY field whose
+// presence/layout depends on the file version is listed below; for each, the
+// writer's gate MUST exactly match the reader's gate. A field present in a v6
+// write MUST be read in v6; a v7-only field MUST be `!writeLegacyV6`-gated on
+// write AND `version >= WALLET_FILE_VERSION_7` on read. ZERO mismatches allowed.
+//
+//  field                | write-gate (SaveUnlocked)          | read-gate (Load)                 | status
+//  ---------------------+------------------------------------+----------------------------------+-------
+//  header magic+version | writeLegacyV6 ? v6 : v7            | reads+validates version 1..7     | MATCH
+//  HMAC + salt block    | unconditional (writer always >=v6) | version >= 3                     | MATCH (v6,v7 >=3)
+//  v1/v2 reserved[16]   | never written                      | version < 3 (else-branch)        | MATCH (writer never <v3)
+//  master-key MAC       | uncond. within masterKey.IsValid() | v3+: always present (uncond.)    | MATCH
+//  mnemonic MAC         | if (!writeLegacyV6)                | if (version >= V7)               | MATCH
+//  HD-master block      | writeLegacyV6 ? legacy-slots : v7  | version >= V7 ? v7 : legacy      | MATCH
+//  HD-master MAC        | v7 encrypted branch (!writeLegacyV6)| v7 encrypted branch (>= V7)     | MATCH
+//  wtx fCoinbase        | unconditional (writer always >=v6) | version >= 4                     | MATCH (v6,v7 >=4)
+//  MIK block (hasMIK..) | unconditional (writer always >=v6) | version >= 5                     | MATCH (v6,v7 >=5)
+//  MIK private-key MAC  | if (!writeLegacyV6)   [LP-7 fix]    | if (version >= V7)               | MATCH
+//  mapSentTx            | unconditional (writer always >=v6) | version >= 6                     | MATCH (v6,v7 >=6)
+//
+// Per-address spending-key MAC (macLen) is a v3+ field written unconditionally
+// and read unconditionally for v3+ (v1/v2 seek-back), so it is NOT version-
+// conditional within this writer's v6/v7 output — symmetric by construction.
+//
+// INVARIANT: every v7-only per-record MAC field (mnemonic, MIK) is
+// `!writeLegacyV6`-gated on write. The HD-master MAC lives inside the v7-only
+// encrypted HD-master branch, so it is structurally excluded from the v6 path.
+// If you add ANY new version-conditional field, add a row here and confirm the
+// write-gate equals the read-gate BEFORE merging — the MIK-MAC desync
+// (round-5 BLOCKER-5) was exactly a missing row in this table.
+// ============================================================================
 bool CWallet::SaveUnlocked(const std::string& filename) const {
     // Use current wallet file if no filename specified
     std::string saveFile = filename.empty() ? m_walletFile : filename;
@@ -3090,13 +3125,25 @@ bool CWallet::SaveUnlocked(const std::string& filename) const {
         }
 
         // LP-7 (v7): write the MIK private-key MAC (variable-length; empty when
-        // the wallet is unencrypted / no encrypted MIK present).
-        uint32_t mikMacLen = static_cast<uint32_t>(vchMIKPrivKeyMAC.size());
-        file.write(reinterpret_cast<const char*>(&mikMacLen), sizeof(mikMacLen));
-        if (!file.good()) return false;
-        if (mikMacLen > 0) {
-            file.write(reinterpret_cast<const char*>(vchMIKPrivKeyMAC.data()), mikMacLen);
+        // the wallet is unencrypted / no encrypted MIK present). LEGACY v3-v6 files
+        // never carried a per-record MIK MAC, so when re-emitting at the loaded v6
+        // version (ChangePassphrase-in-place / non-HD legacy autosave) we must NOT
+        // write the mikMacLen field — the v6 reader does not expect it (it gates the
+        // read on version >= WALLET_FILE_VERSION_7) and writing it would desync the
+        // stream and silently corrupt the MIK / sent-history / best-block fields that
+        // follow. This MUST mirror the mnemonic-MAC gating above exactly. (The MIK
+        // gains its authenticated MAC at the v6->v7 Unlock migration, same as the
+        // mnemonic — see MigrateToEncryptedSeedV7Unlocked.) See the reader/writer
+        // version-gate symmetry table above SaveUnlocked: EVERY v7-only per-record
+        // MAC field is !writeLegacyV6-gated.
+        if (!writeLegacyV6) {
+            uint32_t mikMacLen = static_cast<uint32_t>(vchMIKPrivKeyMAC.size());
+            file.write(reinterpret_cast<const char*>(&mikMacLen), sizeof(mikMacLen));
             if (!file.good()) return false;
+            if (mikMacLen > 0) {
+                file.write(reinterpret_cast<const char*>(vchMIKPrivKeyMAC.data()), mikMacLen);
+                if (!file.good()) return false;
+            }
         }
 
         // Write MIK registered flag

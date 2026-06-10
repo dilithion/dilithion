@@ -738,6 +738,174 @@ static bool BuildLegacyV6NonHDWalletWithKey(const std::string& path,
 }
 
 // ---------------------------------------------------------------------------
+// Legacy v6 NON-HD builder WITH an encrypted MIK present (round-5 BLOCKER-5).
+//
+// This is the missing builder: every existing legacy-v6 builder hard-codes
+// hasMIK=0, so they never exercised the MIK record on the v6 write path — which
+// is exactly where the BLOCKER-5 desync lived. A genuine pre-LP-7 v6 file with
+// an encrypted MIK carries the MIK block WITHOUT any per-record mikMacLen field
+// (the v7-only MAC field did not exist pre-LP-7). On the UNFIXED binary
+// (8e4d3abb), ChangePassphrase rewrites this wallet at v6 via SaveUnlocked, which
+// (pre-fix) emits the mikMacLen field UNCONDITIONALLY → the v6 reader (which gates
+// the read on version>=V7) never consumes it → the stream desyncs and the MIK /
+// sent-history / best-block fields are misparsed → reload fails or loads corrupt
+// MIK state. On the FIXED binary the mikMacLen field is !writeLegacyV6-gated, so
+// the v6 rewrite is byte-symmetric with the v6 reader and the MIK round-trips.
+//
+// NON-HD is deliberate: a non-HD encrypted wallet never sets the seed-migration
+// flag, so it STAYS v6 forever and EVERY SaveUnlocked runs in writeLegacyV6 mode
+// (the broadest, irreversible trigger surface). A mining wallet carrying a MIK is
+// the common case this protects.
+//
+// Non-HD encrypted v6 layout WITH MIK (matches SaveUnlocked for is_hd_wallet=false):
+//   [Magic 8][Version=6 u32][Flags=0x01][HMAC 32][salt 32]
+//   <master key block>
+//   <numCryptedKeys u32 = 1><addr 21><pubKey 1952><cryptedLen u32><ct><iv 16>
+//     <macLen u32 = 64><mac>
+//   <hasDefault u8><addr 21><numTxs u32 = 0><bestHash 32><bestHeight i32>
+//   <hasMIK u8 = 1>
+//     <pubkeyLen u32><MIK pubKey>
+//     <encPrivKeyLen u32><MIK priv ct>
+//     <ivLen u32><MIK iv>
+//     ( NO mikMacLen field — v6 never had it )
+//     <mikRegistered u8 = 0>
+//     <hasUnencryptedMIK u8 = 0>   (encrypted wallet → MIK priv stored encrypted)
+//   <numSentTx u32 = 0>
+// ---------------------------------------------------------------------------
+struct LegacyV6MIKResult {
+    CDilithiumAddress    perAddr;
+    std::vector<uint8_t> perAddrPriv;
+    std::string          mikIdentityHex;   // expected MIK identity after round-trip
+};
+
+static bool BuildLegacyV6NonHDWalletWithMIK(const std::string& path,
+                                            const std::string& passphrase,
+                                            LegacyV6MIKResult& out) {
+    // Encrypted master key block (legacy AES-keyed MAC so v<7 Unlock passes).
+    std::vector<uint8_t> vMasterKeyPlain(WALLET_CRYPTO_KEY_SIZE);
+    if (!GetStrongRandBytes(vMasterKeyPlain.data(), WALLET_CRYPTO_KEY_SIZE)) return false;
+    std::vector<uint8_t> mkSalt;
+    if (!GenerateSalt(mkSalt)) return false;
+    std::vector<uint8_t> derivedKey;
+    if (!DeriveKey(passphrase, mkSalt, WALLET_CRYPTO_PBKDF2_ROUNDS, derivedKey)) return false;
+    std::vector<uint8_t> mkIV;
+    if (!GenerateIV(mkIV)) return false;
+    CCrypter mkCrypter;
+    if (!mkCrypter.SetKey(derivedKey, mkIV)) return false;
+    std::vector<uint8_t> mkCipher;
+    if (!mkCrypter.Encrypt(vMasterKeyPlain, mkCipher)) return false;
+    std::vector<uint8_t> mkMAC;
+    if (!mkCrypter.ComputeMAC(mkCipher, mkMAC, /*useLegacyKeying=*/true)) return false;
+
+    // Per-address spending key: real keypair, encrypted under the master key,
+    // MAC'd with LEGACY keying (so it stays spendable across the v6 rewrite).
+    CKey perKey;
+    if (!WalletCrypto::GenerateKeyPair(perKey)) return false;
+    CDilithiumAddress perAddr(perKey.vchPubKey);
+    std::vector<uint8_t> keyIV;
+    if (!GenerateIV(keyIV)) return false;
+    CCrypter keyCrypter;
+    if (!keyCrypter.SetKey(vMasterKeyPlain, keyIV)) return false;
+    std::vector<uint8_t> keyCipher;
+    if (!keyCrypter.Encrypt(perKey.vchPrivKey, keyCipher)) return false;
+    std::vector<uint8_t> keyMAC;
+    if (!keyCrypter.ComputeMAC(keyCipher, keyMAC, /*useLegacyKeying=*/true)) return false;
+
+    // --- The MIK: a real Dilithium3 keypair, private key encrypted under the
+    //     master key with its own IV. NO MAC field is written (v6 shape). ---
+    DFMP::CMiningIdentityKey mik;
+    if (!mik.Generate()) return false;
+    if (!mik.IsValid() || !mik.HasPrivateKey()) return false;
+    std::string mikIdentityHex = mik.GetIdentityHex();
+
+    std::vector<uint8_t> mikIV;
+    if (!GenerateIV(mikIV)) return false;
+    CCrypter mikCrypter;
+    if (!mikCrypter.SetKey(vMasterKeyPlain, mikIV)) return false;
+    std::vector<uint8_t> mikPlain(mik.privkey.begin(), mik.privkey.end());
+    std::vector<uint8_t> mikCipher;
+    if (!mikCrypter.Encrypt(mikPlain, mikCipher)) {
+        memory_cleanse(mikPlain.data(), mikPlain.size());
+        return false;
+    }
+    memory_cleanse(mikPlain.data(), mikPlain.size());
+
+    std::vector<uint8_t> hmacSalt(WALLET_FILE_SALT_SIZE);
+    if (!GetStrongRandBytes(hmacSalt.data(), hmacSalt.size())) return false;
+
+    std::vector<uint8_t> body;
+    PutBytes(body, hmacSalt);
+
+    // master key block
+    PutU32(body, static_cast<uint32_t>(mkCipher.size()));
+    PutBytes(body, mkCipher);
+    PutBytes(body, mkSalt);
+    PutBytes(body, mkIV);
+    PutU32(body, 0u);
+    PutU32(body, WALLET_CRYPTO_PBKDF2_ROUNDS);
+    PutU32(body, static_cast<uint32_t>(mkMAC.size()));
+    PutBytes(body, mkMAC);
+
+    // keys — ONE encrypted per-address key (no HD block; flags has no 0x02)
+    PutU32(body, 1u);
+    PutBytes(body, out_default_or(perAddr.GetData()));
+    PutBytes(body, perKey.vchPubKey);
+    PutU32(body, static_cast<uint32_t>(keyCipher.size()));
+    PutBytes(body, keyCipher);
+    PutBytes(body, keyIV);
+    PutU32(body, static_cast<uint32_t>(keyMAC.size()));
+    PutBytes(body, keyMAC);
+
+    // default address = the per-address key
+    body.push_back(1);
+    PutBytes(body, out_default_or(perAddr.GetData()));
+    // transactions — 0
+    PutU32(body, 0u);
+    // best block
+    std::vector<uint8_t> bestHash(32, 0);
+    PutBytes(body, bestHash);
+    int32_t bestHeight = -1;
+    PutBytes(body, reinterpret_cast<const uint8_t*>(&bestHeight), sizeof(bestHeight));
+
+    // MIK — PRESENT (the whole point of this builder). v6 shape: NO mikMacLen.
+    body.push_back(1);                                          // hasMIK = 1
+    PutU32(body, static_cast<uint32_t>(mik.pubkey.size()));     // pubkeyLen
+    PutBytes(body, mik.pubkey);                                 // MIK pubkey
+    PutU32(body, static_cast<uint32_t>(mikCipher.size()));      // encPrivKeyLen
+    PutBytes(body, mikCipher);                                  // MIK priv ciphertext
+    PutU32(body, static_cast<uint32_t>(mikIV.size()));          // ivLen
+    PutBytes(body, mikIV);                                      // MIK iv
+    // NO mikMacLen field — a genuine v6 file never carried it.
+    body.push_back(0);                                          // mikRegistered = 0
+    body.push_back(0);                                          // hasUnencryptedMIK = 0
+
+    // sent tx — 0
+    PutU32(body, 0u);
+
+    std::vector<uint8_t> hmacKey(32, 0);
+    std::memcpy(hmacKey.data(), mkSalt.data(), std::min<size_t>(32, mkSalt.size()));
+    std::vector<uint8_t> fileHMAC(32);
+    HMAC_SHA3_256(hmacKey.data(), hmacKey.size(), body.data(), body.size(), fileHMAC.data());
+
+    std::vector<uint8_t> file;
+    file.insert(file.end(), WALLET_FILE_MAGIC_V6, WALLET_FILE_MAGIC_V6 + 8);
+    PutU32(file, WALLET_FILE_VERSION_6);
+    uint32_t flags = 0x01;   // encrypted, NOT HD
+    PutU32(file, flags);
+    PutBytes(file, fileHMAC);
+    PutBytes(file, body);
+
+    out.perAddr = perAddr;
+    out.perAddrPriv.assign(perKey.vchPrivKey.begin(), perKey.vchPrivKey.end());
+    out.mikIdentityHex = mikIdentityHex;
+
+    memory_cleanse(vMasterKeyPlain.data(), vMasterKeyPlain.size());
+    memory_cleanse(derivedKey.data(), derivedKey.size());
+
+    return WriteFileBytes(path, file);
+}
+
+// ---------------------------------------------------------------------------
 // Test 1 — secrecy regression + negative control
 // ---------------------------------------------------------------------------
 static void Test_Secrecy() {
@@ -1469,6 +1637,86 @@ static void Test_ChangePassphraseLegacyNonHD() {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Test 8 — ChangePassphrase on a legacy v6 wallet WITH an encrypted MIK
+//          (round-5 BLOCKER-5 regression).
+//
+// FAILS on 8e4d3abb (unfixed: SaveUnlocked emits the v7-only mikMacLen field into
+// the v6 layout → reader desyncs → reload fails / MIK corrupt). PASSES after the
+// !writeLegacyV6 gate on the MIK-MAC write. The decisive assertion is that the
+// wallet OPENS and the MIK round-trips after ChangePassphrase-in-place.
+// ---------------------------------------------------------------------------
+static void Test_ChangePassphraseLegacyV6WithMIK() {
+    std::cout << COLOR_BLUE "\n[Test 8] ChangePassphrase v6-in-place with an encrypted MIK present "
+                            "(BLOCKER-5: MIK-MAC field must NOT leak into v6)\n" COLOR_RESET;
+
+    const std::string oldPass = "M1n3rOldP@ss!2026#";
+    const std::string newPass = "M1n3rN3wP@ss!2026#";
+    const std::string path = "lp7_changepass_mik_v6.dat";
+    std::remove(path.c_str());
+
+    LegacyV6MIKResult mikw;
+    bool built = BuildLegacyV6NonHDWalletWithMIK(path, oldPass, mikw);
+    CHECK(built, "Built legacy v6 non-HD ENCRYPTED wallet WITH an encrypted MIK (hasMIK=1, no mikMacLen)");
+    if (!built) { std::remove(path.c_str()); return; }
+    CHECK(FileVersion(path) == WALLET_FILE_VERSION_6, "MIK wallet file is v6 before change");
+
+    // Sanity: the freshly-built v6 file loads and the MIK round-trips BEFORE any
+    // ChangePassphrase — isolates the regression to the v6 WRITE path, not the build.
+    {
+        CWallet w;
+        w.SetWalletFile(path);
+        CHECK(w.Load(path), "Pre-change: loaded the v6 MIK wallet");
+        CHECK(w.HasMIK(), "Pre-change: MIK present after load");
+        CHECK(w.Unlock(oldPass), "Pre-change: OLD passphrase unlocks the v6 MIK wallet");
+        CHECK(w.GetMIKIdentityHex() == mikw.mikIdentityHex,
+              "Pre-change: MIK identity matches (encrypted MIK decrypts on the legacy path)");
+    }
+    // Unlock with autosave on a NON-HD wallet does NOT migrate (no seed-migration
+    // flag), so the file must still be v6.
+    CHECK(FileVersion(path) == WALLET_FILE_VERSION_6,
+          "Pre-change: non-HD wallet stays v6 after unlock (no migration)");
+
+    // The load-bearing path: ChangePassphrase rewrites the v6 file in place via
+    // SaveUnlocked(writeLegacyV6). On the unfixed binary this emits the spurious
+    // mikMacLen field and desyncs the stream.
+    {
+        CWallet w;
+        w.SetWalletFile(path);   // autosave on → the change rewrites the file in place
+        CHECK(w.Load(path), "Loaded v6 MIK wallet (locked) for ChangePassphrase");
+        CHECK(w.ChangePassphrase(oldPass, newPass),
+              "ChangePassphrase SUCCEEDS on a legacy v6 wallet WITH a MIK");
+    }
+    CHECK(FileVersion(path) == WALLET_FILE_VERSION_6,
+          "File STAYS v6 after ChangePassphrase (no v7 promotion)");
+
+    // THE decisive assertion: the rewritten v6 file must OPEN and the MIK must
+    // still round-trip. On 8e4d3abb the spurious mikMacLen field desyncs the
+    // reader and either Load() fails outright or the MIK is misparsed.
+    {
+        CWallet w;
+        w.SetWalletFile(path);
+        CHECK(w.Load(path),
+              "LOAD-BEARING (BLOCKER-5): rewritten v6 MIK wallet OPENS (no stream desync)");
+        CHECK(w.HasMIK(),
+              "LOAD-BEARING (BLOCKER-5): MIK still present after the v6 rewrite");
+        CHECK(w.Unlock(newPass),
+              "NEW passphrase unlocks the rotated v6 MIK wallet");
+        CHECK(w.GetMIKIdentityHex() == mikw.mikIdentityHex,
+              "LOAD-BEARING (BLOCKER-5): MIK identity ROUND-TRIPS after ChangePassphrase "
+              "(encrypted MIK private key intact, no desync)");
+        // The per-address spending key must also survive (proves the stream stayed
+        // in sync through the MIK block: a desync would corrupt everything after it).
+        CKey recovered;
+        bool got = w.GetKey(mikw.perAddr, recovered);
+        CHECK(got && std::vector<uint8_t>(recovered.vchPrivKey.begin(), recovered.vchPrivKey.end())
+                  == mikw.perAddrPriv,
+              "Per-address key still SPENDABLE after the v6 MIK rewrite (stream stayed in sync)");
+    }
+
+    std::remove(path.c_str());
+}
+
 int main() {
     std::cout << COLOR_BLUE "==== LP-7 wallet encryption-at-rest tests ====" COLOR_RESET "\n";
 
@@ -1479,6 +1727,7 @@ int main() {
     Test_AtomicRenameCrashWindow();
     Test_LegacyPerAddressKey();
     Test_ChangePassphraseLegacyNonHD();
+    Test_ChangePassphraseLegacyV6WithMIK();
 
     std::cout << "\n=============================================\n";
     std::cout << "PASSED: " << g_pass << "   FAILED: " << g_fail << "\n";
