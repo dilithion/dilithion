@@ -71,32 +71,31 @@ void CSignatureBatchVerifier::Stop() {
     std::cout << "[SignatureVerifier] Stopped" << std::endl;
 }
 
-void CSignatureBatchVerifier::BeginBatch() {
-    // Reset batch state
-    m_pending_count.store(0);
-    m_batch_failed.store(false);
-
-    std::lock_guard<std::mutex> lock(m_error_mutex);
-    m_first_error.clear();
+std::shared_ptr<CBatchSession> CSignatureBatchVerifier::BeginBatch() {
+    // Each batch gets a fresh, independently-owned session. No shared global
+    // batch state is touched here (CRITICAL-1 fix), so concurrent BeginBatch()
+    // calls cannot clobber one another.
+    return std::make_shared<CBatchSession>();
 }
 
-void CSignatureBatchVerifier::Add(const std::vector<uint8_t>& signature,
+void CSignatureBatchVerifier::Add(const std::shared_ptr<CBatchSession>& session,
+                                   const std::vector<uint8_t>& signature,
                                    const std::vector<uint8_t>& message,
                                    const std::vector<uint8_t>& pubkey,
                                    size_t input_index) {
-    // Increment pending count BEFORE adding to queue
-    // This ensures Wait() won't return prematurely
-    m_pending_count.fetch_add(1);
+    // Increment THIS session's pending count BEFORE adding to queue so its
+    // Wait() won't return prematurely.
+    session->pending_count.fetch_add(1);
 
-    // Create task
+    // Create task, binding it to its owning session.
     CSignatureTask task;
     task.signature = signature;
     task.message = message;
     task.pubkey = pubkey;
+    task.session = session;   // keeps the session alive while queued (S-005)
     task.input_index = input_index;
-    task.error_out = nullptr;
 
-    // Add to queue
+    // Add to the shared worker queue
     {
         std::lock_guard<std::mutex> lock(m_queue_mutex);
         m_queue.push(std::move(task));
@@ -106,17 +105,24 @@ void CSignatureBatchVerifier::Add(const std::vector<uint8_t>& signature,
     m_queue_cv.notify_one();
 }
 
-bool CSignatureBatchVerifier::Wait(std::string& error) {
-    // Wait for all pending tasks to complete
-    std::unique_lock<std::mutex> lock(m_complete_mutex);
-    m_complete_cv.wait(lock, [this] {
-        return m_pending_count.load() == 0;
-    });
+bool CSignatureBatchVerifier::Wait(const std::shared_ptr<CBatchSession>& session,
+                                   std::string& error) {
+    // Wait for all pending tasks in THIS session to complete.
+    // The predicate (pending_count==0) is checked under complete_mutex, and the
+    // worker that drives the count to zero notifies under the SAME mutex
+    // (MED-2 lost-wakeup fix), so a Wait() entered just before the final
+    // decrement still wakes.
+    {
+        std::unique_lock<std::mutex> lock(session->complete_mutex);
+        session->complete_cv.wait(lock, [&session] {
+            return session->pending_count.load() == 0;
+        });
+    }
 
-    // Check if batch failed
-    if (m_batch_failed.load()) {
-        std::lock_guard<std::mutex> err_lock(m_error_mutex);
-        error = m_first_error;
+    // Check if THIS batch failed
+    if (session->batch_failed.load()) {
+        std::lock_guard<std::mutex> err_lock(session->error_mutex);
+        error = session->first_error;
         return false;
     }
 
@@ -150,27 +156,38 @@ void CSignatureBatchVerifier::WorkerThread() {
             continue;
         }
 
+        // Resolve the owning session for this task (always set by Add()).
+        std::shared_ptr<CBatchSession> session = task.session;
+
         // Verify signature
         bool valid = VerifySingle(task);
 
-        if (!valid) {
-            // Mark batch as failed
+        if (!valid && session) {
+            // Mark THIS batch as failed
             bool expected = false;
-            if (m_batch_failed.compare_exchange_strong(expected, true)) {
-                // First failure - store error
+            if (session->batch_failed.compare_exchange_strong(expected, true)) {
+                // First failure in this batch - store error
                 char buf[256];
                 snprintf(buf, sizeof(buf), "Signature verification failed for input %zu",
                          task.input_index);
 
-                std::lock_guard<std::mutex> lock(m_error_mutex);
-                m_first_error = buf;
+                std::lock_guard<std::mutex> lock(session->error_mutex);
+                session->first_error = buf;
             }
         }
 
-        // Decrement pending count and notify if batch complete
-        size_t remaining = m_pending_count.fetch_sub(1) - 1;
-        if (remaining == 0) {
-            m_complete_cv.notify_all();
+        // Decrement THIS session's pending count and notify its waiter if the
+        // batch is complete. The notify is done under complete_mutex so the
+        // waiter cannot miss it (MED-2). We capture the session in a local
+        // shared_ptr above and release the task (which may hold the last other
+        // reference) only after notifying, so the session stays alive across
+        // the notify even if Wait() has already returned and dropped its handle.
+        if (session) {
+            std::unique_lock<std::mutex> lock(session->complete_mutex);
+            size_t remaining = session->pending_count.fetch_sub(1) - 1;
+            if (remaining == 0) {
+                session->complete_cv.notify_all();
+            }
         }
     }
 }

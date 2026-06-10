@@ -796,8 +796,10 @@ bool CTransactionValidator::BatchVerifyScripts(const CTransaction& tx, CUTXOSet&
         return false;
     }
 
-    // Begin new batch
-    g_signature_verifier->BeginBatch();
+    // Begin a new batch. The session is owned for the lifetime of this call
+    // (CRITICAL-1 / LP-5): concurrent BatchVerifyScripts callers each get their
+    // own session, so their batch state cannot cross-contaminate.
+    std::shared_ptr<CBatchSession> session = g_signature_verifier->BeginBatch();
 
     // Prepare and add all signature verification tasks
     for (size_t i = 0; i < tx.vin.size(); ++i) {
@@ -806,6 +808,10 @@ bool CTransactionValidator::BatchVerifyScripts(const CTransaction& tx, CUTXOSet&
         // Get UTXO for scriptPubKey
         CUTXOEntry entry;
         if (!utxoSet.GetUTXO(txin.prevout, entry)) {
+            error = "Failed to retrieve UTXO for batch verification";
+            // Drain any tasks already queued for this session before returning,
+            // so workers don't touch a session whose handle we've dropped.
+            g_signature_verifier->Wait(session, error);
             error = "Failed to retrieve UTXO for batch verification";
             return false;
         }
@@ -818,14 +824,17 @@ bool CTransactionValidator::BatchVerifyScripts(const CTransaction& tx, CUTXOSet&
             char buf[256];
             snprintf(buf, sizeof(buf), "Failed to prepare signature data for input %zu: %s",
                      i, prep_error.c_str());
+            // Drain queued tasks for this session before returning (see above).
+            std::string drain_error;
+            g_signature_verifier->Wait(session, drain_error);
             error = buf;
             return false;
         }
 
-        // Add to batch
-        g_signature_verifier->Add(signature, message, pubkey, i);
+        // Add to this batch's session
+        g_signature_verifier->Add(session, signature, message, pubkey, i);
     }
 
-    // Wait for all verifications to complete
-    return g_signature_verifier->Wait(error);
+    // Wait for all verifications in this session to complete
+    return g_signature_verifier->Wait(session, error);
 }

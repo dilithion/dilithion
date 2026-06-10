@@ -942,6 +942,17 @@ asert_test:
 	@echo "$(COLOR_GREEN)✓ ASERT test built successfully$(COLOR_RESET)"
 
 # ============================================================================
+# LP-5 batch-verifier concurrency race + differential harness (CRITICAL-1/MED-2)
+# Links only the verifier object + Dilithium primitives (no full CORE_OBJECTS):
+# the race lives entirely in CSignatureBatchVerifier's per-batch state.
+# Build under ThreadSanitizer on Linux:  make TSAN=1 batch_verifier_race_tests
+# ============================================================================
+batch_verifier_race_tests: $(OBJ_DIR)/consensus/signature_batch_verifier.o $(OBJ_DIR)/test/batch_verifier_race_tests.o $(DILITHIUM_OBJECTS)
+	@echo "$(COLOR_BLUE)[LINK]$(COLOR_RESET) $@"
+	@$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS) $(LIBS)
+	@echo "$(COLOR_GREEN)✓ batch_verifier_race_tests built$(COLOR_RESET)"
+
+# ============================================================================
 # Run Tests
 # ============================================================================
 
