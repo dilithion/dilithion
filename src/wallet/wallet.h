@@ -320,29 +320,23 @@ private:
                          const std::vector<uint8_t>& ciphertext,
                          const std::vector<uint8_t>& mac) const;
 
-    // LP-7 (HIGH-2): CENTRALIZED MAC computation for WRITES / re-MAC. Always uses
-    // the v7 separated-key HMAC — new and migrated records are written ONLY at v7.
-    // Routing all writes through here keeps write-keying in lockstep with the
-    // read policy above. `crypter` must already have SetKey() called.
+    // LP-7 (HIGH-2): CENTRALIZED MAC computation for WRITES / re-MAC. Routing all
+    // writes through here keeps write-keying in lockstep with the read policy above.
+    // `crypter` must already have SetKey() called.
+    //
+    // Keying:
+    //   - Default (useLegacyKeying == false): the v7 separated-key HMAC. Used by
+    //     EncryptWallet, the Unlock-path v6->v7 migration, and any record written
+    //     into a v7 file.
+    //   - useLegacyKeying == true: the legacy AES-keyed HMAC (pre-v7). Used ONLY when
+    //     persisting a record back into a file that STAYS at its existing v3-v6
+    //     version (LP-7 ratified design: ChangePassphrase rotates the passphrase in
+    //     place and does NOT promote the file to v7, so the rewritten master-key MAC
+    //     must match the on-disk legacy keying or it fails VerifyRecordMAC on reload).
     bool ComputeRecordMAC(CCrypter& crypter,
                           const std::vector<uint8_t>& ciphertext,
-                          std::vector<uint8_t>& macOut) const;
-
-    // LP-7 (round 3, MEDIUM-1): re-MAC EVERY present at-rest encrypted record
-    // (per-address spending keys, HD-master seed, mnemonic, MIK private key) with
-    // v7 separated keying, in place. The encrypt-then-MAC tag is over the ciphertext,
-    // which does NOT change when only the passphrase rotates (these records are
-    // keyed under the master key, not the passphrase), so no decrypt is needed — we
-    // re-key a crypter with the master key + each record's own IV and recompute the
-    // MAC via ComputeRecordMAC. Used by ChangePassphrase when it promotes a loaded
-    // legacy (v3-v6) wallet to v7: without this, the file would be re-saved as v7
-    // while its non-master records still carry legacy-keyed MACs, and they would
-    // fail VerifyRecordMAC (separated keying) on the next load — the same
-    // keying-mismatch class as HIGH-2 / MEDIUM-1. `vMasterKeyPlain` is the decrypted
-    // master key these records were encrypted under. Returns false (and leaves
-    // partial in-memory state for the caller to roll back) on any malformed record.
-    // Assumes caller holds cs_wallet.
-    bool ReMACAllRecordsToV7Unlocked(const std::vector<uint8_t>& vMasterKeyPlain);
+                          std::vector<uint8_t>& macOut,
+                          bool useLegacyKeying = false) const;
 
     // UTXO set reference for balance validation in callbacks
     class CUTXOSet* m_utxo_set_ref{nullptr};
