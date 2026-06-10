@@ -4,6 +4,7 @@
 #include <api/http_server.h>
 #include <api/wallet_html.h>
 #include <net/sock.h>
+#include <rpc/host_validator.h>
 #include <iostream>
 #include <cstring>
 #include <sstream>
@@ -244,8 +245,30 @@ void CHttpServer::WorkerThread() {
     }
 }
 
+// LP-12: extract the REAL kernel-reported peer IP from the connected socket
+// (getpeername), mirroring CRPCServer::GetClientIP. Used for (a) the loopback
+// wallet-HTML origin gate and (b) per-IP REST rate-limiting/attribution. Never
+// trusts the client-supplied Host header. Returns "unknown" on failure, which
+// IsLoopbackIP treats as non-loopback (default-deny).
+static std::string GetPeerIP(SOCKET client_socket) {
+    struct sockaddr_storage ss;
+    socklen_t addr_size = sizeof(ss);
+    if (getpeername(client_socket, (struct sockaddr*)&ss, &addr_size) != 0) {
+        return "unknown";
+    }
+    std::string ip_str;
+    uint16_t port;
+    if (CSock::ExtractAddress(ss, ip_str, port)) {
+        return ip_str;
+    }
+    return "unknown";
+}
+
 // Handle a single HTTP request
 void CHttpServer::HandleRequest(SOCKET client_socket) {
+    // LP-12: resolve the real peer IP once, up front, from the kernel socket.
+    const std::string clientIP = GetPeerIP(client_socket);
+
     // Read request
     char buffer[4096];
 #ifdef _WIN32
@@ -306,8 +329,12 @@ void CHttpServer::HandleRequest(SOCKET client_socket) {
                     }
                 }
 
-                // Call REST API handler (returns full HTTP response)
-                std::string response = m_rest_api_handler(method, path, body, "0.0.0.0");
+                // Call REST API handler (returns full HTTP response).
+                // LP-12: pass the REAL peer IP (was hardcoded "0.0.0.0", which
+                // collapsed every client onto one rate-limit bucket and erased
+                // attribution). Per-IP limiting on the REST broadcast path now
+                // keys on the actual connection.
+                std::string response = m_rest_api_handler(method, path, body, clientIP);
 
                 // Send raw response (handler builds complete HTTP response)
 #ifdef _WIN32
@@ -329,6 +356,30 @@ void CHttpServer::HandleRequest(SOCKET client_socket) {
 
     // Handle GET /wallet or /wallet.html - serve embedded web wallet
     if (method == "GET" && (path == "/wallet" || path == "/wallet.html" || path == "/")) {
+        // ====================================================================
+        // LP-12 (mirrors server.cpp:1169-1232, C-01b/F-003) — the wallet UI is a
+        // token-minting desktop affordance, NOT a seed feature. Bring the
+        // standalone CHttpServer to parity with the RPC server, which previously
+        // protected this same HTML while this path served it unconditionally.
+        //
+        //  1. On a --public-api node (all-interfaces bind) the wallet UI is
+        //     DISABLED ENTIRELY — no page — regardless of socket peer. This
+        //     structurally removes the remote-admin-token / phishing-origin class
+        //     on network-bound seeds. Checked FIRST.
+        //  2. Otherwise (localhost default bind) require the REAL kernel socket
+        //     peer to be a loopback IP literal (IsLoopbackIP on getpeername's
+        //     result) — the Host header is never trusted for this decision.
+        // ====================================================================
+        if (m_public_api) {
+            SendResponse(client_socket, 403, "application/json",
+                R"({"error":"Forbidden: the wallet UI is disabled on a public-API node. SSH-tunnel to a loopback RPC to use the wallet.","code":-32600})");
+            return;
+        }
+        if (!rpc::HostValidator::IsLoopbackIP(clientIP)) {
+            SendResponse(client_socket, 403, "application/json",
+                R"({"error":"Forbidden: the wallet UI is served to loopback connections only. Use an SSH tunnel for remote access.","code":-32600})");
+            return;
+        }
         try {
             const std::string& html = GetWalletHTML();
             SendResponse(client_socket, 200, "text/html; charset=utf-8", html);
@@ -403,8 +454,10 @@ void CHttpServer::SendResponse(SOCKET client_socket,
     response << "HTTP/1.1 " << status_code << " ";
     switch (status_code) {
         case 200: response << "OK"; break;
+        case 403: response << "Forbidden"; break;
         case 404: response << "Not Found"; break;
         case 500: response << "Internal Server Error"; break;
+        case 503: response << "Service Unavailable"; break;
         default: response << "Unknown"; break;
     }
     response << "\r\n";

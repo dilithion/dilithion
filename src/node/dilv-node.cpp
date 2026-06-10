@@ -73,6 +73,7 @@
 #include <rpc/server.h>
 #include <rpc/auth.h>      // CVE-2026-RPC-AUTH: RPCAuth::InitializeAuth
 #include <rpc/rest_api.h>  // REST API for light wallet
+#include <rpc/ratelimiter.h>  // LP-12: per-IP rate limiter for the HTTP REST path
 #include <x402/facilitator.h>  // x402 payment facilitator
 #include <core/chainparams.h>
 #include <consensus/pow.h>
@@ -3695,7 +3696,13 @@ load_genesis_block:  // Bug #29: Label for automatic retry after blockchain wipe
         rest_api.RegisterUTXOSet(&utxo_set);
         rest_api.RegisterChainState(&g_chainstate);
         rest_api.SetTestnet(config.testnet);
-        // Note: Rate limiter is optional for HTTP server (RPC server has its own)
+        // LP-12: wire a per-IP rate limiter onto the standalone HTTP server's
+        // REST instance. Previously this was left null ("optional"), so the
+        // public REST broadcast endpoint (ENDPOINT_BROADCAST) returned "allow"
+        // for every request on a --public-api node. The CHttpServer now plumbs
+        // the real peer IP (see http_server.cpp), so this limiter keys per-IP.
+        static CRateLimiter http_rest_rate_limiter;
+        rest_api.RegisterRateLimiter(&http_rest_rate_limiter);
 
         // x402 Payment Facilitator — enables HTTP 402 micropayments on DilV
         static x402::CFacilitator x402_facilitator;
