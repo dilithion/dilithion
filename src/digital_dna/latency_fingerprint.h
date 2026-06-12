@@ -19,11 +19,11 @@ struct SeedNode {
 // Latency statistics for one seed node
 struct LatencyStats {
     std::string seed_name;
-    double median_ms;
-    double p10_ms;
-    double p90_ms;
-    double mean_ms;
-    double stddev_ms;
+    double median_ms = 0.0;
+    double p10_ms = 0.0;
+    double p90_ms = 0.0;
+    double mean_ms = 0.0;
+    double stddev_ms = 0.0;
     uint32_t samples;
     uint32_t failures;
 
