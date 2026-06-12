@@ -1399,6 +1399,19 @@ bool CWallet::EncryptWallet(const std::string& passphrase) {
     std::vector<uint8_t> snap_vchMIKPrivKeyIV(vchMIKPrivKeyIV.begin(), vchMIKPrivKeyIV.end());
     std::vector<uint8_t> snap_vchMIKPubKey = vchMIKPubKey;
     uint32_t snap_loadedFileVersion = m_loadedFileVersion;
+    // LP-7 (red-team MEDIUM-1): snapshot the in-memory MIK plaintext private key.
+    // EncryptMIKPrivKey() + m_mik->privkey.clear() below moves the MIK to a
+    // ciphertext-only in-memory state. The rollback restores the MIK CIPHERTEXT
+    // fields (vchEncryptedMIKPrivKey/...MAC/...IV) to their PRE-encryption snapshot
+    // (i.e. empty, since the wallet was unencrypted) AND restores masterKey to
+    // invalid — so without restoring the plaintext too, a save-failure rollback
+    // would leave the MIK with neither a usable plaintext nor a decryptable
+    // ciphertext (no master key to decrypt with), permanently losing the mining
+    // identity. Snapshot the plaintext so rollback can restore it verbatim.
+    bool snap_mikHadPriv = (m_mik && m_mik->HasPrivateKey());
+    std::vector<uint8_t, SecureAllocator<uint8_t>> snap_mikPrivKey =
+        snap_mikHadPriv ? m_mik->privkey
+                        : std::vector<uint8_t, SecureAllocator<uint8_t>>();
 
     auto rollback = [&]() {
         masterKey = snap_masterKey;
@@ -1429,6 +1442,13 @@ bool CWallet::EncryptWallet(const std::string& passphrase) {
         vchMIKPrivKeyIV.assign(snap_vchMIKPrivKeyIV.begin(), snap_vchMIKPrivKeyIV.end());
         vchMIKPubKey = snap_vchMIKPubKey;
         m_loadedFileVersion = snap_loadedFileVersion;
+        // LP-7 (red-team MEDIUM-1): restore the in-memory MIK plaintext private key
+        // that EncryptMIKPrivKey()+clear() may have scrubbed. Without this the MIK
+        // would be unrecoverable after a save-failure rollback (ciphertext snapshot
+        // is the pre-encryption empty state and masterKey is restored to invalid).
+        if (m_mik && snap_mikHadPriv) {
+            m_mik->privkey = snap_mikPrivKey;
+        }
     };
 
     // Generate random master key
@@ -2995,6 +3015,44 @@ bool CWallet::SaveUnlocked(const std::string& filename) const {
                              "HD wallet — the plaintext seed slots have been scrubbed and "
                              "writing them would corrupt the wallet (version promotion to "
                              "v7 must precede any save of an encrypted seed)" << std::endl;
+                return false;
+            }
+            // STRUCTURAL FAIL-CLOSED GUARD (red-team HIGH-1): close the LP-7
+            // plaintext-seed-at-rest leak on the legacy-v6 write path.
+            //
+            // The dangerous state is masterKey.IsValid()==true (encrypted in memory)
+            // && fHDMasterKeyEncrypted==false (HD seed still plaintext) flowing to the
+            // 32-byte plaintext-seed write below. There are TWO ways to reach that
+            // state on the v6 path, and they are NOT equivalent:
+            //
+            //   (1) LEGITIMATE (ratified BLOCKER-1, Test 7): a wallet LOADED from a
+            //       legacy v3-v6 file is always re-armed for migration on load
+            //       (m_fNeedsSeedMigration=true, see Load ~line 2191). ChangePassphrase
+            //       rewrites it IN PLACE at v6 — preserving the PRE-EXISTING plaintext
+            //       seed shape and deferring re-encryption to the next Unlock's
+            //       migration. This is NOT a new exposure: the seed was already
+            //       plaintext at rest, and migration is still armed to fix it.
+            //
+            //   (2) LEAK (red-team HIGH-1): a wallet that is encrypted-in-memory with a
+            //       plaintext seed but is NOT armed for migration (m_fNeedsSeedMigration
+            //       ==false) — e.g. an EncryptWallet that aborted mid-HD-step without
+            //       rolling back. Persisting the plaintext seed here is a genuine new
+            //       LP-7 exposure with no migration arm to ever fix it.
+            //
+            // Discriminator: refuse exactly the un-armed encrypted state. A migration-
+            // armed legacy wallet (case 1) is allowed to round-trip its pre-existing v6
+            // shape; an un-armed encrypted wallet (case 2) is refused. (The
+            // fHDMasterKeyEncrypted guard above independently catches the scrubbed-seed
+            // corruption window. This guard closes the plaintext-seed leak.)
+            if (masterKey.IsValid() && !m_fNeedsSeedMigration) {
+                std::cerr << "[Wallet] CRITICAL: refusing legacy-v6 plaintext-seed save of an "
+                             "encrypted HD wallet that is NOT armed for seed migration — the "
+                             "wallet has a master key but the HD seed is not encrypted "
+                             "(fHDMasterKeyEncrypted==false) and m_fNeedsSeedMigration==false; "
+                             "persisting a plaintext seed for an encrypted wallet with no "
+                             "migration arm is the LP-7 plaintext-at-rest exposure. The HD seed "
+                             "must be encrypted (EncryptHDMasterKey) before any save of such a "
+                             "wallet." << std::endl;
                 return false;
             }
             file.write(reinterpret_cast<const char*>(hdMasterKey.seed), 32);

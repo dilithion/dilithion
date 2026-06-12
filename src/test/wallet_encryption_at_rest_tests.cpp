@@ -1875,6 +1875,21 @@ struct LP7EncryptRollbackTester {
         return true;
     }
 
+    // red-team HIGH-1 variant: the SAME encrypted-in-memory + plaintext-seed window
+    // but pinned to the LEGACY-v6 writer (m_loadedFileVersion == 6 ⇒ writeLegacyV6
+    // == true). This exercises the legacy-v6 plaintext-seed write path (wallet.cpp
+    // ~3000), which the v7 guard did NOT cover. The dangerous state is the same:
+    // masterKey.IsValid()==true && fHDMasterKeyEncrypted==false flowing to a 32-byte
+    // plaintext seed write. On the pre-fix-#1 binary the legacy-v6 branch's only
+    // guard checks the INVERSE (fHDMasterKeyEncrypted), so this Save SUCCEEDS and
+    // leaks the plaintext seed; with the masterKey.IsValid() guard it must REFUSE.
+    static bool ForceEncryptedPlaintextSeedWindowV6(CWallet& w) {
+        if (!ForceEncryptedPlaintextSeedWindow(w)) return false;
+        // Override the version: legacy-v6 writer path instead of v7.
+        w.m_loadedFileVersion = WALLET_FILE_VERSION_6;
+        return true;
+    }
+
     static bool ForceSave(CWallet& w, const std::string& path) { return w.SaveUnlocked(path); }
     static bool IsHDEncrypted(const CWallet& w) { return w.fHDMasterKeyEncrypted; }
     static bool SeedMatches(const CWallet& w, const std::vector<uint8_t>& seed) {
@@ -1971,6 +1986,54 @@ static void Test_EncryptWalletRollback() {
         if (!savedBytes.empty()) {
             CHECK(!Contains(savedBytes, seed.data(), seed.size()),
                   "FAIL-CLOSED: no plaintext seed persisted for the encrypted wallet");
+        }
+
+        std::remove(path.c_str());
+        std::remove(savePath.c_str());
+    }
+
+    // === PART C (red-team HIGH-1): the LEGACY-v6 writer path is ALSO fail-closed
+    //             for an encrypted wallet with a plaintext seed. The first fold
+    //             only guarded the v7 plaintext branch; the parallel legacy-v6
+    //             writer (writeLegacyV6 == true, wallet.cpp ~3000) wrote the 32-byte
+    //             plaintext seed with no masterKey.IsValid() guard, so the LP-7 leak
+    //             stayed live for v6-loaded encrypted wallets. This case FAILS on
+    //             head 6d6e0b3a (proving HIGH-1) and PASSES after fix #1. ===
+    {
+        const std::string path     = "lp7_rollback_v6_src.dat";
+        const std::string savePath = "lp7_rollback_v6_guard.dat";
+        std::remove(path.c_str());
+        std::remove(savePath.c_str());
+
+        std::string mnemonic;
+        CWallet w;                         // no SetWalletFile → autosave off
+        CHECK(w.GenerateHDWallet(mnemonic), "Generated HD wallet for v6 guard test");
+        std::vector<uint8_t> seed, chaincode;
+        CHECK(DeriveSeedChaincode(mnemonic, seed, chaincode), "Derived expected seed (v6 case)");
+
+        // Force the SAME bug window but pinned to the legacy-v6 writer: encrypted-
+        // in-memory (master key valid) + HD seed still PLAINTEXT, m_loadedFileVersion
+        // == 6 ⇒ writeLegacyV6 == true. The seed is intact (not scrubbed), so the
+        // pre-existing scrubbed-seed guard (fHDMasterKeyEncrypted) does NOT catch it —
+        // only the new masterKey.IsValid() guard refuses this write.
+        CHECK(LP7EncryptRollbackTester::ForceEncryptedPlaintextSeedWindowV6(w),
+              "Entered encrypted-in-memory + plaintext-seed LEGACY-V6 window");
+        CHECK(w.IsCrypted() && !LP7EncryptRollbackTester::IsHDEncrypted(w),
+              "Window invariant holds (v6): master key valid AND HD seed not encrypted");
+
+        // Drive the legacy-v6 writer. With fix #1 (masterKey.IsValid() guard on the
+        // v6 branch) this MUST refuse. Without it, a v6 file with the plaintext seed
+        // is written for an encrypted wallet — the LP-7 leak on the v6 path.
+        bool saved = LP7EncryptRollbackTester::ForceSave(w, savePath);
+        CHECK(!saved,
+              "LOAD-BEARING (HIGH-1): SaveUnlocked REFUSES to write a legacy-v6 plaintext seed for an encrypted wallet");
+
+        std::vector<uint8_t> savedBytes = ReadFileBytes(savePath);
+        CHECK(savedBytes.empty(),
+              "FAIL-CLOSED (v6): no file written at the destination (no v6 encrypted+plaintext-seed artifact)");
+        if (!savedBytes.empty()) {
+            CHECK(!Contains(savedBytes, seed.data(), seed.size()),
+                  "FAIL-CLOSED (v6): no plaintext seed persisted for the encrypted wallet");
         }
 
         std::remove(path.c_str());
