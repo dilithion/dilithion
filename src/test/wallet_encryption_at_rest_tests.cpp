@@ -1042,6 +1042,76 @@ static void Test_Migration() {
 }
 
 // ---------------------------------------------------------------------------
+// Test 2c — surfaced state: NeedsSeedMigration() is the load-bearing hook for the
+// force-migrate fix (round-3 SURVIVING-LEAK). A pre-fix-encrypted wallet must
+// report needs_seed_migration==true at rest (while LOCKED, never unlocked), and
+// the flag must flip false exactly once the migration completes. This is what
+// drives the UI banner / operator remediation / RPC field and proves the
+// drive-to-safety path end to end (load → unlock → migrate → no plaintext seed).
+// ---------------------------------------------------------------------------
+static void Test_NeedsSeedMigrationSurfaced() {
+    std::cout << COLOR_BLUE "\n[Test 2c] Surfaced state: NeedsSeedMigration() flips false on migrate\n" COLOR_RESET;
+
+    const std::string path = "lp7_needs_migration_wallet.dat";
+    const std::string pass = "Surface!State#2026";
+    std::remove(path.c_str());
+
+    LegacyV6Result legacy;
+    bool built = BuildLegacyV6Wallet(path, pass, legacy);
+    CHECK(built, "Built legacy v6 plaintext-seed encrypted wallet (pre-fix artifact)");
+    if (!built) { std::remove(path.c_str()); return; }
+
+    // --- State surfaced at rest: armed, encrypted, LOCKED, NOT yet migrated ---
+    // Load with autosave OFF so nothing migrates; this models the receive/mine-only
+    // wallet that sits plaintext-at-rest forever. The surfaced flag must be true.
+    {
+        CWallet w;
+        CHECK(w.Load(path), "Loaded pre-fix wallet (autosave off, never unlocked)");
+        CHECK(w.IsCrypted(), "Wallet reports encrypted (has master key)");
+        CHECK(w.IsLocked(), "Wallet is LOCKED at rest (masterKey invalid until unlock)");
+        CHECK(w.NeedsSeedMigration(),
+              "SURFACED: NeedsSeedMigration()==true while encrypted+plaintext-seed-at-rest");
+        // Confirm the on-disk seed really is plaintext here (the thing we surface).
+        std::vector<uint8_t> bytes = ReadFileBytes(path);
+        CHECK(Contains(bytes, legacy.seed.data(), legacy.seed.size()),
+              "Seed plaintext IS at rest while NeedsSeedMigration()==true (the leak being surfaced)");
+    }
+
+    // --- Migrate-on-unlock: flag flips false, no plaintext seed remains ---
+    {
+        CWallet w;
+        w.SetWalletFile(path);  // enables autosave → atomic v7 rewrite on unlock
+        CHECK(w.Load(path), "Reloaded pre-fix wallet (autosave on)");
+        CHECK(w.NeedsSeedMigration(), "Pre-unlock: still armed (NeedsSeedMigration()==true)");
+        CHECK(w.Unlock(pass), "Unlock → drives the one-time migration");
+        CHECK(!w.NeedsSeedMigration(),
+              "DRIVE-TO-SAFETY: NeedsSeedMigration() flips FALSE after migration");
+    }
+
+    // After migration the wallet is genuinely safe at rest: v7, no plaintext seed.
+    CHECK(FileVersion(path) == WALLET_FILE_VERSION_7, "Post-migration file is v7");
+    {
+        std::vector<uint8_t> bytes = ReadFileBytes(path);
+        CHECK(!Contains(bytes, legacy.seed.data(), legacy.seed.size()),
+              "Post-migration: NO plaintext seed at rest (drive-to-safety verified)");
+        CHECK(!Contains(bytes, legacy.chaincode.data(), legacy.chaincode.size()),
+              "Post-migration: NO plaintext chaincode at rest");
+    }
+
+    // Reload the migrated wallet: the surfaced flag stays false (no false alarm).
+    {
+        CWallet w;
+        w.SetWalletFile(path);
+        CHECK(w.Load(path), "Reloaded migrated v7 wallet");
+        CHECK(w.IsCrypted(), "Migrated wallet still reports encrypted");
+        CHECK(!w.NeedsSeedMigration(),
+              "Migrated v7 wallet reports NeedsSeedMigration()==false at rest (no false alarm)");
+    }
+
+    std::remove(path.c_str());
+}
+
+// ---------------------------------------------------------------------------
 // Test 2b — fail-closed guard on the scrubbed-seed / legacy-v6 corruption window
 // (red-team LOW-1 hardening). A `friend struct` (declared in wallet.h) so the
 // test can construct the otherwise-unreachable window state and drive the
@@ -2046,6 +2116,7 @@ int main() {
 
     Test_Secrecy();
     Test_Migration();
+    Test_NeedsSeedMigrationSurfaced();
     Test_FailClosedScrubbedV6Window();
     Test_AuthTamper();
     Test_PerRecordMACIsolation();

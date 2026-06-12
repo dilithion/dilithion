@@ -1045,6 +1045,16 @@ bool CWallet::IsLocked() const {
     return masterKey.IsValid() && !fWalletUnlocked;
 }
 
+bool CWallet::NeedsSeedMigration() const {
+    std::lock_guard<std::mutex> lock(cs_wallet);
+    // m_fNeedsSeedMigration is armed at load (CWallet::Load) only when the wallet
+    // is encrypted (masterKey valid) AND the on-disk format held the HD seed in
+    // plaintext (pre-fix bug shape); it is cleared the moment the v7 migration
+    // completes inside Unlock. We additionally require masterKey.IsValid() so a
+    // non-encrypted wallet can never report this state.
+    return masterKey.IsValid() && m_fNeedsSeedMigration;
+}
+
 // VULN-002 FIX: Helper to check if unlock is still valid (not expired)
 // Assumes caller holds cs_wallet lock
 // BUG #74 FIX: Internal version that assumes caller already holds cs_wallet
@@ -2772,6 +2782,18 @@ bool CWallet::Load(const std::string& filename) {
         m_fNeedsSeedMigration = temp_fNeedsSeedMigration;
 
         m_walletFile = filename;  // Set wallet file path only on successful load
+
+        // LP-7 (force-migrate / round-3 SURVIVING-LEAK): if this encrypted wallet
+        // was loaded with a plaintext HD seed at rest (pre-fix bug), emit a LOUD
+        // one-time-per-load CRITICAL so the operator/UI is driven to unlock-and-
+        // migrate. A receive/mine-only wallet would otherwise sit plaintext forever
+        // while reporting "encrypted". The per-autosave warning (SaveUnlocked) keeps
+        // surfacing it until the migration runs on the next Unlock.
+        if (m_fNeedsSeedMigration) {
+            std::cerr << "[Wallet] CRITICAL: wallet seed is stored UNENCRYPTED at rest "
+                         "despite the wallet being encrypted (fixed bug LP-7). Unlock once "
+                         "to complete a one-time security upgrade." << std::endl;
+        }
     }
 
     return true;
@@ -2824,6 +2846,19 @@ bool CWallet::SaveUnlocked(const std::string& filename) const {
     std::string saveFile = filename.empty() ? m_walletFile : filename;
     if (saveFile.empty()) {
         return false;  // No wallet file specified
+    }
+
+    // LP-7 (force-migrate / round-3 SURVIVING-LEAK): re-emit the CRITICAL on EVERY
+    // save while the seed is still plaintext-at-rest (not once). An armed wallet
+    // that is never unlocked is autosaved repeatedly (receive/mine); each save
+    // re-writes the plaintext seed to disk, so each save must re-surface the
+    // remediation. This fires for the legacy v6 path (which re-emits v6 plaintext)
+    // until the next Unlock runs MigrateToEncryptedSeedV7Unlocked() and clears the
+    // flag. Caller holds cs_wallet (SaveUnlocked precondition), so the read is safe.
+    if (masterKey.IsValid() && m_fNeedsSeedMigration) {
+        std::cerr << "[Wallet] CRITICAL: wallet seed is stored UNENCRYPTED at rest "
+                     "despite the wallet being encrypted (fixed bug LP-7). Unlock once "
+                     "to complete a one-time security upgrade." << std::endl;
     }
 
     // SEC-001 FIX: Atomic file write pattern

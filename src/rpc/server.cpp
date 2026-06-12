@@ -4333,12 +4333,20 @@ std::string CRPCServer::RPC_GetWalletInfo(const std::string& params) {
 
     bool isEncrypted = m_wallet->IsCrypted();
     bool isLocked = isEncrypted && m_wallet->IsLocked();
+    // LP-7 (force-migrate / round-3 SURVIVING-LEAK): surface the plaintext-seed-at-
+    // rest state so UI + operators + tests can drive the one-time unlock-and-migrate.
+    // True exactly when the wallet is encrypted but the HD seed is still stored in
+    // plaintext on disk (pre-fix bug) and has not yet been migrated. While true the
+    // wallet must NOT be presented as safely-encrypted.
+    bool needsSeedMigration = m_wallet->NeedsSeedMigration();
 
     std::ostringstream oss;
     oss << "{"
         << "\"encrypted\":" << (isEncrypted ? "true" : "false") << ","
         << "\"locked\":" << (isLocked ? "true" : "false") << ","
-        << "\"unlocked_until\":" << (isLocked ? 0 : 1)  // 0 if locked, 1 if unlocked
+        << "\"unlocked_until\":" << (isLocked ? 0 : 1) << ","  // 0 if locked, 1 if unlocked
+        << "\"needs_seed_migration\":" << (needsSeedMigration ? "true" : "false") << ","
+        << "\"seed_unencrypted_at_rest\":" << (needsSeedMigration ? "true" : "false")
         << "}";
 
     return oss.str();

@@ -803,6 +803,21 @@ public:
     bool IsCrypted() const;
 
     /**
+     * LP-7 (force-migrate / round-3 SURVIVING-LEAK): true exactly when this
+     * wallet is ENCRYPTED (has a passphrase master key) but was loaded from a
+     * pre-fix on-disk format that still holds the HD seed in PLAINTEXT at rest,
+     * and has not yet been migrated. While true, the seed is unencrypted on disk
+     * DESPITE the wallet reporting "encrypted" — the migration to the v7
+     * encrypted-seed format only runs on the next successful Unlock (it needs the
+     * passphrase). Surfaced so the UI / operators can be driven to unlock once,
+     * and so the wallet is never presented as safely-encrypted until migrated.
+     * Flips to false once the migration completes.
+     *
+     * @return true if an encrypted wallet's seed is still plaintext-at-rest
+     */
+    bool NeedsSeedMigration() const;
+
+    /**
      * Change wallet passphrase
      *
      * WL-015 FIX: Complete parameter documentation
