@@ -243,6 +243,15 @@ class CWallet {
     // can reach this state (Unlock promotes the version atomically under cs_wallet).
     friend struct LP7FailClosedTester;
 
+    // LP-7 (Cursor HIGH-2 regression test): grants the encryption-at-rest test
+    // suite access to (a) corrupt the encrypted-mnemonic ciphertext so an
+    // EncryptWallet mid-HD-step fails, and (b) inspect post-failure invariants
+    // (masterKey validity, fHDMasterKeyEncrypted, the plaintext seed slots) to
+    // prove EncryptWallet rolls back to the original UNENCRYPTED state and a
+    // subsequent Save never persists a v7 plaintext seed for an encrypted wallet.
+    // Test-only.
+    friend struct LP7EncryptRollbackTester;
+
 private:
     // Key storage
     std::map<CDilithiumAddress, CKey> mapKeys;              // Unencrypted keys (when wallet not encrypted)

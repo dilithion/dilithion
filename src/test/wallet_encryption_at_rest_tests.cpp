@@ -1818,6 +1818,166 @@ static void Test_ChangePassphraseLegacyV6WithMIK() {
     std::remove(path.c_str());
 }
 
+// ---------------------------------------------------------------------------
+// Test 9 — Cursor HIGH-2: EncryptWallet is transactional + the v7 plaintext-seed
+//          SaveUnlocked branch is fail-closed for an encrypted wallet.
+//
+// THE BUG (Cursor NO-GO): EncryptWallet clears mapKeys + sets the master key, then
+// on any HD-step failure (mnemonic recover / re-encrypt / EncryptHDMasterKey)
+// returned false WITHOUT rollback — leaving the wallet encrypted-in-memory
+// (masterKey valid) with fHDMasterKeyEncrypted==false and a PLAINTEXT seed. A new
+// HD wallet (m_loadedFileVersion==0 ⇒ writes v7) in that state, on the next
+// autosave, persisted a v7 file with encrypted spending keys + PLAINTEXT seed =
+// the LP-7 plaintext-at-rest bug reintroduced, with no migration arm on reload.
+//
+// This test pins BOTH halves of the fold:
+//   PART A (rollback): force an EncryptWallet mid-HD-step failure by corrupting
+//     vchEncryptedMnemonic so the mnemonic-recover Decrypt fails, then assert
+//     (a) EncryptWallet returns false, (b) the wallet rolled back to UNENCRYPTED
+//     (IsCrypted()==false, fHDMasterKeyEncrypted==false), and (c) the in-memory
+//     plaintext seed is intact (not scrubbed) — i.e. the wallet is exactly as it
+//     was before the failed attempt and can be retried.
+//   PART B (fail-closed guard): force the otherwise-unreachable encrypted-in-memory
+//     + plaintext-seed window directly, then drive SaveUnlocked and assert it
+//     REFUSES (no v7 plaintext-seed file for an encrypted wallet ever reaches disk).
+//
+// On the UNFIXED branch (b5a71676): PART A's rollback asserts FAIL (the wallet is
+// left encrypted with a plaintext seed) and PART B's Save SUCCEEDS writing a v7
+// file that contains the plaintext seed. On the fixed branch both PARTs pass.
+// ---------------------------------------------------------------------------
+struct LP7EncryptRollbackTester {
+    // Corrupt the encrypted-mnemonic ciphertext so EncryptWallet's mnemonic-recover
+    // Decrypt fails deterministically: appending one byte makes the length not a
+    // multiple of the AES block size, which DecryptAES256 rejects up front.
+    static bool CorruptMnemonicCiphertext(CWallet& w) {
+        if (w.vchEncryptedMnemonic.empty()) return false;
+        w.vchEncryptedMnemonic.push_back(0x00);  // length now %16 != 0 → Decrypt fails
+        return true;
+    }
+
+    // Force the encrypted-in-memory + plaintext-seed window that EncryptWallet used
+    // to leave behind on a failed HD step. Mirrors that exact partial state: a valid
+    // master key (so IsCrypted()==true) but fHDMasterKeyEncrypted==false with the
+    // plaintext seed still in the fixed slots, at v7 (a freshly generated HD wallet).
+    static bool ForceEncryptedPlaintextSeedWindow(CWallet& w) {
+        if (!w.fIsHDWallet) return false;
+        // Fabricate a structurally-valid master key so masterKey.IsValid() is true
+        // WITHOUT going through EncryptWallet (which we are deliberately bypassing).
+        w.masterKey.vchCryptedKey.assign(48, 0x11);
+        w.masterKey.vchSalt.assign(WALLET_CRYPTO_SALT_SIZE, 0x22);
+        w.masterKey.vchIV.assign(WALLET_CRYPTO_IV_SIZE, 0x33);
+        w.masterKey.vchMAC.assign(64, 0x44);
+        if (!w.masterKey.IsValid()) return false;
+        // The HD seed is STILL plaintext (not encrypted) — the bug state.
+        w.fHDMasterKeyEncrypted = false;
+        // A freshly generated wallet writes v7 (m_loadedFileVersion == 0). Pin it.
+        w.m_loadedFileVersion = WALLET_FILE_VERSION_7;
+        return true;
+    }
+
+    static bool ForceSave(CWallet& w, const std::string& path) { return w.SaveUnlocked(path); }
+    static bool IsHDEncrypted(const CWallet& w) { return w.fHDMasterKeyEncrypted; }
+    static bool SeedMatches(const CWallet& w, const std::vector<uint8_t>& seed) {
+        return seed.size() == 32 && std::memcmp(w.hdMasterKey.seed, seed.data(), 32) == 0;
+    }
+};
+
+static void Test_EncryptWalletRollback() {
+    std::cout << COLOR_BLUE "\n[Test 9] EncryptWallet transactional rollback + v7 plaintext-seed Save fail-closed (Cursor HIGH-1/HIGH-2)\n" COLOR_RESET;
+
+    const std::string pass = "R0llb@ck!Test#2026";
+
+    // === PART A: forced mid-HD-step failure rolls back to UNENCRYPTED ===
+    {
+        const std::string path = "lp7_rollback_wallet.dat";
+        std::remove(path.c_str());
+
+        std::string mnemonic;
+        CWallet w;
+        w.SetWalletFile(path);            // autosave on → a fresh v7 unencrypted wallet
+        CHECK(w.GenerateHDWallet(mnemonic), "Generated HD wallet (unencrypted v7)");
+
+        std::vector<uint8_t> seed, chaincode;
+        CHECK(DeriveSeedChaincode(mnemonic, seed, chaincode), "Derived expected seed from mnemonic");
+
+        // Corrupt the encrypted mnemonic so the mnemonic-recover step inside
+        // EncryptWallet fails AFTER the master key + key maps have been set up.
+        CHECK(LP7EncryptRollbackTester::CorruptMnemonicCiphertext(w),
+              "Corrupted vchEncryptedMnemonic (forces mnemonic-recover Decrypt to fail mid-encrypt)");
+
+        bool encrypted = w.EncryptWallet(pass);
+        CHECK(!encrypted, "LOAD-BEARING (a): EncryptWallet RETURNS FALSE on the mid-HD-step failure");
+
+        // Rollback invariants: the wallet must be back to its original UNENCRYPTED state.
+        CHECK(!w.IsCrypted(),
+              "LOAD-BEARING (b): wallet rolled back to UNENCRYPTED (IsCrypted()==false, master key cleared)");
+        CHECK(!LP7EncryptRollbackTester::IsHDEncrypted(w),
+              "LOAD-BEARING (b): fHDMasterKeyEncrypted==false after rollback");
+        CHECK(LP7EncryptRollbackTester::SeedMatches(w, seed),
+              "LOAD-BEARING (b): in-memory plaintext seed intact after rollback (not scrubbed)");
+
+        // A subsequent Save now writes a LEGITIMATE unencrypted wallet (the rollback
+        // returned it to unencrypted), so a plaintext seed on disk here is correct —
+        // and crucially the file must NOT be an encrypted wallet carrying a plaintext
+        // seed. Assert the file is unencrypted (flags bit 0 clear).
+        CHECK(w.Save(path), "Saved the rolled-back wallet");
+        {
+            std::vector<uint8_t> bytes = ReadFileBytes(path);
+            CHECK(bytes.size() >= 16, "Read the saved wallet file");
+            uint32_t flags = GetU32(bytes, 12);
+            CHECK((flags & 0x01) == 0,
+                  "LOAD-BEARING (c): saved file is UNENCRYPTED (no encrypted-wallet+plaintext-seed file produced)");
+            // The seed IS present, which is correct for an unencrypted wallet (matches
+            // Test 1's negative control). This is NOT the bug: the bug is an ENCRYPTED
+            // file with a plaintext seed, excluded by the flag assertion above.
+            CHECK(Contains(bytes, seed.data(), seed.size()),
+                  "Unencrypted rolled-back wallet legitimately stores the seed (negative-control consistency)");
+        }
+        std::remove(path.c_str());
+    }
+
+    // === PART B: SaveUnlocked is fail-closed for an encrypted wallet with a
+    //             plaintext seed (the v7 plaintext-branch guard) ===
+    {
+        const std::string path    = "lp7_rollback_src.dat";
+        const std::string savePath = "lp7_rollback_guard.dat";
+        std::remove(path.c_str());
+        std::remove(savePath.c_str());
+
+        std::string mnemonic;
+        CWallet w;                         // no SetWalletFile → autosave off
+        CHECK(w.GenerateHDWallet(mnemonic), "Generated HD wallet for guard test");
+        std::vector<uint8_t> seed, chaincode;
+        CHECK(DeriveSeedChaincode(mnemonic, seed, chaincode), "Derived expected seed");
+
+        // Force the exact bug window: encrypted-in-memory (master key valid) + the HD
+        // seed still PLAINTEXT, at v7. This is what a pre-fix failed EncryptWallet (or
+        // a future refactor) could leave behind.
+        CHECK(LP7EncryptRollbackTester::ForceEncryptedPlaintextSeedWindow(w),
+              "Entered encrypted-in-memory + plaintext-seed v7 window (IsCrypted && !fHDMasterKeyEncrypted)");
+        CHECK(w.IsCrypted() && !LP7EncryptRollbackTester::IsHDEncrypted(w),
+              "Window invariant holds: master key valid AND HD seed not encrypted");
+
+        // Drive the writer the public Save() reaches. With the v7 plaintext-branch
+        // guard this MUST refuse. Without it, a v7 file with the plaintext seed is
+        // written for an encrypted wallet (the LP-7 exposure).
+        bool saved = LP7EncryptRollbackTester::ForceSave(w, savePath);
+        CHECK(!saved,
+              "LOAD-BEARING: SaveUnlocked REFUSES to write a v7 plaintext seed for an encrypted wallet");
+
+        std::vector<uint8_t> savedBytes = ReadFileBytes(savePath);
+        CHECK(savedBytes.empty(),
+              "FAIL-CLOSED: no file written at the destination (no v7 encrypted+plaintext-seed artifact)");
+        if (!savedBytes.empty()) {
+            CHECK(!Contains(savedBytes, seed.data(), seed.size()),
+                  "FAIL-CLOSED: no plaintext seed persisted for the encrypted wallet");
+        }
+
+        std::remove(path.c_str());
+        std::remove(savePath.c_str());
+    }
+}
+
 int main() {
     std::cout << COLOR_BLUE "==== LP-7 wallet encryption-at-rest tests ====" COLOR_RESET "\n";
 
@@ -1830,6 +1990,7 @@ int main() {
     Test_LegacyPerAddressKey();
     Test_ChangePassphraseLegacyNonHD();
     Test_ChangePassphraseLegacyV6WithMIK();
+    Test_EncryptWalletRollback();
 
     std::cout << "\n=============================================\n";
     std::cout << "PASSED: " << g_pass << "   FAILED: " << g_fail << "\n";

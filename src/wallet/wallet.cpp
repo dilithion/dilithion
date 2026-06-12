@@ -1363,6 +1363,74 @@ bool CWallet::EncryptWallet(const std::string& passphrase) {
 
     // Allow encrypting empty wallet - keys will be encrypted as they're generated
 
+    // --- TRANSACTIONAL SNAPSHOT (Cursor HIGH-2) ---
+    // EncryptWallet mutates the master key, the key maps, the in-memory unlocked
+    // state, and (for HD wallets) the HD seed/mnemonic/MIK ciphertext fields, and
+    // it scrubs the plaintext seed in EncryptHDMasterKey(). If any later step fails
+    // (mnemonic recover/re-encrypt, EncryptHDMasterKey), the previous code returned
+    // false WITHOUT undoing those mutations — leaving the wallet encrypted-in-memory
+    // (masterKey valid) with fHDMasterKeyEncrypted==false and a plaintext seed. A new
+    // HD wallet (m_loadedFileVersion==0 ⇒ v7 writer) in that state would persist a v7
+    // file with encrypted spending keys + PLAINTEXT seed on the next autosave — the
+    // LP-7 bug reintroduced, with no migration arm on reload.
+    //
+    // Snapshot the full pre-encryption state here (BEFORE any mutation) and RESTORE it
+    // on every failure path so the wallet returns to its original UNENCRYPTED state.
+    // Mirrors the snapshot/rollback structure of MigrateToEncryptedSeedV7Unlocked().
+    CMasterKey snap_masterKey = masterKey;
+    std::map<CDilithiumAddress, CKey> snap_mapKeys = mapKeys;
+    std::map<CDilithiumAddress, CEncryptedKey> snap_mapCryptedKeys = mapCryptedKeys;
+    bool snap_fWalletUnlocked = fWalletUnlocked;
+    std::chrono::time_point<std::chrono::steady_clock> snap_nUnlockTime = nUnlockTime;
+    bool snap_vMasterKey_set = !vMasterKey.empty();
+    CHDExtendedKey snap_hdMasterKey = hdMasterKey;
+    bool snap_fHDMasterKeyEncrypted = fHDMasterKeyEncrypted;
+    bool snap_fHDMasterKeyCached = fHDMasterKeyCached;
+    CHDExtendedKey snap_hdMasterKeyDecrypted = hdMasterKeyDecrypted;
+    std::vector<uint8_t> snap_vchEncryptedMnemonic = vchEncryptedMnemonic;
+    std::vector<uint8_t> snap_vchMnemonicMAC = vchMnemonicMAC;
+    std::vector<uint8_t> snap_vchMnemonicIV(vchMnemonicIV.begin(), vchMnemonicIV.end());
+    std::vector<uint8_t> snap_vchEncryptedHDMasterKey = vchEncryptedHDMasterKey;
+    std::vector<uint8_t> snap_vchHDMasterKeyMAC = vchHDMasterKeyMAC;
+    std::vector<uint8_t> snap_vchHDMasterKeyIV(vchHDMasterKeyIV.begin(), vchHDMasterKeyIV.end());
+    bool snap_fHasMIK = fHasMIK;
+    std::vector<uint8_t> snap_vchEncryptedMIKPrivKey = vchEncryptedMIKPrivKey;
+    std::vector<uint8_t> snap_vchMIKPrivKeyMAC = vchMIKPrivKeyMAC;
+    std::vector<uint8_t> snap_vchMIKPrivKeyIV(vchMIKPrivKeyIV.begin(), vchMIKPrivKeyIV.end());
+    std::vector<uint8_t> snap_vchMIKPubKey = vchMIKPubKey;
+    uint32_t snap_loadedFileVersion = m_loadedFileVersion;
+
+    auto rollback = [&]() {
+        masterKey = snap_masterKey;
+        mapKeys = snap_mapKeys;
+        mapCryptedKeys = snap_mapCryptedKeys;
+        fWalletUnlocked = snap_fWalletUnlocked;
+        nUnlockTime = snap_nUnlockTime;
+        // The wallet was UNENCRYPTED before this call (guarded by masterKey.IsValid()
+        // at the top), so vMasterKey must not retain a usable master key after a
+        // failed encryption — scrub it. (snap_vMasterKey_set is false in the normal
+        // pre-encryption case; this is belt-and-suspenders.)
+        if (!snap_vMasterKey_set && !vMasterKey.empty()) {
+            memory_cleanse(vMasterKey.data_ptr(), vMasterKey.size());
+        }
+        hdMasterKey = snap_hdMasterKey;
+        fHDMasterKeyEncrypted = snap_fHDMasterKeyEncrypted;
+        fHDMasterKeyCached = snap_fHDMasterKeyCached;
+        hdMasterKeyDecrypted = snap_hdMasterKeyDecrypted;
+        vchEncryptedMnemonic = snap_vchEncryptedMnemonic;
+        vchMnemonicMAC = snap_vchMnemonicMAC;
+        vchMnemonicIV.assign(snap_vchMnemonicIV.begin(), snap_vchMnemonicIV.end());
+        vchEncryptedHDMasterKey = snap_vchEncryptedHDMasterKey;
+        vchHDMasterKeyMAC = snap_vchHDMasterKeyMAC;
+        vchHDMasterKeyIV.assign(snap_vchHDMasterKeyIV.begin(), snap_vchHDMasterKeyIV.end());
+        fHasMIK = snap_fHasMIK;
+        vchEncryptedMIKPrivKey = snap_vchEncryptedMIKPrivKey;
+        vchMIKPrivKeyMAC = snap_vchMIKPrivKeyMAC;
+        vchMIKPrivKeyIV.assign(snap_vchMIKPrivKeyIV.begin(), snap_vchMIKPrivKeyIV.end());
+        vchMIKPubKey = snap_vchMIKPubKey;
+        m_loadedFileVersion = snap_loadedFileVersion;
+    };
+
     // Generate random master key
     std::vector<uint8_t> vMasterKeyPlain(WALLET_CRYPTO_KEY_SIZE);
     if (!GetStrongRandBytes(vMasterKeyPlain.data(), WALLET_CRYPTO_KEY_SIZE)) {
@@ -1372,6 +1440,7 @@ bool CWallet::EncryptWallet(const std::string& passphrase) {
     // Generate salt for PBKDF2
     if (!GenerateSalt(masterKey.vchSalt)) {
         memory_cleanse(vMasterKeyPlain.data(), vMasterKeyPlain.size());
+        rollback();
         return false;
     }
 
@@ -1379,6 +1448,7 @@ bool CWallet::EncryptWallet(const std::string& passphrase) {
     std::vector<uint8_t> derivedKey;
     if (!DeriveKey(passphrase, masterKey.vchSalt, WALLET_CRYPTO_PBKDF2_ROUNDS, derivedKey)) {
         memory_cleanse(vMasterKeyPlain.data(), vMasterKeyPlain.size());
+        rollback();
         return false;
     }
 
@@ -1386,6 +1456,7 @@ bool CWallet::EncryptWallet(const std::string& passphrase) {
     if (!GenerateUniqueIV_Locked(masterKey.vchIV)) {
         memory_cleanse(vMasterKeyPlain.data(), vMasterKeyPlain.size());
         memory_cleanse(derivedKey.data(), derivedKey.size());
+        rollback();
         return false;
     }
 
@@ -1394,12 +1465,14 @@ bool CWallet::EncryptWallet(const std::string& passphrase) {
     if (!masterCrypter.SetKey(derivedKey, masterKey.vchIV)) {
         memory_cleanse(vMasterKeyPlain.data(), vMasterKeyPlain.size());
         memory_cleanse(derivedKey.data(), derivedKey.size());
+        rollback();
         return false;
     }
 
     if (!masterCrypter.Encrypt(vMasterKeyPlain, masterKey.vchCryptedKey)) {
         memory_cleanse(vMasterKeyPlain.data(), vMasterKeyPlain.size());
         memory_cleanse(derivedKey.data(), derivedKey.size());
+        rollback();
         return false;
     }
 
@@ -1408,6 +1481,7 @@ bool CWallet::EncryptWallet(const std::string& passphrase) {
     if (!ComputeRecordMAC(masterCrypter, masterKey.vchCryptedKey, masterKey.vchMAC)) {
         memory_cleanse(vMasterKeyPlain.data(), vMasterKeyPlain.size());
         memory_cleanse(derivedKey.data(), derivedKey.size());
+        rollback();
         return false;
     }
 
@@ -1426,6 +1500,7 @@ bool CWallet::EncryptWallet(const std::string& passphrase) {
         if (!GenerateUniqueIV_Locked(encKey.vchIV)) {
             memory_cleanse(vMasterKeyPlain.data(), vMasterKeyPlain.size());
             memory_cleanse(derivedKey.data(), derivedKey.size());
+            rollback();
             return false;
         }
 
@@ -1434,12 +1509,14 @@ bool CWallet::EncryptWallet(const std::string& passphrase) {
         if (!keyCrypter.SetKey(vMasterKeyPlain, encKey.vchIV)) {
             memory_cleanse(vMasterKeyPlain.data(), vMasterKeyPlain.size());
             memory_cleanse(derivedKey.data(), derivedKey.size());
+            rollback();
             return false;
         }
 
         if (!keyCrypter.Encrypt(key.vchPrivKey, encKey.vchCryptedKey)) {
             memory_cleanse(vMasterKeyPlain.data(), vMasterKeyPlain.size());
             memory_cleanse(derivedKey.data(), derivedKey.size());
+            rollback();
             return false;
         }
 
@@ -1448,6 +1525,7 @@ bool CWallet::EncryptWallet(const std::string& passphrase) {
         if (!ComputeRecordMAC(keyCrypter, encKey.vchCryptedKey, encKey.vchMAC)) {
             memory_cleanse(vMasterKeyPlain.data(), vMasterKeyPlain.size());
             memory_cleanse(derivedKey.data(), derivedKey.size());
+            rollback();
             return false;
         }
 
@@ -1493,6 +1571,7 @@ bool CWallet::EncryptWallet(const std::string& passphrase) {
                 memory_cleanse(vMasterKeyPlain.data(), vMasterKeyPlain.size());
                 memory_cleanse(derivedKey.data(), derivedKey.size());
                 std::cerr << "[Wallet] CRITICAL: failed to recover mnemonic for re-encryption" << std::endl;
+                rollback();
                 return false;
             }
             memory_cleanse(obfKey.data(), obfKey.size());
@@ -1508,6 +1587,7 @@ bool CWallet::EncryptWallet(const std::string& passphrase) {
                 memory_cleanse(vMasterKeyPlain.data(), vMasterKeyPlain.size());
                 memory_cleanse(derivedKey.data(), derivedKey.size());
                 std::cerr << "[Wallet] CRITICAL: failed to re-encrypt mnemonic" << std::endl;
+                rollback();
                 return false;
             }
         }
@@ -1518,6 +1598,7 @@ bool CWallet::EncryptWallet(const std::string& passphrase) {
             memory_cleanse(vMasterKeyPlain.data(), vMasterKeyPlain.size());
             memory_cleanse(derivedKey.data(), derivedKey.size());
             std::cerr << "[Wallet] CRITICAL: failed to encrypt HD master key" << std::endl;
+            rollback();
             return false;
         }
     }
@@ -1550,7 +1631,15 @@ bool CWallet::EncryptWallet(const std::string& passphrase) {
     // Save wallet to disk — encryption MUST be persisted
     if (m_autoSave && !m_walletFile.empty()) {
         if (!SaveUnlocked()) {
-            std::cerr << "[Wallet] CRITICAL: Wallet encrypted in memory but failed to save to disk!" << std::endl;
+            // Transactional (Cursor HIGH-2): the in-memory encryption is complete
+            // and correct (HD seed encrypted, fHDMasterKeyEncrypted==true) so this
+            // is NOT the plaintext-at-rest state — but the encryption did not reach
+            // disk. Roll the in-memory state back to UNENCRYPTED so the on-disk file
+            // and memory agree (both unencrypted) and the failure is total rather
+            // than leaving the wallet encrypted-in-memory-but-unsaved. EncryptWallet
+            // can then be retried cleanly.
+            std::cerr << "[Wallet] CRITICAL: Wallet encrypted in memory but failed to save to disk — rolling back to unencrypted state" << std::endl;
+            rollback();
             return false;
         }
     }
@@ -2026,6 +2115,21 @@ bool CWallet::Load(const std::string& filename) {
                 if (!file.good()) return false;
                 file.read(reinterpret_cast<char*>(&temp_hdMasterKey.child_index), sizeof(temp_hdMasterKey.child_index));
                 if (!file.good()) return false;
+
+                // LOAD-TIME DEFENSE-IN-DEPTH (Cursor HIGH-1/HIGH-2): a v7 file whose
+                // HD seed is PLAINTEXT (this branch) while the WALLET is encrypted
+                // (isEncrypted: spending keys under a passphrase master key) is the
+                // LP-7 plaintext-seed-at-rest state — it should never have been
+                // written (the SaveUnlocked guard now refuses it, and EncryptWallet
+                // is now transactional), but a wallet produced by a pre-fix binary
+                // could still exist on disk. Arm migration so the next Unlock
+                // re-encrypts the seed and rewrites the file at v7, exactly as the
+                // legacy-layout branch below does for legacy plaintext seeds. (An
+                // UNencrypted v7 wallet legitimately stores a plaintext seed here —
+                // only arm when the wallet has a master key.)
+                if (isEncrypted) {
+                    temp_fNeedsSeedMigration = true;
+                }
             }
         } else {
             // LEGACY v3-v6 layout: fixed [seed32][chaincode32][depth][fp][ci]
@@ -2952,6 +3056,31 @@ bool CWallet::SaveUnlocked(const std::string& filename) const {
             // Unencrypted HD wallet: seed is plaintext by design (no passphrase
             // set). Write the fixed 32+32 plaintext slots + metadata. An
             // unencrypted seed length of 0 (variable-length) marks "plaintext".
+            //
+            // STRUCTURAL FAIL-CLOSED GUARD (Cursor HIGH-1): refuse to persist a
+            // plaintext HD seed whenever the wallet is encrypted in memory. The
+            // only legitimate way to reach this branch is an UNencrypted wallet
+            // (no passphrase master key). If a master key exists
+            // (masterKey.IsValid()) but fHDMasterKeyEncrypted is still false, the
+            // wallet is encrypted-in-memory with a plaintext seed — exactly the
+            // LP-7 plaintext-seed-at-rest exposure (e.g. an EncryptWallet that
+            // aborted mid-HD-step without rolling back). Writing the v7 plaintext
+            // layout here would mint a v7-labelled file carrying encrypted
+            // spending keys alongside a 32-byte plaintext seed, with no migration
+            // arm on reload (the loader only arms migration for the LEGACY layout).
+            // Refuse the save so this combination is structurally impossible. This
+            // mirrors the refuse guards in the legacy-v6 branch above and the
+            // empty-ciphertext check in the encrypted branch.
+            if (masterKey.IsValid()) {
+                std::cerr << "[Wallet] CRITICAL: refusing v7 plaintext-seed save of an "
+                             "encrypted HD wallet — the wallet has a master key but the HD "
+                             "seed is not encrypted (fHDMasterKeyEncrypted==false); persisting "
+                             "a plaintext seed for an encrypted wallet is the LP-7 "
+                             "plaintext-at-rest exposure. The HD seed must be encrypted "
+                             "(EncryptHDMasterKey) before any save of an encrypted wallet."
+                          << std::endl;
+                return false;
+            }
             file.write(reinterpret_cast<const char*>(&encrypted_flag), 1);
             if (!file.good()) return false;
 
