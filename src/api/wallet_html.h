@@ -5532,7 +5532,15 @@ inline const std::string& GetWalletHTML() {
                     try { await handleModeChange(); } catch (e) { /* connection handled elsewhere */ }
                 }
             } catch (e) {
-                showErr('Could not encrypt wallet: ' + (e && e.message ? e.message : 'unknown error') + ' — your wallet is unchanged. Please try again.');
+                const msg = (e && e.message) ? e.message : 'unknown error';
+                // The "raced" case (another tab encrypted this wallet first) DID change the
+                // stored wallet, so the "your wallet is unchanged" reassurance would be wrong.
+                // That error message already explains the situation; surface it as-is. Only
+                // append "unchanged" for genuine failures where the wallet is truly untouched.
+                const raced = /encrypted in another tab/i.test(msg);
+                showErr(raced
+                    ? ('Could not encrypt wallet: ' + msg)
+                    : ('Could not encrypt wallet: ' + msg + ' — your wallet is unchanged. Please try again.'));
                 if (btn) { btn.disabled = false; btn.textContent = 'Encrypt & Continue'; }
                 return;
             }

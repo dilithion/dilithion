@@ -313,6 +313,44 @@ const race = await page.evaluate(async () => {
   out.winnerSurvived = await crypto.decrypt(finalRec.encryptedSeed, 'winner-pass-9').then(() => true).catch(() => false);
   out.loserPwRejected = await crypto.decrypt(finalRec.encryptedSeed, 'loser-pass-9').then(() => false).catch(() => true);
   loser.db.close();
+
+  // --- 4c: FULL encryptExisting() race (exercises the 'raced' THROW at ~452-457,
+  // not just the _atomicMigratePut primitive). Two tabs call encryptExisting() on the
+  // SAME wallet with DIFFERENT passwords. Both pass the early encrypted-check (both read
+  // plaintext), both round-trip-encrypt, then both hit the atomic put: IndexedDB
+  // serializes the two readwrite transactions so exactly ONE commits and the OTHER sees
+  // encrypted===true in-transaction → 'raced' → encryptExisting() THROWS. The loser must
+  // NOT unlock from its stale plaintext (isUnlocked stays false), and the persisted record
+  // must be the WINNER's ciphertext (decrypts with winner pw, not loser pw).
+  await seedLegacy();
+  const c1 = new window.LocalWallet(crypto); await c1.init();
+  const c2 = new window.LocalWallet(crypto); await c2.init();
+  // Fire BOTH concurrently on the same walletId with different passwords.
+  const settled = await Promise.allSettled([
+    c1.encryptExisting('tabone-pass-1'),
+    c2.encryptExisting('tabtwo-pass-2'),
+  ]);
+  const fulfilled = settled.filter(s => s.status === 'fulfilled' && s.value === true);
+  const rejected = settled.filter(s => s.status === 'rejected');
+  out.fullRaceExactlyOneWon = fulfilled.length === 1;
+  out.fullRaceExactlyOneRejected = rejected.length === 1;
+  out.fullRaceLoserThrewRaceMsg = rejected.length === 1 && /encrypted in another tab/i.test(rejected[0].reason && rejected[0].reason.message || '');
+  // Identify winner/loser instances by their resulting unlock state.
+  const c1Won = settled[0].status === 'fulfilled' && settled[0].value === true;
+  const winnerInst = c1Won ? c1 : c2;
+  const loserInst = c1Won ? c2 : c1;
+  const winnerPw = c1Won ? 'tabone-pass-1' : 'tabtwo-pass-2';
+  const loserPw = c1Won ? 'tabtwo-pass-2' : 'tabone-pass-1';
+  // Loser must NOT have unlocked from stale plaintext.
+  out.fullRaceLoserNotUnlocked = loserInst.isWalletUnlocked() === false;
+  // Winner DID unlock.
+  out.fullRaceWinnerUnlocked = winnerInst.isWalletUnlocked() === true;
+  // Persisted record is encrypted and is the WINNER's ciphertext (not the loser's).
+  const fullRec = await readRec();
+  out.fullRaceStoredEncrypted = fullRec.encrypted === true;
+  out.fullRaceWinnerPwDecrypts = await crypto.decrypt(fullRec.encryptedSeed, winnerPw).then(s => Array.from(s).join(',') === seedArr.join(',')).catch(() => false);
+  out.fullRaceLoserPwRejected = await crypto.decrypt(fullRec.encryptedSeed, loserPw).then(() => false).catch(() => true);
+  c1.db.close(); c2.db.close();
   return out;
 });
 check('M-1 both tabs read plaintext (true race precondition)', race.bothSawUnencrypted === true, JSON.stringify(race));
@@ -326,6 +364,15 @@ check('M-1 encryptExisting reports already-migrated (false)', race.encryptExisti
 check('M-1 direct atomic put on already-encrypted returns raced', race.directRaced === 'raced', JSON.stringify(race.directRaced));
 check('M-1 out-of-band winner ciphertext preserved', race.winnerSurvived === true);
 check('M-1 loser password rejected (would-be lockout averted)', race.loserPwRejected === true);
+// 4c: full encryptExisting() race — exercises the 'raced' THROW + no-unlock path E2E.
+check('M-1 full encryptExisting race: exactly one tab succeeds', race.fullRaceExactlyOneWon === true, JSON.stringify(race.fullRaceExactlyOneWon));
+check('M-1 full encryptExisting race: exactly one tab rejects', race.fullRaceExactlyOneRejected === true, JSON.stringify(race.fullRaceExactlyOneRejected));
+check('M-1 full encryptExisting race: loser throws "encrypted in another tab"', race.fullRaceLoserThrewRaceMsg === true, JSON.stringify(race.fullRaceLoserThrewRaceMsg));
+check('M-1 full encryptExisting race: loser did NOT unlock from stale plaintext', race.fullRaceLoserNotUnlocked === true, JSON.stringify(race.fullRaceLoserNotUnlocked));
+check('M-1 full encryptExisting race: winner is unlocked', race.fullRaceWinnerUnlocked === true, JSON.stringify(race.fullRaceWinnerUnlocked));
+check('M-1 full encryptExisting race: stored record encrypted', race.fullRaceStoredEncrypted === true);
+check('M-1 full encryptExisting race: WINNER password decrypts stored seed', race.fullRaceWinnerPwDecrypts === true);
+check('M-1 full encryptExisting race: LOSER password rejected', race.fullRaceLoserPwRejected === true);
 
 // ---- Scenario 5: L-1 delete requires password (no legacy bypass) ----
 // Encrypted wallet: wrong password must NOT delete; correct password deletes.

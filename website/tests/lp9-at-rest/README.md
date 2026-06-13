@@ -19,7 +19,7 @@ cd tests/lp9-at-rest && npm init -y && npm i playwright-core@1.60.0
 node lp9.test.mjs
 ```
 
-Exit 0 = all assertions pass. Expected: `45 passed, 0 failed`.
+Exit 0 = all assertions pass. Expected: `53 passed, 0 failed`.
 
 ## What it covers
 - AC-1: blank/null/short password rejected on create + import; valid create stays `encrypted:true`.
@@ -34,7 +34,11 @@ Exit 0 = all assertions pass. Expected: `45 passed, 0 failed`.
   wallet and both attempt to migrate with DIFFERENT passwords; the atomic check-and-write in
   `_atomicMigratePut()` lets exactly one commit, the loser aborts as `raced` without
   overwriting, no plaintext is left, and the would-be lockout (loser's password stored) is
-  averted. `encryptExisting()` reports already-migrated rather than clobbering.
+  averted. `encryptExisting()` reports already-migrated rather than clobbering. A further
+  case fires TWO concurrent `encryptExisting()` calls (different passwords) on the same wallet
+  via `Promise.allSettled`: exactly one resolves, the other REJECTS with the "encrypted in
+  another tab" error (the `raced` throw), the loser never unlocks from its stale plaintext, and
+  the persisted ciphertext is the winner's (decrypts with the winner pw, not the loser's).
 - L-1 (Cursor): `deleteWallet()` requires password proof regardless of the `encrypted` flag —
   encrypted wallets reject a wrong password (record survives) and delete on the correct one;
   legacy unencrypted records refuse with `WALLET_NEEDS_ENCRYPTION` (no password-free
