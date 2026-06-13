@@ -1897,9 +1897,10 @@ inline const std::string& GetWalletHTML() {
 
             <!-- LP-9: Blocking "Secure your wallet" migration modal.
                  Shown when a legacy UNENCRYPTED browser wallet is detected at load.
-                 Has NO cancel/close button: the wallet cannot be used until the seed
-                 is encrypted at rest. Dismissing (Escape/click-out is disabled) just
-                 re-presents it on the next load. -->
+                 Has NO cancel/close button and no close-wiring (no Escape/backdrop-click
+                 handler exists), so it cannot be dismissed; the wallet cannot be used until
+                 the seed is encrypted at rest. Even if the element were hidden, the next
+                 load re-presents it because the stored record is still encrypted:false. -->
             <div id="walletMigrationModal" style="display: none; position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: rgba(0,0,0,0.92); z-index: 2000; align-items: center; justify-content: center;">
                 <div style="background: var(--bg-card); padding: 32px; border-radius: 16px; max-width: 480px; width: 90%; max-height: 90vh; overflow-y: auto;">
                     <h3 style="margin-bottom: 8px;">🔒 Secure your wallet</h3>

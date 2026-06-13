@@ -201,7 +201,7 @@ class LocalWallet {
 
     /**
      * Import wallet from mnemonic
-     * @param {string|null} password - New password (null for unencrypted)
+     * @param {string} password - New password (REQUIRED, min 8 chars; LP-9: no plaintext-at-rest path)
      * @param {string[]} mnemonic - 24-word mnemonic
      * @returns {Promise<Object>} {walletId, addresses}
      */
@@ -317,7 +317,8 @@ class LocalWallet {
 
     /**
      * Unlock wallet with password
-     * @param {string|null} password - Wallet password (null for unencrypted wallets)
+     * @param {string} password - Wallet password (REQUIRED; legacy unencrypted wallets are
+     *   rejected with WALLET_NEEDS_ENCRYPTION — there is no null/unencrypted unlock path)
      * @returns {Promise<boolean>} True if unlocked successfully
      */
     async unlock(password) {
@@ -375,8 +376,12 @@ class LocalWallet {
      *    "no seed" state. A crash before the put leaves the original plaintext intact
      *    (next load re-prompts migration); a crash after leaves a fully-encrypted,
      *    verified record.
-     *  - Race-tolerant: state is re-read inside the call; if another tab already
-     *    encrypted the wallet, this returns without clobbering it.
+     *  - Race-tolerant (M-1): the final check-and-write is a SINGLE atomic IndexedDB
+     *    readwrite transaction (re-read the record, verify still unencrypted, put the
+     *    ciphertext). If a concurrent tab encrypted the wallet first — even with a
+     *    different password — this aborts the put (never clobbering the other tab's
+     *    ciphertext) and throws a clear "encrypted in another tab" message. An early
+     *    pre-check still short-circuits the common already-migrated case via `return false`.
      *  - Zeroizing: the in-memory plaintext working copies are wiped, and the stored
      *    record no longer carries the raw seed (the old value is overwritten, not kept).
      *
@@ -424,18 +429,32 @@ class LocalWallet {
             throw e;
         }
 
-        // Atomic replace: single put of the same keyPath swaps plaintext -> ciphertext.
+        // Atomic check-and-replace (M-1): re-read the record and write the ciphertext
+        // INSIDE A SINGLE IndexedDB readwrite transaction. IndexedDB transactions are
+        // atomic, so if another tab already encrypted this wallet (possibly with a
+        // DIFFERENT password) between our initial read and now, the in-transaction
+        // re-check sees encrypted===true and ABORTS the put — we never clobber the
+        // other tab's ciphertext (which would lock the user out with this password).
+        // A plain re-read-then-put outside a transaction would still leave that gap.
         const migrated = {
             ...wallet,
             encrypted: true,
             encryptedSeed: encrypted
         };
+        let putResult;
         try {
-            await this.saveWallet(migrated);
+            putResult = await this._atomicMigratePut(wallet.id, migrated);
         } catch (e) {
             // Write/quota failure: original plaintext record is still intact.
             plaintextSeed.fill(0);
             throw new Error('Could not save encrypted wallet (storage error). Your wallet is unchanged — please try again. ' + (e && e.message ? e.message : ''));
+        }
+        if (putResult === 'raced') {
+            // Another tab encrypted this wallet first. Do NOT overwrite it and do NOT
+            // unlock from our plaintext copy — the stored ciphertext now belongs to the
+            // OTHER tab's password. Surface a clear, recoverable message.
+            plaintextSeed.fill(0);
+            throw new Error('This wallet was just encrypted in another tab. Use that tab\'s password to unlock, or reload this page and unlock there.');
         }
 
         // Establish unlocked in-memory state from the (now verified) seed.
@@ -709,12 +728,25 @@ class LocalWallet {
 
     /**
      * Delete wallet (irreversible!)
-     * @param {string} password - Password to confirm (ignored for unencrypted wallets)
+     *
+     * L-1: a delete is NEVER performed without password proof, regardless of the stored
+     * `encrypted` flag. A legacy unencrypted (`encrypted:false`) record has no password to
+     * verify against — and its `encryptedSeed` is raw plaintext bytes, not a decryptable
+     * ciphertext — so rather than allow a password-free delete (the L-1 hole), we refuse
+     * with WALLET_NEEDS_ENCRYPTION, mirroring unlock(): the wallet must be migrated to
+     * encrypted-at-rest first, after which a normal password-verified delete applies.
+     *
+     * @param {string} password - Password to confirm (required for any delete).
      */
     async deleteWallet(password) {
-        // Verify password for encrypted wallets
         const wallet = await this.getWallet();
-        if (wallet && wallet.encrypted) {
+        if (wallet) {
+            if (wallet.encrypted !== true) {
+                // Legacy plaintext record: no password exists to verify. Force migration
+                // first instead of permitting a password-free destructive delete.
+                throw new Error('WALLET_NEEDS_ENCRYPTION');
+            }
+            // Encrypted record: require correct password before destroying anything.
             try {
                 await this.crypto.decrypt(wallet.encryptedSeed, password);
             } catch (e) {
@@ -797,6 +829,46 @@ class LocalWallet {
 
             request.onsuccess = () => resolve();
             request.onerror = () => reject(request.error);
+        });
+    }
+
+    /**
+     * Atomic check-and-write for the LP-9 plaintext->ciphertext migration (M-1).
+     *
+     * Inside a SINGLE IndexedDB readwrite transaction: re-read the wallet record by id,
+     * verify it is still NOT encrypted, then put the encrypted record. IndexedDB
+     * transactions are atomic, so a concurrent tab cannot interleave between the re-read
+     * and the put. If the record is already `encrypted===true` (another tab won the race),
+     * the put is skipped and the call resolves 'raced' WITHOUT overwriting it.
+     *
+     * @param {string} walletId - id (keyPath) of the wallet record to migrate.
+     * @param {Object} migrated - the encrypted wallet record to write.
+     * @returns {Promise<'ok'|'raced'>} 'ok' if written, 'raced' if already encrypted.
+     */
+    async _atomicMigratePut(walletId, migrated) {
+        await this.init();
+
+        return new Promise((resolve, reject) => {
+            const tx = this.db.transaction(WALLET_STORE, 'readwrite');
+            const store = tx.objectStore(WALLET_STORE);
+            let outcome = 'ok';
+
+            const getReq = store.get(walletId);
+            getReq.onsuccess = () => {
+                const current = getReq.result;
+                if (current && current.encrypted === true) {
+                    // Lost the race: another tab already encrypted. Do not clobber it.
+                    outcome = 'raced';
+                    return;  // skip the put; let the (empty) transaction complete
+                }
+                // Still unencrypted (or record vanished — recreate it): write ciphertext.
+                store.put(migrated);
+            };
+            getReq.onerror = () => reject(getReq.error);
+
+            tx.oncomplete = () => resolve(outcome);
+            tx.onerror = () => reject(tx.error);
+            tx.onabort = () => reject(tx.error || new Error('migration transaction aborted'));
         });
     }
 
