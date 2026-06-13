@@ -3850,6 +3850,17 @@ load_genesis_block:  // Bug #29: Label for automatic retry after blockchain wipe
         // the real peer IP (see http_server.cpp), so this limiter keys per-IP.
         static CRateLimiter http_rest_rate_limiter;
         rest_api.RegisterRateLimiter(&http_rest_rate_limiter);
+        // LP-12 (M-01): also hand the limiter to the HTTP server so it runs the
+        // periodic CleanupOldRecords() maintenance (mirrors the RPC server's
+        // cleanup thread). Without this the per-IP record map grows unbounded as
+        // source IPs rotate (slow memory-DoS) on a --public-api node.
+        http_server.SetRateLimiter(&http_rest_rate_limiter);
+
+        // LP-12 (H-01): configure the anti-DNS-rebinding Host allowlist on the
+        // HTTP server's REST surface, reusing the SAME source as the RPC server
+        // (config.rpc_allow_hosts / --rpcallowhost; loopback always allowed).
+        // Must run before Start() so worker threads see a ready, fail-closed gate.
+        http_server.ConfigureHostAllowlist(config.rpc_allow_hosts);
 
         http_server.SetRestApiHandler([](const std::string& method,
                                          const std::string& path,

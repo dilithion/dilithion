@@ -5,9 +5,11 @@
 #include <api/wallet_html.h>
 #include <net/sock.h>
 #include <rpc/host_validator.h>
+#include <rpc/ratelimiter.h>
 #include <iostream>
 #include <cstring>
 #include <sstream>
+#include <chrono>
 #ifndef _WIN32
 #include <errno.h>
 #endif
@@ -59,6 +61,16 @@ void CHttpServer::SetMetricsHandler(MetricsHandler handler) {
 // Set REST API handler function for /api/v1/* endpoints
 void CHttpServer::SetRestApiHandler(RestApiHandler handler) {
     m_rest_api_handler = handler;
+}
+
+// LP-12 (H-01): configure the anti-DNS-rebinding Host allowlist. Mirrors
+// CRPCServer::Start()'s m_hostValidator.Configure() exactly: the validator is
+// keyed to THIS server's port and the operator-explicit extra hosts; loopback
+// names are always allowed by the validator itself. Setting the ready flag last
+// keeps the fail-closed invariant (an un-configured validator rejects all REST).
+void CHttpServer::ConfigureHostAllowlist(const std::vector<std::string>& extraAllowedHosts) {
+    m_host_validator.Configure(static_cast<uint16_t>(m_port), extraAllowedHosts);
+    m_host_validator_ready.store(true);
 }
 
 // Start the HTTP server
@@ -123,6 +135,11 @@ bool CHttpServer::Start() {
 
         // Launch accept thread
         m_accept_thread = std::thread(&CHttpServer::AcceptThread, this);
+
+        // LP-12 (M-01): launch the rate-limiter maintenance thread so the per-IP
+        // record map is pruned on a cadence (bounded memory under rotating IPs).
+        m_cleanup_thread = std::thread(&CHttpServer::CleanupThread, this);
+
         std::cout << "[HttpServer] Started on port " << m_port << " with " << m_num_threads << " workers" << std::endl;
         return true;
     } catch (const std::exception& e) {
@@ -170,6 +187,11 @@ void CHttpServer::Stop() {
     // Wait for accept thread to finish
     if (m_accept_thread.joinable()) {
         m_accept_thread.join();
+    }
+
+    // LP-12 (M-01): wait for the rate-limiter maintenance thread to finish.
+    if (m_cleanup_thread.joinable()) {
+        m_cleanup_thread.join();
     }
 
     // Wait for worker threads to finish
@@ -245,6 +267,39 @@ void CHttpServer::WorkerThread() {
     }
 }
 
+// LP-12 (M-01): rate-limiter maintenance thread. Faithful mirror of
+// CRPCServer::CleanupThread() — 5-minute cadence, wakes every second to observe
+// m_running for prompt shutdown, wraps the body so a maintenance exception can
+// never take down the process. Without this, the REST limiter's per-IP record
+// map grows unbounded as source IPs rotate (slow memory-DoS), because the
+// standalone HTTP server (unlike the RPC server) never ran the cleanup before.
+void CHttpServer::CleanupThread() {
+    try {
+        const std::chrono::minutes CLEANUP_INTERVAL(5);
+        (void)CLEANUP_INTERVAL;  // documented cadence; loop below counts seconds
+
+        while (m_running.load()) {
+            // Sleep up to 5 minutes, waking each second to honor shutdown.
+            for (int i = 0; i < 300 && m_running.load(); i++) {
+                std::this_thread::sleep_for(std::chrono::seconds(1));
+            }
+
+            if (!m_running.load()) {
+                break;
+            }
+
+            // Prune stale per-IP records (no-op if no limiter registered).
+            if (m_rate_limiter) {
+                m_rate_limiter->CleanupOldRecords();
+            }
+        }
+    } catch (const std::exception& e) {
+        std::cerr << "[HttpServer] Cleanup thread exception: " << e.what() << std::endl;
+    } catch (...) {
+        std::cerr << "[HttpServer] Cleanup thread unknown exception" << std::endl;
+    }
+}
+
 // LP-12: extract the REAL kernel-reported peer IP from the connected socket
 // (getpeername), mirroring CRPCServer::GetClientIP. Used for (a) the loopback
 // wallet-HTML origin gate and (b) per-IP REST rate-limiting/attribution. Never
@@ -315,6 +370,41 @@ void CHttpServer::HandleRequest(SOCKET client_socket) {
         return;
     }
 
+    // ========================================================================
+    // LP-12 (H-01) — ANTI-DNS-REBINDING HOST-HEADER ALLOWLIST.
+    //
+    // Mirrors CRPCServer::HandleRequest (server.cpp:~1095-1139). The standalone
+    // CHttpServer routed /api/v1/* (incl. /api/v1/broadcast → mempool) and
+    // /x402/* with NO Host check, so a DNS-rebound page (evil.com → a
+    // --public-api seed IP) could POST a broadcast or scrape telemetry. This
+    // gate rejects a missing / empty / duplicate / non-allowlisted Host BEFORE
+    // any of those branches dispatch. The Host header is the only input here;
+    // we deliberately do NOT consult X-Forwarded-* (attacker-controlled).
+    //
+    // ORDERING: strictly ABOVE the REST, wallet-HTML, /api/stats and /metrics
+    // branches (every node-touching surface). Only /api/health (an intentional
+    // load-balancer probe) and OPTIONS (already a blanket 403) sit above it.
+    //
+    // FAIL-CLOSED: if the validator was never configured (ready flag false),
+    // REJECT rather than skip — an un-configured validator denies all REST, so
+    // a future reorder of Start() can never silently disable the gate. In
+    // production ConfigureHostAllowlist() runs before Start() spawns workers.
+    // ========================================================================
+    {
+        const bool sensitive_surface =
+            path.rfind("/api/v1/", 0) == 0 ||
+            path.rfind("/x402/", 0) == 0 ||
+            path == "/wallet" || path == "/wallet.html" || path == "/" ||
+            path == "/api/stats" || path == "/metrics";
+        if (sensitive_surface &&
+            (!m_host_validator_ready.load() ||
+             !m_host_validator.IsRequestHostAllowed(request))) {
+            SendResponse(client_socket, 403, "application/json",
+                R"({"error":"Forbidden: Host header not allowed (DNS-rebinding protection). Connect via 127.0.0.1/localhost or configure --rpcallowhost.","code":-32600})");
+            return;
+        }
+    }
+
     // Handle REST API requests for light wallet (/api/v1/*) and x402 facilitator (/x402/*)
     if (path.rfind("/api/v1/", 0) == 0 || path.rfind("/x402/", 0) == 0) {
         if (m_rest_api_handler) {
@@ -378,6 +468,20 @@ void CHttpServer::HandleRequest(SOCKET client_socket) {
         if (!rpc::HostValidator::IsLoopbackIP(clientIP)) {
             SendResponse(client_socket, 403, "application/json",
                 R"({"error":"Forbidden: the wallet UI is served to loopback connections only. Use an SSH tunnel for remote access.","code":-32600})");
+            return;
+        }
+        // ====================================================================
+        // LP-12 (M-03) — SECONDARY loopback-Host check, for parity with the RPC
+        // server's wallet gate (server.cpp:~1240-1261), which requires BOTH a
+        // loopback socket peer (above) AND a loopback Host. The socket-peer gate
+        // is the load-bearing loopback-ORIGIN assertion; this Host check is the
+        // belt-and-suspenders anti-rebinding layer. Fail-closed if the validator
+        // is not ready. Either failing rejects the token-minting page.
+        // ====================================================================
+        if (!m_host_validator_ready.load() ||
+            !m_host_validator.IsRequestLoopbackHost(request)) {
+            SendResponse(client_socket, 403, "application/json",
+                R"({"error":"Forbidden: the wallet UI is served on loopback only (127.0.0.1/localhost). Use an SSH tunnel for remote access.","code":-32600})");
             return;
         }
         try {
