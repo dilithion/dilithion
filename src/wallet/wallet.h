@@ -307,12 +307,29 @@ private:
     // re-encryption + v7 rewrite on the next successful unlock.
     bool m_fNeedsSeedMigration{false};
 
+    // LP-7 L1 (opt-in, default OFF): when true, refuse to SIGN spends while the HD
+    // seed is still plaintext-at-rest (NeedsSeedMigration()). Set once at node startup
+    // from the --require-seed-migration CLI flag. Default OFF preserves the warn-only
+    // behavior (operator surfaced but not blocked). Gated in SignTransaction (the
+    // single spend signing funnel). Coinbase/mining block signing does NOT route
+    // through SignTransaction; the mining refusal is enforced separately at startup.
+    bool m_requireSeedMigration{false};
+
     // LP-7 migration helper (assumes caller holds cs_wallet, wallet unlocked).
     // Re-encrypts the plaintext HD seed + mnemonic under the master key and
     // rewrites the wallet file at v7 atomically (via SaveUnlocked). Leaves the
     // original file byte-identical on any failure (SaveUnlocked only renames a
     // fully-written temp file into place; the original is never truncated).
-    bool MigrateToEncryptedSeedV7Unlocked();
+    //
+    // LP-7 (Cursor M1): in-memory re-encryption success is NOT the same as the
+    // plaintext seed leaving disk. When autosave is off (no m_walletFile), this
+    // re-encrypts in memory and returns true, but the on-disk file STILL carries
+    // the plaintext seed — so the migration flag must NOT be cleared. *persistedToDisk
+    // is set true ONLY when the migrated v7 (no-plaintext) file was actually written
+    // to disk via SaveUnlocked; the caller clears m_fNeedsSeedMigration / promotes
+    // m_loadedFileVersion to v7 ONLY on that signal. Invariant: NeedsSeedMigration()
+    // is true exactly while a plaintext seed is still at rest on disk.
+    bool MigrateToEncryptedSeedV7Unlocked(bool* persistedToDisk = nullptr);
 
     // LP-7 (HIGH-2): CENTRALIZED authenticated-decrypt gate for ALL five at-rest
     // encrypted record types (master key, per-address spending keys, HD-master
@@ -816,6 +833,15 @@ public:
      * @return true if an encrypted wallet's seed is still plaintext-at-rest
      */
     bool NeedsSeedMigration() const;
+
+    /**
+     * LP-7 L1 (opt-in): enable refuse-to-spend while NeedsSeedMigration() is true.
+     * Set once at node startup from --require-seed-migration. Default OFF (warn-only).
+     */
+    void SetRequireSeedMigration(bool require) {
+        std::lock_guard<std::mutex> lock(cs_wallet);
+        m_requireSeedMigration = require;
+    }
 
     /**
      * Change wallet passphrase

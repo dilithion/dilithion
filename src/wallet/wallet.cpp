@@ -1323,15 +1323,24 @@ bool CWallet::Unlock(const std::string& passphrase, int64_t timeout) {
             masterKey.vchMAC = newMasterMAC;
         }
 
-        if (macOk && MigrateToEncryptedSeedV7Unlocked()) {
+        // Cursor M1: clear the migration flag / promote to v7 ONLY when the migrated
+        // v7 (no-plaintext) file actually reached disk (persistedToDisk == true).
+        // MigrateToEncryptedSeedV7Unlocked returns false (no in-memory mutation) when
+        // it cannot persist (autosave off / no file), so the flag STAYS armed and the
+        // on-disk-plaintext state keeps surfacing. Invariant: NeedsSeedMigration() is
+        // true exactly while a plaintext seed is still at rest on disk.
+        bool migrationPersisted = false;
+        if (macOk && MigrateToEncryptedSeedV7Unlocked(&migrationPersisted) && migrationPersisted) {
             m_fNeedsSeedMigration = false;
             m_loadedFileVersion = WALLET_FILE_VERSION_7;
             std::cout << "[Wallet] LP-7: migrated wallet to encrypted-seed v7 format" << std::endl;
         } else {
             // Restore the legacy master MAC so the in-memory state stays consistent
-            // with the untouched on-disk legacy file.
+            // with the untouched on-disk legacy file. Reached when the MAC recompute
+            // failed, the migration could not persist (autosave off → flag stays
+            // armed, surfaced), or the save failed (retry next unlock).
             masterKey.vchMAC = snap_masterMAC;
-            std::cerr << "[Wallet] LP-7: WARNING — seed migration to v7 failed; "
+            std::cerr << "[Wallet] LP-7: seed migration to v7 not persisted; "
                          "original wallet file left unchanged, will retry on next unlock" << std::endl;
         }
     }
@@ -4890,6 +4899,19 @@ bool CWallet::SignTransaction(CTransaction& tx, CUTXOSet& utxo_set, std::string&
             return false;
         }
 
+        // LP-7 L1 (opt-in --require-seed-migration, default OFF): refuse to sign any
+        // spend while the HD seed is still plaintext-at-rest. This is the single spend
+        // signing funnel, so this one gate covers sendtoaddress, raw-tx signing, HTLC,
+        // and bridge spends. Default OFF leaves the warn-only behavior intact.
+        // (masterKey.IsValid() && m_fNeedsSeedMigration mirrors NeedsSeedMigration()
+        // without re-locking cs_wallet, which we already hold here.)
+        if (m_requireSeedMigration && masterKey.IsValid() && m_fNeedsSeedMigration) {
+            error = "Refusing to spend: wallet HD seed is still stored UNENCRYPTED at rest "
+                    "(fixed bug LP-7). Unlock once to complete the one-time security upgrade "
+                    "(walletpassphrase), then retry. (Started with --require-seed-migration.)";
+            return false;
+        }
+
         // Check chain params before loop
         if (Dilithion::g_chainParams == nullptr) {
             error = "Chain parameters not initialized";
@@ -5603,12 +5625,25 @@ bool CWallet::DeriveAndCacheHDAddress(const CHDKeyPath& path) {
 //     in-memory HD state to its pre-migration plaintext-seed form so the wallet
 //     stays consistent with the still-on-disk legacy file, and return false. The
 //     caller does not fail the unlock; migration retries next unlock.
-bool CWallet::MigrateToEncryptedSeedV7Unlocked() {
+bool CWallet::MigrateToEncryptedSeedV7Unlocked(bool* persistedToDisk) {
+    if (persistedToDisk) *persistedToDisk = false;
     if (!masterKey.IsValid() || !fWalletUnlocked || !fIsHDWallet) {
         return false;
     }
     // Defensive: only migrate when the seed is actually plaintext.
     if (fHDMasterKeyEncrypted) {
+        return false;
+    }
+    // Cursor M1: migration is only meaningful if we can PERSIST the migrated v7
+    // (no-plaintext) file. If autosave is off / no wallet file, an in-memory-only
+    // re-encryption would (a) scrub the plaintext seed in memory while the on-disk
+    // file STILL holds it, and (b) leave m_loadedFileVersion at the legacy version,
+    // so a later SaveUnlocked would emit the v6 layout from now-scrubbed seed slots
+    // (data corruption). Skip migration entirely here: keep the wallet in its
+    // consistent legacy-plaintext state (both in memory and on disk) and leave the
+    // caller's m_fNeedsSeedMigration armed so NeedsSeedMigration() stays true and the
+    // remediation keeps surfacing until a real, persistable rewrite can occur.
+    if (!m_autoSave || m_walletFile.empty()) {
         return false;
     }
 
@@ -5802,9 +5837,11 @@ bool CWallet::MigrateToEncryptedSeedV7Unlocked() {
     // Promote to v7 FIRST so the version-aware SaveUnlocked emits the v7 layout (the
     // seed is now encrypted; a v6 write here would be wrong). rollback() restores the
     // loaded version if the save fails, keeping in-memory state consistent with the
-    // still-intact on-disk legacy file. (When autosave is off — an in-memory-only
-    // migration — we do NOT touch m_loadedFileVersion here; the caller's Unlock bumps
-    // it, and the on-disk file legitimately stays v6 until a real rewrite occurs.)
+    // still-intact on-disk legacy file.
+    // Cursor M1: persist-capability (autosave on + wallet file set) was verified at
+    // entry — if it had not held we returned early WITHOUT any in-memory mutation, so
+    // we never reach here with a half-migrated state we cannot persist. The guard
+    // below is kept defensively (the else-arm fails closed).
     if (m_autoSave && !m_walletFile.empty()) {
         m_loadedFileVersion = WALLET_FILE_VERSION_7;
         if (!SaveUnlocked()) {
@@ -5813,6 +5850,15 @@ bool CWallet::MigrateToEncryptedSeedV7Unlocked() {
             rollback();
             return false;
         }
+        // The migrated v7 (no-plaintext) file is now on disk — only NOW is it safe
+        // for the caller to clear the migration flag / treat the file as v7.
+        if (persistedToDisk) *persistedToDisk = true;
+    } else {
+        // Unreachable given the entry guard, but fail closed rather than report a
+        // half-migrated success: roll back so in-memory state stays consistent with
+        // the unchanged on-disk legacy file.
+        rollback();
+        return false;
     }
 
     return true;

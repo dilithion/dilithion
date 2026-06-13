@@ -618,6 +618,182 @@ static bool BuildLegacyV6WalletWithPerAddressKey(const std::string& path,
 }
 
 // ---------------------------------------------------------------------------
+// v7-HEADER + PLAINTEXT-SEED builder (Cursor L2 regression scaffold).
+//
+// Reproduces the EXACT on-disk shape a *pre-fix binary that already wrote v7*
+// could have produced: a v7 file ("DILWLT07") whose WALLET is encrypted (master
+// key under a passphrase) but whose HD master SEED is still PLAINTEXT at rest in
+// the v7 plaintext-HD-block slots (encrypted_flag=0, hdEncLen=0). This is the LP-7
+// plaintext-seed-at-rest state with a v7 header — detection is handled at
+// wallet.cpp:2169 (arm migration when isEncrypted && plaintext-seed v7 branch),
+// but until now only the legacy-v6 shape was byte-tested (Test 2c). This builder
+// lets us byte-test the v7-labelled shape end-to-end (load → armed + plaintext at
+// rest → unlock → migrate → no plaintext at rest, flag clear), the same
+// ReadFileBytes/Contains approach as Test 2c.
+//
+// v7 layout differences vs v6 (see Load: wallet.cpp ~2055 mnemonic, ~2099 HD):
+//   - magic "DILWLT07", version 7
+//   - mnemonic block carries a trailing [mnMacLen][mnMAC] (v7 requires non-empty
+//     MAC on an encrypted wallet; Load only checks mnMacLen!=0, migration recovers
+//     the mnemonic via the obfuscation key, so a legacy-keyed MAC blob suffices)
+//   - HD block: [encrypted_flag=0][hdEncLen=0][seed32][chaincode32][depth][fp][ci]
+//     (NOTE the leading hdEncLen=0 u32 — absent in the v6 layout)
+// ---------------------------------------------------------------------------
+static bool BuildV7PlaintextSeedWallet(const std::string& path,
+                                       const std::string& passphrase,
+                                       LegacyV6Result& out) {
+    std::string scratch = path + ".scratch";
+    std::remove(scratch.c_str());
+
+    std::string mnemonic;
+    std::vector<uint8_t> defAddr;
+    {
+        CWallet w;
+        w.SetWalletFile(scratch);
+        if (!w.GenerateHDWallet(mnemonic)) return false;
+        std::vector<CDilithiumAddress> addrs = w.GetAddresses();
+        if (addrs.empty()) return false;
+        CDilithiumAddress def = w.GetNewHDAddress();
+        (void)def;
+        defAddr = w.GetAddresses().front().GetData();
+    }
+    std::remove(scratch.c_str());
+
+    std::vector<uint8_t> seed, chaincode;
+    if (!DeriveSeedChaincode(mnemonic, seed, chaincode)) return false;
+
+    CHDExtendedKey master;
+    {
+        uint8_t bip39seed[64];
+        if (!CMnemonic::ToSeed(mnemonic, "", bip39seed)) return false;
+        DeriveMaster(bip39seed, master);
+        memory_cleanse(bip39seed, 64);
+    }
+
+    // Encrypted master key block. v7 master MAC uses the SEPARATED (default) keying.
+    std::vector<uint8_t> vMasterKeyPlain(WALLET_CRYPTO_KEY_SIZE);
+    if (!GetStrongRandBytes(vMasterKeyPlain.data(), WALLET_CRYPTO_KEY_SIZE)) return false;
+    std::vector<uint8_t> mkSalt;
+    if (!GenerateSalt(mkSalt)) return false;
+    std::vector<uint8_t> derivedKey;
+    if (!DeriveKey(passphrase, mkSalt, WALLET_CRYPTO_PBKDF2_ROUNDS, derivedKey)) return false;
+    std::vector<uint8_t> mkIV;
+    if (!GenerateIV(mkIV)) return false;
+    CCrypter mkCrypter;
+    if (!mkCrypter.SetKey(derivedKey, mkIV)) return false;
+    std::vector<uint8_t> mkCipher;
+    if (!mkCrypter.Encrypt(vMasterKeyPlain, mkCipher)) return false;
+    std::vector<uint8_t> mkMAC;
+    // v7 master record: separated keying (useLegacyKeying=false) so the fixed
+    // binary's v7 Unlock MAC check passes.
+    if (!mkCrypter.ComputeMAC(mkCipher, mkMAC, /*useLegacyKeying=*/false)) return false;
+
+    // Legacy obfuscated mnemonic (key = HKDF(seed,"mnemonic")). The pre-fix binary
+    // never re-encrypted the mnemonic under the master key (the same as v6), so the
+    // obfuscation-keyed ciphertext is faithful. We attach a non-empty MAC because v7
+    // Load requires mnMacLen!=0 on an encrypted wallet (wallet.cpp:2089).
+    std::vector<uint8_t> obfKey(WALLET_CRYPTO_KEY_SIZE);
+    {
+        std::vector<uint8_t> hdSeed(master.seed, master.seed + 32);
+        DeriveEncryptionKey(hdSeed, "mnemonic", obfKey);
+        memory_cleanse(hdSeed.data(), hdSeed.size());
+    }
+    std::vector<uint8_t> mnIV;
+    if (!GenerateIV(mnIV)) return false;
+    CCrypter mnCrypter;
+    if (!mnCrypter.SetKey(obfKey, mnIV)) return false;
+    std::vector<uint8_t> mnemonicBytes(mnemonic.begin(), mnemonic.end());
+    std::vector<uint8_t> mnCipher;
+    if (!mnCrypter.Encrypt(mnemonicBytes, mnCipher)) return false;
+    std::vector<uint8_t> mnMAC;
+    if (!mnCrypter.ComputeMAC(mnCipher, mnMAC, /*useLegacyKeying=*/false)) return false;
+
+    // --- Assemble the body. ---
+    std::vector<uint8_t> hmacSalt(WALLET_FILE_SALT_SIZE);
+    if (!GetStrongRandBytes(hmacSalt.data(), hmacSalt.size())) return false;
+
+    std::vector<uint8_t> body;
+    PutBytes(body, hmacSalt);
+
+    // master key block
+    PutU32(body, static_cast<uint32_t>(mkCipher.size()));
+    PutBytes(body, mkCipher);
+    PutBytes(body, mkSalt);                // 16
+    PutBytes(body, mkIV);                  // 16
+    PutU32(body, 0u);                      // nDerivationMethod
+    PutU32(body, WALLET_CRYPTO_PBKDF2_ROUNDS);
+    PutU32(body, static_cast<uint32_t>(mkMAC.size()));
+    PutBytes(body, mkMAC);
+
+    // HD block (v7): mnemonic + trailing MAC
+    PutU32(body, static_cast<uint32_t>(mnCipher.size()));
+    PutBytes(body, mnCipher);
+    PutBytes(body, mnIV);                  // 16
+    PutU32(body, static_cast<uint32_t>(mnMAC.size()));   // v7-only mnemonic MAC len
+    PutBytes(body, mnMAC);                               // v7-only mnemonic MAC
+
+    // HD master key — v7 PLAINTEXT layout (the bug): [enc_flag=0][hdEncLen=0][seed][cc]...
+    body.push_back(0);                     // encrypted_flag = 0 (plaintext seed)
+    PutU32(body, 0u);                      // hdEncLen = 0 (plaintext branch)
+    PutBytes(body, master.seed, 32);
+    PutBytes(body, master.chaincode, 32);
+    PutU32(body, master.depth);
+    PutU32(body, master.fingerprint);
+    PutU32(body, master.child_index);
+
+    // HD chain state + 0 path mappings
+    PutU32(body, 0u);                      // account
+    PutU32(body, 0u);                      // external index
+    PutU32(body, 0u);                      // internal index
+    PutU32(body, 0u);                      // numPaths = 0
+
+    // keys (encrypted wallet) — 0 crypted keys
+    PutU32(body, 0u);
+
+    // default address
+    body.push_back(1);                     // hasDefault
+    PutBytes(body, out_default_or(defAddr));
+
+    // transactions — 0
+    PutU32(body, 0u);
+    // best block
+    std::vector<uint8_t> bestHash(32, 0);
+    PutBytes(body, bestHash);
+    int32_t bestHeight = -1;
+    PutBytes(body, reinterpret_cast<const uint8_t*>(&bestHeight), sizeof(bestHeight));
+    // MIK — none
+    body.push_back(0);
+    // sent tx — 0
+    PutU32(body, 0u);
+
+    // file integrity HMAC (key = first 32 bytes of mk salt)
+    std::vector<uint8_t> hmacKey(32, 0);
+    std::memcpy(hmacKey.data(), mkSalt.data(), std::min<size_t>(32, mkSalt.size()));
+    std::vector<uint8_t> fileHMAC(32);
+    HMAC_SHA3_256(hmacKey.data(), hmacKey.size(), body.data(), body.size(), fileHMAC.data());
+
+    // Full file: v7 magic + version 7
+    std::vector<uint8_t> file;
+    file.insert(file.end(), WALLET_FILE_MAGIC_V7, WALLET_FILE_MAGIC_V7 + 8);
+    PutU32(file, WALLET_FILE_VERSION_7);
+    uint32_t flags = 0x01 /*encrypted*/ | 0x02 /*HD*/;
+    PutU32(file, flags);
+    PutBytes(file, fileHMAC);
+    PutBytes(file, body);
+
+    memory_cleanse(vMasterKeyPlain.data(), vMasterKeyPlain.size());
+    memory_cleanse(derivedKey.data(), derivedKey.size());
+    memory_cleanse(obfKey.data(), obfKey.size());
+
+    out.seed = seed;
+    out.chaincode = chaincode;
+    out.mnemonic = mnemonic;
+    out.defaultAddr = defAddr;
+
+    return WriteFileBytes(path, file);
+}
+
+// ---------------------------------------------------------------------------
 // Legacy v6 NON-HD builder with ONE legacy-MAC'd per-address key.
 //
 // Isolates the RAW v6 GetKey path (manifestation 1 of HIGH-2): a NON-HD
@@ -1106,6 +1282,139 @@ static void Test_NeedsSeedMigrationSurfaced() {
         CHECK(w.IsCrypted(), "Migrated wallet still reports encrypted");
         CHECK(!w.NeedsSeedMigration(),
               "Migrated v7 wallet reports NeedsSeedMigration()==false at rest (no false alarm)");
+    }
+
+    std::remove(path.c_str());
+}
+
+// ---------------------------------------------------------------------------
+// Test 2d — v7-HEADER + plaintext-seed artifact (Cursor L2). Test 2c covered the
+// legacy-v6 byte shape; this covers the OTHER pre-fix shape detection handles
+// (wallet.cpp:2169): a v7-labelled file whose seed is still plaintext-at-rest.
+// Same ReadFileBytes/Contains byte-level approach: load → assert armed + plaintext
+// seed IS at rest (while LOCKED) → unlock/migrate → assert NO plaintext seed at
+// rest + flag false.
+// ---------------------------------------------------------------------------
+static void Test_V7PlaintextSeedArtifactMigrates() {
+    std::cout << COLOR_BLUE "\n[Test 2d] v7-header + plaintext-seed artifact: armed at rest, migrates clean\n" COLOR_RESET;
+
+    const std::string path = "lp7_v7_plaintext_seed_wallet.dat";
+    const std::string pass = "V7Header!Plain#2026";
+    std::remove(path.c_str());
+
+    LegacyV6Result art;
+    bool built = BuildV7PlaintextSeedWallet(path, pass, art);
+    CHECK(built, "Built v7-header + plaintext-seed encrypted wallet (pre-fix v7 artifact)");
+    if (!built) { std::remove(path.c_str()); return; }
+
+    CHECK(FileVersion(path) == WALLET_FILE_VERSION_7, "Artifact carries a v7 header");
+
+    // --- Surfaced at rest: encrypted, LOCKED, armed, plaintext seed on disk ---
+    {
+        CWallet w;
+        CHECK(w.Load(path), "Loaded v7-plaintext artifact (autosave off, never unlocked)");
+        CHECK(w.IsCrypted(), "Wallet reports encrypted (has master key)");
+        CHECK(w.IsLocked(), "Wallet is LOCKED at rest");
+        CHECK(w.NeedsSeedMigration(),
+              "SURFACED: NeedsSeedMigration()==true for a v7-header plaintext-seed wallet");
+        std::vector<uint8_t> bytes = ReadFileBytes(path);
+        CHECK(Contains(bytes, art.seed.data(), art.seed.size()),
+              "Plaintext seed IS at rest in the v7-header artifact (the leak being surfaced)");
+        CHECK(Contains(bytes, art.chaincode.data(), art.chaincode.size()),
+              "Plaintext chaincode IS at rest in the v7-header artifact");
+    }
+
+    // --- Migrate-on-unlock: flag flips false, no plaintext seed remains ---
+    {
+        CWallet w;
+        w.SetWalletFile(path);  // enables autosave → atomic v7 rewrite on unlock
+        CHECK(w.Load(path), "Reloaded v7-plaintext artifact (autosave on)");
+        CHECK(w.NeedsSeedMigration(), "Pre-unlock: still armed");
+        CHECK(w.Unlock(pass), "Unlock → drives the one-time re-encryption migration");
+        CHECK(!w.NeedsSeedMigration(),
+              "DRIVE-TO-SAFETY: NeedsSeedMigration() flips FALSE after migration");
+    }
+
+    CHECK(FileVersion(path) == WALLET_FILE_VERSION_7, "Post-migration file is (still) v7");
+    {
+        std::vector<uint8_t> bytes = ReadFileBytes(path);
+        CHECK(!Contains(bytes, art.seed.data(), art.seed.size()),
+              "Post-migration: NO plaintext seed at rest (v7-header artifact drive-to-safety verified)");
+        CHECK(!Contains(bytes, art.chaincode.data(), art.chaincode.size()),
+              "Post-migration: NO plaintext chaincode at rest");
+    }
+
+    // Reload: armed flag stays false (no false alarm on the now-clean v7 file).
+    {
+        CWallet w;
+        w.SetWalletFile(path);
+        CHECK(w.Load(path), "Reloaded migrated v7 wallet");
+        CHECK(w.IsCrypted(), "Migrated wallet still reports encrypted");
+        CHECK(!w.NeedsSeedMigration(),
+              "Migrated wallet reports NeedsSeedMigration()==false at rest (no false alarm)");
+    }
+
+    std::remove(path.c_str());
+}
+
+// ---------------------------------------------------------------------------
+// Test 2e — Cursor M1: the migration flag tracks ON-DISK state, NOT in-memory
+// re-encryption success. When a wallet is unlocked with autosave OFF (no wallet
+// file / persistence skipped), the migration MUST NOT clear the flag, because the
+// on-disk file STILL carries the plaintext seed. The invariant: NeedsSeedMigration()
+// is true exactly while a plaintext seed is still at rest on disk. Before the fix,
+// MigrateToEncryptedSeedV7Unlocked returned true on in-memory success and Unlock
+// cleared the flag + bumped to v7 → false-negative (surfacing turned off while the
+// disk file was still plaintext).
+// ---------------------------------------------------------------------------
+static void Test_M1_FlagTracksOnDiskNotInMemory() {
+    std::cout << COLOR_BLUE "\n[Test 2e] M1: migration flag tracks on-disk state (autosave-off stays armed)\n" COLOR_RESET;
+
+    const std::string path = "lp7_m1_autosave_off_wallet.dat";
+    const std::string pass = "AutoSaveOff!M1#2026";
+    std::remove(path.c_str());
+
+    LegacyV6Result legacy;
+    bool built = BuildLegacyV6Wallet(path, pass, legacy);
+    CHECK(built, "Built legacy v6 plaintext-seed encrypted wallet (pre-fix artifact)");
+    if (!built) { std::remove(path.c_str()); return; }
+
+    std::vector<uint8_t> before = ReadFileBytes(path);
+    CHECK(Contains(before, legacy.seed.data(), legacy.seed.size()),
+          "Plaintext seed IS at rest before any unlock");
+
+    // Load with autosave OFF (no SetWalletFile) → Unlock cannot persist a v7 rewrite.
+    {
+        CWallet w;
+        CHECK(w.Load(path), "Loaded pre-fix wallet (autosave OFF)");
+        CHECK(w.NeedsSeedMigration(), "Pre-unlock: armed (autosave off)");
+        CHECK(w.Unlock(pass), "Unlock succeeds (migration cannot persist, must not fail unlock)");
+        // THE M1 INVARIANT: flag STAYS armed because the on-disk file is still plaintext.
+        CHECK(w.NeedsSeedMigration(),
+              "M1: NeedsSeedMigration() STAYS true after autosave-off unlock (false-negative closed)");
+    }
+
+    // The on-disk file must be byte-identical (still legacy v6, still plaintext seed):
+    // nothing was persisted, so no in-memory-only half-migration reached disk.
+    std::vector<uint8_t> after = ReadFileBytes(path);
+    CHECK(after == before, "M1: on-disk file is byte-identical after autosave-off unlock");
+    CHECK(FileVersion(path) == WALLET_FILE_VERSION_6, "M1: on-disk file is still legacy v6");
+    CHECK(Contains(after, legacy.seed.data(), legacy.seed.size()),
+          "M1: plaintext seed STILL at rest (flag correctly stayed armed)");
+
+    // Sanity: with autosave ON, the same wallet DOES migrate and clears the flag.
+    {
+        CWallet w;
+        w.SetWalletFile(path);
+        CHECK(w.Load(path), "Reloaded (autosave ON)");
+        CHECK(w.Unlock(pass), "Unlock → migrates + persists");
+        CHECK(!w.NeedsSeedMigration(), "M1 sanity: flag clears once the v7 file is persisted");
+    }
+    CHECK(FileVersion(path) == WALLET_FILE_VERSION_7, "M1 sanity: file is v7 after persisted migration");
+    {
+        std::vector<uint8_t> bytes = ReadFileBytes(path);
+        CHECK(!Contains(bytes, legacy.seed.data(), legacy.seed.size()),
+              "M1 sanity: NO plaintext seed at rest after persisted migration");
     }
 
     std::remove(path.c_str());
@@ -2117,6 +2426,8 @@ int main() {
     Test_Secrecy();
     Test_Migration();
     Test_NeedsSeedMigrationSurfaced();
+    Test_V7PlaintextSeedArtifactMigrates();
+    Test_M1_FlagTracksOnDiskNotInMemory();
     Test_FailClosedScrubbedV6Window();
     Test_AuthTamper();
     Test_PerRecordMACIsolation();

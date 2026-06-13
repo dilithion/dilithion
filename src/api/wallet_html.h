@@ -1787,7 +1787,16 @@ inline const std::string& GetWalletHTML() {
 
                 <!-- Encrypted -->
                 <div id="nodeWalletEncrypted" style="display: none;">
-                    <div style="display: flex; align-items: center; gap: 8px; margin-bottom: 16px; padding: 12px; background: rgba(34, 197, 94, 0.1); border-radius: 8px;">
+                    <!-- LP-7 (Cursor M2): armed state — seed still plaintext-at-rest despite "encrypted".
+                         Mirrors the dashboard migration banner so this card cannot falsely reassure. -->
+                    <div id="nodeWalletNeedsMigration" style="display: none; align-items: center; gap: 8px; margin-bottom: 16px; padding: 12px; background: rgba(239, 68, 68, 0.1); border-radius: 8px;">
+                        <span style="font-size: 1.2rem;">⚠️</span>
+                        <div>
+                            <div style="font-weight: 600; color: var(--error);">Security Upgrade Required</div>
+                            <div style="font-size: 0.8rem; color: var(--text-muted);">Your wallet is encrypted, but the seed is still stored unencrypted at rest (fixed bug LP-7). Unlock once to complete a one-time security upgrade.</div>
+                        </div>
+                    </div>
+                    <div id="nodeWalletEncryptedOk" style="display: flex; align-items: center; gap: 8px; margin-bottom: 16px; padding: 12px; background: rgba(34, 197, 94, 0.1); border-radius: 8px;">
                         <span style="font-size: 1.2rem;">✅</span>
                         <div>
                             <div style="font-weight: 600; color: var(--success);">Wallet Encrypted</div>
@@ -5532,12 +5541,23 @@ inline const std::string& GetWalletHTML() {
 
                 // Handle both boolean and string responses
                 const isEncrypted = walletInfo.encrypted === true || walletInfo.encrypted === 'true';
-                console.log('[Wallet] isEncrypted:', isEncrypted);
+                // LP-7 (Cursor M2): "encrypted" alone is not "safe" — the seed can still
+                // be plaintext-at-rest (armed for migration). Mirror the dashboard banner
+                // so this card reflects the armed state instead of falsely reassuring.
+                const needsMigration = walletInfo.needs_seed_migration === true || walletInfo.needs_seed_migration === 'true';
+                console.log('[Wallet] isEncrypted:', isEncrypted, 'needsMigration:', needsMigration);
 
                 document.getElementById('nodeWalletNotEncrypted').style.display = isEncrypted ? 'none' : 'block';
                 document.getElementById('nodeWalletEncrypted').style.display = isEncrypted ? 'block' : 'none';
 
                 if (isEncrypted) {
+                    // Gate the green "Wallet Encrypted" confirmation on !needsMigration;
+                    // show the armed-state warning instead while migration is pending.
+                    const okRow = document.getElementById('nodeWalletEncryptedOk');
+                    const migrationRow = document.getElementById('nodeWalletNeedsMigration');
+                    if (okRow) okRow.style.display = needsMigration ? 'none' : 'flex';
+                    if (migrationRow) migrationRow.style.display = needsMigration ? 'flex' : 'none';
+
                     const lockStatus = document.getElementById('nodeWalletLockStatus');
                     const isUnlocked = walletInfo.unlocked_until > 0 || walletInfo.locked === false;
                     lockStatus.textContent = isUnlocked ? 'Unlocked' : 'Locked';
