@@ -17,6 +17,7 @@
 #ifdef _WIN32
 #include <winsock2.h>
 #include <ws2tcpip.h>
+#include <windows.h>   // LP-13 H-2: MoveFileExW for atomic key-file replace
 #pragma comment(lib, "ws2_32.lib")
 #else
 #include <sys/socket.h>
@@ -73,17 +74,35 @@ static std::string GetSeedKeyPassphrase() {
 
 // Restrict a key file to owner read/write only. POSIX: chmod 0600. Windows:
 // best-effort no-op (NTFS confines the per-user profile data dir; documented).
-static void RestrictKeyFilePerms(const std::string& path) {
+// Returns true if perms are owner-only after the call (Windows: always true).
+static bool RestrictKeyFilePerms(const std::string& path) {
 #ifndef _WIN32
-    // 0600 = owner rw, no group/other. Failure is logged but non-fatal: the
-    // secret is still written; an operator on an exotic FS can harden manually.
+    // 0600 = owner rw, no group/other. Failure is logged; the caller decides
+    // whether it is fatal (Save M-4 fail-closed) or merely a warning.
     if (chmod(path.c_str(), S_IRUSR | S_IWUSR) != 0) {
         std::cerr << "[Attestation] WARNING: could not chmod 0600 key file: " << path << std::endl;
+        return false;
     }
+    return true;
 #else
     (void)path;  // Windows: relies on NTFS ACL of the user profile data dir.
+    return true;
 #endif
 }
+
+// LP-13 M-3: on Load, report whether a pre-existing file is group/other-readable
+// (a legacy v1 file may have been written 0644 before this hardening landed).
+// POSIX only; Windows relies on the NTFS ACL of the profile dir.
+#ifndef _WIN32
+static bool KeyFileIsPermissive(const std::string& path) {
+    struct stat st;
+    if (stat(path.c_str(), &st) != 0) return false;  // can't tell; don't warn
+    return (st.st_mode & (S_IRWXG | S_IRWXO)) != 0;   // any group/other bit set
+}
+#endif
+
+// LP-13 H-2 atomic-save test seam (see header). nullptr in production.
+bool (*g_seedKeySaveFailpoint)() = nullptr;
 
 // ============================================================================
 // CSeedAttestationKey
@@ -99,6 +118,7 @@ void CSeedAttestationKey::Clear() {
     }
     m_privkey.clear();
     m_pubkey.clear();
+    m_loadedV1Plaintext = false;
 }
 
 bool CSeedAttestationKey::Generate() {
@@ -115,6 +135,22 @@ bool CSeedAttestationKey::Generate() {
 
 bool CSeedAttestationKey::Load(const std::string& dataDir) {
     std::string path = dataDir + "/" + SEED_KEY_FILENAME;
+    m_loadedV1Plaintext = false;
+
+    // LP-13 M-3: repair perms on a pre-existing key file BEFORE reading its
+    // secret bytes. A legacy v1 file may have been written world/group-readable
+    // (0644) prior to this hardening; chmod it back to 0600 and warn loudly so
+    // the operator knows the key was exposed at rest.
+#ifndef _WIN32
+    if (KeyFileIsPermissive(path)) {
+        std::cerr << "[Attestation] WARNING: key file " << path
+                  << " was group/other-readable; repairing to 0600. The consensus"
+                     " signing key may have been exposed — consider rotating it."
+                  << std::endl;
+        RestrictKeyFilePerms(path);
+    }
+#endif
+
     // Read the whole file up front so v2 length/format checks are robust against
     // truncation, and so we never leave a half-read secret in memory on error.
     std::ifstream file(path, std::ios::binary);
@@ -153,6 +189,7 @@ bool CSeedAttestationKey::Load(const std::string& dataDir) {
         m_privkey.assign(buf.begin() + off, buf.begin() + off + DFMP::MIK_PRIVKEY_SIZE);
         // Wipe the plaintext private key out of the read buffer.
         memory_cleanse(buf.data() + off, DFMP::MIK_PRIVKEY_SIZE);
+        m_loadedV1Plaintext = true;  // LP-13 H-1: provenance for require-encryption gate
         std::cout << "[Attestation] Loaded seed attestation key (v1 plaintext): "
                   << GetPubKeyHex().substr(0, 16) << "..." << std::endl;
         std::cerr << "[Attestation] NOTE: key file is unencrypted (v1). Set "
@@ -256,10 +293,20 @@ void CleanseSeedKeyBuffer(std::vector<uint8_t>& buf) {
     if (!buf.empty()) memory_cleanse(buf.data(), buf.size());
 }
 
-bool CSeedAttestationKey::Save(const std::string& dataDir) const {
+bool CSeedAttestationKey::Save(const std::string& dataDir, bool requireEncryption) const {
     if (!IsValid()) return false;
 
     std::string path = dataDir + "/" + SEED_KEY_FILENAME;
+
+    // LP-13 H-1: when the operator demands encryption-at-rest, refuse to write a
+    // v1 (plaintext) key. Fail loud so the misconfiguration is impossible to miss
+    // rather than silently persisting an unencrypted consensus signing key.
+    if (requireEncryption && GetSeedKeyPassphrase().empty()) {
+        std::cerr << "[Attestation] FATAL: --require-seed-key-encryption is set but "
+                  << SEED_KEY_PASSPHRASE_ENV << " is unset. Refusing to write an"
+                     " UNENCRYPTED (v1) seed consensus signing key." << std::endl;
+        return false;
+    }
 
     // LP-13: assemble the full serialized blob in memory first, then write it
     // in one shot. This lets us harden file permissions BEFORE any secret bytes
@@ -349,23 +396,30 @@ bool CSeedAttestationKey::Save(const std::string& dataDir) const {
         out.insert(out.end(), ciphertext.begin(), ciphertext.end());
     }
 
+    // LP-13 H-2: ATOMIC SAVE. Mirror the wallet's proven temp+fsync+rename
+    // pattern (CWallet::SaveUnlocked). A failed/partial write hits "<file>.tmp"
+    // only — the live "<file>" is left byte-intact and replaced ONLY by an
+    // atomic rename of a fully-written, fsync'd temp. A copy of the prior key is
+    // first staged at "<file>.bak" so even a botched rename has a fallback. A
+    // crash / partial write / full disk therefore can NEVER destroy the only
+    // copy of the consensus signing key.
+    std::string tmpPath = path + ".tmp";
+    std::string bakPath = path + ".bak";
+
 #ifndef _WIN32
-    // POSIX: create the file with 0600 from the outset (no world-readable
-    // window between create and chmod). open() honors the mode on creation.
-    int fd = ::open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, S_IRUSR | S_IWUSR);
+    // Create the temp with 0600 from the outset (no world-readable window).
+    int fd = ::open(tmpPath.c_str(), O_WRONLY | O_CREAT | O_TRUNC, S_IRUSR | S_IWUSR);
     if (fd < 0) {
-        std::cerr << "[Attestation] Failed to open key file for writing: " << path << std::endl;
+        std::cerr << "[Attestation] Failed to open temp key file for writing: " << tmpPath << std::endl;
         return finish(false);
     }
-    // LP-13 LOW-2: O_TRUNC does NOT reset the mode of a PRE-EXISTING file, so a
-    // stale 0644 file would hold fresh secret bytes between ::write and the
-    // post-write chmod. fchmod the open fd to 0600 BEFORE writing any secret,
-    // closing that microsecond window (the open-with-mode above only covers the
-    // freshly-created case). Non-fatal on failure — the post-write re-assert below
-    // and the warning in RestrictKeyFilePerms still apply.
-    if (::fchmod(fd, S_IRUSR | S_IWUSR) != 0) {
-        std::cerr << "[Attestation] WARNING: fchmod 0600 on key file failed (errno "
-                  << errno << "); proceeding, will re-assert perms after write." << std::endl;
+    // LP-13 M-4: re-assert 0600 on the open fd. O_TRUNC does NOT reset the mode
+    // of a pre-existing temp. Track whether owner-only perms were established;
+    // if BOTH this and the post-write chmod fail we fail-closed below.
+    bool permOk = (::fchmod(fd, S_IRUSR | S_IWUSR) == 0);
+    if (!permOk) {
+        std::cerr << "[Attestation] WARNING: fchmod 0600 on temp key file failed (errno "
+                  << errno << "); will re-assert after write." << std::endl;
     }
     size_t written = 0;
     bool writeOk = true;
@@ -374,27 +428,132 @@ bool CSeedAttestationKey::Save(const std::string& dataDir) const {
         if (n <= 0) { writeOk = false; break; }
         written += static_cast<size_t>(n);
     }
+    // fsync the data to physical disk BEFORE the rename, so a power loss after
+    // rename cannot expose a zero-length/partial file as the live key.
+    if (writeOk && ::fsync(fd) != 0) {
+        std::cerr << "[Attestation] WARNING: fsync of temp key file failed (errno "
+                  << errno << ")" << std::endl;
+    }
     ::close(fd);
-    // Belt-and-braces: re-assert 0600 in case a pre-existing file kept old perms.
-    RestrictKeyFilePerms(path);
+
+    // Belt-and-braces: re-assert 0600 on the path in case fchmod was unsupported.
+    bool permOk2 = RestrictKeyFilePerms(tmpPath);
+
     if (!writeOk) {
-        std::cerr << "[Attestation] Key file write error" << std::endl;
+        std::cerr << "[Attestation] Key file write error (temp)" << std::endl;
+        ::unlink(tmpPath.c_str());
         return finish(false);
+    }
+    // LP-13 M-4 fail-closed: if owner-only perms could NOT be set by either
+    // mechanism, refuse to publish a possibly group/other-readable consensus key.
+    if (!permOk && !permOk2) {
+        std::cerr << "[Attestation] FATAL: could not set 0600 perms on key file; "
+                     "refusing to publish a possibly readable consensus key." << std::endl;
+        ::unlink(tmpPath.c_str());
+        return finish(false);
+    }
+
+    // H-2 test seam: simulate a crash between temp-write and rename.
+    if (g_seedKeySaveFailpoint && g_seedKeySaveFailpoint()) {
+        std::cerr << "[Attestation] (test) save failpoint fired before rename" << std::endl;
+        ::unlink(tmpPath.c_str());
+        return finish(false);
+    }
+
+    // Stage a .bak of the EXISTING key before we clobber it. Best-effort: if
+    // there is no prior file (first provision) there is nothing to back up.
+    {
+        std::ifstream src(path, std::ios::binary);
+        if (src.is_open()) {
+            std::vector<uint8_t> prior((std::istreambuf_iterator<char>(src)),
+                                        std::istreambuf_iterator<char>());
+            src.close();
+            int bfd = ::open(bakPath.c_str(), O_WRONLY | O_CREAT | O_TRUNC, S_IRUSR | S_IWUSR);
+            if (bfd >= 0) {
+                size_t bw = 0; bool bok = true;
+                while (bw < prior.size()) {
+                    ssize_t n = ::write(bfd, prior.data() + bw, prior.size() - bw);
+                    if (n <= 0) { bok = false; break; }
+                    bw += static_cast<size_t>(n);
+                }
+                if (bok) ::fsync(bfd);
+                ::close(bfd);
+                if (!bok) std::cerr << "[Attestation] WARNING: failed to write key .bak" << std::endl;
+            }
+        }
+    }
+
+    // Atomic publish: rename(2) over the target is atomic on POSIX.
+    if (::rename(tmpPath.c_str(), path.c_str()) != 0) {
+        std::cerr << "[Attestation] Key file atomic rename failed (errno " << errno
+                  << "); original key left intact at " << path << std::endl;
+        ::unlink(tmpPath.c_str());
+        return finish(false);
+    }
+    RestrictKeyFilePerms(path);  // perms ride with rename, but re-assert defensively
+
+    // fsync the directory so the rename metadata is durable across power loss.
+    {
+        size_t lastSlash = path.find_last_of("/\\");
+        std::string parentDir = (lastSlash == std::string::npos) ? "." : path.substr(0, lastSlash);
+        if (parentDir.empty()) parentDir = ".";
+        int dirfd = ::open(parentDir.c_str(), O_RDONLY);
+        if (dirfd >= 0) { ::fsync(dirfd); ::close(dirfd); }
     }
 #else
-    std::ofstream file(path, std::ios::binary | std::ios::trunc);
-    if (!file.is_open()) {
-        std::cerr << "[Attestation] Failed to open key file for writing: " << path << std::endl;
+    // Windows: write temp, stage .bak, then MoveFileEx atomic replace.
+    {
+        std::ofstream tf(tmpPath, std::ios::binary | std::ios::trunc);
+        if (!tf.is_open()) {
+            std::cerr << "[Attestation] Failed to open temp key file for writing: " << tmpPath << std::endl;
+            return finish(false);
+        }
+        tf.write(reinterpret_cast<const char*>(out.data()), out.size());
+        bool writeOk = tf.good();
+        tf.flush();
+        tf.close();
+        if (!writeOk) {
+            std::cerr << "[Attestation] Key file write error (temp)" << std::endl;
+            std::remove(tmpPath.c_str());
+            return finish(false);
+        }
+    }
+
+    // H-2 test seam: simulate a crash between temp-write and rename.
+    if (g_seedKeySaveFailpoint && g_seedKeySaveFailpoint()) {
+        std::cerr << "[Attestation] (test) save failpoint fired before rename" << std::endl;
+        std::remove(tmpPath.c_str());
         return finish(false);
     }
-    file.write(reinterpret_cast<const char*>(out.data()), out.size());
-    bool writeOk = file.good();
-    file.close();
+
+    // Stage a .bak of the existing key (best-effort).
+    {
+        std::ifstream src(path, std::ios::binary);
+        if (src.is_open()) {
+            std::vector<uint8_t> prior((std::istreambuf_iterator<char>(src)),
+                                        std::istreambuf_iterator<char>());
+            src.close();
+            std::ofstream bf(bakPath, std::ios::binary | std::ios::trunc);
+            if (bf.is_open()) {
+                bf.write(reinterpret_cast<const char*>(prior.data()), prior.size());
+                if (!bf.good()) std::cerr << "[Attestation] WARNING: failed to write key .bak" << std::endl;
+                bf.close();
+            }
+        }
+    }
+
+    // Atomic publish via MoveFileExW (REPLACE_EXISTING | WRITE_THROUGH): either
+    // fully succeeds or fully fails — never a partial/corrupt live key file.
+    std::wstring wTmp(tmpPath.begin(), tmpPath.end());
+    std::wstring wDst(path.begin(), path.end());
+    if (!MoveFileExW(wTmp.c_str(), wDst.c_str(),
+                     MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+        std::cerr << "[Attestation] Key file atomic move failed; original key left intact at "
+                  << path << std::endl;
+        std::remove(tmpPath.c_str());
+        return finish(false);
+    }
     RestrictKeyFilePerms(path);  // best-effort no-op on Windows (NTFS ACL governs)
-    if (!writeOk) {
-        std::cerr << "[Attestation] Key file write error" << std::endl;
-        return finish(false);
-    }
 #endif
 
     std::cout << "[Attestation] Saved seed attestation key to: " << path
@@ -402,8 +561,20 @@ bool CSeedAttestationKey::Save(const std::string& dataDir) const {
     return finish(true);
 }
 
-bool CSeedAttestationKey::LoadOrGenerate(const std::string& dataDir, bool allowGenerate) {
+bool CSeedAttestationKey::LoadOrGenerate(const std::string& dataDir, bool allowGenerate,
+                                         bool requireEncryption) {
     if (Load(dataDir)) {
+        // LP-13 H-1: if encryption-at-rest is required but the key on disk is a
+        // v1 plaintext file, refuse to run on it. The operator must re-provision
+        // with the passphrase set (which re-saves it as v2 encrypted).
+        if (requireEncryption && LoadedPlaintext()) {
+            std::cerr << "[Attestation] FATAL: --require-seed-key-encryption is set but the"
+                         " on-disk key is UNENCRYPTED (v1). Set "
+                      << SEED_KEY_PASSPHRASE_ENV << " and re-provision to encrypt it at rest."
+                      << std::endl;
+            Clear();
+            return false;
+        }
         return true;
     }
 
@@ -428,9 +599,16 @@ bool CSeedAttestationKey::LoadOrGenerate(const std::string& dataDir, bool allowG
         return false;
     }
 
-    if (!Save(dataDir)) {
-        std::cerr << "[Attestation] WARNING: Generated key but failed to save to disk" << std::endl;
-        // Key is still valid in memory, so don't fail
+    // LP-13 M-2: a freshly minted key that cannot be PERSISTED is worthless — on
+    // the next restart the node would have a different (or no) key that does not
+    // match chainparams. Do NOT run on a non-persisted ephemeral key: fail loud.
+    if (!Save(dataDir, requireEncryption)) {
+        std::cerr << "[Attestation] FATAL: generated a new seed key but failed to save it"
+                     " to disk. Refusing to run on a non-persisted (ephemeral) consensus"
+                     " signing key — fix the data dir / perms / passphrase and retry."
+                  << std::endl;
+        Clear();
+        return false;
     }
 
     std::cout << "[Attestation] Generated new seed attestation key: " << GetPubKeyHex().substr(0, 16) << "..." << std::endl;

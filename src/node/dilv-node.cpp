@@ -562,6 +562,7 @@ struct NodeConfig {
     std::string external_ip = "";   // --externalip: Manual external IP (for manual port forwarding)
     bool public_api = false;        // --public-api: Enable public REST API for light wallets (seed nodes only)
     bool generate_seed_key = false; // --generate-seed-key: LP-13 — explicitly permit minting a NEW seed attestation consensus key when none exists (first-time provision only; otherwise fail loud)
+    bool require_seed_key_encryption = false; // --require-seed-key-encryption: LP-13 H-1 — refuse to load/save a plaintext (v1) seed key; requires DILITHION_SEED_KEY_PASSPHRASE. Default OFF preserves backward-compatible loadable behavior.
     int max_connections = 0;         // --maxconnections: Maximum peer connections (0 = default 125)
     int max_connections_per_ip = 2;  // --max-connections-per-ip: Max inbound per IP (default 2, range 1-64)
     int attestation_rate_limit = 1;  // --attestation-rate-limit: Max attestations per /24 subnet per day (Sybil defense)
@@ -758,6 +759,13 @@ struct NodeConfig {
                 // instead of silently minting an unrecognized signing key.
                 generate_seed_key = true;
             }
+            else if (arg == "--require-seed-key-encryption") {
+                // LP-13 H-1: enforce encryption-at-rest for the seed consensus
+                // signing key. Refuses to load/save a plaintext (v1) key; the
+                // DILITHION_SEED_KEY_PASSPHRASE env MUST be set. Default OFF keeps
+                // the backward-compatible loadable behavior for rolling deploys.
+                require_seed_key_encryption = true;
+            }
             else if (arg.find("--rpcallowhost=") == 0) {
                 // wallet-rpc-login-restore: anti-DNS-rebinding Host allowlist.
                 // Repeatable. Loopback is always allowed implicitly.
@@ -870,6 +878,9 @@ struct NodeConfig {
         std::cout << "  --generate-seed-key   Permit minting a NEW seed attestation key if none exists" << std::endl;
         std::cout << "                          (first-time provision only; otherwise the node fails loud)." << std::endl;
         std::cout << "                          Set " << Attestation::SEED_KEY_PASSPHRASE_ENV << " to encrypt it at rest." << std::endl;
+        std::cout << "  --require-seed-key-encryption" << std::endl;
+        std::cout << "                          Refuse to load/save a plaintext (v1) seed key; requires" << std::endl;
+        std::cout << "                          " << Attestation::SEED_KEY_PASSPHRASE_ENV << ". Default OFF (backward compatible)." << std::endl;
         std::cout << "  --rpcallowhost=<host> Allow this Host header on the RPC/HTTP server" << std::endl;
         std::cout << "                          (anti-DNS-rebinding allowlist; repeatable)." << std::endl;
         std::cout << "                          Loopback is always allowed. Under --public-api," << std::endl;
@@ -6858,7 +6869,33 @@ load_genesis_block:  // Bug #29: Label for automatic retry after blockchain wipe
 
             // Load or generate attestation key (LP-13: minting gated behind
             // --generate-seed-key so a reprovisioned seed fails loud).
-            if (seedAttestKey.LoadOrGenerate(dataDir, config.generate_seed_key)) {
+            // LP-13 M-1 (fail-stop on GENUINE failure): a key file PRESENT but
+            // unusable (corrupt / wrong-or-missing passphrase / 0600-repair
+            // failure / plaintext-when-encryption-required), OR a requested mint
+            // that could not be persisted, is a real attestation outage. On a
+            // seed-capable node we ABORT startup rather than run silently without
+            // attestation. The benign case — a non-seed relay with NO key file
+            // and no --generate-seed-key — is NOT fatal (it just doesn't attest).
+            bool keyFileExists = false;
+            {
+                std::ifstream kf(dataDir + "/" + Attestation::SEED_KEY_FILENAME, std::ios::binary);
+                keyFileExists = kf.good();
+            }
+            bool attestOk = seedAttestKey.LoadOrGenerate(
+                dataDir, config.generate_seed_key, config.require_seed_key_encryption);
+            if (!attestOk) {
+                bool genuineFailure = keyFileExists || config.generate_seed_key
+                                      || config.require_seed_key_encryption;
+                if (genuineFailure) {
+                    std::cerr << "[Attestation] FATAL: seed attestation key initialization FAILED "
+                                 "(corrupt key, wrong/missing " << Attestation::SEED_KEY_PASSPHRASE_ENV
+                              << ", permission repair failure, or save failure). A seed must not run "
+                                 "without a usable consensus signing key. Aborting startup." << std::endl;
+                    return 1;
+                }
+                std::cerr << "[Attestation] No seed attestation key and minting not requested; "
+                             "this relay will not serve attestations." << std::endl;
+            } else {
                 // Determine seed ID by matching our IP against known seed IPs
                 // For now, use a simple index. In production, compare external IP.
                 int seedId = -1;
