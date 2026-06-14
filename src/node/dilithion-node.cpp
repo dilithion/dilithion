@@ -770,6 +770,7 @@ struct NodeConfig {
                 // LP-7 L1 (opt-in, default OFF): refuse mining/spending while the HD
                 // seed is still plaintext-at-rest. Default behavior is warn-only.
                 require_seed_migration = true;
+            }
             else if (arg == "--generate-seed-key") {
                 // LP-13: explicit opt-in to mint a NEW seed attestation consensus
                 // key if none exists. Without this flag a missing key fails loud
