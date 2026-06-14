@@ -565,6 +565,10 @@ struct NodeConfig {
     bool upnp_prompted = false;     // True if user was already prompted or used explicit flag
     std::string external_ip = "";   // --externalip: Manual external IP (for manual port forwarding)
     bool public_api = false;        // --public-api: Enable public REST API for light wallets (seed nodes only)
+    bool require_seed_migration = false;  // LP-7 L1 (opt-in): when set, refuse mining/spending while the
+                                          // wallet's HD seed is still plaintext-at-rest (NeedsSeedMigration()).
+                                          // DEFAULT OFF preserves warn-only behavior (operator is surfaced but
+                                          // not blocked); SET requires unlocking once to migrate before mining.
     int max_connections = 0;         // --maxconnections: Maximum peer connections (0 = default 125)
     int max_connections_per_ip = 2;  // --max-connections-per-ip: Max inbound per IP (default 2, range 1-64)
     int attestation_rate_limit = 1;  // --attestation-rate-limit: Max attestations per /24 subnet per day
@@ -759,6 +763,11 @@ struct NodeConfig {
                 // Public REST API: bind to 0.0.0.0 for light wallet access (seed nodes only)
                 public_api = true;
             }
+            else if (arg == "--require-seed-migration") {
+                // LP-7 L1 (opt-in, default OFF): refuse mining/spending while the HD
+                // seed is still plaintext-at-rest. Default behavior is warn-only.
+                require_seed_migration = true;
+            }
             else if (arg.find("--rpcallowhost=") == 0) {
                 // wallet-rpc-login-restore: add an allowed Host header to the
                 // anti-DNS-rebinding allowlist. Repeatable. Loopback
@@ -885,6 +894,10 @@ struct NodeConfig {
         std::cout << "                          Add --yes to skip the confirmation prompt." << std::endl;
         std::cout << "  --relay-only          Relay-only mode: skip wallet (for seed nodes)" << std::endl;
         std::cout << "  --public-api          Enable public REST API for light wallets (seed nodes)" << std::endl;
+        std::cout << "  --require-seed-migration  Refuse to mine/spend while the wallet's HD seed is" << std::endl;
+        std::cout << "                          still stored UNENCRYPTED at rest (fixed bug LP-7)." << std::endl;
+        std::cout << "                          Default is warn-only; this opt-in flag hard-gates the" << std::endl;
+        std::cout << "                          node until you unlock once to complete the upgrade." << std::endl;
         std::cout << "  --rpcallowhost=<host> Allow this Host header on the RPC/HTTP server" << std::endl;
         std::cout << "                          (anti-DNS-rebinding allowlist; repeatable)." << std::endl;
         std::cout << "                          Loopback (127.0.0.1/::1/localhost) is always" << std::endl;
@@ -5077,6 +5090,9 @@ load_genesis_block:  // Bug #29: Label for automatic retry after blockchain wipe
         // BUG #56 FIX: Full wallet persistence with Bitcoin Core pattern
         CWallet wallet;
         g_node_state.wallet = &wallet;
+        // LP-7 L1 (opt-in, default OFF): when --require-seed-migration is set, the
+        // wallet refuses to sign spends while the HD seed is still plaintext-at-rest.
+        wallet.SetRequireSeedMigration(config.require_seed_migration);
         // Phase 1.5: also wire the wallet into NodeContext so BroadcastDNASample
         // can find the MIK private key for signing. Without this, signed-DNA
         // broadcasts are silently skipped and Phase 1.5 has no effect on the wire.
@@ -5684,6 +5700,25 @@ load_genesis_block:  // Bug #29: Label for automatic retry after blockchain wipe
                 config.start_mining = false;
                 g_node_state.mining_enabled = false;
             }
+        }
+
+        // LP-7 L1 (opt-in --require-seed-migration, default OFF): when the operator
+        // has opted in, REFUSE to mine while the HD seed is still plaintext-at-rest.
+        // (Unlocking above normally drives the one-time v7 migration and clears this;
+        // we still gate here for the case it did not complete — e.g. unlock failed, or
+        // migration could not persist.) Default OFF preserves the warn-only behavior:
+        // the operator is surfaced the state but not blocked.
+        if (config.require_seed_migration && config.start_mining && wallet.NeedsSeedMigration()) {
+            std::cerr << std::endl;
+            std::cerr << "  ERROR (--require-seed-migration): wallet HD seed is still stored" << std::endl;
+            std::cerr << "  UNENCRYPTED at rest (fixed bug LP-7). Refusing to mine." << std::endl;
+            std::cerr << "  Unlock the wallet ONCE to complete the one-time security upgrade:" << std::endl;
+            std::cerr << "    walletpassphrase <password> <timeout>" << std::endl;
+            std::cerr << "  Then restart with --mine. (Omit --require-seed-migration to run" << std::endl;
+            std::cerr << "  in warn-only mode.)" << std::endl;
+            std::cerr << std::endl;
+            config.start_mining = false;
+            g_node_state.mining_enabled = false;
         }
 
         }  // end else (!relay_only)

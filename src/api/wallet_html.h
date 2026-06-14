@@ -1217,6 +1217,35 @@ inline const std::string& GetWalletHTML() {
                 </div>
             </div>
 
+            <!-- LP-7 (force-migrate): persistent banner shown when the wallet is
+                 encrypted but its HD seed is still stored UNENCRYPTED at rest
+                 (pre-fix bug). Drives the one-time unlock that re-encrypts the seed.
+                 Reuses the standard walletpassphrase unlock flow. -->
+            <div id="seedMigrationBanner" style="display: none; background: rgba(255,68,68,0.10); border: 1px solid rgba(255,68,68,0.55); border-radius: 10px; padding: 20px; margin-bottom: 16px;">
+                <div style="display: flex; align-items: flex-start; gap: 12px;">
+                    <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="#ff4444" stroke-width="2" style="flex-shrink: 0; margin-top: 2px;">
+                        <path d="M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0z"></path>
+                        <line x1="12" y1="9" x2="12" y2="13"></line>
+                        <line x1="12" y1="17" x2="12.01" y2="17"></line>
+                    </svg>
+                    <div style="flex: 1;">
+                        <div style="font-weight: 700; color: #ff4444; margin-bottom: 6px;">Security upgrade required</div>
+                        <div style="font-size: 0.88rem; color: var(--text-muted); margin-bottom: 12px;">
+                            This wallet is encrypted, but your recovery seed is still stored <strong>unencrypted on disk</strong>
+                            because it was created by an older version (bug LP-7). Unlock once to complete a one-time security
+                            upgrade that encrypts the seed at rest. Your funds are safe to keep using in the meantime.
+                        </div>
+                        <div style="display: flex; gap: 12px; align-items: flex-end;">
+                            <div style="flex: 1; max-width: 320px;">
+                                <label class="form-label" style="font-size: 0.85rem;">Wallet password</label>
+                                <input type="password" id="seedMigrationPassword" class="form-input" placeholder="Enter wallet password">
+                            </div>
+                            <button class="btn btn-primary" onclick="migrateSeedFromBanner()">Unlock &amp; upgrade</button>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
             <!-- Node Wallet Security Card (Dashboard) -->
             <div class="card" id="dashboardWalletSecurity" style="margin-bottom: 16px; display: none;">
                 <div class="card-title">
@@ -1758,7 +1787,16 @@ inline const std::string& GetWalletHTML() {
 
                 <!-- Encrypted -->
                 <div id="nodeWalletEncrypted" style="display: none;">
-                    <div style="display: flex; align-items: center; gap: 8px; margin-bottom: 16px; padding: 12px; background: rgba(34, 197, 94, 0.1); border-radius: 8px;">
+                    <!-- LP-7 (Cursor M2): armed state — seed still plaintext-at-rest despite "encrypted".
+                         Mirrors the dashboard migration banner so this card cannot falsely reassure. -->
+                    <div id="nodeWalletNeedsMigration" style="display: none; align-items: center; gap: 8px; margin-bottom: 16px; padding: 12px; background: rgba(239, 68, 68, 0.1); border-radius: 8px;">
+                        <span style="font-size: 1.2rem;">⚠️</span>
+                        <div>
+                            <div style="font-weight: 600; color: var(--error);">Security Upgrade Required</div>
+                            <div style="font-size: 0.8rem; color: var(--text-muted);">Your wallet is encrypted, but the seed is still stored unencrypted at rest (fixed bug LP-7). Unlock once to complete a one-time security upgrade.</div>
+                        </div>
+                    </div>
+                    <div id="nodeWalletEncryptedOk" style="display: flex; align-items: center; gap: 8px; margin-bottom: 16px; padding: 12px; background: rgba(34, 197, 94, 0.1); border-radius: 8px;">
                         <span style="font-size: 1.2rem;">✅</span>
                         <div>
                             <div style="font-weight: 600; color: var(--success);">Wallet Encrypted</div>
@@ -5503,12 +5541,23 @@ inline const std::string& GetWalletHTML() {
 
                 // Handle both boolean and string responses
                 const isEncrypted = walletInfo.encrypted === true || walletInfo.encrypted === 'true';
-                console.log('[Wallet] isEncrypted:', isEncrypted);
+                // LP-7 (Cursor M2): "encrypted" alone is not "safe" — the seed can still
+                // be plaintext-at-rest (armed for migration). Mirror the dashboard banner
+                // so this card reflects the armed state instead of falsely reassuring.
+                const needsMigration = walletInfo.needs_seed_migration === true || walletInfo.needs_seed_migration === 'true';
+                console.log('[Wallet] isEncrypted:', isEncrypted, 'needsMigration:', needsMigration);
 
                 document.getElementById('nodeWalletNotEncrypted').style.display = isEncrypted ? 'none' : 'block';
                 document.getElementById('nodeWalletEncrypted').style.display = isEncrypted ? 'block' : 'none';
 
                 if (isEncrypted) {
+                    // Gate the green "Wallet Encrypted" confirmation on !needsMigration;
+                    // show the armed-state warning instead while migration is pending.
+                    const okRow = document.getElementById('nodeWalletEncryptedOk');
+                    const migrationRow = document.getElementById('nodeWalletNeedsMigration');
+                    if (okRow) okRow.style.display = needsMigration ? 'none' : 'flex';
+                    if (migrationRow) migrationRow.style.display = needsMigration ? 'flex' : 'none';
+
                     const lockStatus = document.getElementById('nodeWalletLockStatus');
                     const isUnlocked = walletInfo.unlocked_until > 0 || walletInfo.locked === false;
                     lockStatus.textContent = isUnlocked ? 'Unlocked' : 'Locked';
@@ -5597,23 +5646,31 @@ inline const std::string& GetWalletHTML() {
             const mode = connectionManager ? connectionManager.getMode() : 'full';
             const warningBanner = document.getElementById('encryptionWarningBanner');
             const okBanner = document.getElementById('encryptionOkBanner');
+            const migrationBanner = document.getElementById('seedMigrationBanner');
 
             // Only show in full node mode when connected
             if (mode !== 'full' || !connected) {
                 warningBanner.style.display = 'none';
                 okBanner.style.display = 'none';
+                if (migrationBanner) migrationBanner.style.display = 'none';
                 return;
             }
 
             try {
                 const walletInfo = await rpcCall('getwalletinfo');
                 const isEncrypted = walletInfo.encrypted === true || walletInfo.encrypted === 'true';
+                // LP-7 (force-migrate): seed plaintext-at-rest despite "encrypted".
+                const needsMigration = walletInfo.needs_seed_migration === true || walletInfo.needs_seed_migration === 'true';
+
+                // The migration banner takes priority: while it is up, do NOT present
+                // the wallet as safely-encrypted (suppress the green OK banner).
+                if (migrationBanner) migrationBanner.style.display = needsMigration ? 'block' : 'none';
 
                 warningBanner.style.display = isEncrypted ? 'none' : 'block';
-                okBanner.style.display = isEncrypted ? 'block' : 'none';
+                okBanner.style.display = (isEncrypted && !needsMigration) ? 'block' : 'none';
 
                 // Auto-hide the "encrypted OK" banner after 10 seconds (not a permanent fixture)
-                if (isEncrypted) {
+                if (isEncrypted && !needsMigration) {
                     setTimeout(() => {
                         okBanner.style.display = 'none';
                     }, 10000);
@@ -5622,6 +5679,40 @@ inline const std::string& GetWalletHTML() {
                 // If we can't check, hide both banners
                 warningBanner.style.display = 'none';
                 okBanner.style.display = 'none';
+                if (migrationBanner) migrationBanner.style.display = 'none';
+            }
+        }
+
+        // LP-7 (force-migrate): unlock from the seed-migration banner. The unlock
+        // triggers the one-time v7 seed re-encryption on the node side; we then
+        // re-poll so the banner clears once needs_seed_migration flips false.
+        async function migrateSeedFromBanner() {
+            const pwEl = document.getElementById('seedMigrationPassword');
+            const password = pwEl ? pwEl.value : '';
+
+            if (!password) {
+                showNotification('Please enter your wallet password', 'error');
+                return;
+            }
+
+            try {
+                showNotification('Unlocking and upgrading wallet security...', 'info');
+                // Standard unlock flow — the node re-encrypts the seed at rest on unlock.
+                await rpcCall('walletpassphrase', {passphrase: password, timeout: 60});
+                if (pwEl) pwEl.value = '';
+
+                // Re-poll: the node clears needs_seed_migration after the upgrade.
+                const walletInfo = await rpcCall('getwalletinfo');
+                const stillNeeds = walletInfo.needs_seed_migration === true || walletInfo.needs_seed_migration === 'true';
+                if (stillNeeds) {
+                    showNotification('Unlocked, but the security upgrade did not complete. It will retry on the next unlock.', 'error');
+                } else {
+                    showNotification('Security upgrade complete. Your seed is now encrypted at rest.', 'success');
+                }
+                await updateDashboardEncryptionBanner();
+                await checkNodeWalletEncryption();
+            } catch (e) {
+                showNotification('Failed to unlock: ' + e.message, 'error');
             }
         }
 
