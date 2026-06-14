@@ -4715,9 +4715,9 @@ load_genesis_block:  // Bug #29: Label for automatic retry after blockchain wipe
                 if (!g_dna_sample_limiter.consume_peer_bucket(peer_id, now_sec)) {
                     return;
                 }
-                // First time seeing this MIK — accept without rate-limiting, as the
-                // miner's initial-registration broadcast establishes the peer_id→MIK
-                // mapping that subsequent samples rely on for plausibility.
+                // First-seen registration is now rate-capped by the per-peer token
+                // bucket above (H-1), but still accepted: it establishes the
+                // peer_id→MIK mapping that subsequent samples rely on for plausibility.
                 //
                 // Signed trailer is intentionally ignored on first-registration:
                 // the pubkey may not be in our identity DB yet (if the chain hasn't

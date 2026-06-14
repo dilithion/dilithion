@@ -24,8 +24,8 @@ struct LatencyStats {
     double p90_ms = 0.0;
     double mean_ms = 0.0;
     double stddev_ms = 0.0;
-    uint32_t samples;
-    uint32_t failures;
+    uint32_t samples = 0;
+    uint32_t failures = 0;
 
     // Raw measurements for analysis
     std::vector<double> measurements;
@@ -74,7 +74,12 @@ private:
     static double compute_stddev(const std::vector<double>& values, double mean);
 };
 
-// Default mainnet seed nodes
+// Default mainnet seed nodes.
+// APPEND-ONLY CONSTRAINT: LatencyFingerprint::distance() compares per-seed medians
+// POSITIONALLY (index i in one fingerprint vs index i in another). These ordered seed
+// lists are what the collector probes, so the list must only ever grow — never remove
+// or reorder an entry — or cross-version fingerprint comparisons would silently compare
+// different cities (e.g. London-vs-Singapore) and produce meaningless distances.
 const std::array<SeedNode, 4> MAINNET_SEEDS = {{
     {"NYC", "138.197.68.128", 8444},
     {"London", "167.172.56.119", 8444},

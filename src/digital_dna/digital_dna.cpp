@@ -218,6 +218,11 @@ static std::optional<DigitalDNA> deserialize_v1(const std::vector<uint8_t>& data
     dna.latency.seed_stats.resize(seed_count);
     for (uint32_t s = 0; s < seed_count; s++) {
         if (!read_double(data, off, dna.latency.seed_stats[s].median_ms)) return std::nullopt;
+        // Reject attacker-crafted non-finite/negative medians: distance() now consumes
+        // these doubles, and a NaN would poison combined_score (every threshold compare
+        // becomes false → the identity self-exempts from similarity checks).
+        const double m = dna.latency.seed_stats[s].median_ms;
+        if (!std::isfinite(m) || m < 0.0) return std::nullopt;
     }
 
     if (!read_double(data, off, dna.timing.iterations_per_second)) return std::nullopt;
@@ -276,6 +281,11 @@ std::optional<DigitalDNA> DigitalDNA::deserialize(const std::vector<uint8_t>& da
         dna.latency.seed_stats.resize(seed_count);
         for (uint32_t s = 0; s < seed_count; s++) {
             if (!read_double(data, off, dna.latency.seed_stats[s].median_ms)) return std::nullopt;
+            // Reject attacker-crafted non-finite/negative medians: distance() now consumes
+            // these doubles, and a NaN would poison combined_score (every threshold compare
+            // becomes false → the identity self-exempts from similarity checks).
+            const double m = dna.latency.seed_stats[s].median_ms;
+            if (!std::isfinite(m) || m < 0.0) return std::nullopt;
         }
 
         // Core v2.0: Timing
