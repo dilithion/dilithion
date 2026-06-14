@@ -472,8 +472,10 @@ bool CSeedAttestationKey::Save(const std::string& dataDir, bool requireEncryptio
     // already has WRITE access to the seed's root-owned 0600/0700 data dir (i.e. is
     // already root-equivalent and can destroy the key directly), and this atomic
     // temp+rename mirrors the audited CWallet::SaveUnlocked, which carries the same
-    // accepted residual under the same operator-owned-datadir threat model. Tracked
-    // for follow-up in missions/seed-key-at-rest/FOLLOWUPS.md; not a #113 blocker.
+    // accepted residual under the same operator-owned-datadir threat model. Accepted
+    // as a deferred follow-up (not a #113 blocker); the deferred items are tracked
+    // out-of-tree in the project's security record rather than enumerated here, to
+    // avoid expanding public detail on un-deployed fixes during the disclosure window.
     int fd = ::open(tmpPath.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW, S_IRUSR | S_IWUSR);
     if (fd < 0) {
         std::cerr << "[Attestation] Failed to open temp key file for writing: " << tmpPath
