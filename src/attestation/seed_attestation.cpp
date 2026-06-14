@@ -251,8 +251,23 @@ bool CSeedAttestationKey::Load(const std::string& dataDir) {
             return false;
         }
 
+        // LP-13 M-3 (Cursor): RAII exception-safe wipe of the v2 decrypt secrets —
+        // mirrors Save()'s SecretScopeWipe (Cursor flagged the asymmetry). passphrase
+        // / aesKey / plain are cleansed on EVERY exit from here including a thrown
+        // std::bad_alloc, not just the explicit returns below (which keep their
+        // earlier inline cleanses for minimal live-window hygiene; double-cleansing
+        // already-zeroed bytes is harmless).
+        std::vector<uint8_t> aesKey, plain;
+        struct LoadSecretWipe {
+            std::string& p; std::vector<uint8_t>& k; std::vector<uint8_t>& pl;
+            ~LoadSecretWipe() {
+                if (!p.empty()) memory_cleanse(&p[0], p.size());
+                if (!k.empty()) memory_cleanse(k.data(), k.size());
+                if (!pl.empty()) memory_cleanse(pl.data(), pl.size());
+            }
+        } loadSecretWipe{passphrase, aesKey, plain};
+
         // Derive AES key from passphrase + salt, then encrypt-then-MAC verify.
-        std::vector<uint8_t> aesKey;
         if (!DeriveKey(passphrase, salt, SEED_KEY_PBKDF2_ROUNDS, aesKey)) {
             std::cerr << "[Attestation] ERROR: key derivation failed" << std::endl;
             memory_cleanse(&passphrase[0], passphrase.size());
@@ -279,7 +294,6 @@ bool CSeedAttestationKey::Load(const std::string& dataDir) {
             return false;
         }
 
-        std::vector<uint8_t> plain;
         if (!crypter.Decrypt(ciphertext, plain) || plain.size() != DFMP::MIK_PRIVKEY_SIZE) {
             std::cerr << "[Attestation] ERROR: key file decryption failed" << std::endl;
             if (!plain.empty()) memory_cleanse(plain.data(), plain.size());
@@ -442,14 +456,24 @@ bool CSeedAttestationKey::Save(const std::string& dataDir, bool requireEncryptio
 
 #ifndef _WIN32
     // Create the temp with 0600 from the outset (no world-readable window).
-    // LP-13 (symlink-hardening fold, nemotron extreview finding): O_NOFOLLOW
-    // refuses to open the temp if its final path component is a symlink — closing
-    // a symlink-swap vector where an attacker pre-plants "<file>.tmp" as a symlink
-    // to redirect the consensus key write or clobber an unintended file. (We do
-    // NOT add O_EXCL: a stale ".tmp" from a prior crashed save is legitimately
-    // re-truncated; O_EXCL would wedge the save. The seed datadir is operator-
-    // owned, so this is defense-in-depth, and it fails closed — a symlinked temp
-    // aborts Save with the canonical key left intact.)
+    // LP-13 (PARTIAL symlink-hardening, nemotron extreview finding): O_NOFOLLOW
+    // refuses to open the temp if its final path component is ALREADY a symlink at
+    // open() time — closing the pre-open half of the symlink-swap vector (an
+    // attacker pre-planting "<file>.tmp" as a symlink to redirect the key write).
+    // We do NOT add O_EXCL: a stale ".tmp" from a prior crashed save is
+    // legitimately re-truncated; O_EXCL would wedge the save.
+    //
+    // SCOPE / KNOWN RESIDUAL (Cursor C-1, accepted out-of-scope): O_NOFOLLOW does
+    // NOT close the close()->rename() TOCTOU — between this fd being closed and the
+    // ::rename below, a writer in the data dir could swap "<file>.tmp" for a symlink
+    // and have rename publish that symlink over the canonical key. Closing that
+    // fully needs an O_TMPFILE+linkat (POSIX) / reparse-point (Windows) restructure.
+    // It is deliberately NOT done here: it defends only against an attacker who
+    // already has WRITE access to the seed's root-owned 0600/0700 data dir (i.e. is
+    // already root-equivalent and can destroy the key directly), and this atomic
+    // temp+rename mirrors the audited CWallet::SaveUnlocked, which carries the same
+    // accepted residual under the same operator-owned-datadir threat model. Tracked
+    // for follow-up in missions/seed-key-at-rest/FOLLOWUPS.md; not a #113 blocker.
     int fd = ::open(tmpPath.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW, S_IRUSR | S_IWUSR);
     if (fd < 0) {
         std::cerr << "[Attestation] Failed to open temp key file for writing: " << tmpPath
@@ -555,6 +579,9 @@ bool CSeedAttestationKey::Save(const std::string& dataDir, bool requireEncryptio
                               << std::endl;
                 }
             }
+            // LP-13 L-2 (Cursor): `prior` holds the prior key file bytes (the v1
+            // plaintext private key for a v1 file); wipe before it leaves scope.
+            if (!prior.empty()) memory_cleanse(prior.data(), prior.size());
         }
     }
 
@@ -659,6 +686,8 @@ bool CSeedAttestationKey::Save(const std::string& dataDir, bool requireEncryptio
                 if (!bf.good()) std::cerr << "[Attestation] WARNING: failed to write key .bak" << std::endl;
                 bf.close();
             }
+            // LP-13 L-2 (Cursor): wipe the prior-key bytes (v1 plaintext for a v1 file).
+            if (!prior.empty()) memory_cleanse(prior.data(), prior.size());
         }
     }
 
