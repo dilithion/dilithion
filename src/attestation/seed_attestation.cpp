@@ -340,6 +340,23 @@ bool CSeedAttestationKey::Save(const std::string& dataDir, bool requireEncryptio
     std::string passphrase = GetSeedKeyPassphrase();
     bool encrypt = !passphrase.empty();
 
+    // LP-13 (exception-safety fold, convergent across red-team + extreview grok/
+    // qwen3/nemotron): the finish() lambda below + the inline memory_cleanse calls
+    // only run on EXPLICIT returns. A std::bad_alloc thrown mid-assembly (e.g. an
+    // out.insert / DeriveKey allocation) would unwind PAST them, leaving the
+    // plaintext private key (v1 `out`) or the passphrase in freed heap. This RAII
+    // guard makes the wipe exception-safe: it cleanses both on EVERY scope exit,
+    // including a throw. (Double-cleansing already-zeroed bytes on the normal path
+    // is harmless.)
+    struct SecretScopeWipe {
+        std::vector<uint8_t>& buf;
+        std::string& pass;
+        ~SecretScopeWipe() {
+            CleanseSeedKeyBuffer(buf);
+            if (!pass.empty()) memory_cleanse(&pass[0], pass.size());
+        }
+    } secretScopeWipe{out, passphrase};
+
     // LP-13 MEDIUM-1: on the v1 (default, un-passphrased) path `out` holds the
     // plaintext Dilithium3 private key; on the v2 path it holds only ciphertext.
     // Cleanse `out` UNCONDITIONALLY before every return so the plaintext key is
@@ -425,9 +442,18 @@ bool CSeedAttestationKey::Save(const std::string& dataDir, bool requireEncryptio
 
 #ifndef _WIN32
     // Create the temp with 0600 from the outset (no world-readable window).
-    int fd = ::open(tmpPath.c_str(), O_WRONLY | O_CREAT | O_TRUNC, S_IRUSR | S_IWUSR);
+    // LP-13 (symlink-hardening fold, nemotron extreview finding): O_NOFOLLOW
+    // refuses to open the temp if its final path component is a symlink — closing
+    // a symlink-swap vector where an attacker pre-plants "<file>.tmp" as a symlink
+    // to redirect the consensus key write or clobber an unintended file. (We do
+    // NOT add O_EXCL: a stale ".tmp" from a prior crashed save is legitimately
+    // re-truncated; O_EXCL would wedge the save. The seed datadir is operator-
+    // owned, so this is defense-in-depth, and it fails closed — a symlinked temp
+    // aborts Save with the canonical key left intact.)
+    int fd = ::open(tmpPath.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW, S_IRUSR | S_IWUSR);
     if (fd < 0) {
-        std::cerr << "[Attestation] Failed to open temp key file for writing: " << tmpPath << std::endl;
+        std::cerr << "[Attestation] Failed to open temp key file for writing: " << tmpPath
+                  << " (errno " << errno << "; O_NOFOLLOW rejects a symlinked temp)" << std::endl;
         return finish(false);
     }
     // LP-13 M-4: re-assert 0600 on the open fd. O_TRUNC does NOT reset the mode
@@ -505,7 +531,8 @@ bool CSeedAttestationKey::Save(const std::string& dataDir, bool requireEncryptio
             std::vector<uint8_t> prior((std::istreambuf_iterator<char>(src)),
                                         std::istreambuf_iterator<char>());
             src.close();
-            int bfd = ::open(bakPath.c_str(), O_WRONLY | O_CREAT | O_TRUNC, S_IRUSR | S_IWUSR);
+            // LP-13 symlink-hardening (nemotron extreview): O_NOFOLLOW on the .bak too.
+            int bfd = ::open(bakPath.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW, S_IRUSR | S_IWUSR);
             if (bfd >= 0) {
                 size_t bw = 0; bool bok = true;
                 while (bw < prior.size()) {

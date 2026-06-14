@@ -515,6 +515,49 @@ static void TestPosixPerms() {
     CHECK(stat(KeyPath(dir2).c_str(), &st2) == 0, "stat v1 key file");
     CHECK((st2.st_mode & 0777) == (S_IRUSR | S_IWUSR), "v1 perms == 0600");
 }
+
+// LP-13 (symlink-hardening, nemotron extreview finding): the temp key file is
+// opened O_NOFOLLOW, so a pre-planted "<key>.tmp" symlink cannot redirect the
+// consensus key write. Save must FAIL (fail-closed), leave the canonical key
+// byte-intact, and NOT write the key through the symlink to its target.
+// Mutation self-check: removing O_NOFOLLOW lets the open follow the symlink, the
+// victim file receives the key bytes, and the "victim untouched" assertion fails.
+static void TestTempSymlinkRejected() {
+    std::cout << "[Test] symlink-hardening: O_NOFOLLOW rejects a symlinked temp (POSIX)" << std::endl;
+    std::string dir = MakeTempDir();
+    SetPass("symlink-pass");
+
+    // 1) Establish the canonical key.
+    CSeedAttestationKey k1;
+    CHECK(k1.Generate(), "generate original keypair");
+    std::vector<uint8_t> origPub = k1.GetPubKey();
+    CHECK(k1.Save(dir), "save original key");
+    std::vector<uint8_t> origBytes = ReadFileBytes(KeyPath(dir));
+    CHECK(!origBytes.empty(), "original key file non-empty");
+
+    // 2) Plant "<key>.tmp" as a symlink to a victim file the attacker wants written.
+    std::string tmpPath = KeyPath(dir) + ".tmp";
+    std::string victimPath = dir + "/victim.bin";
+    WriteFileBytes(victimPath, std::vector<uint8_t>{0xCC, 0xCC, 0xCC});
+    std::vector<uint8_t> victimBefore = ReadFileBytes(victimPath);
+    ::unlink(tmpPath.c_str());  // ensure no stale temp
+    CHECK(symlink(victimPath.c_str(), tmpPath.c_str()) == 0, "plant symlink at <key>.tmp -> victim");
+
+    // 3) Attempt to Save a DIFFERENT key. O_NOFOLLOW must make the temp open fail.
+    CSeedAttestationKey k2;
+    CHECK(k2.Generate(), "generate replacement keypair");
+    CHECK(k2.GetPubKey() != origPub, "replacement differs");
+    CHECK(!k2.Save(dir), "Save FAILS when temp path is a symlink (O_NOFOLLOW)");
+
+    // 4) Canonical key untouched, and the victim was NOT written through the symlink.
+    std::vector<uint8_t> afterBytes = ReadFileBytes(KeyPath(dir));
+    CHECK(afterBytes == origBytes, "canonical key byte-intact after rejected symlink save");
+    std::vector<uint8_t> victimAfter = ReadFileBytes(victimPath);
+    CHECK(victimAfter == victimBefore, "victim file NOT written through the symlink");
+
+    ::unlink(tmpPath.c_str());  // cleanup the planted symlink
+    SetPass(nullptr);
+}
 #endif
 
 // LP-13 (extreview HIGH): SeedKeyFilePresent must test PRESENCE, not readability.
@@ -581,6 +624,7 @@ int main() {
     TestLoadRepairsPerms();                  // M-3
     TestFailClosedPerms();                   // M-4 (best-effort/informational)
     TestPosixPerms();
+    TestTempSymlinkRejected();               // O_NOFOLLOW symlink-hardening (nemotron extreview)
 #endif
 
     std::cout << "=========================================" << std::endl;
