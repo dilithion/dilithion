@@ -6949,12 +6949,26 @@ load_genesis_block:  // Bug #29: Label for automatic retry after blockchain wipe
                 CRPCServer::NotifyBlockTipChanged();
             });
 
-        // Phase 2+3: Seed attestation initialization (relay-only seed nodes only)
+        // Phase 2+3: Seed attestation initialization (DIL seed-capable nodes)
         // Loads ASN database and attestation signing key so seeds can serve
         // getmikattestation RPC requests from miners.
+        //
+        // LP-13 (DIL parity with the dilv-node H-3 fix): gate on
+        // `relay_only || public_api`, NOT bare `relay_only`. Verified live
+        // 2026-06-14: NYC's DIL node runs `--public-api` WITHOUT `--relay-only`
+        // (it is the bridge host), so under the prior bare-relay_only gate NYC's
+        // seed_attestation_key.dat existed on disk but was never loaded —
+        // getmikattestation returned "only available on seed nodes" — leaving DIL
+        // at exactly 3-of-4 functional attestation (MIN_ATTESTATIONS=3) with ZERO
+        // margin. This is the SAME failure mode the DilV v4.3 fix (2026-05-04)
+        // addressed for DilV but which was never applied to DIL. Every DIL seed
+        // runs --public-api (NYC included) to serve light wallets; a plain miner
+        // runs neither flag. Bridge ops are unaffected: init only registers an RPC
+        // handler + loads keys.
+        const bool seedCapable = config.relay_only || config.public_api;
         static Attestation::CSeedAttestationKey seedAttestKey;
         static CASNDatabase asnDatabase;
-        if (config.relay_only && Dilithion::g_chainParams) {
+        if (seedCapable && Dilithion::g_chainParams) {
             std::string dataDir = Dilithion::g_chainParams->dataDir;
 
             // Load ASN database from data directory (or project root)

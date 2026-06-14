@@ -525,6 +525,7 @@ bool CSeedAttestationKey::Save(const std::string& dataDir, bool requireEncryptio
         std::cerr << "[Attestation] Key file atomic rename failed (errno " << errno
                   << "); original key left intact at " << path << std::endl;
         ::unlink(tmpPath.c_str());
+        ::unlink(bakPath.c_str());  // LOW-3: don't leave a stale (plaintext-for-v1) .bak copy
         return finish(false);
     }
     RestrictKeyFilePerms(path);  // perms ride with rename, but re-assert defensively
@@ -537,6 +538,13 @@ bool CSeedAttestationKey::Save(const std::string& dataDir, bool requireEncryptio
         int dirfd = ::open(parentDir.c_str(), O_RDONLY);
         if (dirfd >= 0) { ::fsync(dirfd); ::close(dirfd); }
     }
+
+    // LP-13 LOW-3: the .bak was a fallback for a botched rename. The publish
+    // succeeded, so it's now a stale copy of the OLD key — and for a v1
+    // (unencrypted) key it would be a second plaintext copy of the consensus
+    // signing key lingering at rest. Remove it. (rename atomicity already
+    // guarantees the no-key-loss property without a persisted .bak.)
+    ::unlink(bakPath.c_str());
 #else
     // Windows: write temp with a durable flush, stage .bak, then MoveFileEx
     // atomic replace.
@@ -625,9 +633,13 @@ bool CSeedAttestationKey::Save(const std::string& dataDir, bool requireEncryptio
         std::cerr << "[Attestation] Key file atomic move failed; original key left intact at "
                   << path << std::endl;
         std::remove(tmpPath.c_str());
+        std::remove(bakPath.c_str());  // LOW-3: don't leave a stale (plaintext-for-v1) .bak copy
         return finish(false);
     }
     RestrictKeyFilePerms(path);  // best-effort no-op on Windows (NTFS ACL governs)
+    // LP-13 LOW-3: publish succeeded — remove the now-stale .bak (a second copy
+    // of the OLD key; plaintext for a v1 key). See the POSIX path for rationale.
+    std::remove(bakPath.c_str());
 #endif
 
     std::cout << "[Attestation] Saved seed attestation key to: " << path

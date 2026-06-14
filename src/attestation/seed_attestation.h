@@ -142,16 +142,21 @@ public:
      *
      * LP-13 H-2 / B-1: the write is ATOMIC and fail-closed-durable — the blob is
      * written to "<file>.tmp", the prior key (if any) is copied to "<file>.bak",
-     * then the temp is atomically renamed over the target. The durability
-     * guarantee — that a crash / partial write / power loss cannot destroy the
-     * only copy of the consensus signing key — rests on THREE properties, not an
-     * absolute claim: (1) the temp's fsync (POSIX) / FlushFileBuffers (Windows)
-     * is FATAL — on failure Save removes the temp and returns false WITHOUT
-     * renaming, so un-flushed data is never published over the live key; (2) the
-     * publish is an atomic rename(2) / MoveFileExW replace; (3) the parent
-     * directory is fsync'd after the rename so the rename metadata is durable.
-     * If any of these cannot be confirmed, Save fails-closed and the canonical
-     * key is left byte-intact.
+     * then the temp is atomically renamed over the target and the "<file>.bak"
+     * is removed on success. The guarantee that a crash / partial write / power
+     * loss cannot destroy the only copy of the consensus signing key rests on TWO
+     * fail-closed properties: (1) the temp's fsync (POSIX) / FlushFileBuffers
+     * (Windows) is FATAL — on failure Save removes the temp and returns false
+     * WITHOUT renaming, so un-flushed data is never published over the live key;
+     * (2) the publish is an atomic rename(2) / MoveFileExW(MOVEFILE_WRITE_THROUGH)
+     * replace, so an observer (and a post-crash reader) sees either the old key or
+     * the fully-flushed new key, never a partial/absent file. After the rename the
+     * POSIX path also fsync's the parent directory to make the rename metadata
+     * durable sooner; that step is best-effort (its failure is logged, not fatal)
+     * and is NOT load-bearing for the no-key-loss guarantee — rename atomicity
+     * already bounds the worst case to "old key still on disk." (Windows relies on
+     * MOVEFILE_WRITE_THROUGH for the same metadata durability; there is no
+     * directory-fsync on that path.)
      *
      * LP-13 M-4: if BOTH the create-time mode and the post-write chmod fail to
      * set 0600 (POSIX), Save REFUSES to publish a possibly group/other-readable
