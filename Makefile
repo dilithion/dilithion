@@ -942,6 +942,41 @@ asert_test:
 	@echo "$(COLOR_GREEN)✓ ASERT test built successfully$(COLOR_RESET)"
 
 # ============================================================================
+# LP-5 batch-verifier concurrency race + differential harness (CRITICAL-1/MED-2)
+# Links only the verifier object + Dilithium primitives (no full CORE_OBJECTS):
+# the race lives entirely in CSignatureBatchVerifier's per-batch state.
+# Build under ThreadSanitizer on Linux:  make TSAN=1 batch_verifier_race_tests
+# ============================================================================
+batch_verifier_race_tests: $(OBJ_DIR)/consensus/signature_batch_verifier.o $(OBJ_DIR)/test/batch_verifier_race_tests.o $(DILITHIUM_OBJECTS)
+	@echo "$(COLOR_BLUE)[LINK]$(COLOR_RESET) $@"
+	@$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS) $(LIBS)
+	@echo "$(COLOR_GREEN)✓ batch_verifier_race_tests built$(COLOR_RESET)"
+
+# ----------------------------------------------------------------------------
+# A-010 CONTROL target: SAME harness source, -DPREFIX_API, linked against the
+# FROZEN pre-fix verifier (src/test/lp5_control/, a verbatim copy of bb933d53).
+# This deterministically HANGS — proving the harness is a real discriminator,
+# not a no-op. The control-red and the fix-green therefore come from one source.
+#   make batch_verifier_race_control   # then run with a timeout; expect a HANG.
+# Distinct object dir so the -DPREFIX_API harness object never collides with the
+# default (no-PREFIX_API) batch_verifier_race_tests.o.
+$(OBJ_DIR)/test/lp5_control:
+	@mkdir -p $@
+
+$(OBJ_DIR)/test/lp5_control/signature_batch_verifier_prefix.o: src/test/lp5_control/signature_batch_verifier_prefix.cpp | $(OBJ_DIR)/test/lp5_control
+	@echo "$(COLOR_BLUE)[CXX]$(COLOR_RESET)  $< (LP-5 control, frozen pre-fix)"
+	@$(CXX) $(CXXFLAGS) $(INCLUDES) -I src/test/lp5_control -c $< -o $@
+
+$(OBJ_DIR)/test/lp5_control/batch_verifier_race_tests.o: src/test/batch_verifier_race_tests.cpp | $(OBJ_DIR)/test/lp5_control
+	@echo "$(COLOR_BLUE)[CXX]$(COLOR_RESET)  $< (-DPREFIX_API control variant)"
+	@$(CXX) $(CXXFLAGS) $(INCLUDES) -I src/test/lp5_control -DPREFIX_API -c $< -o $@
+
+batch_verifier_race_control: $(OBJ_DIR)/test/lp5_control/signature_batch_verifier_prefix.o $(OBJ_DIR)/test/lp5_control/batch_verifier_race_tests.o $(DILITHIUM_OBJECTS)
+	@echo "$(COLOR_BLUE)[LINK]$(COLOR_RESET) $@"
+	@$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS) $(LIBS)
+	@echo "$(COLOR_GREEN)✓ batch_verifier_race_control built (A-010 control — expect HANG when run)$(COLOR_RESET)"
+
+# ============================================================================
 # Run Tests
 # ============================================================================
 

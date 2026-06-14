@@ -796,8 +796,22 @@ bool CTransactionValidator::BatchVerifyScripts(const CTransaction& tx, CUTXOSet&
         return false;
     }
 
-    // Begin new batch
-    g_signature_verifier->BeginBatch();
+    // Begin a new batch. The session is owned for the lifetime of this call
+    // (CRITICAL-1 / LP-5): concurrent BatchVerifyScripts callers each get their
+    // own session, so their batch state cannot cross-contaminate.
+    //
+    // The RAII guard (CCheckQueueControl pattern, see checkqueue.h) drains the
+    // session via Wait() on EVERY exit path that does not consume the result —
+    // both early-return branches below and any future exception. Draining is a
+    // latency bound, not a safety requirement: every queued task shared_ptr-
+    // owns the session (signature_batch_verifier.h S-005), so an abandoned
+    // session is UAF-safe — the guard only avoids spending CPU on signatures
+    // we're about to discard and a leaked-task-on-an-abandoned-session waste.
+    // The guard's drain uses a throwaway error internally, so a bad signature
+    // in an already-queued task can never clobber the real operator-facing
+    // `error` we set on the early-return branches.
+    std::shared_ptr<CBatchSession> session = g_signature_verifier->BeginBatch();
+    CBatchSessionGuard guard(g_signature_verifier, session);
 
     // Prepare and add all signature verification tasks
     for (size_t i = 0; i < tx.vin.size(); ++i) {
@@ -807,7 +821,7 @@ bool CTransactionValidator::BatchVerifyScripts(const CTransaction& tx, CUTXOSet&
         CUTXOEntry entry;
         if (!utxoSet.GetUTXO(txin.prevout, entry)) {
             error = "Failed to retrieve UTXO for batch verification";
-            return false;
+            return false;  // guard drains queued tasks; `error` preserved
         }
 
         // Prepare signature data
@@ -819,13 +833,14 @@ bool CTransactionValidator::BatchVerifyScripts(const CTransaction& tx, CUTXOSet&
             snprintf(buf, sizeof(buf), "Failed to prepare signature data for input %zu: %s",
                      i, prep_error.c_str());
             error = buf;
-            return false;
+            return false;  // guard drains queued tasks; `error` preserved
         }
 
-        // Add to batch
-        g_signature_verifier->Add(signature, message, pubkey, i);
+        // Add to this batch's session
+        g_signature_verifier->Add(session, signature, message, pubkey, i);
     }
 
-    // Wait for all verifications to complete
-    return g_signature_verifier->Wait(error);
+    // Wait for all verifications in this session to complete. WaitResult()
+    // consumes the verdict so the guard does NOT drain again on destruction.
+    return guard.WaitResult(error);
 }
