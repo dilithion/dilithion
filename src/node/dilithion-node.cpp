@@ -73,6 +73,7 @@
 #include <rpc/server.h>
 #include <rpc/auth.h>      // CVE-2026-RPC-AUTH: RPCAuth::InitializeAuth
 #include <rpc/rest_api.h>  // REST API for light wallet
+#include <rpc/ratelimiter.h>  // LP-12: per-IP rate limiter for the HTTP REST path
 #include <core/chainparams.h>
 #include <consensus/pow.h>
 #include <consensus/chain.h>
@@ -3855,7 +3856,24 @@ load_genesis_block:  // Bug #29: Label for automatic retry after blockchain wipe
         rest_api.RegisterUTXOSet(&utxo_set);
         rest_api.RegisterChainState(&g_chainstate);
         rest_api.SetTestnet(config.testnet);
-        // Note: Rate limiter is optional for HTTP server (RPC server has its own)
+        // LP-12: wire a per-IP rate limiter onto the standalone HTTP server's
+        // REST instance. Previously this was left null ("optional"), so the
+        // public REST broadcast endpoint (ENDPOINT_BROADCAST) returned "allow"
+        // for every request on a --public-api node. The CHttpServer now plumbs
+        // the real peer IP (see http_server.cpp), so this limiter keys per-IP.
+        static CRateLimiter http_rest_rate_limiter;
+        rest_api.RegisterRateLimiter(&http_rest_rate_limiter);
+        // LP-12 (M-01): also hand the limiter to the HTTP server so it runs the
+        // periodic CleanupOldRecords() maintenance (mirrors the RPC server's
+        // cleanup thread). Without this the per-IP record map grows unbounded as
+        // source IPs rotate (slow memory-DoS) on a --public-api node.
+        http_server.SetRateLimiter(&http_rest_rate_limiter);
+
+        // LP-12 (H-01): configure the anti-DNS-rebinding Host allowlist on the
+        // HTTP server's REST surface, reusing the SAME source as the RPC server
+        // (config.rpc_allow_hosts / --rpcallowhost; loopback always allowed).
+        // Must run before Start() so worker threads see a ready, fail-closed gate.
+        http_server.ConfigureHostAllowlist(config.rpc_allow_hosts);
 
         http_server.SetRestApiHandler([](const std::string& method,
                                          const std::string& path,
