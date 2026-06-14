@@ -555,6 +555,10 @@ bool CSeedAttestationKey::Save(const std::string& dataDir, bool requireEncryptio
             std::vector<uint8_t> prior((std::istreambuf_iterator<char>(src)),
                                         std::istreambuf_iterator<char>());
             src.close();
+            // LP-13 L-2 (RAII, qwen3 extreview): wipe the prior key bytes (v1 plaintext
+            // private key for a v1 file) on EVERY scope exit incl. a throw, matching
+            // M-3/Save's exception-safe pattern (consistency over the manual cleanse).
+            struct PriorWipe { std::vector<uint8_t>& v; ~PriorWipe(){ if (!v.empty()) memory_cleanse(v.data(), v.size()); } } priorWipe{prior};
             // LP-13 symlink-hardening (nemotron extreview): O_NOFOLLOW on the .bak too.
             int bfd = ::open(bakPath.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW, S_IRUSR | S_IWUSR);
             if (bfd >= 0) {
@@ -579,9 +583,6 @@ bool CSeedAttestationKey::Save(const std::string& dataDir, bool requireEncryptio
                               << std::endl;
                 }
             }
-            // LP-13 L-2 (Cursor): `prior` holds the prior key file bytes (the v1
-            // plaintext private key for a v1 file); wipe before it leaves scope.
-            if (!prior.empty()) memory_cleanse(prior.data(), prior.size());
         }
     }
 
@@ -680,14 +681,14 @@ bool CSeedAttestationKey::Save(const std::string& dataDir, bool requireEncryptio
             std::vector<uint8_t> prior((std::istreambuf_iterator<char>(src)),
                                         std::istreambuf_iterator<char>());
             src.close();
+            // LP-13 L-2 (RAII, qwen3 extreview): wipe prior (v1 plaintext for a v1 file) on any exit incl. throw.
+            struct PriorWipe { std::vector<uint8_t>& v; ~PriorWipe(){ if (!v.empty()) memory_cleanse(v.data(), v.size()); } } priorWipe{prior};
             std::ofstream bf(bakPath, std::ios::binary | std::ios::trunc);
             if (bf.is_open()) {
                 bf.write(reinterpret_cast<const char*>(prior.data()), prior.size());
                 if (!bf.good()) std::cerr << "[Attestation] WARNING: failed to write key .bak" << std::endl;
                 bf.close();
             }
-            // LP-13 L-2 (Cursor): wipe the prior-key bytes (v1 plaintext for a v1 file).
-            if (!prior.empty()) memory_cleanse(prior.data(), prior.size());
         }
     }
 
