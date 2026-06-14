@@ -6982,12 +6982,17 @@ load_genesis_block:  // Bug #29: Label for automatic retry after blockchain wipe
             // --generate-seed-key so a reprovisioned seed fails loud).
             //
             // LP-13 M-1 (fail-stop on GENUINE failure): a key file PRESENT but
-            // unusable (corrupt / wrong-or-missing passphrase / 0600-repair
-            // failure / plaintext-when-encryption-required), OR a requested mint
-            // that could not be persisted, is a real attestation outage. On a
-            // seed-capable node we ABORT startup rather than run silently without
-            // attestation. The benign case — a non-seed relay with NO key file
-            // and no --generate-seed-key — is NOT fatal (it just doesn't attest).
+            // unusable (corrupt / decrypt-or-parse failure / wrong-or-missing
+            // passphrase / plaintext-when-encryption-required), OR a requested
+            // mint that could not be persisted, is a real attestation outage. On
+            // a seed-capable node we ABORT startup rather than run silently
+            // without attestation. genuineFailure also fires when
+            // --require-seed-key-encryption is set even with NO key file present:
+            // fail-closed is intended — an operator who demanded at-rest
+            // encryption must not be left running with no usable encrypted key.
+            // The ONLY benign (non-fatal) case is: NO key file, no
+            // --generate-seed-key, AND no --require-seed-key-encryption — the
+            // relay simply doesn't attest.
             bool keyFileExists = false;
             {
                 std::ifstream kf(dataDir + "/" + Attestation::SEED_KEY_FILENAME, std::ios::binary);
@@ -7000,8 +7005,10 @@ load_genesis_block:  // Bug #29: Label for automatic retry after blockchain wipe
                                       || config.require_seed_key_encryption;
                 if (genuineFailure) {
                     std::cerr << "[Attestation] FATAL: seed attestation key initialization FAILED "
-                                 "(corrupt key, wrong/missing " << Attestation::SEED_KEY_PASSPHRASE_ENV
-                              << ", permission repair failure, or save failure). A seed must not run "
+                                 "(key file present but unreadable/corrupt, decrypt/parse failure, "
+                                 "wrong/missing " << Attestation::SEED_KEY_PASSPHRASE_ENV
+                              << ", plaintext key when --require-seed-key-encryption is set, or a "
+                                 "requested mint that could not be persisted). A seed must not run "
                                  "without a usable consensus signing key. Aborting startup." << std::endl;
                     return 1;
                 }

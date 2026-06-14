@@ -103,6 +103,8 @@ static bool KeyFileIsPermissive(const std::string& path) {
 
 // LP-13 H-2 atomic-save test seam (see header). nullptr in production.
 bool (*g_seedKeySaveFailpoint)() = nullptr;
+// LP-13 B-1 fsync-failure test seam (see header). nullptr in production.
+bool (*g_seedKeyFsyncFailpoint)() = nullptr;
 
 // ============================================================================
 // CSeedAttestationKey
@@ -396,13 +398,17 @@ bool CSeedAttestationKey::Save(const std::string& dataDir, bool requireEncryptio
         out.insert(out.end(), ciphertext.begin(), ciphertext.end());
     }
 
-    // LP-13 H-2: ATOMIC SAVE. Mirror the wallet's proven temp+fsync+rename
-    // pattern (CWallet::SaveUnlocked). A failed/partial write hits "<file>.tmp"
-    // only — the live "<file>" is left byte-intact and replaced ONLY by an
-    // atomic rename of a fully-written, fsync'd temp. A copy of the prior key is
-    // first staged at "<file>.bak" so even a botched rename has a fallback. A
-    // crash / partial write / full disk therefore can NEVER destroy the only
-    // copy of the consensus signing key.
+    // LP-13 H-2 / B-1: ATOMIC, FAIL-CLOSED-DURABLE SAVE. Mirror the wallet's
+    // proven temp+fsync+rename pattern (CWallet::SaveUnlocked), but make the
+    // durability fatal: the consensus signing key is irreplaceable (not derivable
+    // from chainparams), so a failed/partial write hits "<file>.tmp" only — the
+    // live "<file>" is left byte-intact and replaced ONLY by an atomic rename of
+    // a fully-written, fsync'd temp; if the fsync (POSIX) / FlushFileBuffers
+    // (Windows) cannot be confirmed, Save deletes the temp and returns WITHOUT
+    // renaming. A copy of the prior key is first staged at "<file>.bak" so even a
+    // botched rename has a fallback. The guarantee that a crash / partial write /
+    // power loss cannot destroy the only copy rests on fsync-before-rename being
+    // fatal + the atomic rename + the post-rename dir-fsync below.
     std::string tmpPath = path + ".tmp";
     std::string bakPath = path + ".bak";
 
@@ -430,11 +436,31 @@ bool CSeedAttestationKey::Save(const std::string& dataDir, bool requireEncryptio
     }
     // fsync the data to physical disk BEFORE the rename, so a power loss after
     // rename cannot expose a zero-length/partial file as the live key.
-    if (writeOk && ::fsync(fd) != 0) {
-        std::cerr << "[Attestation] WARNING: fsync of temp key file failed (errno "
-                  << errno << ")" << std::endl;
+    // LP-13 B-1 (fail-closed durability): a failed fsync means the temp's bytes
+    // are NOT guaranteed on stable storage. The consensus signing key is NOT
+    // recoverable if lost (not derivable from chainparams), so — unlike
+    // wallet.cpp's warn-and-continue (the wallet is seed-recoverable) — we treat
+    // fsync failure as FATAL: close, remove the temp, and return WITHOUT
+    // renaming. The canonical "<file>" is left byte-intact rather than risk
+    // publishing un-flushed (possibly zero-length/partial) data as the live key.
+    bool fsyncOk = writeOk && (::fsync(fd) == 0);
+    if (writeOk && !fsyncOk) {
+        std::cerr << "[Attestation] FATAL: fsync of temp key file failed (errno "
+                  << errno << "); refusing to publish un-flushed consensus key. "
+                     "Canonical key at " << path << " left untouched." << std::endl;
+    }
+    // LP-13 B-1 TEST SEAM: let a test force the "fsync failed" branch without a
+    // real disk fault (checked here, mirroring g_seedKeySaveFailpoint). nullptr
+    // in production (no overhead, no behavior change).
+    if (writeOk && fsyncOk && g_seedKeyFsyncFailpoint && g_seedKeyFsyncFailpoint()) {
+        std::cerr << "[Attestation] (test) fsync failpoint fired — treating as FATAL fsync failure" << std::endl;
+        fsyncOk = false;
     }
     ::close(fd);
+    if (writeOk && !fsyncOk) {
+        ::unlink(tmpPath.c_str());
+        return finish(false);
+    }
 
     // Belt-and-braces: re-assert 0600 on the path in case fchmod was unsupported.
     bool permOk2 = RestrictKeyFilePerms(tmpPath);
@@ -476,9 +502,20 @@ bool CSeedAttestationKey::Save(const std::string& dataDir, bool requireEncryptio
                     if (n <= 0) { bok = false; break; }
                     bw += static_cast<size_t>(n);
                 }
-                if (bok) ::fsync(bfd);
+                // LP-13 B-1: surface a .bak fsync failure honestly rather than
+                // swallow it. NOT fatal — with fsync(tmp) now fatal above and the
+                // dir-fsync below, the NEW key is durable before Save returns; the
+                // .bak is belt-and-braces. But on an UPDATE save (a prior key
+                // existed) a non-durable fallback copy is worth logging clearly.
+                bool bsync = bok && (::fsync(bfd) == 0);
                 ::close(bfd);
-                if (!bok) std::cerr << "[Attestation] WARNING: failed to write key .bak" << std::endl;
+                if (!bok) {
+                    std::cerr << "[Attestation] WARNING: failed to write key .bak" << std::endl;
+                } else if (!bsync) {
+                    std::cerr << "[Attestation] WARNING: fsync of key .bak failed (errno "
+                              << errno << "); fallback copy may not be durable across power loss."
+                              << std::endl;
+                }
             }
         }
     }
@@ -501,19 +538,56 @@ bool CSeedAttestationKey::Save(const std::string& dataDir, bool requireEncryptio
         if (dirfd >= 0) { ::fsync(dirfd); ::close(dirfd); }
     }
 #else
-    // Windows: write temp, stage .bak, then MoveFileEx atomic replace.
+    // Windows: write temp with a durable flush, stage .bak, then MoveFileEx
+    // atomic replace.
+    //
+    // LP-13 B-1 (fail-closed durability, Windows): ofstream::flush()/close() only
+    // pushes bytes into the OS cache — NOT to stable storage. We must
+    // FlushFileBuffers() the temp BEFORE the MoveFileEx, matching the POSIX
+    // fsync-before-rename guarantee. If the durable flush cannot be confirmed we
+    // fail-closed (delete temp, leave canonical key untouched) rather than
+    // MoveFileEx un-flushed data over the irreplaceable consensus key.
     {
-        std::ofstream tf(tmpPath, std::ios::binary | std::ios::trunc);
-        if (!tf.is_open()) {
-            std::cerr << "[Attestation] Failed to open temp key file for writing: " << tmpPath << std::endl;
+        std::wstring wTmpW(tmpPath.begin(), tmpPath.end());
+        HANDLE hTmp = CreateFileW(wTmpW.c_str(), GENERIC_WRITE, 0, nullptr,
+                                  CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (hTmp == INVALID_HANDLE_VALUE) {
+            std::cerr << "[Attestation] Failed to open temp key file for writing: " << tmpPath
+                      << " (GetLastError " << GetLastError() << ")" << std::endl;
             return finish(false);
         }
-        tf.write(reinterpret_cast<const char*>(out.data()), out.size());
-        bool writeOk = tf.good();
-        tf.flush();
-        tf.close();
+        bool writeOk = true;
+        size_t written = 0;
+        while (written < out.size()) {
+            DWORD toWrite = static_cast<DWORD>(
+                std::min<size_t>(out.size() - written, 1u << 20));
+            DWORD wrote = 0;
+            if (!WriteFile(hTmp, out.data() + written, toWrite, &wrote, nullptr) || wrote == 0) {
+                writeOk = false;
+                break;
+            }
+            written += wrote;
+        }
+        // Durable flush to stable storage before the atomic replace.
+        bool flushOk = writeOk && (FlushFileBuffers(hTmp) != 0);
+        if (writeOk && !flushOk) {
+            std::cerr << "[Attestation] FATAL: FlushFileBuffers of temp key file failed "
+                         "(GetLastError " << GetLastError() << "); refusing to publish "
+                         "un-flushed consensus key. Canonical key at " << path
+                      << " left untouched." << std::endl;
+        }
+        // LP-13 B-1 TEST SEAM (Windows): force the "flush failed" branch.
+        if (writeOk && flushOk && g_seedKeyFsyncFailpoint && g_seedKeyFsyncFailpoint()) {
+            std::cerr << "[Attestation] (test) fsync failpoint fired — treating as FATAL flush failure" << std::endl;
+            flushOk = false;
+        }
+        CloseHandle(hTmp);
         if (!writeOk) {
             std::cerr << "[Attestation] Key file write error (temp)" << std::endl;
+            std::remove(tmpPath.c_str());
+            return finish(false);
+        }
+        if (!flushOk) {
             std::remove(tmpPath.c_str());
             return finish(false);
         }

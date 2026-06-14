@@ -6826,23 +6826,32 @@ load_genesis_block:  // Bug #29: Label for automatic retry after blockchain wipe
                 CRPCServer::NotifyBlockTipChanged();
             });
 
-        // Phase 2+3: Seed attestation initialization (ALL DilV mainnet seeds)
+        // Phase 2+3: Seed attestation initialization (DilV seed-capable nodes)
         // Loads ASN database and attestation signing key so seeds can serve
         // getmikattestation RPC requests from miners.
         //
-        // v4.3 fix 2026-05-04: removed `config.relay_only` gate. NYC runs
-        // without --relay-only because it's the bridge host. Under the prior
-        // gate, NYC's seed_attestation_key.dat existed on disk but was never
-        // loaded — RegisterSeedAttestation() never called — making NYC
+        // v4.3 fix 2026-05-04: removed the original `config.relay_only` gate. NYC
+        // runs WITHOUT --relay-only because it's the bridge host. Under the prior
+        // relay_only-only gate, NYC's seed_attestation_key.dat existed on disk but
+        // was never loaded — RegisterSeedAttestation() never called — making NYC
         // unable to serve getmikattestation RPCs ("is only available on seed
         // nodes" error). Network attestation capacity dropped from 4-of-4
-        // baked-in seed pubkeys to 3-of-4 functional. Fix: gate attestation
-        // init only on IsDilV() (the chain semantic), not on a CLI flag
-        // unrelated to attestation. Bridge ops are unaffected because
-        // attestation init only registers an RPC handler + loads keys.
+        // baked-in seed pubkeys to 3-of-4 functional.
+        //
+        // LP-13 H-3/L-3: gating purely on IsDilV() over-broadened the LP-13 FATAL
+        // abort below to EVERY DilV node, including miners — a DilV miner with a
+        // stray/corrupt seed_attestation_key.dat would abort on startup even
+        // though a miner never attests. We do NOT revert to relay_only-only (that
+        // re-introduces the v4.3 NYC outage: NYC is a non-relay-only seed). The
+        // correct seed-capability predicate that includes NYC and excludes plain
+        // miners is `relay_only || public_api` — every seed runs --public-api to
+        // serve light wallets (NYC included), while a miner runs neither. Init AND
+        // the abort are gated on that predicate. Bridge ops are unaffected: init
+        // only registers an RPC handler + loads keys.
+        const bool seedCapable = config.relay_only || config.public_api;
         static Attestation::CSeedAttestationKey seedAttestKey;
         static CASNDatabase asnDatabase;
-        if (Dilithion::g_chainParams && Dilithion::g_chainParams->IsDilV()) {
+        if (Dilithion::g_chainParams && Dilithion::g_chainParams->IsDilV() && seedCapable) {
             std::string dataDir = Dilithion::g_chainParams->dataDir;
 
             // Load ASN database from data directory (or project root)
@@ -6870,12 +6879,17 @@ load_genesis_block:  // Bug #29: Label for automatic retry after blockchain wipe
             // Load or generate attestation key (LP-13: minting gated behind
             // --generate-seed-key so a reprovisioned seed fails loud).
             // LP-13 M-1 (fail-stop on GENUINE failure): a key file PRESENT but
-            // unusable (corrupt / wrong-or-missing passphrase / 0600-repair
-            // failure / plaintext-when-encryption-required), OR a requested mint
-            // that could not be persisted, is a real attestation outage. On a
-            // seed-capable node we ABORT startup rather than run silently without
-            // attestation. The benign case — a non-seed relay with NO key file
-            // and no --generate-seed-key — is NOT fatal (it just doesn't attest).
+            // unusable (corrupt / decrypt-or-parse failure / wrong-or-missing
+            // passphrase / plaintext-when-encryption-required), OR a requested
+            // mint that could not be persisted, is a real attestation outage. We
+            // ABORT startup rather than run silently without attestation.
+            // genuineFailure also fires when --require-seed-key-encryption is set
+            // even with NO key file present: fail-closed is intended — an operator
+            // who demanded at-rest encryption must not be left running with no
+            // usable encrypted key. The ONLY benign (non-fatal) case is: NO key
+            // file, no --generate-seed-key, AND no --require-seed-key-encryption —
+            // the seed-capable relay simply doesn't attest. (This whole block is
+            // already gated on `seedCapable` above, so miners never reach here.)
             bool keyFileExists = false;
             {
                 std::ifstream kf(dataDir + "/" + Attestation::SEED_KEY_FILENAME, std::ios::binary);
@@ -6888,8 +6902,10 @@ load_genesis_block:  // Bug #29: Label for automatic retry after blockchain wipe
                                       || config.require_seed_key_encryption;
                 if (genuineFailure) {
                     std::cerr << "[Attestation] FATAL: seed attestation key initialization FAILED "
-                                 "(corrupt key, wrong/missing " << Attestation::SEED_KEY_PASSPHRASE_ENV
-                              << ", permission repair failure, or save failure). A seed must not run "
+                                 "(key file present but unreadable/corrupt, decrypt/parse failure, "
+                                 "wrong/missing " << Attestation::SEED_KEY_PASSPHRASE_ENV
+                              << ", plaintext key when --require-seed-key-encryption is set, or a "
+                                 "requested mint that could not be persisted). A seed must not run "
                                  "without a usable consensus signing key. Aborting startup." << std::endl;
                     return 1;
                 }

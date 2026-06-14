@@ -329,6 +329,55 @@ static void TestAtomicSaveOriginalSurvives() {
     SetPass(nullptr);
 }
 
+// LP-13 B-1 (BLOCKER, THE load-bearing test): an fsync/flush failure of the temp
+// must be FATAL — Save returns false, NO rename happens, and the ORIGINAL key
+// file is left byte-intact. If the fix were reverted to warn-and-continue, the
+// rename would publish (possibly un-flushed) data and this test must FAIL.
+static bool g_fsyncFailActive = false;
+static bool FsyncFailpoint() { return g_fsyncFailActive; }
+
+static void TestFsyncFailureIsFatalBeforeRename() {
+    std::cout << "[Test] B-1: fsync failure is FATAL before rename, original key survives" << std::endl;
+    std::string dir = MakeTempDir();
+    SetPass("fsync-pass");  // exercise the v2 (encrypted) path
+
+    // 1) Establish the live key file.
+    CSeedAttestationKey k1;
+    CHECK(k1.Generate(), "generate original keypair");
+    std::vector<uint8_t> origPub = k1.GetPubKey();
+    CHECK(k1.Save(dir), "save original key");
+    std::vector<uint8_t> origBytes = ReadFileBytes(KeyPath(dir));
+    CHECK(!origBytes.empty(), "original key file non-empty");
+
+    // 2) Arm the fsync failpoint and attempt an UPDATE save with a DIFFERENT key.
+    g_seedKeyFsyncFailpoint = FsyncFailpoint;
+    g_fsyncFailActive = true;
+
+    CSeedAttestationKey k2;
+    CHECK(k2.Generate(), "generate replacement keypair");
+    CHECK(k2.GetPubKey() != origPub, "replacement differs from original");
+    // (a) Save returns false on fsync failure.
+    CHECK(!k2.Save(dir), "Save returns false when fsync fails");
+
+    g_fsyncFailActive = false;
+    g_seedKeyFsyncFailpoint = nullptr;
+
+    // (b)+(c) NO rename happened: the live key file is byte-identical to the
+    // original, still loads, and still signs with the original key.
+    std::vector<uint8_t> afterBytes = ReadFileBytes(KeyPath(dir));
+    CHECK(afterBytes == origBytes, "ORIGINAL key file byte-intact after fatal fsync failure");
+    CSeedAttestationKey k3;
+    CHECK(k3.Load(dir), "original key still loads after fatal fsync failure");
+    CHECK(k3.GetPubKey() == origPub, "loaded pubkey == original");
+    CHECK(PrivKeyRoundTrips(k3, origPub), "original private key still signs/verifies");
+
+    // (d) No leftover .tmp occupying the path.
+    std::ifstream tmp(KeyPath(dir) + ".tmp", std::ios::binary);
+    CHECK(!tmp.good(), "no leftover .tmp after fatal fsync failure");
+
+    SetPass(nullptr);
+}
+
 // LP-13 M-2: a generated key that cannot be PERSISTED must make LoadOrGenerate
 // return false (never run on an ephemeral key that won't survive restart).
 static void TestSaveFailMakesLoadOrGenerateFail() {
@@ -480,6 +529,7 @@ int main() {
     TestAutoMintGate();
     TestSecretBufferCleansed();
     TestAtomicSaveOriginalSurvives();        // H-2 (THE load-bearing test)
+    TestFsyncFailureIsFatalBeforeRename();   // B-1 (THE load-bearing test)
     TestSaveFailMakesLoadOrGenerateFail();   // M-2
     TestRequireEncryptionPolicy();           // H-1
 #ifndef _WIN32

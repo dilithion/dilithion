@@ -92,6 +92,16 @@ void CleanseSeedKeyBuffer(std::vector<uint8_t>& buf);
  *  production (no overhead, no behavior change). Not for general use. */
 extern bool (*g_seedKeySaveFailpoint)();
 
+/** LP-13 B-1 (fail-closed durability) TEST SEAM. When set to a non-null
+ *  function, Save() invokes it right after the temp file's fsync (POSIX) /
+ *  FlushFileBuffers (Windows) reports success. If the hook returns true, Save
+ *  treats it as a FATAL fsync/flush failure: it removes the temp and returns
+ *  false WITHOUT renaming, leaving the canonical key byte-intact — exactly the
+ *  power-loss-before-durable case. Lets the load-bearing B-1 test exercise that
+ *  branch without a real disk fault. nullptr in production (no overhead, no
+ *  behavior change). Not for general use. */
+extern bool (*g_seedKeyFsyncFailpoint)();
+
 /**
  * Seed node's Dilithium3 keypair for signing attestations.
  *
@@ -130,10 +140,18 @@ public:
      * file format. If absent, the legacy v1 plaintext format is written so
      * existing un-passphrased operators are not silently broken.
      *
-     * LP-13 H-2: the write is ATOMIC — the blob is written to "<file>.tmp",
-     * fsync'd, the prior key (if any) is copied to "<file>.bak", then the temp
-     * is atomically renamed over the target. A crash / partial write / full disk
-     * therefore can NEVER destroy the only copy of the consensus signing key.
+     * LP-13 H-2 / B-1: the write is ATOMIC and fail-closed-durable — the blob is
+     * written to "<file>.tmp", the prior key (if any) is copied to "<file>.bak",
+     * then the temp is atomically renamed over the target. The durability
+     * guarantee — that a crash / partial write / power loss cannot destroy the
+     * only copy of the consensus signing key — rests on THREE properties, not an
+     * absolute claim: (1) the temp's fsync (POSIX) / FlushFileBuffers (Windows)
+     * is FATAL — on failure Save removes the temp and returns false WITHOUT
+     * renaming, so un-flushed data is never published over the live key; (2) the
+     * publish is an atomic rename(2) / MoveFileExW replace; (3) the parent
+     * directory is fsync'd after the rename so the rename metadata is durable.
+     * If any of these cannot be confirmed, Save fails-closed and the canonical
+     * key is left byte-intact.
      *
      * LP-13 M-4: if BOTH the create-time mode and the post-write chmod fail to
      * set 0600 (POSIX), Save REFUSES to publish a possibly group/other-readable
