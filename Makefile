@@ -383,6 +383,7 @@ WALLET_TEST_SOURCE := src/test/wallet_tests.cpp
 RPC_TEST_SOURCE := src/test/rpc_tests.cpp
 RPC_AUTH_TEST_SOURCE := src/test/rpc_auth_tests.cpp
 RPC_HOST_HEADER_TEST_SOURCE := src/test/rpc_host_header_tests.cpp
+HTTP_SERVER_WALLET_GATE_TEST_SOURCE := src/test/http_server_wallet_gate_tests.cpp
 RPC_HD_WALLET_TEST_SOURCE := src/test/rpc_hd_wallet_tests.cpp
 RPC_SSL_TEST_SOURCE := src/test/rpc_ssl_tests.cpp
 RPC_WEBSOCKET_TEST_SOURCE := src/test/rpc_websocket_tests.cpp
@@ -492,7 +493,7 @@ dilv-genesis-vdf: $(CORE_OBJECTS) $(OBJ_DIR)/tools/dilv_genesis_vdf.o $(DILITHIU
 # Test Binaries
 # ============================================================================
 
-tests: phase1_test miner_tests wallet_tests rpc_tests rpc_auth_tests rpc_host_header_tests ratelimiter_tests timestamp_tests crypter_tests seed_attestation_key_tests wallet_encryption_integration_tests wallet_persistence_tests integration_tests net_tests connman_tests tx_validation_tests tx_relay_tests mining_integration_tests bug_003_block_size_tests dfmp_mik_tests mik_registration_persistence_tests dna_propagation_tests test_passphrase_validator script_tests addrman_v2_tests peer_scorer_tests peer_scorer_banman_integration_tests header_proof_checker_tests chain_selector_tests getchaintips_equivalence_tests chain_case_2_5_equivalence_tests chain_work_smoke_tests reorg_wal_crash_injection_tests competing_sibling_below_checkpoint_tests headers_manager_to_chain_selector_wiring_tests fast_path_2_boundary_tests v4_1_checkpoint_enforcement_tests v4_1_chain_selector_suppression_tests auto_rebuild_marker_mode_symmetry_tests add_block_index_flag_merge_tests port_chain_selector_invariants_tests legacy_vs_port_differential_tests chainstate_integrity_tests
+tests: phase1_test miner_tests wallet_tests rpc_tests rpc_auth_tests rpc_host_header_tests http_server_wallet_gate_tests ratelimiter_tests timestamp_tests crypter_tests seed_attestation_key_tests wallet_encryption_integration_tests wallet_persistence_tests integration_tests net_tests connman_tests tx_validation_tests tx_relay_tests mining_integration_tests bug_003_block_size_tests dfmp_mik_tests mik_registration_persistence_tests dna_propagation_tests test_passphrase_validator script_tests addrman_v2_tests peer_scorer_tests peer_scorer_banman_integration_tests header_proof_checker_tests chain_selector_tests getchaintips_equivalence_tests chain_case_2_5_equivalence_tests chain_work_smoke_tests reorg_wal_crash_injection_tests competing_sibling_below_checkpoint_tests headers_manager_to_chain_selector_wiring_tests fast_path_2_boundary_tests v4_1_checkpoint_enforcement_tests v4_1_chain_selector_suppression_tests auto_rebuild_marker_mode_symmetry_tests add_block_index_flag_merge_tests port_chain_selector_invariants_tests legacy_vs_port_differential_tests chainstate_integrity_tests
 	@echo "$(COLOR_GREEN)✓ All tests built successfully$(COLOR_RESET)"
 
 phase1_test: $(CORE_OBJECTS) $(OBJ_DIR)/test/phase1_simple_test.o $(DILITHIUM_OBJECTS) $(CHIAVDF_OBJECTS)
@@ -522,6 +523,13 @@ rpc_host_header_tests: $(OBJ_DIR)/rpc/host_validator.o $(OBJ_DIR)/test/rpc_host_
 	@echo "$(COLOR_BLUE)[LINK]$(COLOR_RESET) $@"
 	@$(CXX) $(CXXFLAGS) -o $@ $^
 
+# LP-12: CHttpServer wallet-HTML serving-gate unit tests. Self-contained — links
+# ONLY host_validator.o (the IsLoopbackIP SSoT predicate), so it builds and runs
+# WITHOUT the node's depends/ (libzmq/randomx/chiavdf). No CORE_OBJECTS dependency.
+http_server_wallet_gate_tests: $(OBJ_DIR)/rpc/host_validator.o $(OBJ_DIR)/test/http_server_wallet_gate_tests.o
+	@echo "$(COLOR_BLUE)[LINK]$(COLOR_RESET) $@"
+	@$(CXX) $(CXXFLAGS) -o $@ $^
+
 ratelimiter_tests: $(CORE_OBJECTS) $(OBJ_DIR)/test/ratelimiter_tests.o $(DILITHIUM_OBJECTS) $(CHIAVDF_OBJECTS)
 	@echo "$(COLOR_BLUE)[LINK]$(COLOR_RESET) $@"
 	@$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS) $(LIBS)
@@ -544,6 +552,12 @@ wallet_encryption_integration_tests: $(CORE_OBJECTS) $(OBJ_DIR)/test/wallet_encr
 	@$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS) $(LIBS)
 
 wallet_persistence_tests: $(CORE_OBJECTS) $(OBJ_DIR)/test/wallet_persistence_tests.o $(DILITHIUM_OBJECTS) $(CHIAVDF_OBJECTS)
+	@echo "$(COLOR_BLUE)[LINK]$(COLOR_RESET) $@"
+	@$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS) $(LIBS)
+
+# LP-7: wallet encryption-at-rest fix tests (secrecy regression + negative control,
+# migration round-trip + interrupted migration, auth-tamper rejection).
+wallet_encryption_at_rest_tests: $(CORE_OBJECTS) $(OBJ_DIR)/test/wallet_encryption_at_rest_tests.o $(DILITHIUM_OBJECTS) $(CHIAVDF_OBJECTS)
 	@echo "$(COLOR_BLUE)[LINK]$(COLOR_RESET) $@"
 	@$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS) $(LIBS)
 
@@ -948,6 +962,41 @@ asert_test:
 	@echo "$(COLOR_GREEN)✓ ASERT test built successfully$(COLOR_RESET)"
 
 # ============================================================================
+# LP-5 batch-verifier concurrency race + differential harness (CRITICAL-1/MED-2)
+# Links only the verifier object + Dilithium primitives (no full CORE_OBJECTS):
+# the race lives entirely in CSignatureBatchVerifier's per-batch state.
+# Build under ThreadSanitizer on Linux:  make TSAN=1 batch_verifier_race_tests
+# ============================================================================
+batch_verifier_race_tests: $(OBJ_DIR)/consensus/signature_batch_verifier.o $(OBJ_DIR)/test/batch_verifier_race_tests.o $(DILITHIUM_OBJECTS)
+	@echo "$(COLOR_BLUE)[LINK]$(COLOR_RESET) $@"
+	@$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS) $(LIBS)
+	@echo "$(COLOR_GREEN)✓ batch_verifier_race_tests built$(COLOR_RESET)"
+
+# ----------------------------------------------------------------------------
+# A-010 CONTROL target: SAME harness source, -DPREFIX_API, linked against the
+# FROZEN pre-fix verifier (src/test/lp5_control/, a verbatim copy of bb933d53).
+# This deterministically HANGS — proving the harness is a real discriminator,
+# not a no-op. The control-red and the fix-green therefore come from one source.
+#   make batch_verifier_race_control   # then run with a timeout; expect a HANG.
+# Distinct object dir so the -DPREFIX_API harness object never collides with the
+# default (no-PREFIX_API) batch_verifier_race_tests.o.
+$(OBJ_DIR)/test/lp5_control:
+	@mkdir -p $@
+
+$(OBJ_DIR)/test/lp5_control/signature_batch_verifier_prefix.o: src/test/lp5_control/signature_batch_verifier_prefix.cpp | $(OBJ_DIR)/test/lp5_control
+	@echo "$(COLOR_BLUE)[CXX]$(COLOR_RESET)  $< (LP-5 control, frozen pre-fix)"
+	@$(CXX) $(CXXFLAGS) $(INCLUDES) -I src/test/lp5_control -c $< -o $@
+
+$(OBJ_DIR)/test/lp5_control/batch_verifier_race_tests.o: src/test/batch_verifier_race_tests.cpp | $(OBJ_DIR)/test/lp5_control
+	@echo "$(COLOR_BLUE)[CXX]$(COLOR_RESET)  $< (-DPREFIX_API control variant)"
+	@$(CXX) $(CXXFLAGS) $(INCLUDES) -I src/test/lp5_control -DPREFIX_API -c $< -o $@
+
+batch_verifier_race_control: $(OBJ_DIR)/test/lp5_control/signature_batch_verifier_prefix.o $(OBJ_DIR)/test/lp5_control/batch_verifier_race_tests.o $(DILITHIUM_OBJECTS)
+	@echo "$(COLOR_BLUE)[LINK]$(COLOR_RESET) $@"
+	@$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS) $(LIBS)
+	@echo "$(COLOR_GREEN)✓ batch_verifier_race_control built (A-010 control — expect HANG when run)$(COLOR_RESET)"
+
+# ============================================================================
 # Run Tests
 # ============================================================================
 
@@ -978,6 +1027,9 @@ test: tests test_dilithion asert_test
 	@echo ""
 	@echo "$(COLOR_YELLOW)Running RPC Host-header allowlist + session-token tests...$(COLOR_RESET)"
 	@./rpc_host_header_tests
+	@echo ""
+	@echo "$(COLOR_YELLOW)Running LP-12 CHttpServer wallet-HTML gate tests...$(COLOR_RESET)"
+	@./http_server_wallet_gate_tests
 	@echo ""
 	@echo "$(COLOR_YELLOW)Running rate limiter regression tests...$(COLOR_RESET)"
 	@./ratelimiter_tests

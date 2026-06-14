@@ -283,6 +283,98 @@ bool CWallet::HasKey(const CDilithiumAddress& address) const {
     return mapCryptedKeys.find(address) != mapCryptedKeys.end();
 }
 
+// LP-7 (HIGH-2): the ONE authenticated-decrypt gate shared by all five at-rest
+// record types. See the declaration in wallet.h for the full policy contract.
+// Returns true iff the caller may proceed to decrypt `ciphertext`.
+//
+// =====================================================================================
+// LP-7 (round 3, MEDIUM-1): EXHAUSTIVE AT-REST RECORD MAC-CONSUMER ENUMERATION
+// -------------------------------------------------------------------------------------
+// Every per-record at-rest MAC verify/compute in the wallet MUST route through
+// VerifyRecordMAC (reads) or ComputeRecordMAC (writes) so the keying selection is
+// version-correct in exactly ONE place. The complete census (grep the wallet for
+// `\.VerifyMAC(` / `\.ComputeMAC(`):
+//
+//   VERIFY (read-before-decrypt) — all 6 route through VerifyRecordMAC:
+//     1. per-address spending key   wallet.cpp  GetKeyUnlocked        -> VerifyRecordMAC
+//     2. master key                 wallet.cpp  Unlock                -> VerifyRecordMAC
+//     3. HD-master seed             wallet.cpp  DecryptHDMasterKey    -> VerifyRecordMAC
+//     4. mnemonic                   wallet.cpp  DecryptMnemonic       -> VerifyRecordMAC
+//     5. MIK private key            wallet.cpp  DecryptMIKPrivKey     -> VerifyRecordMAC
+//     6. master key (passphrase rotation)  wallet.cpp  ChangePassphrase
+//                                                                     -> VerifyRecordMAC
+//        (this was the MEDIUM-1 bypass: it open-coded crypter.VerifyMAC with default
+//         v7 keying and bricked passphrase change on loaded legacy v3-v6 wallets;
+//         now routed.)
+//
+//   COMPUTE (write / re-MAC) — all route through ComputeRecordMAC:
+//     a. master key (EncryptWallet)          -> ComputeRecordMAC (separated v7 keying)
+//     b. per-address key (EncryptWallet)     -> ComputeRecordMAC (separated v7 keying)
+//     c. master key re-MAC (Unlock migration)-> ComputeRecordMAC (separated v7 keying)
+//     d. per-address re-MAC (migration Step 2c) -> ComputeRecordMAC (separated v7 keying)
+//     e. master key (ChangePassphrase write) -> ComputeRecordMAC with VERSION-MATCHED
+//        keying: legacy AES-keyed HMAC when the loaded file is v3-v6 (the file STAYS
+//        at its version — LP-7 ratified design: ChangePassphrase rotates the
+//        passphrase in place and never promotes to v7), separated v7 keying when the
+//        loaded file is already v7. The whole `ReMACAllRecordsToV7Unlocked`
+//        re-MAC-everything surface that the round-1..4 recurrence lived in is DELETED:
+//        ChangePassphrase touches ONLY the master-key record now; v3-v6 non-master
+//        records keep their legacy MACs and stay valid because the file stays v6, and
+//        the v6->v7 migration (with full re-MAC) happens exactly once, on the next
+//        Unlock (MigrateToEncryptedSeedV7Unlocked — the single source of truth).
+//     f. HD-master seed (EncryptHDMasterKey) -> ComputeRecordMAC (separated v7 keying)
+//     g. mnemonic (EncryptMnemonic, encrypted branch) -> ComputeRecordMAC (separated v7 keying)
+//     h. MIK private key (EncryptMIKPrivKey) -> ComputeRecordMAC (separated v7 keying)
+//
+//   The ONLY direct crypter.VerifyMAC / crypter.ComputeMAC calls remaining are the two
+//   inside VerifyRecordMAC / ComputeRecordMAC themselves (the implementations).
+//
+//   LEGITIMATELY NOT routed (different mechanism, by design):
+//     - The whole-file integrity HMAC (wallet.cpp Load/SaveUnlocked, HMAC_SHA3_256 over
+//       [salt||data], keyed off the master-key salt). This is a file-level integrity
+//       seal, NOT a per-record authenticated-decrypt MAC — it has no version-keyed
+//       legacy/separated split and must not flow through the per-record helper.
+//     - Obfuscation-keyed crypter.Decrypt paths on UNencrypted wallets (mnemonic/MIK
+//       else-branches): by-design-unauthenticated obfuscation, no MAC is written or
+//       checked (the write side clears the MAC), so there is nothing to route.
+//
+//   INVARIANT: there are ZERO at-rest record MAC verify/compute sites that bypass the
+//   central helper. If you add a new at-rest encrypted record, its MAC verify/compute
+//   MUST go through VerifyRecordMAC/ComputeRecordMAC — extend this census.
+// =====================================================================================
+bool CWallet::VerifyRecordMAC(CCrypter& crypter,
+                             const std::vector<uint8_t>& ciphertext,
+                             const std::vector<uint8_t>& mac) const {
+    const bool isV7 = (m_loadedFileVersion >= WALLET_FILE_VERSION_7);
+
+    if (mac.empty()) {
+        // v7: an empty MAC is a corrupt/stripped record — refuse to decrypt the
+        // secret unauthenticated. pre-v7: this is the genuine legacy record that
+        // never carried a MAC — allow the (unauthenticated) legacy decrypt so the
+        // wallet loads and can be migrated to v7.
+        return !isV7;
+    }
+
+    // MAC present — verify it BEFORE the caller decrypts, with the keying that
+    // matches the on-disk version: legacy AES-keyed HMAC for v3-v6, separated
+    // MAC key for v7. (m_loadedFileVersion == 0 means a freshly-created in-memory
+    // wallet whose records this build wrote with the default separated keying.)
+    const bool legacyKeying =
+        (m_loadedFileVersion != 0 && m_loadedFileVersion < WALLET_FILE_VERSION_7);
+    return crypter.VerifyMAC(ciphertext, mac, legacyKeying);
+}
+
+// LP-7 (HIGH-2): the ONE MAC-compute helper for writes / re-MAC. Default = v7
+// separated keying (new + migrated records). `useLegacyKeying == true` emits the
+// pre-v7 AES-keyed HMAC, used ONLY when a record is persisted back into a file that
+// stays at its existing v3-v6 version (LP-7 ratified ChangePassphrase-in-place).
+bool CWallet::ComputeRecordMAC(CCrypter& crypter,
+                              const std::vector<uint8_t>& ciphertext,
+                              std::vector<uint8_t>& macOut,
+                              bool useLegacyKeying) const {
+    return crypter.ComputeMAC(ciphertext, macOut, useLegacyKeying);
+}
+
 // Public GetKey - acquires lock
 bool CWallet::GetKey(const CDilithiumAddress& address, CKey& keyOut) const {
     std::lock_guard<std::mutex> lock(cs_wallet);
@@ -320,13 +412,16 @@ bool CWallet::GetKeyUnlocked(const CDilithiumAddress& address, CKey& keyOut) con
         return false;
     }
 
-    // FIX-008 (CRYPT-007): Verify MAC before decryption (prevents padding oracle)
-    // For legacy keys without MAC, skip verification
-    if (!encKey.IsLegacy()) {
-        if (!crypter.VerifyMAC(encKey.vchCryptedKey, encKey.vchMAC)) {
-            memory_cleanse(masterKeyVec.data(), masterKeyVec.size());
-            return false;  // MAC verification failed - corrupted or tampered key
-        }
+    // LP-7 (HIGH-2): authenticate-before-decrypt via the ONE centralized gate.
+    // This is the per-address spending-key consumer that round-2 found left on
+    // the default (separated) keying while the other four paths were version-
+    // keyed — making legacy v3-v6 per-address keys (which carry a non-empty
+    // legacy-AES-keyed MAC) fail verification and become unspendable. Routing
+    // through VerifyRecordMAC fixes the keying selection AND the empty-MAC policy
+    // in one place so this can never drift from the other four record types.
+    if (!VerifyRecordMAC(crypter, encKey.vchCryptedKey, encKey.vchMAC)) {
+        memory_cleanse(masterKeyVec.data(), masterKeyVec.size());
+        return false;  // empty MAC on v7, or MAC verification failed — refuse
     }
 
     std::vector<uint8_t> decryptedPrivKey;
@@ -950,6 +1045,16 @@ bool CWallet::IsLocked() const {
     return masterKey.IsValid() && !fWalletUnlocked;
 }
 
+bool CWallet::NeedsSeedMigration() const {
+    std::lock_guard<std::mutex> lock(cs_wallet);
+    // m_fNeedsSeedMigration is armed at load (CWallet::Load) only when the wallet
+    // is encrypted (masterKey valid) AND the on-disk format held the HD seed in
+    // plaintext (pre-fix bug shape); it is cleared the moment the v7 migration
+    // completes inside Unlock. We additionally require masterKey.IsValid() so a
+    // non-encrypted wallet can never report this state.
+    return masterKey.IsValid() && m_fNeedsSeedMigration;
+}
+
 // VULN-002 FIX: Helper to check if unlock is still valid (not expired)
 // Assumes caller holds cs_wallet lock
 // BUG #74 FIX: Internal version that assumes caller already holds cs_wallet
@@ -1146,15 +1251,15 @@ bool CWallet::Unlock(const std::string& passphrase, int64_t timeout) {
         return false;
     }
 
-    // FIX-008 (CRYPT-007): Verify MAC before decryption (prevents padding oracle)
-    // For legacy keys without MAC, skip verification
-    if (!masterKey.IsLegacy()) {
-        if (!crypter.VerifyMAC(masterKey.vchCryptedKey, masterKey.vchMAC)) {
-            // WL-011 FIX: Track failed unlock attempt
-            nUnlockFailedAttempts++;
-            nLastFailedUnlock = std::chrono::steady_clock::now();
-            return false;  // MAC verification failed - wrong passphrase or tampered data
-        }
+    // LP-7 (HIGH-2): authenticate-before-decrypt via the ONE centralized gate.
+    // Master-key consumer. The gate handles both the v7-empty-MAC rejection and
+    // the version-keyed verify; on any failure we still record a failed-unlock
+    // attempt (WL-011) since a tampered/empty MAC is indistinguishable from a
+    // wrong passphrase from the user's perspective.
+    if (!VerifyRecordMAC(crypter, masterKey.vchCryptedKey, masterKey.vchMAC)) {
+        nUnlockFailedAttempts++;
+        nLastFailedUnlock = std::chrono::steady_clock::now();
+        return false;  // empty MAC on v7, or MAC verification failed
     }
 
     std::vector<uint8_t> decryptedKey;
@@ -1198,6 +1303,49 @@ bool CWallet::Unlock(const std::string& passphrase, int64_t timeout) {
     memory_cleanse(derivedKey.data(), derivedKey.size());
     memory_cleanse(decryptedKey.data(), decryptedKey.size());
 
+    // LP-7 (wallet-Inv-5 migration): if this encrypted wallet was loaded from a
+    // legacy plaintext-seed format, re-encrypt the seed+mnemonic now that we hold
+    // the master key, and atomically rewrite the file at v7. The rewrite is
+    // atomic + reversible-on-failure (SaveUnlocked: temp-write + fsync + rename;
+    // the original is never truncated). A migration failure does NOT fail the
+    // unlock — the wallet is fully usable in memory and migration retries on the
+    // next unlock; the on-disk file is left byte-identical.
+    if (m_fNeedsSeedMigration) {
+        // The master-key MAC on a v3-v6 file was computed with the legacy
+        // AES-keyed HMAC. Once we rewrite as v7, Unlock will verify it with the
+        // separated-key HMAC, so recompute it here with the SAME crypter that just
+        // decrypted the master key (keyed with the passphrase-derived key) using
+        // the new (default) separated keying. Snapshot for rollback symmetry.
+        std::vector<uint8_t> snap_masterMAC = masterKey.vchMAC;
+        std::vector<uint8_t> newMasterMAC;
+        bool macOk = ComputeRecordMAC(crypter, masterKey.vchCryptedKey, newMasterMAC);
+        if (macOk) {
+            masterKey.vchMAC = newMasterMAC;
+        }
+
+        // Cursor M1: clear the migration flag / promote to v7 ONLY when the migrated
+        // v7 (no-plaintext) file actually reached disk (persistedToDisk == true).
+        // MigrateToEncryptedSeedV7Unlocked returns false (no in-memory mutation) when
+        // it cannot persist (autosave off / no file), so the flag STAYS armed and the
+        // on-disk-plaintext state keeps surfacing. Invariant: NeedsSeedMigration() is
+        // true exactly while a plaintext seed is still at rest on disk.
+        bool migrationPersisted = false;
+        if (macOk && MigrateToEncryptedSeedV7Unlocked(&migrationPersisted) && migrationPersisted) {
+            m_fNeedsSeedMigration = false;
+            m_loadedFileVersion = WALLET_FILE_VERSION_7;
+            std::cout << "[Wallet] LP-7: migrated wallet to encrypted-seed v7 format" << std::endl;
+        } else {
+            // Restore the legacy master MAC so the in-memory state stays consistent
+            // with the untouched on-disk legacy file. Reached when the MAC recompute
+            // failed, the migration could not persist (autosave off → flag stays
+            // armed, surfaced), or the save failed (retry next unlock).
+            masterKey.vchMAC = snap_masterMAC;
+            std::cerr << "[Wallet] LP-7: seed migration to v7 not persisted; "
+                         "original wallet file left unchanged, will retry on next unlock" << std::endl;
+        }
+    }
+
+    // Wipe the unlock crypter's key material is handled by CCrypter's destructor.
     return true;
 }
 
@@ -1234,6 +1382,94 @@ bool CWallet::EncryptWallet(const std::string& passphrase) {
 
     // Allow encrypting empty wallet - keys will be encrypted as they're generated
 
+    // --- TRANSACTIONAL SNAPSHOT (Cursor HIGH-2) ---
+    // EncryptWallet mutates the master key, the key maps, the in-memory unlocked
+    // state, and (for HD wallets) the HD seed/mnemonic/MIK ciphertext fields, and
+    // it scrubs the plaintext seed in EncryptHDMasterKey(). If any later step fails
+    // (mnemonic recover/re-encrypt, EncryptHDMasterKey), the previous code returned
+    // false WITHOUT undoing those mutations — leaving the wallet encrypted-in-memory
+    // (masterKey valid) with fHDMasterKeyEncrypted==false and a plaintext seed. A new
+    // HD wallet (m_loadedFileVersion==0 ⇒ v7 writer) in that state would persist a v7
+    // file with encrypted spending keys + PLAINTEXT seed on the next autosave — the
+    // LP-7 bug reintroduced, with no migration arm on reload.
+    //
+    // Snapshot the full pre-encryption state here (BEFORE any mutation) and RESTORE it
+    // on every failure path so the wallet returns to its original UNENCRYPTED state.
+    // Mirrors the snapshot/rollback structure of MigrateToEncryptedSeedV7Unlocked().
+    CMasterKey snap_masterKey = masterKey;
+    std::map<CDilithiumAddress, CKey> snap_mapKeys = mapKeys;
+    std::map<CDilithiumAddress, CEncryptedKey> snap_mapCryptedKeys = mapCryptedKeys;
+    bool snap_fWalletUnlocked = fWalletUnlocked;
+    std::chrono::time_point<std::chrono::steady_clock> snap_nUnlockTime = nUnlockTime;
+    bool snap_vMasterKey_set = !vMasterKey.empty();
+    CHDExtendedKey snap_hdMasterKey = hdMasterKey;
+    bool snap_fHDMasterKeyEncrypted = fHDMasterKeyEncrypted;
+    bool snap_fHDMasterKeyCached = fHDMasterKeyCached;
+    CHDExtendedKey snap_hdMasterKeyDecrypted = hdMasterKeyDecrypted;
+    std::vector<uint8_t> snap_vchEncryptedMnemonic = vchEncryptedMnemonic;
+    std::vector<uint8_t> snap_vchMnemonicMAC = vchMnemonicMAC;
+    std::vector<uint8_t> snap_vchMnemonicIV(vchMnemonicIV.begin(), vchMnemonicIV.end());
+    std::vector<uint8_t> snap_vchEncryptedHDMasterKey = vchEncryptedHDMasterKey;
+    std::vector<uint8_t> snap_vchHDMasterKeyMAC = vchHDMasterKeyMAC;
+    std::vector<uint8_t> snap_vchHDMasterKeyIV(vchHDMasterKeyIV.begin(), vchHDMasterKeyIV.end());
+    bool snap_fHasMIK = fHasMIK;
+    std::vector<uint8_t> snap_vchEncryptedMIKPrivKey = vchEncryptedMIKPrivKey;
+    std::vector<uint8_t> snap_vchMIKPrivKeyMAC = vchMIKPrivKeyMAC;
+    std::vector<uint8_t> snap_vchMIKPrivKeyIV(vchMIKPrivKeyIV.begin(), vchMIKPrivKeyIV.end());
+    std::vector<uint8_t> snap_vchMIKPubKey = vchMIKPubKey;
+    uint32_t snap_loadedFileVersion = m_loadedFileVersion;
+    // LP-7 (red-team MEDIUM-1): snapshot the in-memory MIK plaintext private key.
+    // EncryptMIKPrivKey() + m_mik->privkey.clear() below moves the MIK to a
+    // ciphertext-only in-memory state. The rollback restores the MIK CIPHERTEXT
+    // fields (vchEncryptedMIKPrivKey/...MAC/...IV) to their PRE-encryption snapshot
+    // (i.e. empty, since the wallet was unencrypted) AND restores masterKey to
+    // invalid — so without restoring the plaintext too, a save-failure rollback
+    // would leave the MIK with neither a usable plaintext nor a decryptable
+    // ciphertext (no master key to decrypt with), permanently losing the mining
+    // identity. Snapshot the plaintext so rollback can restore it verbatim.
+    bool snap_mikHadPriv = (m_mik && m_mik->HasPrivateKey());
+    std::vector<uint8_t, SecureAllocator<uint8_t>> snap_mikPrivKey =
+        snap_mikHadPriv ? m_mik->privkey
+                        : std::vector<uint8_t, SecureAllocator<uint8_t>>();
+
+    auto rollback = [&]() {
+        masterKey = snap_masterKey;
+        mapKeys = snap_mapKeys;
+        mapCryptedKeys = snap_mapCryptedKeys;
+        fWalletUnlocked = snap_fWalletUnlocked;
+        nUnlockTime = snap_nUnlockTime;
+        // The wallet was UNENCRYPTED before this call (guarded by masterKey.IsValid()
+        // at the top), so vMasterKey must not retain a usable master key after a
+        // failed encryption — scrub it. (snap_vMasterKey_set is false in the normal
+        // pre-encryption case; this is belt-and-suspenders.)
+        if (!snap_vMasterKey_set && !vMasterKey.empty()) {
+            memory_cleanse(vMasterKey.data_ptr(), vMasterKey.size());
+        }
+        hdMasterKey = snap_hdMasterKey;
+        fHDMasterKeyEncrypted = snap_fHDMasterKeyEncrypted;
+        fHDMasterKeyCached = snap_fHDMasterKeyCached;
+        hdMasterKeyDecrypted = snap_hdMasterKeyDecrypted;
+        vchEncryptedMnemonic = snap_vchEncryptedMnemonic;
+        vchMnemonicMAC = snap_vchMnemonicMAC;
+        vchMnemonicIV.assign(snap_vchMnemonicIV.begin(), snap_vchMnemonicIV.end());
+        vchEncryptedHDMasterKey = snap_vchEncryptedHDMasterKey;
+        vchHDMasterKeyMAC = snap_vchHDMasterKeyMAC;
+        vchHDMasterKeyIV.assign(snap_vchHDMasterKeyIV.begin(), snap_vchHDMasterKeyIV.end());
+        fHasMIK = snap_fHasMIK;
+        vchEncryptedMIKPrivKey = snap_vchEncryptedMIKPrivKey;
+        vchMIKPrivKeyMAC = snap_vchMIKPrivKeyMAC;
+        vchMIKPrivKeyIV.assign(snap_vchMIKPrivKeyIV.begin(), snap_vchMIKPrivKeyIV.end());
+        vchMIKPubKey = snap_vchMIKPubKey;
+        m_loadedFileVersion = snap_loadedFileVersion;
+        // LP-7 (red-team MEDIUM-1): restore the in-memory MIK plaintext private key
+        // that EncryptMIKPrivKey()+clear() may have scrubbed. Without this the MIK
+        // would be unrecoverable after a save-failure rollback (ciphertext snapshot
+        // is the pre-encryption empty state and masterKey is restored to invalid).
+        if (m_mik && snap_mikHadPriv) {
+            m_mik->privkey = snap_mikPrivKey;
+        }
+    };
+
     // Generate random master key
     std::vector<uint8_t> vMasterKeyPlain(WALLET_CRYPTO_KEY_SIZE);
     if (!GetStrongRandBytes(vMasterKeyPlain.data(), WALLET_CRYPTO_KEY_SIZE)) {
@@ -1243,6 +1479,7 @@ bool CWallet::EncryptWallet(const std::string& passphrase) {
     // Generate salt for PBKDF2
     if (!GenerateSalt(masterKey.vchSalt)) {
         memory_cleanse(vMasterKeyPlain.data(), vMasterKeyPlain.size());
+        rollback();
         return false;
     }
 
@@ -1250,6 +1487,7 @@ bool CWallet::EncryptWallet(const std::string& passphrase) {
     std::vector<uint8_t> derivedKey;
     if (!DeriveKey(passphrase, masterKey.vchSalt, WALLET_CRYPTO_PBKDF2_ROUNDS, derivedKey)) {
         memory_cleanse(vMasterKeyPlain.data(), vMasterKeyPlain.size());
+        rollback();
         return false;
     }
 
@@ -1257,6 +1495,7 @@ bool CWallet::EncryptWallet(const std::string& passphrase) {
     if (!GenerateUniqueIV_Locked(masterKey.vchIV)) {
         memory_cleanse(vMasterKeyPlain.data(), vMasterKeyPlain.size());
         memory_cleanse(derivedKey.data(), derivedKey.size());
+        rollback();
         return false;
     }
 
@@ -1265,19 +1504,23 @@ bool CWallet::EncryptWallet(const std::string& passphrase) {
     if (!masterCrypter.SetKey(derivedKey, masterKey.vchIV)) {
         memory_cleanse(vMasterKeyPlain.data(), vMasterKeyPlain.size());
         memory_cleanse(derivedKey.data(), derivedKey.size());
+        rollback();
         return false;
     }
 
     if (!masterCrypter.Encrypt(vMasterKeyPlain, masterKey.vchCryptedKey)) {
         memory_cleanse(vMasterKeyPlain.data(), vMasterKeyPlain.size());
         memory_cleanse(derivedKey.data(), derivedKey.size());
+        rollback();
         return false;
     }
 
-    // FIX-008 (CRYPT-007): Compute MAC for authenticated encryption
-    if (!masterCrypter.ComputeMAC(masterKey.vchCryptedKey, masterKey.vchMAC)) {
+    // FIX-008 (CRYPT-007): Compute MAC for authenticated encryption (master key).
+    // LP-7 (round 3): route through ComputeRecordMAC — at-rest record, always v7.
+    if (!ComputeRecordMAC(masterCrypter, masterKey.vchCryptedKey, masterKey.vchMAC)) {
         memory_cleanse(vMasterKeyPlain.data(), vMasterKeyPlain.size());
         memory_cleanse(derivedKey.data(), derivedKey.size());
+        rollback();
         return false;
     }
 
@@ -1296,6 +1539,7 @@ bool CWallet::EncryptWallet(const std::string& passphrase) {
         if (!GenerateUniqueIV_Locked(encKey.vchIV)) {
             memory_cleanse(vMasterKeyPlain.data(), vMasterKeyPlain.size());
             memory_cleanse(derivedKey.data(), derivedKey.size());
+            rollback();
             return false;
         }
 
@@ -1304,19 +1548,23 @@ bool CWallet::EncryptWallet(const std::string& passphrase) {
         if (!keyCrypter.SetKey(vMasterKeyPlain, encKey.vchIV)) {
             memory_cleanse(vMasterKeyPlain.data(), vMasterKeyPlain.size());
             memory_cleanse(derivedKey.data(), derivedKey.size());
+            rollback();
             return false;
         }
 
         if (!keyCrypter.Encrypt(key.vchPrivKey, encKey.vchCryptedKey)) {
             memory_cleanse(vMasterKeyPlain.data(), vMasterKeyPlain.size());
             memory_cleanse(derivedKey.data(), derivedKey.size());
+            rollback();
             return false;
         }
 
-        // FIX-008 (CRYPT-007): Compute MAC for authenticated encryption
-        if (!keyCrypter.ComputeMAC(encKey.vchCryptedKey, encKey.vchMAC)) {
+        // FIX-008 (CRYPT-007): Compute MAC for authenticated encryption (per-address key).
+        // LP-7 (round 3): route through ComputeRecordMAC — at-rest record, always v7.
+        if (!ComputeRecordMAC(keyCrypter, encKey.vchCryptedKey, encKey.vchMAC)) {
             memory_cleanse(vMasterKeyPlain.data(), vMasterKeyPlain.size());
             memory_cleanse(derivedKey.data(), derivedKey.size());
+            rollback();
             return false;
         }
 
@@ -1330,6 +1578,69 @@ bool CWallet::EncryptWallet(const std::string& passphrase) {
     memcpy(vMasterKey.data_ptr(), vMasterKeyPlain.data(), WALLET_CRYPTO_KEY_SIZE);
     fWalletUnlocked = true;
     nUnlockTime = std::chrono::steady_clock::time_point::max();
+
+    // LP-7 (wallet-Inv-5 + wallet-Inv-4): re-encrypt the HD seed + mnemonic under
+    // the wallet master key. The previous code never did this, so encrypted HD
+    // wallets shipped a PLAINTEXT seed at rest and ExportMnemonic broke (the
+    // mnemonic stayed under the unencrypted-obfuscation key while DecryptMnemonic
+    // switched to the master-key branch).
+    //
+    // ORDER MATTERS: decrypt the mnemonic FIRST (while the HD seed is still
+    // plaintext, since the obfuscation key is derived from it), re-encrypt the
+    // mnemonic under the master key, THEN encrypt the HD master key (which scrubs
+    // the plaintext seed). Both are encrypted under, and later decrypted with, the
+    // SAME master key — fixing the key mismatch.
+    if (fIsHDWallet) {
+        if (!vchEncryptedMnemonic.empty()) {
+            // Recover the plaintext mnemonic using the current (pre-encryption,
+            // obfuscation-key) representation. masterKey is now valid, so call the
+            // obfuscation-key derivation explicitly rather than via DecryptMnemonic
+            // (which would already take the master-key branch).
+            std::vector<uint8_t> obfKey(WALLET_CRYPTO_KEY_SIZE);
+            std::vector<uint8_t> hdSeed(hdMasterKey.seed, hdMasterKey.seed + 32);
+            DeriveEncryptionKey(hdSeed, "mnemonic", obfKey);
+            memory_cleanse(hdSeed.data(), hdSeed.size());
+
+            CCrypter obfCrypter;
+            std::vector<uint8_t> ivVec(vchMnemonicIV.begin(), vchMnemonicIV.end());
+            std::vector<uint8_t> mnemonicPlain;
+            if (!obfCrypter.SetKey(obfKey, ivVec) ||
+                !obfCrypter.Decrypt(vchEncryptedMnemonic, mnemonicPlain)) {
+                memory_cleanse(obfKey.data(), obfKey.size());
+                memory_cleanse(vMasterKeyPlain.data(), vMasterKeyPlain.size());
+                memory_cleanse(derivedKey.data(), derivedKey.size());
+                std::cerr << "[Wallet] CRITICAL: failed to recover mnemonic for re-encryption" << std::endl;
+                rollback();
+                return false;
+            }
+            memory_cleanse(obfKey.data(), obfKey.size());
+
+            std::string mnemonicStr(mnemonicPlain.begin(), mnemonicPlain.end());
+            memory_cleanse(mnemonicPlain.data(), mnemonicPlain.size());
+
+            // Re-encrypt under master key (masterKey.IsValid() is now true → master
+            // branch → also computes the mnemonic MAC).
+            bool ok = EncryptMnemonic(mnemonicStr);
+            memory_cleanse(&mnemonicStr[0], mnemonicStr.size());
+            if (!ok) {
+                memory_cleanse(vMasterKeyPlain.data(), vMasterKeyPlain.size());
+                memory_cleanse(derivedKey.data(), derivedKey.size());
+                std::cerr << "[Wallet] CRITICAL: failed to re-encrypt mnemonic" << std::endl;
+                rollback();
+                return false;
+            }
+        }
+
+        // Encrypt the HD master seed (scrubs the plaintext seed; stores the
+        // variable-length ciphertext + MAC; sets fHDMasterKeyEncrypted).
+        if (!EncryptHDMasterKey()) {
+            memory_cleanse(vMasterKeyPlain.data(), vMasterKeyPlain.size());
+            memory_cleanse(derivedKey.data(), derivedKey.size());
+            std::cerr << "[Wallet] CRITICAL: failed to encrypt HD master key" << std::endl;
+            rollback();
+            return false;
+        }
+    }
 
     // Encrypt MIK private key if present (must happen after vMasterKey is set)
     if (fHasMIK && m_mik && m_mik->HasPrivateKey()) {
@@ -1347,10 +1658,27 @@ bool CWallet::EncryptWallet(const std::string& passphrase) {
     memory_cleanse(vMasterKeyPlain.data(), vMasterKeyPlain.size());
     memory_cleanse(derivedKey.data(), derivedKey.size());
 
+    // LP-7 (version-aware writer): encrypting the wallet produces v7-shaped records
+    // (encrypted variable-length HD seed when HD; separated-keyed master + per-record
+    // MACs). Promote the loaded version to v7 so SaveUnlocked emits the v7 layout — a
+    // v6 write here would (a) re-emit the now-SCRUBBED plaintext seed slots as zeros
+    // and (b) write separated-keyed MACs under a v6 header. New wallets are
+    // m_loadedFileVersion==0 (already write v7); this matters for a wallet LOADED from
+    // a v6 file and then encrypted in place.
+    m_loadedFileVersion = WALLET_FILE_VERSION_7;
+
     // Save wallet to disk — encryption MUST be persisted
     if (m_autoSave && !m_walletFile.empty()) {
         if (!SaveUnlocked()) {
-            std::cerr << "[Wallet] CRITICAL: Wallet encrypted in memory but failed to save to disk!" << std::endl;
+            // Transactional (Cursor HIGH-2): the in-memory encryption is complete
+            // and correct (HD seed encrypted, fHDMasterKeyEncrypted==true) so this
+            // is NOT the plaintext-at-rest state — but the encryption did not reach
+            // disk. Roll the in-memory state back to UNENCRYPTED so the on-disk file
+            // and memory agree (both unencrypted) and the failure is total rather
+            // than leaving the wallet encrypted-in-memory-but-unsaved. EncryptWallet
+            // can then be retried cleanly.
+            std::cerr << "[Wallet] CRITICAL: Wallet encrypted in memory but failed to save to disk — rolling back to unencrypted state" << std::endl;
+            rollback();
             return false;
         }
     }
@@ -1403,13 +1731,19 @@ bool CWallet::ChangePassphrase(const std::string& passphraseOld,
         return false;
     }
 
-    // FIX-008 (CRYPT-007): Verify MAC before decryption (prevents padding oracle)
-    // For legacy keys without MAC, skip verification
-    if (!masterKey.IsLegacy()) {
-        if (!crypterOld.VerifyMAC(masterKey.vchCryptedKey, masterKey.vchMAC)) {
-            memory_cleanse(derivedKeyOld.data(), derivedKeyOld.size());
-            return false;  // MAC verification failed - wrong passphrase or tampered data
-        }
+    // FIX-008 (CRYPT-007): Verify MAC before decryption (prevents padding oracle).
+    // LP-7 (MEDIUM-1, round 3): route through the central VerifyRecordMAC gate so the
+    // keying selection matches the LOADED file version, exactly like the five read
+    // paths. The previous open-coded `crypterOld.VerifyMAC(...)` used the default
+    // separated (v7) keying unconditionally; on a loaded legacy v3-v6 wallet whose
+    // master MAC is legacy-AES-keyed (and non-empty, so IsLegacy()==false), that
+    // mismatched the on-disk MAC and made ChangePassphrase reject the CORRECT
+    // passphrase — permanently bricking passphrase rotation for non-HD legacy
+    // wallets (which never migrate). VerifyRecordMAC also subsumes the empty-MAC
+    // pre-v7 case, so the IsLegacy() special-case is no longer needed.
+    if (!VerifyRecordMAC(crypterOld, masterKey.vchCryptedKey, masterKey.vchMAC)) {
+        memory_cleanse(derivedKeyOld.data(), derivedKeyOld.size());
+        return false;  // MAC verification failed - wrong passphrase or tampered data
     }
 
     std::vector<uint8_t> vMasterKeyPlain;
@@ -1460,9 +1794,21 @@ bool CWallet::ChangePassphrase(const std::string& passphraseOld,
         return false;
     }
 
-    // FIX-008 (CRYPT-007): Compute MAC for authenticated encryption
+    // FIX-008 (CRYPT-007): Compute MAC for authenticated encryption.
+    // LP-7 (ratified design): route through ComputeRecordMAC with the keying that
+    // MATCHES the file's current on-disk version. ChangePassphrase rotates the
+    // passphrase IN PLACE and does NOT promote the file to v7 (SaveUnlocked re-emits
+    // the loaded version), so the rewritten master-key MAC must use the SAME keying
+    // the rest of that file uses, or VerifyRecordMAC rejects the correct passphrase on
+    // the next load:
+    //   - loaded v3-v6  -> legacy AES-keyed HMAC (file stays v6)
+    //   - loaded v7 / 0 -> separated v7 keying (file is/stays v7)
+    // (The single v6->v7 migration — which DOES recompute every MAC to separated
+    // keying — still happens exactly once, on the next Unlock, never here.)
+    const bool legacyMasterKeying =
+        (m_loadedFileVersion != 0 && m_loadedFileVersion < WALLET_FILE_VERSION_7);
     std::vector<uint8_t> newMAC;
-    if (!crypterNew.ComputeMAC(newCryptedKey, newMAC)) {
+    if (!ComputeRecordMAC(crypterNew, newCryptedKey, newMAC, legacyMasterKeying)) {
         memory_cleanse(derivedKeyOld.data(), derivedKeyOld.size());
         memory_cleanse(derivedKeyNew.data(), derivedKeyNew.size());
         memory_cleanse(vMasterKeyPlain.data(), vMasterKeyPlain.size());
@@ -1481,6 +1827,22 @@ bool CWallet::ChangePassphrase(const std::string& passphraseOld,
     masterKey.vchMAC = newMAC;  // FIX-008: Store MAC
     masterKey.vchIV = newIV;
 
+    // LP-7 (ratified design): ChangePassphrase rotates the passphrase IN PLACE only.
+    // It touches ONLY the master-key record (re-encrypted above under the new
+    // passphrase-derived key + version-matched MAC). It deliberately does NOT:
+    //   - promote m_loadedFileVersion to v7,
+    //   - touch fHDMasterKeyEncrypted or migrate the HD seed,
+    //   - re-MAC the per-address / HD-master / mnemonic / MIK records.
+    // Those non-master records are encrypted under the (UNCHANGED) master key, so a
+    // passphrase rotation leaves their ciphertext + IV + MAC byte-identical — nothing
+    // to rewrite. SaveUnlocked re-emits the file at its existing version (legacy v6
+    // layout for a loaded v6 wallet), so the legacy-keyed non-master MACs stay valid
+    // on reload. The one-time v6->v7 migration (re-encrypt seed + re-MAC every record)
+    // happens on the next Unlock via MigrateToEncryptedSeedV7Unlocked — the single
+    // source of truth. This DELETES the round-1..4 ReMACAllRecordsToV7Unlocked seam
+    // that re-introduced plaintext-seed-at-rest (BLOCKER-1) and bricked empty-MAC
+    // mnemonic/MIK records (BLOCKER-2).
+
     // Wipe sensitive data
     memory_cleanse(derivedKeyOld.data(), derivedKeyOld.size());
     memory_cleanse(derivedKeyNew.data(), derivedKeyNew.size());
@@ -1495,7 +1857,8 @@ bool CWallet::ChangePassphrase(const std::string& passphraseOld,
             std::this_thread::sleep_for(std::chrono::milliseconds(500));
             if (!SaveUnlocked()) {
                 std::cerr << "[Wallet] CRITICAL: Retry failed. Reverting passphrase change." << std::endl;
-                // Revert so in-memory state matches what's on disk
+                // Revert the master key so in-memory state matches what's on disk
+                // (the original, untouched file). Only the master-key record changed.
                 masterKey.vchCryptedKey = oldCryptedKey;
                 masterKey.vchSalt = oldSalt;
                 masterKey.vchMAC = oldMAC;
@@ -1547,14 +1910,16 @@ bool CWallet::Load(const std::string& filename) {
     std::string magic_str(magic, 8);
     // FIX-011 (PERSIST-001): Support DILWLT03 format with file integrity HMAC
     // v4: Added fCoinbase field to track mining rewards
-    if (magic_str != "DILWLT01" && magic_str != "DILWLT02" && magic_str != "DILWLT03" && magic_str != "DILWLT04" && magic_str != "DILWLT05" && magic_str != "DILWLT06") {
+    // LP-7: v7 (DILWLT07) — encryption-at-rest fix (variable-length encrypted seed
+    // + per-record MACs).
+    if (magic_str != "DILWLT01" && magic_str != "DILWLT02" && magic_str != "DILWLT03" && magic_str != "DILWLT04" && magic_str != "DILWLT05" && magic_str != "DILWLT06" && magic_str != "DILWLT07") {
         return false;  // Invalid file format
     }
 
     uint32_t version;
     file.read(reinterpret_cast<char*>(&version), sizeof(version));
     if (!file.good()) return false;  // SEC-001: Check I/O error
-    if (version != 1 && version != 2 && version != 3 && version != 4 && version != 5 && version != 6) {
+    if (version != 1 && version != 2 && version != 3 && version != 4 && version != 5 && version != 6 && version != 7) {
         return false;  // Unsupported version
     }
 
@@ -1647,6 +2012,17 @@ bool CWallet::Load(const std::string& filename) {
             temp_masterKey.vchMAC.clear();
         }
 
+        // LP-7 (HIGH-1 / S-004 / A-007): a v7 wallet MUST carry a non-empty
+        // master-key MAC. The v7 writer always populates it (wallet.cpp), so an
+        // empty/absent MAC on a v7 file means the MAC was stripped — reject it as
+        // corrupt rather than silently falling back to the unauthenticated
+        // "legacy" path (which would re-open the encrypt-then-MAC downgrade on the
+        // root secret). The legacy unauthenticated path is preserved ONLY for
+        // genuine v3-v6 files being read for migration.
+        if (version >= WALLET_FILE_VERSION_7 && temp_masterKey.vchMAC.empty()) {
+            return false;  // v7 master key with stripped/absent MAC — reject as tampered
+        }
+
         // Wallet starts locked (encryption status determined by masterKey.IsValid())
         temp_fWalletUnlocked = false;
     }
@@ -1654,10 +2030,16 @@ bool CWallet::Load(const std::string& filename) {
     // Read HD wallet data (v2 only)
     bool temp_fIsHDWallet = false;
     std::vector<uint8_t> temp_vchEncryptedMnemonic;
+    std::vector<uint8_t> temp_vchMnemonicMAC;          // LP-7 (v7)
     std::vector<uint8_t> temp_vchMnemonicIV;
     CHDExtendedKey temp_hdMasterKey;
     bool temp_fHDMasterKeyEncrypted = false;
+    std::vector<uint8_t> temp_vchEncryptedHDMasterKey;  // LP-7 (v7): variable-length seed ciphertext
+    std::vector<uint8_t> temp_vchHDMasterKeyMAC;        // LP-7 (v7)
     std::vector<uint8_t> temp_vchHDMasterKeyIV;
+    // LP-7: true if this is an encrypted wallet whose HD seed is plaintext at rest
+    // (the pre-v7 bug) and therefore needs migration on next unlock.
+    bool temp_fNeedsSeedMigration = false;
     uint32_t temp_nHDAccountIndex = 0;
     uint32_t temp_nHDExternalChainIndex = 0;
     uint32_t temp_nHDInternalChainIndex = 0;
@@ -1690,34 +2072,143 @@ bool CWallet::Load(const std::string& filename) {
             // FIX-010: Register mnemonic IV to prevent reuse
             // CID 1675317 FIX: Access to usedIVs is protected by lock acquired at line 1260
             usedIVs.insert(temp_vchMnemonicIV);
+
+            // LP-7 (v7): read the mnemonic MAC (variable-length). Absent in v3-v6.
+            if (version >= WALLET_FILE_VERSION_7) {
+                uint32_t mnMacLen = 0;
+                file.read(reinterpret_cast<char*>(&mnMacLen), sizeof(mnMacLen));
+                if (!file.good()) return false;
+                if (mnMacLen > 64) return false;  // HMAC-SHA3-512 is 64 bytes
+                // LP-7 (HIGH-2 item 3, load-symmetry): on a v7 ENCRYPTED wallet a
+                // present mnemonic ciphertext MUST carry a non-empty MAC (it was
+                // master-key-encrypted-then-MAC'd). An empty MAC here is corrupt —
+                // reject at load to match master/per-address/HD-master. (An
+                // UNencrypted v7 wallet legitimately writes mnMacLen==0 because the
+                // mnemonic is under the obfuscation key, so only enforce when the
+                // master key is valid.)
+                if (mnMacLen == 0 && temp_masterKey.IsValid()) return false;
+                if (mnMacLen > 0) {
+                    temp_vchMnemonicMAC.resize(mnMacLen);
+                    file.read(reinterpret_cast<char*>(temp_vchMnemonicMAC.data()), mnMacLen);
+                    if (!file.good()) return false;
+                }
+            }
         }
 
-        // Read HD master key
-        file.read(reinterpret_cast<char*>(temp_hdMasterKey.seed), 32);
-        if (!file.good()) return false;
-        file.read(reinterpret_cast<char*>(temp_hdMasterKey.chaincode), 32);
-        if (!file.good()) return false;
-        file.read(reinterpret_cast<char*>(&temp_hdMasterKey.depth), sizeof(temp_hdMasterKey.depth));
-        if (!file.good()) return false;
-        file.read(reinterpret_cast<char*>(&temp_hdMasterKey.fingerprint), sizeof(temp_hdMasterKey.fingerprint));
-        if (!file.good()) return false;
-        file.read(reinterpret_cast<char*>(&temp_hdMasterKey.child_index), sizeof(temp_hdMasterKey.child_index));
-        if (!file.good()) return false;
+        // LP-7: the HD-master block layout depends on the file version.
+        if (version >= WALLET_FILE_VERSION_7) {
+            // v7 layout: [encrypted_flag]
+            //   if encrypted: [hdEncLen][ciphertext][hdMacLen][mac][depth][fp][ci][IV]
+            //   if plaintext: [hdEncLen=0][seed32][chaincode32][depth][fp][ci]
+            uint8_t encrypted_flag;
+            file.read(reinterpret_cast<char*>(&encrypted_flag), 1);
+            if (!file.good()) return false;
+            temp_fHDMasterKeyEncrypted = (encrypted_flag != 0);
 
-        // Read HD master key encryption flag
-        uint8_t encrypted_flag;
-        file.read(reinterpret_cast<char*>(&encrypted_flag), 1);
-        if (!file.good()) return false;
-        temp_fHDMasterKeyEncrypted = (encrypted_flag != 0);
-
-        if (temp_fHDMasterKeyEncrypted) {
-            temp_vchHDMasterKeyIV.resize(WALLET_CRYPTO_IV_SIZE);
-            file.read(reinterpret_cast<char*>(temp_vchHDMasterKeyIV.data()), WALLET_CRYPTO_IV_SIZE);
+            uint32_t hdEncLen = 0;
+            file.read(reinterpret_cast<char*>(&hdEncLen), sizeof(hdEncLen));
             if (!file.good()) return false;
 
-            // FIX-010: Register HD master key IV to prevent reuse
-            // CID 1675317 FIX: Access to usedIVs is protected by lock acquired at line 1260
-            usedIVs.insert(temp_vchHDMasterKeyIV);
+            if (temp_fHDMasterKeyEncrypted) {
+                // Variable-length ciphertext (bounded: 64-byte plaintext → 80-byte
+                // ciphertext; allow generous slack but reject absurd sizes).
+                const uint32_t MAX_HD_ENC_SIZE = 4096;
+                if (hdEncLen == 0 || (hdEncLen % 16) != 0 || hdEncLen > MAX_HD_ENC_SIZE) {
+                    return false;
+                }
+                temp_vchEncryptedHDMasterKey.resize(hdEncLen);
+                file.read(reinterpret_cast<char*>(temp_vchEncryptedHDMasterKey.data()), hdEncLen);
+                if (!file.good()) return false;
+
+                uint32_t hdMacLen = 0;
+                file.read(reinterpret_cast<char*>(&hdMacLen), sizeof(hdMacLen));
+                if (!file.good()) return false;
+                if (hdMacLen == 0 || hdMacLen > 64) return false;  // v7 requires a MAC
+                temp_vchHDMasterKeyMAC.resize(hdMacLen);
+                file.read(reinterpret_cast<char*>(temp_vchHDMasterKeyMAC.data()), hdMacLen);
+                if (!file.good()) return false;
+
+                file.read(reinterpret_cast<char*>(&temp_hdMasterKey.depth), sizeof(temp_hdMasterKey.depth));
+                if (!file.good()) return false;
+                file.read(reinterpret_cast<char*>(&temp_hdMasterKey.fingerprint), sizeof(temp_hdMasterKey.fingerprint));
+                if (!file.good()) return false;
+                file.read(reinterpret_cast<char*>(&temp_hdMasterKey.child_index), sizeof(temp_hdMasterKey.child_index));
+                if (!file.good()) return false;
+
+                temp_vchHDMasterKeyIV.resize(WALLET_CRYPTO_IV_SIZE);
+                file.read(reinterpret_cast<char*>(temp_vchHDMasterKeyIV.data()), WALLET_CRYPTO_IV_SIZE);
+                if (!file.good()) return false;
+                usedIVs.insert(temp_vchHDMasterKeyIV);
+                // seed/chaincode slots remain zero in memory; ciphertext is the
+                // storage-of-record. No plaintext seed present in a v7 file.
+            } else {
+                // Plaintext (unencrypted wallet) — hdEncLen must be 0.
+                if (hdEncLen != 0) return false;
+                file.read(reinterpret_cast<char*>(temp_hdMasterKey.seed), 32);
+                if (!file.good()) return false;
+                file.read(reinterpret_cast<char*>(temp_hdMasterKey.chaincode), 32);
+                if (!file.good()) return false;
+                file.read(reinterpret_cast<char*>(&temp_hdMasterKey.depth), sizeof(temp_hdMasterKey.depth));
+                if (!file.good()) return false;
+                file.read(reinterpret_cast<char*>(&temp_hdMasterKey.fingerprint), sizeof(temp_hdMasterKey.fingerprint));
+                if (!file.good()) return false;
+                file.read(reinterpret_cast<char*>(&temp_hdMasterKey.child_index), sizeof(temp_hdMasterKey.child_index));
+                if (!file.good()) return false;
+
+                // LOAD-TIME DEFENSE-IN-DEPTH (Cursor HIGH-1/HIGH-2): a v7 file whose
+                // HD seed is PLAINTEXT (this branch) while the WALLET is encrypted
+                // (isEncrypted: spending keys under a passphrase master key) is the
+                // LP-7 plaintext-seed-at-rest state — it should never have been
+                // written (the SaveUnlocked guard now refuses it, and EncryptWallet
+                // is now transactional), but a wallet produced by a pre-fix binary
+                // could still exist on disk. Arm migration so the next Unlock
+                // re-encrypts the seed and rewrites the file at v7, exactly as the
+                // legacy-layout branch below does for legacy plaintext seeds. (An
+                // UNencrypted v7 wallet legitimately stores a plaintext seed here —
+                // only arm when the wallet has a master key.)
+                if (isEncrypted) {
+                    temp_fNeedsSeedMigration = true;
+                }
+            }
+        } else {
+            // LEGACY v3-v6 layout: fixed [seed32][chaincode32][depth][fp][ci]
+            //                      [encrypted_flag] [IV if encrypted]
+            // In this format the seed is ALWAYS stored in the fixed slots, in
+            // PLAINTEXT (the LP-7 bug) — the encrypted_flag only ever gated the IV.
+            file.read(reinterpret_cast<char*>(temp_hdMasterKey.seed), 32);
+            if (!file.good()) return false;
+            file.read(reinterpret_cast<char*>(temp_hdMasterKey.chaincode), 32);
+            if (!file.good()) return false;
+            file.read(reinterpret_cast<char*>(&temp_hdMasterKey.depth), sizeof(temp_hdMasterKey.depth));
+            if (!file.good()) return false;
+            file.read(reinterpret_cast<char*>(&temp_hdMasterKey.fingerprint), sizeof(temp_hdMasterKey.fingerprint));
+            if (!file.good()) return false;
+            file.read(reinterpret_cast<char*>(&temp_hdMasterKey.child_index), sizeof(temp_hdMasterKey.child_index));
+            if (!file.good()) return false;
+
+            uint8_t encrypted_flag;
+            file.read(reinterpret_cast<char*>(&encrypted_flag), 1);
+            if (!file.good()) return false;
+            bool legacyEncFlag = (encrypted_flag != 0);
+
+            if (legacyEncFlag) {
+                temp_vchHDMasterKeyIV.resize(WALLET_CRYPTO_IV_SIZE);
+                file.read(reinterpret_cast<char*>(temp_vchHDMasterKeyIV.data()), WALLET_CRYPTO_IV_SIZE);
+                if (!file.good()) return false;
+                usedIVs.insert(temp_vchHDMasterKeyIV);
+            }
+
+            // LP-7 (wallet-Inv-5): in legacy files the seed is plaintext at rest
+            // regardless of the flag. We deliberately treat the in-memory HD master
+            // as NOT encrypted (plaintext seed loaded into the slots) and, if the
+            // wallet is encrypted (has a passphrase master key), flag it for
+            // migration on next unlock so the seed gets re-encrypted and rewritten
+            // at v7. The stored legacyEncFlag is ignored on purpose: the old
+            // "encrypted" path never produced a recoverable ciphertext.
+            temp_fHDMasterKeyEncrypted = false;
+            if (isEncrypted) {
+                temp_fNeedsSeedMigration = true;
+            }
         }
 
         // Read HD chain state
@@ -1840,6 +2331,15 @@ bool CWallet::Load(const std::string& filename) {
                     encKey.vchMAC.resize(macLen);
                     file.read(reinterpret_cast<char*>(encKey.vchMAC.data()), macLen);
                     if (!file.good()) return false;  // SEC-001: Check I/O error
+                }
+                // LP-7 (HIGH-1 / S-004 / A-007): a v7 wallet MUST carry a
+                // non-empty MAC on every per-address spending key. The v7 writer
+                // always populates it, so macLen==0 on a v7 file means the MAC was
+                // stripped — reject as tampered rather than loading it as an
+                // unauthenticated "legacy" key (which would re-open the MAC
+                // downgrade on a spending key). v3-v6 keys keep the legacy path.
+                if (version >= WALLET_FILE_VERSION_7 && encKey.vchMAC.empty()) {
+                    return false;  // v7 per-address key with stripped/absent MAC — reject
                 }
             } else {
                 // Legacy v1/v2: try to read macLen, seek back if not present
@@ -1980,6 +2480,7 @@ bool CWallet::Load(const std::string& filename) {
     bool temp_fMIKRegistered = false;
     std::vector<uint8_t> temp_vchMIKPubKey;
     std::vector<uint8_t> temp_vchEncryptedMIKPrivKey;
+    std::vector<uint8_t> temp_vchMIKPrivKeyMAC;  // LP-7 (v7)
     std::vector<uint8_t, SecureAllocator<uint8_t>> temp_vchMIKPrivKeyIV;
     std::vector<uint8_t, SecureAllocator<uint8_t>> temp_vchMIKPrivKey;
 
@@ -2011,6 +2512,27 @@ bool CWallet::Load(const std::string& filename) {
             if (file.good() && ivLen > 0 && ivLen <= 32) {
                 temp_vchMIKPrivKeyIV.resize(ivLen);
                 file.read(reinterpret_cast<char*>(temp_vchMIKPrivKeyIV.data()), ivLen);
+            }
+
+            // LP-7 (v7): Read MIK private-key MAC (variable-length). Absent in v5-v6.
+            if (file.good() && version >= WALLET_FILE_VERSION_7) {
+                uint32_t mikMacLen = 0;
+                file.read(reinterpret_cast<char*>(&mikMacLen), sizeof(mikMacLen));
+                if (mikMacLen > 64) return false;  // HMAC-SHA3-512 is 64 bytes
+                // LP-7 (HIGH-2 item 3, load-symmetry): a v7 ENCRYPTED wallet that
+                // carries an encrypted MIK private key MUST carry its MAC — an
+                // empty MAC on that record is corrupt; reject at load to match the
+                // other records. (Unencrypted wallets / no-MIK files write
+                // mikMacLen==0 legitimately, so only enforce when both an encrypted
+                // MIK privkey is present AND the wallet master key is valid.)
+                if (mikMacLen == 0 && temp_masterKey.IsValid() &&
+                    !temp_vchEncryptedMIKPrivKey.empty()) {
+                    return false;
+                }
+                if (file.good() && mikMacLen > 0 && mikMacLen <= 64) {
+                    temp_vchMIKPrivKeyMAC.resize(mikMacLen);
+                    file.read(reinterpret_cast<char*>(temp_vchMIKPrivKeyMAC.data()), mikMacLen);
+                }
             }
 
             // Read MIK registered flag
@@ -2194,6 +2716,10 @@ bool CWallet::Load(const std::string& filename) {
         // temp_hdMasterKey is a local variable that's no longer used after assignment
         hdMasterKey = std::move(temp_hdMasterKey);
         fHDMasterKeyEncrypted = temp_fHDMasterKeyEncrypted;
+        // LP-7 (v7) variable-length encrypted-seed + per-record MACs
+        vchEncryptedHDMasterKey = std::move(temp_vchEncryptedHDMasterKey);
+        vchHDMasterKeyMAC = std::move(temp_vchHDMasterKeyMAC);
+        vchMnemonicMAC = std::move(temp_vchMnemonicMAC);
         // FIX-009: Use assign() for SecureAllocator vectors
         vchHDMasterKeyIV.assign(temp_vchHDMasterKeyIV.begin(), temp_vchHDMasterKeyIV.end());
         nHDAccountIndex = temp_nHDAccountIndex;
@@ -2224,6 +2750,7 @@ bool CWallet::Load(const std::string& filename) {
         fMIKRegistered = temp_fMIKRegistered;
         vchMIKPubKey = std::move(temp_vchMIKPubKey);
         vchEncryptedMIKPrivKey = std::move(temp_vchEncryptedMIKPrivKey);
+        vchMIKPrivKeyMAC = std::move(temp_vchMIKPrivKeyMAC);
         vchMIKPrivKeyIV = std::move(temp_vchMIKPrivKeyIV);
 
         if (temp_fHasMIK) {
@@ -2257,7 +2784,25 @@ bool CWallet::Load(const std::string& filename) {
         // v6: Restore sent transaction history
         mapSentTx = std::move(temp_mapSentTx);
 
+        // LP-7: record the on-disk format version + whether this encrypted wallet
+        // carries a plaintext HD seed (pre-v7 bug) and therefore needs migration
+        // on next unlock.
+        m_loadedFileVersion = version;
+        m_fNeedsSeedMigration = temp_fNeedsSeedMigration;
+
         m_walletFile = filename;  // Set wallet file path only on successful load
+
+        // LP-7 (force-migrate / round-3 SURVIVING-LEAK): if this encrypted wallet
+        // was loaded with a plaintext HD seed at rest (pre-fix bug), emit a LOUD
+        // one-time-per-load CRITICAL so the operator/UI is driven to unlock-and-
+        // migrate. A receive/mine-only wallet would otherwise sit plaintext forever
+        // while reporting "encrypted". The per-autosave warning (SaveUnlocked) keeps
+        // surfacing it until the migration runs on the next Unlock.
+        if (m_fNeedsSeedMigration) {
+            std::cerr << "[Wallet] CRITICAL: wallet seed is stored UNENCRYPTED at rest "
+                         "despite the wallet being encrypted (fixed bug LP-7). Unlock once "
+                         "to complete a one-time security upgrade." << std::endl;
+        }
     }
 
     return true;
@@ -2270,11 +2815,59 @@ bool CWallet::Save(const std::string& filename) const {
 }
 
 // Private SaveUnlocked() method - assumes caller already holds cs_wallet lock
+// ============================================================================
+// LP-7 READER/WRITER VERSION-GATE SYMMETRY TABLE (authoritative)
+// ----------------------------------------------------------------------------
+// This writer (SaveUnlocked) emits ONLY v6 ("DILWLT06", writeLegacyV6==true) or
+// v7 ("DILWLT07"). The matching reader is CWallet::Load. EVERY field whose
+// presence/layout depends on the file version is listed below; for each, the
+// writer's gate MUST exactly match the reader's gate. A field present in a v6
+// write MUST be read in v6; a v7-only field MUST be `!writeLegacyV6`-gated on
+// write AND `version >= WALLET_FILE_VERSION_7` on read. ZERO mismatches allowed.
+//
+//  field                | write-gate (SaveUnlocked)          | read-gate (Load)                 | status
+//  ---------------------+------------------------------------+----------------------------------+-------
+//  header magic+version | writeLegacyV6 ? v6 : v7            | reads+validates version 1..7     | MATCH
+//  HMAC + salt block    | unconditional (writer always >=v6) | version >= 3                     | MATCH (v6,v7 >=3)
+//  v1/v2 reserved[16]   | never written                      | version < 3 (else-branch)        | MATCH (writer never <v3)
+//  master-key MAC       | uncond. within masterKey.IsValid() | v3+: always present (uncond.)    | MATCH
+//  mnemonic MAC         | if (!writeLegacyV6)                | if (version >= V7)               | MATCH
+//  HD-master block      | writeLegacyV6 ? legacy-slots : v7  | version >= V7 ? v7 : legacy      | MATCH
+//  HD-master MAC        | v7 encrypted branch (!writeLegacyV6)| v7 encrypted branch (>= V7)     | MATCH
+//  wtx fCoinbase        | unconditional (writer always >=v6) | version >= 4                     | MATCH (v6,v7 >=4)
+//  MIK block (hasMIK..) | unconditional (writer always >=v6) | version >= 5                     | MATCH (v6,v7 >=5)
+//  MIK private-key MAC  | if (!writeLegacyV6)   [LP-7 fix]    | if (version >= V7)               | MATCH
+//  mapSentTx            | unconditional (writer always >=v6) | version >= 6                     | MATCH (v6,v7 >=6)
+//
+// Per-address spending-key MAC (macLen) is a v3+ field written unconditionally
+// and read unconditionally for v3+ (v1/v2 seek-back), so it is NOT version-
+// conditional within this writer's v6/v7 output — symmetric by construction.
+//
+// INVARIANT: every v7-only per-record MAC field (mnemonic, MIK) is
+// `!writeLegacyV6`-gated on write. The HD-master MAC lives inside the v7-only
+// encrypted HD-master branch, so it is structurally excluded from the v6 path.
+// If you add ANY new version-conditional field, add a row here and confirm the
+// write-gate equals the read-gate BEFORE merging — the MIK-MAC desync
+// (round-5 BLOCKER-5) was exactly a missing row in this table.
+// ============================================================================
 bool CWallet::SaveUnlocked(const std::string& filename) const {
     // Use current wallet file if no filename specified
     std::string saveFile = filename.empty() ? m_walletFile : filename;
     if (saveFile.empty()) {
         return false;  // No wallet file specified
+    }
+
+    // LP-7 (force-migrate / round-3 SURVIVING-LEAK): re-emit the CRITICAL on EVERY
+    // save while the seed is still plaintext-at-rest (not once). An armed wallet
+    // that is never unlocked is autosaved repeatedly (receive/mine); each save
+    // re-writes the plaintext seed to disk, so each save must re-surface the
+    // remediation. This fires for the legacy v6 path (which re-emits v6 plaintext)
+    // until the next Unlock runs MigrateToEncryptedSeedV7Unlocked() and clears the
+    // flag. Caller holds cs_wallet (SaveUnlocked precondition), so the read is safe.
+    if (masterKey.IsValid() && m_fNeedsSeedMigration) {
+        std::cerr << "[Wallet] CRITICAL: wallet seed is stored UNENCRYPTED at rest "
+                     "despite the wallet being encrypted (fixed bug LP-7). Unlock once "
+                     "to complete a one-time security upgrade." << std::endl;
     }
 
     // SEC-001 FIX: Atomic file write pattern
@@ -2309,10 +2902,31 @@ bool CWallet::SaveUnlocked(const std::string& filename) const {
 
     // FIX-011 (PERSIST-001): Write header with file integrity HMAC (v3 format)
     // Format: [Magic][Version][Flags][HMAC-placeholder][Salt][Data...]
-    file.write(WALLET_FILE_MAGIC_V6, 8);  // "DILWLT06" - v6 adds sent tx persistence
+    //
+    // LP-7 (ratified design, version-aware write): SaveUnlocked normally emits v7
+    // ("DILWLT07") — variable-length encrypted HD seed + per-record MACs. The ONE
+    // exception is a wallet LOADED from a legacy v3-v6 file that has NOT yet been
+    // migrated (m_loadedFileVersion < v7): there we re-emit the SAME on-disk version
+    // (legacy plaintext-seed layout, no per-record mnemonic/MIK MAC). This is what
+    // lets ChangePassphrase rotate the passphrase IN PLACE without promoting the
+    // file to v7 — which previously (round 4) re-introduced plaintext-seed-at-rest
+    // (BLOCKER-1) and bricked empty-MAC mnemonic/MIK records (BLOCKER-2). The single
+    // v6->v7 migration (re-encrypt seed, re-MAC every record) still happens exactly
+    // once, on the next Unlock (MigrateToEncryptedSeedV7Unlocked) — which bumps
+    // m_loadedFileVersion to v7, so this writer then emits v7 from then on. A freshly
+    // created in-memory wallet (m_loadedFileVersion == 0) and an already-v7 wallet
+    // both write v7.
+    const bool writeLegacyV6 =
+        (m_loadedFileVersion != 0 && m_loadedFileVersion < WALLET_FILE_VERSION_7);
+
+    if (writeLegacyV6) {
+        file.write(WALLET_FILE_MAGIC_V6, 8);  // "DILWLT06" — keep the loaded version
+    } else {
+        file.write(WALLET_FILE_MAGIC_V7, 8);  // "DILWLT07"
+    }
     if (!file.good()) return false;
 
-    uint32_t version = WALLET_FILE_VERSION_6;
+    uint32_t version = writeLegacyV6 ? WALLET_FILE_VERSION_6 : WALLET_FILE_VERSION_7;
     file.write(reinterpret_cast<const char*>(&version), sizeof(version));
     if (!file.good()) return false;
 
@@ -2389,26 +3003,202 @@ bool CWallet::SaveUnlocked(const std::string& filename) const {
             if (!file.good()) return false;
             file.write(reinterpret_cast<const char*>(vchMnemonicIV.data()), WALLET_CRYPTO_IV_SIZE);
             if (!file.good()) return false;
+
+            // LP-7 (v7): write the mnemonic MAC (variable-length; empty for the
+            // unencrypted-obfuscation case). LEGACY v3-v6 files never carried a
+            // per-record mnemonic MAC, so when re-emitting at the loaded v6 version
+            // we must NOT write the mnMacLen field — the v6 reader does not expect it
+            // and writing it would desync the stream. (The mnemonic stays readable on
+            // reload via the legacy unauthenticated path; it gains an authenticated
+            // MAC only at the v6->v7 Unlock migration.)
+            if (!writeLegacyV6) {
+                uint32_t mnMacLen = static_cast<uint32_t>(vchMnemonicMAC.size());
+                file.write(reinterpret_cast<const char*>(&mnMacLen), sizeof(mnMacLen));
+                if (!file.good()) return false;
+                if (mnMacLen > 0) {
+                    file.write(reinterpret_cast<const char*>(vchMnemonicMAC.data()), mnMacLen);
+                    if (!file.good()) return false;
+                }
+            }
         }
 
-        // Write HD master key (seed + chaincode = 64 bytes)
-        file.write(reinterpret_cast<const char*>(hdMasterKey.seed), 32);
-        if (!file.good()) return false;
-        file.write(reinterpret_cast<const char*>(hdMasterKey.chaincode), 32);
-        if (!file.good()) return false;
-        file.write(reinterpret_cast<const char*>(&hdMasterKey.depth), sizeof(hdMasterKey.depth));
-        if (!file.good()) return false;
-        file.write(reinterpret_cast<const char*>(&hdMasterKey.fingerprint), sizeof(hdMasterKey.fingerprint));
-        if (!file.good()) return false;
-        file.write(reinterpret_cast<const char*>(&hdMasterKey.child_index), sizeof(hdMasterKey.child_index));
-        if (!file.good()) return false;
-
-        // Write HD master key encryption flag and IV
+        // LP-7 (S-007 / S-001): NEVER write a plaintext seed for an encrypted
+        // wallet. The writer is one-way: if the HD master key is encrypted we
+        // emit ONLY the variable-length ciphertext; if (impossibly) the
+        // ciphertext is missing, refuse the save rather than fall back to
+        // plaintext.
         uint8_t encrypted_flag = fHDMasterKeyEncrypted ? 1 : 0;
-        file.write(reinterpret_cast<const char*>(&encrypted_flag), 1);
-        if (!file.good()) return false;
-        if (fHDMasterKeyEncrypted) {
+
+        if (writeLegacyV6) {
+            // LP-7 (ratified): re-emit the EXACT legacy v3-v6 HD-master layout when
+            // the file stays at its loaded version (ChangePassphrase-in-place). A
+            // legacy-loaded wallet keeps its seed in the fixed plaintext slots and is
+            // flagged for migration on next Unlock — we are NOT migrating here, so we
+            // preserve that on-disk shape byte-for-byte:
+            //   [seed32][chaincode32][depth][fp][ci][encrypted_flag][IV if flagged]
+            // This is NOT a NEW plaintext-at-rest exposure: the seed was already
+            // plaintext in this v6 file before ChangePassphrase, Load re-arms
+            // m_fNeedsSeedMigration for it, and the next Unlock encrypts it + rewrites
+            // at v7. Writing v7 here instead (with fHDMasterKeyEncrypted==false) is
+            // exactly round-4 BLOCKER-1: it would mint a v7-labelled plaintext-seed
+            // file that permanently disarms migration. (Mirrors the pre-LP-7 writer.)
+            //
+            // FAIL-CLOSED GUARD (red-team LOW-1 hardening): the legacy-v6 layout
+            // carries the seed in the FIXED plaintext slots written just below. If
+            // fHDMasterKeyEncrypted is true at this point, the in-memory seed/chaincode
+            // have already been scrubbed (memory_cleanse) by EncryptHDMasterKey — so
+            // these slots would persist 32+32 ZERO bytes, corrupting the wallet
+            // irrecoverably. By construction this combination is impossible (Unlock
+            // promotes m_loadedFileVersion to v7 atomically under cs_wallet the instant
+            // it scrubs, so writeLegacyV6 is never true while encrypted), but we refuse
+            // here as belt-and-suspenders so the corruption is structurally impossible
+            // even if a future refactor introduces a scrub-without-promote caller. This
+            // mirrors the refuse-on-empty-ciphertext guard in the encrypted branch below.
+            if (fHDMasterKeyEncrypted) {
+                std::cerr << "[Wallet] CRITICAL: refusing legacy-v6 save of an encrypted "
+                             "HD wallet — the plaintext seed slots have been scrubbed and "
+                             "writing them would corrupt the wallet (version promotion to "
+                             "v7 must precede any save of an encrypted seed)" << std::endl;
+                return false;
+            }
+            // STRUCTURAL FAIL-CLOSED GUARD (red-team HIGH-1): close the LP-7
+            // plaintext-seed-at-rest leak on the legacy-v6 write path.
+            //
+            // The dangerous state is masterKey.IsValid()==true (encrypted in memory)
+            // && fHDMasterKeyEncrypted==false (HD seed still plaintext) flowing to the
+            // 32-byte plaintext-seed write below. There are TWO ways to reach that
+            // state on the v6 path, and they are NOT equivalent:
+            //
+            //   (1) LEGITIMATE (ratified BLOCKER-1, Test 7): a wallet LOADED from a
+            //       legacy v3-v6 file is always re-armed for migration on load
+            //       (m_fNeedsSeedMigration=true, see Load ~line 2191). ChangePassphrase
+            //       rewrites it IN PLACE at v6 — preserving the PRE-EXISTING plaintext
+            //       seed shape and deferring re-encryption to the next Unlock's
+            //       migration. This is NOT a new exposure: the seed was already
+            //       plaintext at rest, and migration is still armed to fix it.
+            //
+            //   (2) LEAK (red-team HIGH-1): a wallet that is encrypted-in-memory with a
+            //       plaintext seed but is NOT armed for migration (m_fNeedsSeedMigration
+            //       ==false) — e.g. an EncryptWallet that aborted mid-HD-step without
+            //       rolling back. Persisting the plaintext seed here is a genuine new
+            //       LP-7 exposure with no migration arm to ever fix it.
+            //
+            // Discriminator: refuse exactly the un-armed encrypted state. A migration-
+            // armed legacy wallet (case 1) is allowed to round-trip its pre-existing v6
+            // shape; an un-armed encrypted wallet (case 2) is refused. (The
+            // fHDMasterKeyEncrypted guard above independently catches the scrubbed-seed
+            // corruption window. This guard closes the plaintext-seed leak.)
+            if (masterKey.IsValid() && !m_fNeedsSeedMigration) {
+                std::cerr << "[Wallet] CRITICAL: refusing legacy-v6 plaintext-seed save of an "
+                             "encrypted HD wallet that is NOT armed for seed migration — the "
+                             "wallet has a master key but the HD seed is not encrypted "
+                             "(fHDMasterKeyEncrypted==false) and m_fNeedsSeedMigration==false; "
+                             "persisting a plaintext seed for an encrypted wallet with no "
+                             "migration arm is the LP-7 plaintext-at-rest exposure. The HD seed "
+                             "must be encrypted (EncryptHDMasterKey) before any save of such a "
+                             "wallet." << std::endl;
+                return false;
+            }
+            file.write(reinterpret_cast<const char*>(hdMasterKey.seed), 32);
+            if (!file.good()) return false;
+            file.write(reinterpret_cast<const char*>(hdMasterKey.chaincode), 32);
+            if (!file.good()) return false;
+            file.write(reinterpret_cast<const char*>(&hdMasterKey.depth), sizeof(hdMasterKey.depth));
+            if (!file.good()) return false;
+            file.write(reinterpret_cast<const char*>(&hdMasterKey.fingerprint), sizeof(hdMasterKey.fingerprint));
+            if (!file.good()) return false;
+            file.write(reinterpret_cast<const char*>(&hdMasterKey.child_index), sizeof(hdMasterKey.child_index));
+            if (!file.good()) return false;
+
+            file.write(reinterpret_cast<const char*>(&encrypted_flag), 1);
+            if (!file.good()) return false;
+            if (fHDMasterKeyEncrypted) {
+                file.write(reinterpret_cast<const char*>(vchHDMasterKeyIV.data()), WALLET_CRYPTO_IV_SIZE);
+                if (!file.good()) return false;
+            }
+        } else if (fHDMasterKeyEncrypted) {
+            if (vchEncryptedHDMasterKey.empty()) {
+                // Encrypted-but-no-ciphertext is a programming error; refuse to
+                // persist rather than risk writing/keeping plaintext.
+                std::cerr << "[Wallet] CRITICAL: encrypted HD wallet has no seed ciphertext — refusing to save" << std::endl;
+                return false;
+            }
+            // Write the encryption flag, then the variable-length ciphertext +
+            // metadata. NO plaintext seed/chaincode slots are written.
+            file.write(reinterpret_cast<const char*>(&encrypted_flag), 1);
+            if (!file.good()) return false;
+
+            uint32_t hdEncLen = static_cast<uint32_t>(vchEncryptedHDMasterKey.size());
+            file.write(reinterpret_cast<const char*>(&hdEncLen), sizeof(hdEncLen));
+            if (!file.good()) return false;
+            file.write(reinterpret_cast<const char*>(vchEncryptedHDMasterKey.data()), hdEncLen);
+            if (!file.good()) return false;
+
+            // HD-master MAC (variable-length; required non-empty for v7)
+            uint32_t hdMacLen = static_cast<uint32_t>(vchHDMasterKeyMAC.size());
+            file.write(reinterpret_cast<const char*>(&hdMacLen), sizeof(hdMacLen));
+            if (!file.good()) return false;
+            if (hdMacLen > 0) {
+                file.write(reinterpret_cast<const char*>(vchHDMasterKeyMAC.data()), hdMacLen);
+                if (!file.good()) return false;
+            }
+
+            // Metadata (depth/fingerprint/child_index) — non-secret
+            file.write(reinterpret_cast<const char*>(&hdMasterKey.depth), sizeof(hdMasterKey.depth));
+            if (!file.good()) return false;
+            file.write(reinterpret_cast<const char*>(&hdMasterKey.fingerprint), sizeof(hdMasterKey.fingerprint));
+            if (!file.good()) return false;
+            file.write(reinterpret_cast<const char*>(&hdMasterKey.child_index), sizeof(hdMasterKey.child_index));
+            if (!file.good()) return false;
+
+            // IV
             file.write(reinterpret_cast<const char*>(vchHDMasterKeyIV.data()), WALLET_CRYPTO_IV_SIZE);
+            if (!file.good()) return false;
+        } else {
+            // Unencrypted HD wallet: seed is plaintext by design (no passphrase
+            // set). Write the fixed 32+32 plaintext slots + metadata. An
+            // unencrypted seed length of 0 (variable-length) marks "plaintext".
+            //
+            // STRUCTURAL FAIL-CLOSED GUARD (Cursor HIGH-1): refuse to persist a
+            // plaintext HD seed whenever the wallet is encrypted in memory. The
+            // only legitimate way to reach this branch is an UNencrypted wallet
+            // (no passphrase master key). If a master key exists
+            // (masterKey.IsValid()) but fHDMasterKeyEncrypted is still false, the
+            // wallet is encrypted-in-memory with a plaintext seed — exactly the
+            // LP-7 plaintext-seed-at-rest exposure (e.g. an EncryptWallet that
+            // aborted mid-HD-step without rolling back). Writing the v7 plaintext
+            // layout here would mint a v7-labelled file carrying encrypted
+            // spending keys alongside a 32-byte plaintext seed, with no migration
+            // arm on reload (the loader only arms migration for the LEGACY layout).
+            // Refuse the save so this combination is structurally impossible. This
+            // mirrors the refuse guards in the legacy-v6 branch above and the
+            // empty-ciphertext check in the encrypted branch.
+            if (masterKey.IsValid()) {
+                std::cerr << "[Wallet] CRITICAL: refusing v7 plaintext-seed save of an "
+                             "encrypted HD wallet — the wallet has a master key but the HD "
+                             "seed is not encrypted (fHDMasterKeyEncrypted==false); persisting "
+                             "a plaintext seed for an encrypted wallet is the LP-7 "
+                             "plaintext-at-rest exposure. The HD seed must be encrypted "
+                             "(EncryptHDMasterKey) before any save of an encrypted wallet."
+                          << std::endl;
+                return false;
+            }
+            file.write(reinterpret_cast<const char*>(&encrypted_flag), 1);
+            if (!file.good()) return false;
+
+            uint32_t hdEncLen = 0;  // 0 ⇒ plaintext fixed-slot layout follows
+            file.write(reinterpret_cast<const char*>(&hdEncLen), sizeof(hdEncLen));
+            if (!file.good()) return false;
+
+            file.write(reinterpret_cast<const char*>(hdMasterKey.seed), 32);
+            if (!file.good()) return false;
+            file.write(reinterpret_cast<const char*>(hdMasterKey.chaincode), 32);
+            if (!file.good()) return false;
+            file.write(reinterpret_cast<const char*>(&hdMasterKey.depth), sizeof(hdMasterKey.depth));
+            if (!file.good()) return false;
+            file.write(reinterpret_cast<const char*>(&hdMasterKey.fingerprint), sizeof(hdMasterKey.fingerprint));
+            if (!file.good()) return false;
+            file.write(reinterpret_cast<const char*>(&hdMasterKey.child_index), sizeof(hdMasterKey.child_index));
             if (!file.good()) return false;
         }
 
@@ -2582,6 +3372,28 @@ bool CWallet::SaveUnlocked(const std::string& filename) const {
         if (ivLen > 0) {
             file.write(reinterpret_cast<const char*>(vchMIKPrivKeyIV.data()), ivLen);
             if (!file.good()) return false;
+        }
+
+        // LP-7 (v7): write the MIK private-key MAC (variable-length; empty when
+        // the wallet is unencrypted / no encrypted MIK present). LEGACY v3-v6 files
+        // never carried a per-record MIK MAC, so when re-emitting at the loaded v6
+        // version (ChangePassphrase-in-place / non-HD legacy autosave) we must NOT
+        // write the mikMacLen field — the v6 reader does not expect it (it gates the
+        // read on version >= WALLET_FILE_VERSION_7) and writing it would desync the
+        // stream and silently corrupt the MIK / sent-history / best-block fields that
+        // follow. This MUST mirror the mnemonic-MAC gating above exactly. (The MIK
+        // gains its authenticated MAC at the v6->v7 Unlock migration, same as the
+        // mnemonic — see MigrateToEncryptedSeedV7Unlocked.) See the reader/writer
+        // version-gate symmetry table above SaveUnlocked: EVERY v7-only per-record
+        // MAC field is !writeLegacyV6-gated.
+        if (!writeLegacyV6) {
+            uint32_t mikMacLen = static_cast<uint32_t>(vchMIKPrivKeyMAC.size());
+            file.write(reinterpret_cast<const char*>(&mikMacLen), sizeof(mikMacLen));
+            if (!file.good()) return false;
+            if (mikMacLen > 0) {
+                file.write(reinterpret_cast<const char*>(vchMIKPrivKeyMAC.data()), mikMacLen);
+                if (!file.good()) return false;
+            }
         }
 
         // Write MIK registered flag
@@ -2912,11 +3724,20 @@ void CWallet::Clear() {
         memory_cleanse(vchEncryptedMnemonic.data(), vchEncryptedMnemonic.size());
     }
     vchEncryptedMnemonic.clear();
+    vchMnemonicMAC.clear();   // LP-7
     vchMnemonicIV.clear();
 
     // Wipe HD master key
     hdMasterKey.Wipe();
     vchHDMasterKeyIV.clear();
+    // LP-7: clear v7 encrypted-seed material + migration state
+    if (!vchEncryptedHDMasterKey.empty()) {
+        memory_cleanse(vchEncryptedHDMasterKey.data(), vchEncryptedHDMasterKey.size());
+    }
+    vchEncryptedHDMasterKey.clear();
+    vchHDMasterKeyMAC.clear();
+    m_fNeedsSeedMigration = false;
+    m_loadedFileVersion = 0;
 
     // Clear HD chain state
     nHDAccountIndex = 0;
@@ -4078,6 +4899,19 @@ bool CWallet::SignTransaction(CTransaction& tx, CUTXOSet& utxo_set, std::string&
             return false;
         }
 
+        // LP-7 L1 (opt-in --require-seed-migration, default OFF): refuse to sign any
+        // spend while the HD seed is still plaintext-at-rest. This is the single spend
+        // signing funnel, so this one gate covers sendtoaddress, raw-tx signing, HTLC,
+        // and bridge spends. Default OFF leaves the warn-only behavior intact.
+        // (masterKey.IsValid() && m_fNeedsSeedMigration mirrors NeedsSeedMigration()
+        // without re-locking cs_wallet, which we already hold here.)
+        if (m_requireSeedMigration && masterKey.IsValid() && m_fNeedsSeedMigration) {
+            error = "Refusing to spend: wallet HD seed is still stored UNENCRYPTED at rest "
+                    "(fixed bug LP-7). Unlock once to complete the one-time security upgrade "
+                    "(walletpassphrase), then retry. (Started with --require-seed-migration.)";
+            return false;
+        }
+
         // Check chain params before loop
         if (Dilithion::g_chainParams == nullptr) {
             error = "Chain parameters not initialized";
@@ -4774,11 +5608,270 @@ bool CWallet::DeriveAndCacheHDAddress(const CHDKeyPath& path) {
     return true;
 }
 
+// LP-7 (wallet-Inv-5 migration): re-encrypt a legacy plaintext HD seed + mnemonic
+// under the wallet master key and atomically rewrite the file at v7.
+//
+// Preconditions (asserted by caller Unlock): wallet is encrypted (masterKey valid),
+// unlocked (vMasterKey populated), HD wallet, and the seed is currently PLAINTEXT in
+// hdMasterKey.seed/chaincode (m_fHDMasterKeyEncrypted == false, loaded from a v3-v6
+// file). cs_wallet is held.
+//
+// Atomicity / no-data-loss (S-002/S-003):
+//   - The on-disk rewrite goes through SaveUnlocked, which writes a temp file,
+//     fsyncs, then atomically renames over the original (MoveFileEx / rename).
+//     The original is NEVER truncated; an interrupted rewrite leaves either the
+//     intact legacy file or the complete v7 file.
+//   - If ANY in-memory re-encryption step OR the save fails, we restore the
+//     in-memory HD state to its pre-migration plaintext-seed form so the wallet
+//     stays consistent with the still-on-disk legacy file, and return false. The
+//     caller does not fail the unlock; migration retries next unlock.
+bool CWallet::MigrateToEncryptedSeedV7Unlocked(bool* persistedToDisk) {
+    if (persistedToDisk) *persistedToDisk = false;
+    if (!masterKey.IsValid() || !fWalletUnlocked || !fIsHDWallet) {
+        return false;
+    }
+    // Defensive: only migrate when the seed is actually plaintext.
+    if (fHDMasterKeyEncrypted) {
+        return false;
+    }
+    // Cursor M1: migration is only meaningful if we can PERSIST the migrated v7
+    // (no-plaintext) file. If autosave is off / no wallet file, an in-memory-only
+    // re-encryption would (a) scrub the plaintext seed in memory while the on-disk
+    // file STILL holds it, and (b) leave m_loadedFileVersion at the legacy version,
+    // so a later SaveUnlocked would emit the v6 layout from now-scrubbed seed slots
+    // (data corruption). Skip migration entirely here: keep the wallet in its
+    // consistent legacy-plaintext state (both in memory and on disk) and leave the
+    // caller's m_fNeedsSeedMigration armed so NeedsSeedMigration() stays true and the
+    // remediation keeps surfacing until a real, persistable rewrite can occur.
+    if (!m_autoSave || m_walletFile.empty()) {
+        return false;
+    }
+
+    // --- Snapshot pre-migration in-memory state for rollback ---
+    CHDExtendedKey snap_hdMasterKey = hdMasterKey;
+    bool snap_fHDMasterKeyEncrypted = fHDMasterKeyEncrypted;
+    bool snap_fHDMasterKeyCached = fHDMasterKeyCached;
+    CHDExtendedKey snap_hdMasterKeyDecrypted = hdMasterKeyDecrypted;
+    std::vector<uint8_t> snap_vchEncryptedMnemonic = vchEncryptedMnemonic;
+    std::vector<uint8_t> snap_vchMnemonicMAC = vchMnemonicMAC;
+    std::vector<uint8_t> snap_vchMnemonicIV(vchMnemonicIV.begin(), vchMnemonicIV.end());
+    std::vector<uint8_t> snap_vchEncryptedHDMasterKey = vchEncryptedHDMasterKey;
+    std::vector<uint8_t> snap_vchHDMasterKeyMAC = vchHDMasterKeyMAC;
+    std::vector<uint8_t> snap_vchHDMasterKeyIV(vchHDMasterKeyIV.begin(), vchHDMasterKeyIV.end());
+    // MIK snapshot (re-MAC'd in Step 2b). Note: m_mik->privkey is kept cleared
+    // outside migration, so only the at-rest ciphertext/IV/MAC + flag matter for
+    // rollback consistency with the on-disk file.
+    bool snap_fHasMIK = fHasMIK;
+    std::vector<uint8_t> snap_vchEncryptedMIKPrivKey_all = vchEncryptedMIKPrivKey;
+    std::vector<uint8_t> snap_vchMIKPrivKeyMAC_all = vchMIKPrivKeyMAC;
+    std::vector<uint8_t> snap_vchMIKPrivKeyIV_all(vchMIKPrivKeyIV.begin(), vchMIKPrivKeyIV.end());
+    std::vector<uint8_t> snap_vchMIKPubKey = vchMIKPubKey;
+    // LP-7 (HIGH-2): per-address spending keys are re-MAC'd in Step 2c so the
+    // migrated v7 file carries v7-keyed (not legacy-AES-keyed) per-address MACs.
+    // Snapshot the whole map so a later failure restores the legacy MACs.
+    std::map<CDilithiumAddress, CEncryptedKey> snap_mapCryptedKeys = mapCryptedKeys;
+    // LP-7 (version-aware writer): migration IS the v6->v7 promotion event. We bump
+    // m_loadedFileVersion to v7 BEFORE the Step-3 SaveUnlocked so the version-aware
+    // writer emits the v7 layout (encrypted seed, per-record MACs). Snapshot for
+    // rollback so a failed migration restores the loaded version → the version-aware
+    // writer would then (correctly) emit the intact legacy layout again.
+    uint32_t snap_loadedFileVersion = m_loadedFileVersion;
+
+    auto rollback = [&]() {
+        m_loadedFileVersion = snap_loadedFileVersion;
+        hdMasterKey = snap_hdMasterKey;
+        fHDMasterKeyEncrypted = snap_fHDMasterKeyEncrypted;
+        fHDMasterKeyCached = snap_fHDMasterKeyCached;
+        hdMasterKeyDecrypted = snap_hdMasterKeyDecrypted;
+        vchEncryptedMnemonic = snap_vchEncryptedMnemonic;
+        vchMnemonicMAC = snap_vchMnemonicMAC;
+        vchMnemonicIV.assign(snap_vchMnemonicIV.begin(), snap_vchMnemonicIV.end());
+        vchEncryptedHDMasterKey = snap_vchEncryptedHDMasterKey;
+        vchHDMasterKeyMAC = snap_vchHDMasterKeyMAC;
+        vchHDMasterKeyIV.assign(snap_vchHDMasterKeyIV.begin(), snap_vchHDMasterKeyIV.end());
+        fHasMIK = snap_fHasMIK;
+        vchEncryptedMIKPrivKey = snap_vchEncryptedMIKPrivKey_all;
+        vchMIKPrivKeyMAC = snap_vchMIKPrivKeyMAC_all;
+        vchMIKPrivKeyIV.assign(snap_vchMIKPrivKeyIV_all.begin(), snap_vchMIKPrivKeyIV_all.end());
+        vchMIKPubKey = snap_vchMIKPubKey;
+        mapCryptedKeys = snap_mapCryptedKeys;
+    };
+
+    // --- Step 1: recover + re-encrypt the mnemonic under the master key ---
+    // Legacy HD-first wallets stored the mnemonic under an obfuscation key derived
+    // from the (plaintext) seed; EncryptWallet never re-encrypted it. We still hold
+    // the plaintext seed here, so derive that same obfuscation key, decrypt, then
+    // re-encrypt under the master key (which also attaches a MAC).
+    if (!vchEncryptedMnemonic.empty()) {
+        std::vector<uint8_t> ivVec(vchMnemonicIV.begin(), vchMnemonicIV.end());
+        std::vector<uint8_t> mnemonicPlain;
+        bool decOk = false;
+
+        // Primary case (legacy HD-first wallet): mnemonic under the obfuscation key
+        // derived from the still-plaintext seed.
+        {
+            std::vector<uint8_t> obfKey(WALLET_CRYPTO_KEY_SIZE);
+            std::vector<uint8_t> hdSeed(hdMasterKey.seed, hdMasterKey.seed + 32);
+            DeriveEncryptionKey(hdSeed, "mnemonic", obfKey);
+            memory_cleanse(hdSeed.data(), hdSeed.size());
+
+            CCrypter obfCrypter;
+            decOk = obfCrypter.SetKey(obfKey, ivVec) &&
+                    obfCrypter.Decrypt(vchEncryptedMnemonic, mnemonicPlain);
+            memory_cleanse(obfKey.data(), obfKey.size());
+        }
+
+        // Fallback: a legacy wallet whose mnemonic was encrypted under the master
+        // key directly (no MAC). Try the master key if the obfuscation key failed.
+        if (!decOk) {
+            std::vector<uint8_t> mkVec(vMasterKey.data_ptr(),
+                                       vMasterKey.data_ptr() + vMasterKey.size());
+            CCrypter mkCrypter;
+            mnemonicPlain.clear();
+            decOk = mkCrypter.SetKey(mkVec, ivVec) &&
+                    mkCrypter.Decrypt(vchEncryptedMnemonic, mnemonicPlain);
+            memory_cleanse(mkVec.data(), mkVec.size());
+        }
+
+        if (!decOk) {
+            // Could not recover the mnemonic plaintext under either key. Abort
+            // migration (leave everything byte-identical) rather than risk a wallet
+            // whose mnemonic becomes unreadable. Seed migration only proceeds when
+            // the mnemonic can be carried forward.
+            memory_cleanse(mnemonicPlain.data(), mnemonicPlain.size());
+            rollback();
+            return false;
+        }
+
+        std::string mnemonicStr(mnemonicPlain.begin(), mnemonicPlain.end());
+        memory_cleanse(mnemonicPlain.data(), mnemonicPlain.size());
+
+        bool reOk = EncryptMnemonic(mnemonicStr);  // master-key branch + MAC
+        memory_cleanse(&mnemonicStr[0], mnemonicStr.size());
+        if (!reOk) {
+            rollback();
+            return false;
+        }
+    }
+
+    // --- Step 2: encrypt the HD master seed (scrubs plaintext, sets ciphertext+MAC) ---
+    if (!EncryptHDMasterKey()) {
+        rollback();
+        return false;
+    }
+
+    // --- Step 2b: re-MAC the MIK private key (legacy encrypted MIK had no MAC) ---
+    // A legacy encrypted wallet stored the MIK ciphertext WITHOUT a MAC. Once we
+    // mark this wallet v7, DecryptMIKPrivKey requires a non-empty MAC, so recover
+    // the MIK plaintext (legacy path: empty MAC + pre-v7 version still set) and
+    // re-encrypt it under the master key with a MAC. If the MIK can't be recovered
+    // it is non-fatal (MIK is regenerable) — clear it so it regenerates on next use.
+    if (fHasMIK && !vchEncryptedMIKPrivKey.empty() && vchMIKPrivKeyMAC.empty()) {
+        std::vector<uint8_t, SecureAllocator<uint8_t>> mikPlain;
+        if (DecryptMIKPrivKey(mikPlain)) {
+            if (!m_mik) {
+                m_mik = std::make_unique<DFMP::CMiningIdentityKey>();
+                m_mik->pubkey = vchMIKPubKey;
+                m_mik->identity = DFMP::DeriveIdentityFromMIK(vchMIKPubKey);
+            }
+            m_mik->privkey.assign(mikPlain.begin(), mikPlain.end());
+            bool mikOk = EncryptMIKPrivKey();   // adds MAC under master key
+            m_mik->privkey.clear();
+            if (!mikOk) {
+                rollback();
+                return false;
+            }
+        } else {
+            // MIK plaintext unrecoverable — drop it (regenerated on next mining).
+            std::cerr << "[Wallet] LP-7: MIK private key unrecoverable during migration; "
+                         "will regenerate on next mining attempt" << std::endl;
+            fHasMIK = false;
+            vchEncryptedMIKPrivKey.clear();
+            vchMIKPrivKeyMAC.clear();
+            vchMIKPubKey.clear();
+            m_mikIdentity = DFMP::Identity();
+            m_mik.reset();
+        }
+    }
+
+    // --- Step 2c: re-MAC every per-address spending key under v7 keying ---
+    // LP-7 (HIGH-2): a pre-LP-7 build computed per-address MACs with the legacy
+    // AES-keyed HMAC (or, for a v3-v6 key that predates the MAC, with no MAC at
+    // all). Once this file is marked v7, GetKey verifies per-address MACs with the
+    // SEPARATED keying — so the legacy-keyed / empty MACs would mismatch and the
+    // keys would become unspendable in a file that claims to be v7. Recompute each
+    // MAC with v7 separated keying now (the encrypt-then-MAC tag is over the
+    // ciphertext, which migration does NOT change, so no decrypt is needed — we
+    // re-key the crypter with each key's own IV and recompute). The master key in
+    // vMasterKey is the same key these were encrypted under.
+    {
+        std::vector<uint8_t> mkVec(vMasterKey.data_ptr(),
+                                   vMasterKey.data_ptr() + vMasterKey.size());
+        for (auto& kv : mapCryptedKeys) {
+            CEncryptedKey& ek = kv.second;
+            if (ek.vchCryptedKey.empty() || ek.vchIV.size() != WALLET_CRYPTO_IV_SIZE) {
+                // Malformed entry — cannot re-MAC safely. Abort rather than write a
+                // v7 file with a per-address key that can't be authenticated.
+                memory_cleanse(mkVec.data(), mkVec.size());
+                rollback();
+                return false;
+            }
+            CCrypter keyCrypter;
+            if (!keyCrypter.SetKey(mkVec, ek.vchIV)) {
+                memory_cleanse(mkVec.data(), mkVec.size());
+                rollback();
+                return false;
+            }
+            std::vector<uint8_t> newMAC;
+            if (!ComputeRecordMAC(keyCrypter, ek.vchCryptedKey, newMAC)) {
+                memory_cleanse(mkVec.data(), mkVec.size());
+                rollback();
+                return false;
+            }
+            ek.vchMAC = newMAC;
+        }
+        memory_cleanse(mkVec.data(), mkVec.size());
+    }
+
+    // --- Step 3: atomic v7 rewrite. SaveUnlocked never truncates the original. ---
+    // Promote to v7 FIRST so the version-aware SaveUnlocked emits the v7 layout (the
+    // seed is now encrypted; a v6 write here would be wrong). rollback() restores the
+    // loaded version if the save fails, keeping in-memory state consistent with the
+    // still-intact on-disk legacy file.
+    // Cursor M1: persist-capability (autosave on + wallet file set) was verified at
+    // entry — if it had not held we returned early WITHOUT any in-memory mutation, so
+    // we never reach here with a half-migrated state we cannot persist. The guard
+    // below is kept defensively (the else-arm fails closed).
+    if (m_autoSave && !m_walletFile.empty()) {
+        m_loadedFileVersion = WALLET_FILE_VERSION_7;
+        if (!SaveUnlocked()) {
+            // The on-disk legacy file is still intact (temp file was discarded).
+            // Roll back in-memory state to match it (including the loaded version).
+            rollback();
+            return false;
+        }
+        // The migrated v7 (no-plaintext) file is now on disk — only NOW is it safe
+        // for the caller to clear the migration flag / treat the file as v7.
+        if (persistedToDisk) *persistedToDisk = true;
+    } else {
+        // Unreachable given the entry guard, but fail closed rather than report a
+        // half-migrated success: roll back so in-memory state stays consistent with
+        // the unchanged on-disk legacy file.
+        rollback();
+        return false;
+    }
+
+    return true;
+}
+
 bool CWallet::EncryptHDMasterKey() {
     // Assumes caller holds cs_wallet lock
 
     if (!masterKey.IsValid()) {
         return false;  // Wallet not encrypted
+    }
+    if (!fWalletUnlocked) {
+        return false;  // Need the in-memory master key to encrypt
     }
 
     // FIX-010: Generate unique IV for HD master key
@@ -4802,8 +5895,12 @@ bool CWallet::EncryptHDMasterKey() {
         return false;
     }
 
-    // Store encrypted data back in hdMasterKey structure
-    // We'll reuse the seed/chaincode fields to store encrypted data
+    // LP-7 (wallet-Inv-5): AES-256-CBC with PKCS#7 padding turns the 64-byte
+    // plaintext (an exact multiple of the 16-byte block) into an 80-byte
+    // ciphertext (a full extra padding block is appended). The old code rejected
+    // any size != 64 and tried to cram the result into the fixed 32+32 slots,
+    // which was unsatisfiable -> the encrypt path was dead. We now store the FULL
+    // variable-length ciphertext in vchEncryptedHDMasterKey.
     std::vector<uint8_t> encrypted;
     if (!crypter.Encrypt(masterKeyData, encrypted)) {
         memory_cleanse(vMasterKeyVec.data(), vMasterKeyVec.size());
@@ -4811,18 +5908,46 @@ bool CWallet::EncryptHDMasterKey() {
         return false;
     }
 
-    // Copy encrypted data to hdMasterKey (first 32 bytes in seed, rest in chaincode)
-    if (encrypted.size() != 64) {
+    // Sanity: AES-CBC ciphertext must be a non-empty multiple of the block size.
+    if (encrypted.empty() || (encrypted.size() % 16) != 0) {
         memory_cleanse(vMasterKeyVec.data(), vMasterKeyVec.size());
         memory_cleanse(masterKeyData.data(), masterKeyData.size());
         memory_cleanse(encrypted.data(), encrypted.size());
         return false;
     }
 
-    std::memcpy(hdMasterKey.seed, encrypted.data(), 32);
-    std::memcpy(hdMasterKey.chaincode, encrypted.data() + 32, 32);
+    // LP-7 (wallet-Inv-2): authenticate the ciphertext (encrypt-then-MAC) with a
+    // separately-derived MAC key (key separation, default keying).
+    // LP-7 (round 3): route through ComputeRecordMAC — at-rest HD-master record, always v7.
+    std::vector<uint8_t> mac;
+    if (!ComputeRecordMAC(crypter, encrypted, mac)) {
+        memory_cleanse(vMasterKeyVec.data(), vMasterKeyVec.size());
+        memory_cleanse(masterKeyData.data(), masterKeyData.size());
+        memory_cleanse(encrypted.data(), encrypted.size());
+        return false;
+    }
+
+    // Store the variable-length ciphertext + MAC.
+    vchEncryptedHDMasterKey = encrypted;
+    vchHDMasterKeyMAC = mac;
+
+    // LP-7 (S-001 / S-006): scrub the plaintext seed/chaincode from the in-memory
+    // struct now that the ciphertext is the storage-of-record. SaveUnlocked at v7
+    // persists vchEncryptedHDMasterKey, NOT these slots, so no plaintext can reach
+    // disk. The decrypted value lives only in hdMasterKeyDecrypted (re-cached below).
+    memory_cleanse(hdMasterKey.seed, sizeof(hdMasterKey.seed));
+    memory_cleanse(hdMasterKey.chaincode, sizeof(hdMasterKey.chaincode));
 
     fHDMasterKeyEncrypted = true;
+
+    // Refresh the decrypted cache so callers that read it (e.g. address
+    // derivation) keep working while unlocked.
+    std::memcpy(hdMasterKeyDecrypted.seed, masterKeyData.data(), 32);
+    std::memcpy(hdMasterKeyDecrypted.chaincode, masterKeyData.data() + 32, 32);
+    hdMasterKeyDecrypted.depth = hdMasterKey.depth;
+    hdMasterKeyDecrypted.fingerprint = hdMasterKey.fingerprint;
+    hdMasterKeyDecrypted.child_index = hdMasterKey.child_index;
+    fHDMasterKeyCached = true;
 
     // Wipe sensitive data
     memory_cleanse(vMasterKeyVec.data(), vMasterKeyVec.size());
@@ -4851,6 +5976,12 @@ bool CWallet::DecryptHDMasterKey(CHDExtendedKey& decrypted) const {
         return true;
     }
 
+    // LP-7 (wallet-Inv-5): the ciphertext must come from the variable-length
+    // field. A v7 wallet always populates vchEncryptedHDMasterKey on load.
+    if (vchEncryptedHDMasterKey.empty()) {
+        return false;
+    }
+
     // Cache miss - decrypt HD master key
     CCrypter crypter;
     std::vector<uint8_t> vMasterKeyVec(vMasterKey.data_ptr(),
@@ -4861,21 +5992,23 @@ bool CWallet::DecryptHDMasterKey(CHDExtendedKey& decrypted) const {
         return false;
     }
 
-    // Prepare encrypted data (64 bytes from seed + chaincode)
-    std::vector<uint8_t> encrypted(64);
-    std::memcpy(encrypted.data(), hdMasterKey.seed, 32);
-    std::memcpy(encrypted.data() + 32, hdMasterKey.chaincode, 32);
+    // LP-7 (HIGH-2): authenticate-before-decrypt via the ONE centralized gate.
+    // HD-master-seed consumer. Empty MAC on a v7 wallet is rejected; legacy v3-v6
+    // records (no HD-master MAC) take the unauthenticated legacy path; a present
+    // MAC is verified with the version-correct keying.
+    if (!VerifyRecordMAC(crypter, vchEncryptedHDMasterKey, vchHDMasterKeyMAC)) {
+        memory_cleanse(vMasterKeyVec.data(), vMasterKeyVec.size());
+        return false;  // empty MAC on v7, or MAC verification failed
+    }
 
     std::vector<uint8_t> decrypted_data;
-    if (!crypter.Decrypt(encrypted, decrypted_data)) {
+    if (!crypter.Decrypt(vchEncryptedHDMasterKey, decrypted_data)) {
         memory_cleanse(vMasterKeyVec.data(), vMasterKeyVec.size());
-        memory_cleanse(encrypted.data(), encrypted.size());
         return false;
     }
 
     if (decrypted_data.size() != 64) {
         memory_cleanse(vMasterKeyVec.data(), vMasterKeyVec.size());
-        memory_cleanse(encrypted.data(), encrypted.size());
         memory_cleanse(decrypted_data.data(), decrypted_data.size());
         return false;
     }
@@ -4889,7 +6022,6 @@ bool CWallet::DecryptHDMasterKey(CHDExtendedKey& decrypted) const {
 
     // Wipe sensitive data
     memory_cleanse(vMasterKeyVec.data(), vMasterKeyVec.size());
-    memory_cleanse(encrypted.data(), encrypted.size());
     memory_cleanse(decrypted_data.data(), decrypted_data.size());
 
     return true;
@@ -4918,6 +6050,14 @@ bool CWallet::EncryptMnemonic(const std::string& mnemonic) {
         }
 
         if (!crypter.Encrypt(mnemonicBytes, vchEncryptedMnemonic)) {
+            memory_cleanse(vMasterKeyVec.data(), vMasterKeyVec.size());
+            memory_cleanse(mnemonicBytes.data(), mnemonicBytes.size());
+            return false;
+        }
+
+        // LP-7 (wallet-Inv-2): authenticate the mnemonic ciphertext (encrypt-then-MAC)
+        // LP-7 (round 3): route through ComputeRecordMAC — at-rest mnemonic record, always v7.
+        if (!ComputeRecordMAC(crypter, vchEncryptedMnemonic, vchMnemonicMAC)) {
             memory_cleanse(vMasterKeyVec.data(), vMasterKeyVec.size());
             memory_cleanse(mnemonicBytes.data(), mnemonicBytes.size());
             return false;
@@ -4964,6 +6104,10 @@ bool CWallet::EncryptMnemonic(const std::string& mnemonic) {
             return false;
         }
 
+        // Obfuscation-only (unencrypted wallet): no authenticated MAC. Clear any
+        // stale MAC so it is never mistaken for an authenticated record.
+        vchMnemonicMAC.clear();
+
         memory_cleanse(tempKey.data(), tempKey.size());
     }
 
@@ -4993,6 +6137,15 @@ bool CWallet::DecryptMnemonic(std::string& mnemonic) const {
         if (!crypter.SetKey(vMasterKeyVec, vchMnemonicIV)) {
             memory_cleanse(vMasterKeyVec.data(), vMasterKeyVec.size());
             return false;
+        }
+
+        // LP-7 (HIGH-2): authenticate-before-decrypt via the ONE centralized gate.
+        // Mnemonic consumer. Empty MAC on a v7 wallet is rejected; legacy v3-v6
+        // (no mnemonic MAC) takes the unauthenticated legacy path; a present MAC
+        // is verified with the version-correct keying.
+        if (!VerifyRecordMAC(crypter, vchEncryptedMnemonic, vchMnemonicMAC)) {
+            memory_cleanse(vMasterKeyVec.data(), vMasterKeyVec.size());
+            return false;  // empty MAC on v7, or MAC verification failed
         }
 
         if (!crypter.Decrypt(vchEncryptedMnemonic, decrypted)) {
@@ -5119,6 +6272,14 @@ bool CWallet::EncryptMIKPrivKey() {
         return false;
     }
 
+    // LP-7 (wallet-Inv-2): authenticate the MIK ciphertext (encrypt-then-MAC)
+    // LP-7 (round 3): route through ComputeRecordMAC — at-rest MIK record, always v7.
+    if (!ComputeRecordMAC(crypter, vchEncryptedMIKPrivKey, vchMIKPrivKeyMAC)) {
+        memory_cleanse(vMasterKeyVec.data(), vMasterKeyVec.size());
+        memory_cleanse(plaintext.data(), plaintext.size());
+        return false;
+    }
+
     memory_cleanse(vMasterKeyVec.data(), vMasterKeyVec.size());
     memory_cleanse(plaintext.data(), plaintext.size());
 
@@ -5148,6 +6309,16 @@ bool CWallet::DecryptMIKPrivKey(std::vector<uint8_t, SecureAllocator<uint8_t>>& 
 
     if (!crypter.SetKey(vMasterKeyVec, iv)) {
         std::cerr << "[WALLET] DecryptMIKPrivKey: SetKey failed" << std::endl;
+        memory_cleanse(vMasterKeyVec.data(), vMasterKeyVec.size());
+        return false;
+    }
+
+    // LP-7 (HIGH-2): authenticate-before-decrypt via the ONE centralized gate.
+    // MIK-private-key consumer. Empty MAC on a v7 wallet is rejected; legacy v3-v6
+    // (no MIK MAC) takes the unauthenticated legacy path; a present MAC is
+    // verified with the version-correct keying.
+    if (!VerifyRecordMAC(crypter, vchEncryptedMIKPrivKey, vchMIKPrivKeyMAC)) {
+        std::cerr << "[WALLET] DecryptMIKPrivKey: MAC verification failed or missing on v7 wallet" << std::endl;
         memory_cleanse(vMasterKeyVec.data(), vMasterKeyVec.size());
         return false;
     }

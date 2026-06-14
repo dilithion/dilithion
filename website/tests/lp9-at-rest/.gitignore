@@ -1,0 +1,7 @@
+# Downloaded-on-first-run CDN fixtures (pinned bytes; fetched from jsDelivr)
+sha3.build.min.js
+ethers.umd.min.js
+node_modules/
+package.json
+package-lock.json
+run.out
