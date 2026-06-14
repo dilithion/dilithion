@@ -7007,21 +7007,10 @@ load_genesis_block:  // Bug #29: Label for automatic retry after blockchain wipe
             // The ONLY benign (non-fatal) case is: NO key file, no
             // --generate-seed-key, AND no --require-seed-key-encryption — the
             // relay simply doesn't attest.
-            bool keyFileExists = false;
-            {
-                // LP-13 (extreview HIGH): test PRESENCE, not readability. An
-                // ifstream::good() on a present-but-UNREADABLE key returns false,
-                // misclassifying a genuine key as absent and letting the node run
-                // WITHOUT attestation silently — defeating the M-1 fail-loud
-                // guarantee. std::filesystem::exists() stats the path, so a
-                // present-but-unreadable file still reports as existing.
-                std::error_code ec;
-                keyFileExists = std::filesystem::exists(
-                    dataDir + "/" + Attestation::SEED_KEY_FILENAME, ec);
-                // A stat error (ec set) means we cannot prove ABSENCE; fail closed
-                // (treat as present) so an unstattable-but-genuine key still aborts.
-                if (ec) keyFileExists = true;
-            }
+            // LP-13 (extreview HIGH): PRESENCE test (stat), not ifstream::good()
+            // readability — a present-but-unreadable key must still be treated as
+            // present so genuineFailure fires (fail loud, M-1). See SeedKeyFilePresent.
+            bool keyFileExists = Attestation::SeedKeyFilePresent(dataDir);
             bool attestOk = seedAttestKey.LoadOrGenerate(
                 dataDir, config.generate_seed_key, config.require_seed_key_encryption);
             if (!attestOk) {

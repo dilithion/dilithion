@@ -84,6 +84,17 @@ constexpr const char* SEED_KEY_PASSPHRASE_ENV = "DILITHION_SEED_KEY_PASSPHRASE";
  *  test suite can verify the wipe; not intended for general use. */
 void CleanseSeedKeyBuffer(std::vector<uint8_t>& buf);
 
+/** LP-13 (extreview HIGH): true if the seed attestation key FILE is present in
+ *  dataDir, testing PRESENCE (stat) — NOT readability. The earlier node glue
+ *  used std::ifstream::good(), which returns false for a present-but-UNREADABLE
+ *  key, misclassifying a genuine key as absent and letting the node run WITHOUT
+ *  attestation (defeating the M-1 fail-loud guarantee). std::filesystem::exists()
+ *  stats the path, so a present-but-unreadable file still reports present.
+ *  Fail-closed: an indeterminate stat (e.g. EACCES traversing dataDir) also
+ *  reports present, so an unstattable-but-genuine key still drives fail-loud
+ *  startup. Both node binaries call this to classify a LoadOrGenerate failure. */
+bool SeedKeyFilePresent(const std::string& dataDir);
+
 /** LP-13 H-2 (atomic-save) TEST SEAM. When set to a non-null function, Save()
  *  invokes it immediately after the temp file has been fully written + fsynced
  *  but BEFORE the atomic rename over the target. If the hook returns true, Save

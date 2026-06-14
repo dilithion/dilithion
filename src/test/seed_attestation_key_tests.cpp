@@ -517,6 +517,50 @@ static void TestPosixPerms() {
 }
 #endif
 
+// LP-13 (extreview HIGH): SeedKeyFilePresent must test PRESENCE, not readability.
+// The earlier node glue used ifstream::good(), which is FALSE for a present-but-
+// UNREADABLE key — so a genuine key was misclassified as absent and the node ran
+// WITHOUT attestation (defeating M-1 fail-loud). This pins the distinction:
+//   - absent           => NOT present
+//   - readable file    => present
+//   - unreadable file  => STILL present (the fix), while ifstream::good()==false
+// The unreadable leg needs a uid that cannot bypass DAC: under root (e.g. the CI
+// build box) chmod-000 does NOT make a file unreadable, so the probe self-detects
+// that case and reports [info]/SKIP rather than a false pass (M-4 precedent). Run
+// the binary as a non-root user (e.g. `sudo -u nobody`) to exercise the real
+// mutation-killing assertion. Mutation self-check: reverting SeedKeyFilePresent to
+// ifstream::good() fails the unreadable assertion under a non-root run.
+static void TestSeedKeyFilePresentDetectsUnreadable() {
+    std::cout << "[Test] extreview-HIGH: present-but-unreadable key reports PRESENT" << std::endl;
+    std::string dir = MakeTempDir();
+
+    CHECK(!SeedKeyFilePresent(dir), "empty dir => key file NOT present");
+
+    SetPass(nullptr);
+    CSeedAttestationKey k1;
+    CHECK(k1.Generate(), "generate key");
+    CHECK(k1.Save(dir), "save key file");
+    CHECK(SeedKeyFilePresent(dir), "readable key file => present");
+
+#ifndef _WIN32
+    if (chmod(KeyPath(dir).c_str(), 0) == 0) {
+        std::ifstream probe(KeyPath(dir), std::ios::binary);
+        if (probe.good()) {
+            // Caller bypasses DAC (root): cannot induce unreadable. Honest SKIP.
+            std::cout << "  [info] cannot revoke read (running as root?); "
+                         "unreadable-distinction assertion skipped — run as non-root to exercise it"
+                      << std::endl;
+        } else {
+            CHECK(SeedKeyFilePresent(dir),
+                  "present-but-UNREADABLE key reports PRESENT (the fix; ifstream::good()==false here)");
+        }
+        chmod(KeyPath(dir).c_str(), S_IRUSR | S_IWUSR);  // restore for clean temp teardown
+    } else {
+        std::cout << "  [info] chmod 000 failed; unreadable leg skipped" << std::endl;
+    }
+#endif
+}
+
 int main() {
     std::cout << "=== LP-13 seed_attestation_key_tests ===" << std::endl;
 
@@ -532,6 +576,7 @@ int main() {
     TestFsyncFailureIsFatalBeforeRename();   // B-1 (THE load-bearing test)
     TestSaveFailMakesLoadOrGenerateFail();   // M-2
     TestRequireEncryptionPolicy();           // H-1
+    TestSeedKeyFilePresentDetectsUnreadable(); // extreview HIGH (presence vs readability)
 #ifndef _WIN32
     TestLoadRepairsPerms();                  // M-3
     TestFailClosedPerms();                   // M-4 (best-effort/informational)

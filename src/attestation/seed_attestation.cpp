@@ -10,6 +10,7 @@
 #include <cerrno>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>  // LP-13 (extreview HIGH): presence test, not readability
 #include <fstream>
 #include <iostream>
 #include <sstream>
@@ -100,6 +101,16 @@ static bool KeyFileIsPermissive(const std::string& path) {
     return (st.st_mode & (S_IRWXG | S_IRWXO)) != 0;   // any group/other bit set
 }
 #endif
+
+// LP-13 (extreview HIGH): presence test (stat), not readability. See header.
+bool SeedKeyFilePresent(const std::string& dataDir) {
+    std::error_code ec;
+    bool present = std::filesystem::exists(dataDir + "/" + SEED_KEY_FILENAME, ec);
+    // A stat error (ec set) means we cannot prove ABSENCE; fail closed (report
+    // present) so an unstattable-but-genuine key still drives fail-loud startup.
+    if (ec) return true;
+    return present;
+}
 
 // LP-13 H-2 atomic-save test seam (see header). nullptr in production.
 bool (*g_seedKeySaveFailpoint)() = nullptr;
