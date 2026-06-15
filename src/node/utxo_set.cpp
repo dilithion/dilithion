@@ -12,6 +12,51 @@
 #include <iostream>
 #include <atomic>
 
+// v4.4 (fix/integrity-monitor-self-heal): classify a non-ok leveldb::Status
+// from an undo-record Get() into the (cause, transient) taxonomy the periodic
+// ChainstateIntegrityMonitor routes on. The monitor uses the transient flag to
+// decide whether to TOLERATE (keep running, re-check next cycle) or to
+// confirm-and-rebuild (marker + shutdown). Extracted to namespace scope and
+// declared in the header so the safety-critical mapping is unit-testable with
+// synthetic leveldb::Status values (see chainstate_integrity_tests.cpp Test 9b).
+//
+//   * IsCorruption() -> transient=false. LevelDB's signal for REAL on-disk data
+//     damage: a failed SST block CRC32C checksum, a malformed block handle, or a
+//     corrupt manifest/log. It REPRODUCES on every read (that is the whole point
+//     of the checksum), so it survives the monitor's retry loop. Classifying it
+//     transient would route a genuinely-corrupt node into the tolerate branch
+//     and mask real corruption FOREVER (the inverse, more-dangerous failure
+//     mode). It must go through the cs_main revalidation gate -> marker ->
+//     shutdown -> rebuild, exactly like the application-level checksum_mismatch
+//     / size_invalid cases.
+//
+//   * IsIOError() -> transient=true. A recoverable storage-layer blip
+//     (open-file-handle exhaustion, an EIO hiccup, a momentary AV file lock on
+//     Windows). May clear across the retry loop; we must not wipe-and-resync a
+//     healthy chain because of a flaky disk. (A *persistent* IsIOError that
+//     never clears is still tolerated with a loud stderr warning — a known,
+//     accepted residual: limp-with-warning beats bricking on a transient blip.)
+//
+//   * else (IsNotFound and any other unexpected non-ok status) -> "missing" /
+//     non-transient. A genuinely-absent key on an active-chain block is real
+//     corruption; anything unexpected fails safe toward the corruption gate
+//     (shutdown) rather than tolerate.
+// v4.4 test-only fault-injection hook (see utxo_set.h). Production leaves null.
+std::function<leveldb::Status()> g_undo_fetch_fault_injector = nullptr;
+
+void ClassifyUndoFetchStatus(const leveldb::Status& st, UndoIntegrityFailure& failure_out) {
+    if (st.IsCorruption()) {
+        failure_out.cause = "io_corruption";
+        failure_out.transient = false;
+    } else if (st.IsIOError()) {
+        failure_out.cause = "io_error";
+        failure_out.transient = true;
+    } else {
+        failure_out.cause = "missing";
+        failure_out.transient = false;
+    }
+}
+
 namespace {
 
 // v4.4 trap-7 (storage-of-record) fix: single canonical undo-checksum verifier.
@@ -53,24 +98,19 @@ bool FetchAndVerifyUndo(leveldb::DB* db,
     undoKey.append(reinterpret_cast<const char*>(blockHash.data), 32);
 
     std::string undoValue;
-    leveldb::Status st = db->Get(leveldb::ReadOptions(), undoKey, &undoValue);
+    // v4.4 test-only fault injection (g_undo_fetch_fault_injector is null in
+    // production). A non-ok injected Status simulates a storage-layer fault
+    // (IsCorruption / IsIOError) that real on-disk data can't easily produce, so
+    // the monitor's retry/tolerate/confirm routing is exercised end-to-end.
+    leveldb::Status st = g_undo_fetch_fault_injector ? g_undo_fetch_fault_injector()
+                                                     : leveldb::Status::OK();
+    if (st.ok()) {
+        st = db->Get(leveldb::ReadOptions(), undoKey, &undoValue);
+    }
     if (!st.ok()) {
         failure_out.height = height;
         failure_out.blockHash = blockHash;
-        // Distinguish a TRANSIENT storage-layer fault (IsIOError / IsCorruption
-        // — flaky disk, fsync lag, AV file lock on Windows) from a clean
-        // IsNotFound() (key genuinely absent). Only the latter is real
-        // "missing undo data" corruption. The periodic monitor uses the
-        // transient flag to avoid self-bricking a healthy node on a recoverable
-        // read fault. A genuinely-missing key on an active-chain block is real
-        // corruption and still confirms after the monitor's retry loop.
-        if (st.IsIOError() || st.IsCorruption()) {
-            failure_out.cause = "io_error";
-            failure_out.transient = true;
-        } else {
-            failure_out.cause = "missing";
-            failure_out.transient = false;
-        }
+        ClassifyUndoFetchStatus(st, failure_out);
         return false;
     }
     switch (VerifyUndoChecksum(undoValue)) {

@@ -480,6 +480,141 @@ void test_transient_classification_never_masks_real_corruption() {
 }
 
 // =============================================================================
+// Test 9b: classifier unit — the (cause, transient) mapping at the LevelDB-
+// status seam. This is the EXACT line that shipped the BLOCKER: IsCorruption()
+// was bucketed transient=true, so real on-disk corruption would be tolerated
+// forever. A no-op classifier (or one that buckets IsCorruption with IsIOError)
+// MUST fail these asserts. Drives synthetic leveldb::Status values directly —
+// the dangerous direction (IsCorruption) that Test 9 admitted it couldn't reach.
+// =============================================================================
+void test_classify_undo_fetch_status_mapping() {
+    std::cout << "  test_classify_undo_fetch_status_mapping..." << std::flush;
+
+    // IsCorruption() => HARD FAIL. Real on-disk damage reproduces on every read;
+    // it must route to the corruption gate (marker + shutdown), NOT tolerate.
+    {
+        UndoIntegrityFailure f;
+        ClassifyUndoFetchStatus(leveldb::Status::Corruption("bad SST CRC32C"), f);
+        assert(f.transient == false &&
+               "IsCorruption MUST be non-transient (real on-disk corruption, not a blip)");
+        assert(f.cause == "io_corruption" && "IsCorruption => cause 'io_corruption'");
+    }
+
+    // IsIOError() => transient. A recoverable storage blip may clear on retry.
+    {
+        UndoIntegrityFailure f;
+        ClassifyUndoFetchStatus(leveldb::Status::IOError("EIO blip"), f);
+        assert(f.transient == true &&
+               "IsIOError MUST be transient (recoverable storage-layer blip)");
+        assert(f.cause == "io_error" && "IsIOError => cause 'io_error'");
+    }
+
+    // NotFound / any other non-ok status => fail-safe non-transient "missing".
+    {
+        UndoIntegrityFailure f;
+        ClassifyUndoFetchStatus(leveldb::Status::NotFound("absent key"), f);
+        assert(f.transient == false &&
+               "a genuinely-absent key must be non-transient ('missing')");
+        assert(f.cause == "missing" && "IsNotFound => cause 'missing'");
+    }
+
+    std::cout << " OK\n";
+}
+
+// =============================================================================
+// Test 9c: end-to-end monitor routing through the undo-fetch fault injector.
+// Proves the DANGEROUS direction the BLOCKER was about — a persistent
+// IsCorruption is NEVER tolerated; it confirms across retries -> marker +
+// shutdown. And the SAFE-but-tolerant direction — a transient IsIOError that
+// clears on retry IS tolerated (node keeps running, no marker). A no-op
+// classifier (IsCorruption mislabelled transient) fails the persistent-
+// corruption case: it would take the tolerate branch, leave running=true, and
+// write no marker.
+// =============================================================================
+void test_monitor_routes_injected_faults() {
+    std::cout << "  test_monitor_routes_injected_faults..." << std::flush;
+
+    // --- Case A: persistent IsCorruption -> shut down WITH marker (NOT tolerated).
+    {
+        TempDir td("inject-corruption");
+        CUTXOSet utxo;
+        assert(utxo.Open(td.str(), true));
+        std::vector<std::unique_ptr<CBlockIndex>> chain;
+        CBlockIndex* tip = BuildSyntheticChain(50, chain);
+        WriteValidUndoForChain(utxo, chain);  // chain is otherwise CLEAN on disk
+        CChainState cs;
+        cs.SetUTXOSet(&utxo);
+        cs.SetTipForTest(tip);
+
+        // Inject a persistent (every-call) IsCorruption at the fetch seam.
+        int corruptionCalls = 0;
+        g_undo_fetch_fault_injector = [&corruptionCalls]() {
+            ++corruptionCalls;
+            return leveldb::Status::Corruption("persistent SST CRC failure");
+        };
+
+        std::atomic<bool> running{true};
+        Dilithion::ChainstateIntegrityMonitor monitor(cs, utxo, td.str(), &running);
+        monitor.SetRevalidateBackoffForTesting(std::chrono::milliseconds::zero());
+        bool cyclePass = monitor.RunOneCycleForTesting();
+        g_undo_fetch_fault_injector = nullptr;  // clear before asserts/destructors
+
+        assert(!cyclePass &&
+               "persistent IsCorruption must NOT pass the cycle (real corruption)");
+        assert(!running.load() &&
+               "persistent IsCorruption MUST flip running=false (shutdown), NOT tolerate");
+        auto markerPath = std::filesystem::path(td.str()) / "auto_rebuild";
+        assert(std::filesystem::exists(markerPath) &&
+               "persistent IsCorruption MUST write the auto_rebuild marker");
+        assert(corruptionCalls >= 1 && "injector must have been consulted");
+    }
+
+    // --- Case B: transient IsIOError that CLEARS on retry -> tolerated (running).
+    {
+        TempDir td("inject-ioerror-clears");
+        CUTXOSet utxo;
+        assert(utxo.Open(td.str(), true));
+        std::vector<std::unique_ptr<CBlockIndex>> chain;
+        CBlockIndex* tip = BuildSyntheticChain(50, chain);
+        WriteValidUndoForChain(utxo, chain);  // clean on disk
+        CChainState cs;
+        cs.SetUTXOSet(&utxo);
+        cs.SetTipForTest(tip);
+
+        // Deterministic one-shot: fail the very FIRST fetch with IsIOError, then
+        // clear. The walk short-circuits on first failure, so attempt 1 fails
+        // (transient IOError); the post-backoff (zero) retry walk reads the
+        // healthy on-disk data and passes -> the fault is tolerated, no marker.
+        std::atomic<int> calls{0};
+        g_undo_fetch_fault_injector = [&calls]() {
+            if (calls.fetch_add(1) == 0) {
+                return leveldb::Status::IOError("transient EIO (one-shot)");
+            }
+            return leveldb::Status::OK();
+        };
+
+        std::atomic<bool> running{true};
+        Dilithion::ChainstateIntegrityMonitor monitor(cs, utxo, td.str(), &running);
+        monitor.SetRevalidateBackoffForTesting(std::chrono::milliseconds::zero());
+        bool cyclePass = monitor.RunOneCycleForTesting();
+        g_undo_fetch_fault_injector = nullptr;
+
+        assert(calls.load() >= 2 &&
+               "injector must have been consulted on attempt 1 (fail) and a retry");
+        assert(cyclePass &&
+               "transient IsIOError that clears on retry MUST pass (tolerated)");
+        assert(running.load() &&
+               "transient IsIOError that clears MUST keep running (no shutdown)");
+        auto markerPath = std::filesystem::path(td.str()) / "auto_rebuild";
+        assert(!std::filesystem::exists(markerPath) &&
+               "no marker for a transient fault that cleared on retry");
+        (void)tip;
+    }
+
+    std::cout << " OK\n";
+}
+
+// =============================================================================
 // Test 10: retry loop confirms reproducible corruption only after exhausting
 // all attempts (with zeroed backoff) — and a clean chain still passes through
 // the multi-attempt loop with no false positive.
@@ -553,9 +688,11 @@ int main() {
 
         std::cout << "[self-heal / transient tolerance]" << std::endl;
         test_transient_classification_never_masks_real_corruption();
+        test_classify_undo_fetch_status_mapping();
+        test_monitor_routes_injected_faults();
         test_retry_loop_confirms_reproducible_corruption();
 
-        std::cout << "\n=== All 10 tests passed ===\n" << std::endl;
+        std::cout << "\n=== All 12 tests passed ===\n" << std::endl;
         return 0;
     } catch (const std::exception& e) {
         std::cerr << "Test failed: " << e.what() << std::endl;
