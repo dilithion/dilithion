@@ -1055,6 +1055,12 @@ bool CWallet::NeedsSeedMigration() const {
     return masterKey.IsValid() && m_fNeedsSeedMigration;
 }
 
+bool CWallet::MigrationDeferredForPassphrase() const {
+    std::lock_guard<std::mutex> lock(cs_wallet);
+    // Only meaningful while a migration is still pending on an encrypted wallet.
+    return masterKey.IsValid() && m_fNeedsSeedMigration && m_migrationDeferredPassphrase;
+}
+
 // VULN-002 FIX: Helper to check if unlock is still valid (not expired)
 // Assumes caller holds cs_wallet lock
 // BUG #74 FIX: Internal version that assumes caller already holds cs_wallet
@@ -1208,7 +1214,8 @@ bool CWallet::LockUnlocked() {
     return true;
 }
 
-bool CWallet::Unlock(const std::string& passphrase, int64_t timeout) {
+bool CWallet::Unlock(const std::string& passphrase, int64_t timeout,
+                     const std::string& bip39Passphrase) {
     std::lock_guard<std::mutex> lock(cs_wallet);
 
     if (!masterKey.IsValid()) {
@@ -1330,16 +1337,29 @@ bool CWallet::Unlock(const std::string& passphrase, int64_t timeout) {
         // on-disk-plaintext state keeps surfacing. Invariant: NeedsSeedMigration() is
         // true exactly while a plaintext seed is still at rest on disk.
         bool migrationPersisted = false;
-        if (macOk && MigrateToEncryptedSeedV7Unlocked(&migrationPersisted) && migrationPersisted) {
+        if (macOk && MigrateToEncryptedSeedV7Unlocked(&migrationPersisted, bip39Passphrase) && migrationPersisted) {
             m_fNeedsSeedMigration = false;
+            m_migrationDeferredPassphrase = false;  // F1 r3: verified + migrated
             m_loadedFileVersion = WALLET_FILE_VERSION_7;
             std::cout << "[Wallet] LP-7: migrated wallet to encrypted-seed v7 format" << std::endl;
         } else {
             // Restore the legacy master MAC so the in-memory state stays consistent
             // with the untouched on-disk legacy file. Reached when the MAC recompute
             // failed, the migration could not persist (autosave off → flag stays
-            // armed, surfaced), or the save failed (retry next unlock).
+            // armed, surfaced), or the identity check could not verify the mnemonic
+            // (BIP39-passphrase wallet with no/wrong passphrase supplied — retry by
+            // re-running unlock with the correct "bip39passphrase").
             masterKey.vchMAC = snap_masterMAC;
+            // F1 r3: surface the passphrase-required state ONLY when migration was
+            // genuinely ATTEMPTED (autosave on + wallet file present) and failed — i.e.
+            // the identity check could not verify the mnemonic. We exclude the
+            // autosave-off / no-file early-return (a node-config issue, NOT a
+            // passphrase problem) so the UI does not falsely prompt for a BIP39
+            // passphrase. NeedsSeedMigration() still surfaces the general migration-
+            // pending state in those cases.
+            if (macOk && fIsHDWallet && m_autoSave && !m_walletFile.empty()) {
+                m_migrationDeferredPassphrase = true;
+            }
             std::cerr << "[Wallet] LP-7: seed migration to v7 not persisted; "
                          "original wallet file left unchanged, will retry on next unlock" << std::endl;
         }
@@ -1349,7 +1369,8 @@ bool CWallet::Unlock(const std::string& passphrase, int64_t timeout) {
     return true;
 }
 
-bool CWallet::EncryptWallet(const std::string& passphrase) {
+bool CWallet::EncryptWallet(const std::string& passphrase,
+                            const std::string& bip39Passphrase) {
     std::lock_guard<std::mutex> lock(cs_wallet);
 
     if (masterKey.IsValid()) {
@@ -1625,37 +1646,65 @@ bool CWallet::EncryptWallet(const std::string& passphrase) {
             // decrypt), we'd permanently replace the backup phrase with the wrong one.
             // Apply the SAME identity guard: re-derive the master seed from the recovered
             // mnemonic and require an exact match to the authoritative in-memory
-            // hdMasterKey.seed BEFORE re-encrypting. On any mismatch (valid-but-wrong, or
-            // a non-re-derivable BIP39-passphrase wallet) ABORT-AND-PRESERVE via rollback
-            // so the original mnemonic ciphertext is never discarded.
-            if (!MnemonicReDerivesSeed(mnemonicStr)) {
+            // hdMasterKey.seed BEFORE re-encrypting.
+            //
+            // F1 round 3 (Cursor HIGH): EncryptWallet must NEVER FAIL because the
+            // mnemonic can't be verified. The previous code rolled back + returned false
+            // here — which permanently stranded BIP39-passphrase wallets (they could
+            // never encrypt at all). Instead:
+            //   verified (empty passphrase OR supplied bip39Passphrase)
+            //       → re-encrypt under master, discard the original (safe: PROVEN identity).
+            //   NOT verified (passphrase wallet w/o passphrase, or valid-but-wrong phrase)
+            //       → DEFER-AND-PRESERVE: leave vchEncryptedMnemonic/IV/MAC byte-for-byte
+            //         intact (do NOT call EncryptMnemonic), still encrypt the seed + keys
+            //         below, arm m_fNeedsSeedMigration so the next unlock retries, and
+            //         SUCCEED with a distinct "passphrase required" diagnostic.
+            // INVARIANT (absolute): the original mnemonic ciphertext is discarded ONLY
+            // when the recovered phrase PROVABLY re-derives this wallet's seed.
+            bool mnemonicVerified = MnemonicReDerivesSeed(mnemonicStr, "");
+            if (!mnemonicVerified && !bip39Passphrase.empty()) {
+                mnemonicVerified = MnemonicReDerivesSeed(mnemonicStr, bip39Passphrase);
+            }
+
+            if (mnemonicVerified) {
+                // Re-encrypt under master key (masterKey.IsValid() is now true → master
+                // branch → also computes the mnemonic MAC). This overwrites the original
+                // obfuscation-key ciphertext — safe, identity is PROVEN.
+                bool ok = EncryptMnemonic(mnemonicStr);
                 if (!mnemonicStr.empty()) {
                     memory_cleanse(&mnemonicStr[0], mnemonicStr.size());
                 }
-                memory_cleanse(vMasterKeyPlain.data(), vMasterKeyPlain.size());
-                memory_cleanse(derivedKey.data(), derivedKey.size());
-                std::cerr << "[Wallet] LP-7 CRITICAL: wallet encryption ABORTED — the "
-                             "recovered mnemonic does not re-derive this wallet's seed "
-                             "(valid-but-wrong BIP39 phrase, or an unrecoverable BIP39 "
-                             "passphrase). The original seed ciphertext was NOT modified; "
-                             "encryption was rolled back to preserve the backup phrase."
-                          << std::endl;
-                rollback();
-                return false;
-            }
-
-            // Re-encrypt under master key (masterKey.IsValid() is now true → master
-            // branch → also computes the mnemonic MAC).
-            bool ok = EncryptMnemonic(mnemonicStr);
-            if (!mnemonicStr.empty()) {
-                memory_cleanse(&mnemonicStr[0], mnemonicStr.size());
-            }
-            if (!ok) {
-                memory_cleanse(vMasterKeyPlain.data(), vMasterKeyPlain.size());
-                memory_cleanse(derivedKey.data(), derivedKey.size());
-                std::cerr << "[Wallet] CRITICAL: failed to re-encrypt mnemonic" << std::endl;
-                rollback();
-                return false;
+                if (!ok) {
+                    memory_cleanse(vMasterKeyPlain.data(), vMasterKeyPlain.size());
+                    memory_cleanse(derivedKey.data(), derivedKey.size());
+                    std::cerr << "[Wallet] CRITICAL: failed to re-encrypt mnemonic" << std::endl;
+                    rollback();
+                    return false;
+                }
+            } else {
+                // DEFER-AND-PRESERVE. Do NOT touch vchEncryptedMnemonic/IV/MAC — the
+                // original obfuscation-key ciphertext stays byte-for-byte intact and
+                // remains recoverable (the seed is encrypted below but re-derived into
+                // hdMasterKey.seed on every unlock, so the migration path can re-derive
+                // the obfuscation key and read it). Arm the migration so a later unlock
+                // with the correct BIP39 passphrase completes the v7 re-encryption.
+                if (!mnemonicStr.empty()) {
+                    memory_cleanse(&mnemonicStr[0], mnemonicStr.size());
+                }
+                m_fNeedsSeedMigration = true;
+                m_migrationDeferredPassphrase = true;
+                std::cerr << "[Wallet] LP-7: wallet ENCRYPTED, mnemonic migration "
+                             "DEFERRED — the recovered mnemonic does not re-derive this "
+                             "wallet's seed under the empty passphrase"
+                          << (bip39Passphrase.empty()
+                                  ? " (no BIP39 passphrase was supplied)"
+                                  : " or the supplied BIP39 passphrase")
+                          << ". This is EXPECTED for a BIP39-passphrase wallet. The wallet "
+                             "and all keys ARE encrypted and the ORIGINAL backup phrase "
+                             "ciphertext was PRESERVED unchanged. Re-run unlock "
+                             "(walletpassphrase) with the correct \"bip39passphrase\" to "
+                             "complete migration. This is NOT corruption." << std::endl;
+                // Fall through to encrypt the HD seed + remaining state and SUCCEED.
             }
         }
 
@@ -2068,6 +2117,10 @@ bool CWallet::Load(const std::string& filename) {
     // LP-7: true if this is an encrypted wallet whose HD seed is plaintext at rest
     // (the pre-v7 bug) and therefore needs migration on next unlock.
     bool temp_fNeedsSeedMigration = false;
+    // LP-7 (F1 round 3): set when a v7 ENCRYPTED wallet carries a present mnemonic
+    // ciphertext with an EMPTY MAC — the defer-and-preserve (BIP39-passphrase) state.
+    // Combined with isEncrypted after the HD block is parsed to arm migration.
+    bool mnemonicNeedsMigration = false;
     uint32_t temp_nHDAccountIndex = 0;
     uint32_t temp_nHDExternalChainIndex = 0;
     uint32_t temp_nHDInternalChainIndex = 0;
@@ -2108,13 +2161,27 @@ bool CWallet::Load(const std::string& filename) {
                 if (!file.good()) return false;
                 if (mnMacLen > 64) return false;  // HMAC-SHA3-512 is 64 bytes
                 // LP-7 (HIGH-2 item 3, load-symmetry): on a v7 ENCRYPTED wallet a
-                // present mnemonic ciphertext MUST carry a non-empty MAC (it was
-                // master-key-encrypted-then-MAC'd). An empty MAC here is corrupt —
-                // reject at load to match master/per-address/HD-master. (An
-                // UNencrypted v7 wallet legitimately writes mnMacLen==0 because the
-                // mnemonic is under the obfuscation key, so only enforce when the
-                // master key is valid.)
-                if (mnMacLen == 0 && temp_masterKey.IsValid()) return false;
+                // present mnemonic ciphertext MUST carry a non-empty MAC IF it was
+                // master-key-encrypted-then-MAC'd. (An UNencrypted v7 wallet
+                // legitimately writes mnMacLen==0 because the mnemonic is under the
+                // obfuscation key.)
+                //
+                // F1 round 3 EXCEPTION: a BIP39-passphrase wallet encrypted via the
+                // defer-and-preserve path is a v7 ENCRYPTED wallet whose mnemonic was
+                // intentionally LEFT under the obfuscation key (empty MAC), pending the
+                // user supplying the passphrase to complete migration. That is a
+                // legitimate state, NOT corruption. We cannot tell the two apart from
+                // the mnemonic record alone, so DEFER the decision: capture the
+                // empty-MAC-on-encrypted condition here and, after the HD-master block
+                // is parsed, ARM migration for it (mnemonicNeedsMigration). The
+                // downstream migration is fail-closed — it re-derives + identity-checks
+                // the mnemonic before any rewrite, so a genuinely corrupt/truncated
+                // mnemonic simply fails the identity check and defers (preserving),
+                // never destructively rewriting. This keeps the wallet LOADABLE instead
+                // of bricking it on a hard reject.
+                if (mnMacLen == 0 && temp_masterKey.IsValid()) {
+                    mnemonicNeedsMigration = true;
+                }
                 if (mnMacLen > 0) {
                     temp_vchMnemonicMAC.resize(mnMacLen);
                     file.read(reinterpret_cast<char*>(temp_vchMnemonicMAC.data()), mnMacLen);
@@ -2237,6 +2304,17 @@ bool CWallet::Load(const std::string& filename) {
             if (isEncrypted) {
                 temp_fNeedsSeedMigration = true;
             }
+        }
+
+        // LP-7 (F1 round 3): a v7 ENCRYPTED wallet whose mnemonic record had an empty
+        // MAC (mnemonicNeedsMigration) is the defer-and-preserve state — the mnemonic
+        // is still under the obfuscation key (recoverable from the seed at unlock) and
+        // migration must complete once the BIP39 passphrase is supplied. Arm it here.
+        // (Note the seed itself may already be ENCRYPTED in this state, so the
+        // plaintext-seed detection above does not catch it.) Only meaningful for an
+        // encrypted wallet — isEncrypted is the master-key gate.
+        if (mnemonicNeedsMigration && isEncrypted) {
+            temp_fNeedsSeedMigration = true;
         }
 
         // Read HD chain state
@@ -2817,6 +2895,11 @@ bool CWallet::Load(const std::string& filename) {
         // on next unlock.
         m_loadedFileVersion = version;
         m_fNeedsSeedMigration = temp_fNeedsSeedMigration;
+        // LP-7 (F1 round 3): if migration was armed specifically because a v7 ENCRYPTED
+        // wallet carried an empty-MAC (obfuscation-key) mnemonic, this is the
+        // defer-and-preserve / BIP39-passphrase-required state. Surface it so the UI can
+        // prompt for the passphrase rather than presenting the wallet as fully migrated.
+        m_migrationDeferredPassphrase = (mnemonicNeedsMigration && isEncrypted);
 
         m_walletFile = filename;  // Set wallet file path only on successful load
 
@@ -5653,14 +5736,24 @@ bool CWallet::DeriveAndCacheHDAddress(const CHDKeyPath& path) {
 //     in-memory HD state to its pre-migration plaintext-seed form so the wallet
 //     stays consistent with the still-on-disk legacy file, and return false. The
 //     caller does not fail the unlock; migration retries next unlock.
-bool CWallet::MigrateToEncryptedSeedV7Unlocked(bool* persistedToDisk) {
+bool CWallet::MigrateToEncryptedSeedV7Unlocked(bool* persistedToDisk,
+                                               const std::string& bip39Passphrase) {
     if (persistedToDisk) *persistedToDisk = false;
     if (!masterKey.IsValid() || !fWalletUnlocked || !fIsHDWallet) {
         return false;
     }
-    // Defensive: only migrate when the seed is actually plaintext.
-    if (fHDMasterKeyEncrypted) {
-        return false;
+    // F1 round 3: two migration shapes are handled here.
+    //   (a) seed PLAINTEXT at rest (the original LP-7 bug) — re-encrypt the mnemonic
+    //       AND the seed, rewrite at v7.
+    //   (b) seed ALREADY ENCRYPTED but mnemonic still under the obfuscation key (empty
+    //       MAC) — the defer-and-preserve / BIP39-passphrase state produced by the
+    //       round-3 EncryptWallet. Only the MNEMONIC needs re-encrypting; the seed is
+    //       already safe. seedAlreadyEncrypted gates the EncryptHDMasterKey step below.
+    // Any OTHER fully-migrated state (encrypted seed + non-empty mnemonic MAC) is
+    // nothing to do — refuse so we never rewrite a clean v7 wallet.
+    const bool seedAlreadyEncrypted = fHDMasterKeyEncrypted;
+    if (seedAlreadyEncrypted && !vchMnemonicMAC.empty()) {
+        return false;  // already fully migrated — nothing to do
     }
     // Cursor M1: migration is only meaningful if we can PERSIST the migrated v7
     // (no-plaintext) file. If autosave is off / no wallet file, an in-memory-only
@@ -5736,17 +5829,24 @@ bool CWallet::MigrateToEncryptedSeedV7Unlocked(bool* persistedToDisk) {
         bool decOk = false;
 
         // Primary case (legacy HD-first wallet): mnemonic under the obfuscation key
-        // derived from the still-plaintext seed.
+        // derived from the seed. F1 round 3: use the LIVE seed via DecryptHDMasterKey,
+        // NOT hdMasterKey.seed directly — in the defer-and-preserve (seed-already-
+        // encrypted) state that slot is scrubbed and the seed lives in the cache /
+        // ciphertext. DecryptHDMasterKey returns the right value in both states.
         {
-            std::vector<uint8_t> obfKey(WALLET_CRYPTO_KEY_SIZE);
-            std::vector<uint8_t> hdSeed(hdMasterKey.seed, hdMasterKey.seed + 32);
-            DeriveEncryptionKey(hdSeed, "mnemonic", obfKey);
-            memory_cleanse(hdSeed.data(), hdSeed.size());
+            CHDExtendedKey live;
+            if (DecryptHDMasterKey(live)) {
+                std::vector<uint8_t> obfKey(WALLET_CRYPTO_KEY_SIZE);
+                std::vector<uint8_t> hdSeed(live.seed, live.seed + 32);
+                DeriveEncryptionKey(hdSeed, "mnemonic", obfKey);
+                memory_cleanse(hdSeed.data(), hdSeed.size());
+                live.Wipe();
 
-            CCrypter obfCrypter;
-            decOk = obfCrypter.SetKey(obfKey, ivVec) &&
-                    obfCrypter.Decrypt(vchEncryptedMnemonic, mnemonicPlain);
-            memory_cleanse(obfKey.data(), obfKey.size());
+                CCrypter obfCrypter;
+                decOk = obfCrypter.SetKey(obfKey, ivVec) &&
+                        obfCrypter.Decrypt(vchEncryptedMnemonic, mnemonicPlain);
+                memory_cleanse(obfKey.data(), obfKey.size());
+            }
         }
 
         // Fallback: a legacy wallet whose mnemonic was encrypted under the master
@@ -5796,18 +5896,33 @@ bool CWallet::MigrateToEncryptedSeedV7Unlocked(bool* persistedToDisk) {
         // prior valid state. The migration safely defers and re-arms on the next
         // unlock. INVARIANT (absolute): the original seed ciphertext is NEVER discarded
         // unless the recovered phrase PROVABLY derives this wallet's seed.
-        if (!MnemonicReDerivesSeed(mnemonicStr)) {
+        //
+        // F1 round 3: try the empty passphrase FIRST (the common cohort, behaviour
+        // unchanged), then — only if that fails AND the caller supplied a non-empty
+        // BIP39 passphrase — retry the identity check WITH that passphrase so a
+        // legitimate passphrase wallet can complete migration. Still fail-closed: a
+        // wrong/absent passphrase leaves verified==false → ABORT-AND-PRESERVE.
+        bool verified = MnemonicReDerivesSeed(mnemonicStr, "");
+        if (!verified && !bip39Passphrase.empty()) {
+            verified = MnemonicReDerivesSeed(mnemonicStr, bip39Passphrase);
+        }
+        if (!verified) {
             // LOW-5: &mnemonicStr[0] on an empty string is UB; guard the cleanse.
             if (!mnemonicStr.empty()) {
                 memory_cleanse(&mnemonicStr[0], mnemonicStr.size());
             }
-            std::cerr << "[Wallet] LP-7 CRITICAL: v7 seed migration ABORTED — the "
-                         "recovered mnemonic does not re-derive this wallet's seed "
-                         "(either decrypt produced a valid-but-wrong BIP39 phrase, or "
-                         "this wallet uses an optional BIP39 passphrase that cannot be "
-                         "re-derived). The original seed ciphertext was NOT modified; "
-                         "the wallet remains loadable with its existing seed. Migration "
-                         "will be retried on the next unlock." << std::endl;
+            std::cerr << "[Wallet] LP-7: v7 seed migration DEFERRED — the recovered "
+                         "mnemonic does not re-derive this wallet's seed under the "
+                         "empty passphrase"
+                      << (bip39Passphrase.empty()
+                              ? " (no BIP39 passphrase was supplied)"
+                              : " or the supplied BIP39 passphrase")
+                      << ". This wallet either uses an optional BIP39 passphrase (re-run "
+                         "unlock with the correct \"bip39passphrase\") or the decrypt "
+                         "produced a valid-but-wrong phrase. The original seed "
+                         "ciphertext was NOT modified; the wallet remains fully "
+                         "loadable and usable. Migration will be retried on the next "
+                         "unlock." << std::endl;
             rollback();
             return false;
         }
@@ -5824,9 +5939,14 @@ bool CWallet::MigrateToEncryptedSeedV7Unlocked(bool* persistedToDisk) {
     }
 
     // --- Step 2: encrypt the HD master seed (scrubs plaintext, sets ciphertext+MAC) ---
-    if (!EncryptHDMasterKey()) {
-        rollback();
-        return false;
+    // F1 round 3: in the defer-and-preserve state (b) the seed is ALREADY encrypted —
+    // EncryptHDMasterKey would fail/double-encrypt, so skip it. Only the plaintext-seed
+    // case (a) needs this step.
+    if (!seedAlreadyEncrypted) {
+        if (!EncryptHDMasterKey()) {
+            rollback();
+            return false;
+        }
     }
 
     // --- Step 2b: re-MAC the MIK private key (legacy encrypted MIK had no MAC) ---
@@ -6096,7 +6216,8 @@ bool CWallet::DecryptHDMasterKey(CHDExtendedKey& decrypted) const {
     return true;
 }
 
-bool CWallet::MnemonicReDerivesSeed(const std::string& mnemonic) const {
+bool CWallet::MnemonicReDerivesSeed(const std::string& mnemonic,
+                                    const std::string& candidatePassphrase) const {
     // Assumes caller holds cs_wallet lock and the plaintext hdMasterKey.seed is
     // available (true on every legacy-migration / EncryptWallet re-encrypt path,
     // where the obfuscation key itself is derived from that same plaintext seed).
@@ -6109,11 +6230,13 @@ bool CWallet::MnemonicReDerivesSeed(const std::string& mnemonic) const {
     // it byte-for-byte against the authoritative in-memory hdMasterKey.seed. Only an
     // EXACT match proves identity.
     //
-    // Passphrase note: Dilithion's optional BIP39 passphrase is never persisted, so
-    // we can only re-derive with the empty passphrase. A passphrase-protected seed
-    // will (correctly) NOT match here and the caller must ABORT-AND-PRESERVE — an
-    // unverifiable mnemonic is never permitted to overwrite the authoritative
-    // ciphertext. This is the conservative outcome the seed-loss invariant requires.
+    // Passphrase note (F1 round 3): Dilithion's optional BIP39 passphrase is never
+    // persisted, so it must be SUPPLIED to verify a passphrase-protected seed.
+    // candidatePassphrase defaults to "" (the empty-passphrase cohort, unchanged).
+    // A passphrase wallet matches ONLY when the caller threads the correct BIP39
+    // passphrase through here; a wrong/absent candidate returns false and the caller
+    // MUST ABORT-AND-PRESERVE — an unverifiable mnemonic is never permitted to
+    // overwrite the authoritative ciphertext. Conservative by construction.
 
     // Cheap structural gate first (word count + wordlist + checksum). Keeps the
     // expensive PBKDF2 derive off obviously-garbage input.
@@ -6121,22 +6244,38 @@ bool CWallet::MnemonicReDerivesSeed(const std::string& mnemonic) const {
         return false;
     }
 
-    // Re-derive the BIP39 seed (empty passphrase) then the HD master seed.
+    // Re-derive the BIP39 seed (with the supplied candidate passphrase, default "")
+    // then the HD master seed.
     CKeyingMaterial bip39_seed(64);  // RAII: auto-wipes on scope exit
-    if (!CMnemonic::ToSeed(mnemonic, "", bip39_seed.data_ptr())) {
+    if (!CMnemonic::ToSeed(mnemonic, candidatePassphrase, bip39_seed.data_ptr())) {
         return false;
     }
 
     CHDExtendedKey rederived;
     DeriveMaster(bip39_seed.data_ptr(), rederived);
 
-    // Constant-time-ish byte compare against the authoritative in-memory seed.
+    // F1 round 3: compare against the LIVE master seed obtained via DecryptHDMasterKey.
+    // hdMasterKey.seed is the plaintext slot ONLY while the seed is plaintext at rest;
+    // once EncryptHDMasterKey() has run (e.g. the defer-and-preserve EncryptWallet path,
+    // or a reloaded deferred-state wallet), that slot is SCRUBBED and the live seed lives
+    // in the decrypted cache / ciphertext. DecryptHDMasterKey returns the right value in
+    // both states (plaintext copy, or cache/decrypt when encrypted+unlocked), so the
+    // identity check works on the deferred (seed-encrypted) path too. Fail closed if the
+    // live seed cannot be obtained (e.g. locked).
+    CHDExtendedKey authoritative;
+    if (!DecryptHDMasterKey(authoritative)) {
+        rederived.Wipe();
+        return false;
+    }
+
+    // Constant-time-ish byte compare against the authoritative live seed.
     // (memcmp is acceptable here: a mismatch means abort, not a secret-leaking
     //  timing oracle — both inputs are local and the decision is fail-closed.)
     const bool match =
-        std::memcmp(rederived.seed, hdMasterKey.seed, sizeof(hdMasterKey.seed)) == 0;
+        std::memcmp(rederived.seed, authoritative.seed, sizeof(authoritative.seed)) == 0;
 
     rederived.Wipe();
+    authoritative.Wipe();
     return match;
 }
 
@@ -6250,6 +6389,43 @@ bool CWallet::DecryptMnemonic(std::string& mnemonic) const {
         if (!crypter.SetKey(vMasterKeyVec, vchMnemonicIV)) {
             memory_cleanse(vMasterKeyVec.data(), vMasterKeyVec.size());
             return false;
+        }
+
+        // LP-7 (F1 round 3): DEFER-AND-PRESERVE window. When a BIP39-passphrase wallet
+        // was encrypted but its mnemonic migration was deferred, the mnemonic is still
+        // under the OBFUSCATION key (empty MAC) — the master-key branch below would
+        // (correctly, for the general case) reject the empty MAC. To keep the backup
+        // phrase exportable in this window (e.g. so the user can verify it before
+        // supplying the passphrase), fall back to the obfuscation key when migration is
+        // deferred-for-passphrase AND no mnemonic MAC is present. The seed is encrypted
+        // at rest but decrypted into hdMasterKey.seed while unlocked, so the obfuscation
+        // key is re-derivable. This fallback is gated narrowly on the deferred flag —
+        // it does NOT relax the authenticated master-key path for normal v7 wallets.
+        if (m_migrationDeferredPassphrase && vchMnemonicMAC.empty()) {
+            memory_cleanse(vMasterKeyVec.data(), vMasterKeyVec.size());
+            // Use the LIVE seed (via DecryptHDMasterKey) — in the deferred state the seed
+            // is encrypted at rest, so hdMasterKey.seed is scrubbed; the obfuscation key
+            // must be derived from the decrypted cache / ciphertext.
+            CHDExtendedKey live;
+            if (!DecryptHDMasterKey(live)) {
+                return false;
+            }
+            std::vector<uint8_t> obfKey(WALLET_CRYPTO_KEY_SIZE);
+            std::vector<uint8_t> hdSeed(live.seed, live.seed + 32);
+            DeriveEncryptionKey(hdSeed, "mnemonic", obfKey);
+            memory_cleanse(hdSeed.data(), hdSeed.size());
+            live.Wipe();
+
+            CCrypter obfCrypter;
+            bool ok = obfCrypter.SetKey(obfKey, vchMnemonicIV) &&
+                      obfCrypter.Decrypt(vchEncryptedMnemonic, decrypted);
+            memory_cleanse(obfKey.data(), obfKey.size());
+            if (!ok) {
+                return false;
+            }
+            mnemonic = std::string(decrypted.begin(), decrypted.end());
+            memory_cleanse(decrypted.data(), decrypted.size());
+            return true;
         }
 
         // LP-7 (HIGH-2): authenticate-before-decrypt via the ONE centralized gate.

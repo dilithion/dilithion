@@ -2338,7 +2338,22 @@ struct LP7EncryptRollbackTester {
     static std::vector<uint8_t> MnemonicCiphertext(const CWallet& w) {
         return w.vchEncryptedMnemonic;
     }
+    // LP-7 (F1 round 3): observe the defer-and-preserve internal flag directly.
+    static bool DeferredPassphrase(const CWallet& w) { return w.m_migrationDeferredPassphrase; }
+    static bool NeedsMigrationRaw(const CWallet& w) { return w.m_fNeedsSeedMigration; }
+    static bool HDSeedEncrypted(const CWallet& w) { return w.fHDMasterKeyEncrypted; }
+    static std::vector<uint8_t> MnemonicMAC(const CWallet& w) { return w.vchMnemonicMAC; }
+    // LP-7 (F1 round 3): exercise the passphrase-threaded identity check directly.
+    static bool ReDerives(const CWallet& w, const std::string& mnemonic,
+                          const std::string& candidatePassphrase) {
+        return w.MnemonicReDerivesSeed(mnemonic, candidatePassphrase);
+    }
 };
+
+// Convenience: empty-passphrase re-derive (must FAIL for a passphrase wallet).
+static bool LP7Reseed_Empty(const CWallet& w, const std::string& mnemonic) {
+    return LP7EncryptRollbackTester::ReDerives(w, mnemonic, "");
+}
 
 static void Test_EncryptWalletRollback() {
     std::cout << COLOR_BLUE "\n[Test 9] EncryptWallet transactional rollback + v7 plaintext-seed Save fail-closed (Cursor HIGH-1/HIGH-2)\n" COLOR_RESET;
@@ -2739,21 +2754,27 @@ static void Test_F1_MasterKeyFallbackArm() {
 }
 
 // ---------------------------------------------------------------------------
-// Test 9b — F1 FOLD (MED-2): the EncryptWallet re-encrypt path has the SAME
-// decrypt → EncryptMnemonic → discard-original shape as the v7 migration, and the
-// pre-fold code had NO identity guard there. Inject a valid-but-WRONG BIP39 phrase
-// into a fresh UNENCRYPTED HD wallet's obfuscated-mnemonic slot, then call
-// EncryptWallet. The identity cross-check must ABORT-AND-PRESERVE: EncryptWallet
-// returns false, the wallet rolls back to UNENCRYPTED, and the original (wrong but
-// not-yet-discarded) ciphertext is preserved unmodified — crucially, the wrong phrase
-// is NEVER re-encrypted under the master key and committed as the authoritative seed.
+// Test 9b — F1 FOLD (MED-2) + F1 ROUND-3 (Cursor HIGH): the EncryptWallet re-encrypt
+// path has the SAME decrypt → EncryptMnemonic → discard-original shape as the v7
+// migration. Inject a valid-but-WRONG BIP39 phrase into a fresh UNENCRYPTED HD
+// wallet's obfuscated-mnemonic slot, then call EncryptWallet.
 //
-// MUTATION CHECK: removing the MnemonicReDerivesSeed guard at the EncryptWallet site
-// lets EncryptWallet SUCCEED and commit the wrong mnemonic → this test's "returns
-// false / rolled back to unencrypted" assertions break. Load-bearing.
+// ROUND-3 CONTRACT CHANGE: EncryptWallet now NEVER FAILS because the mnemonic can't be
+// verified (the old behavior — return false + roll back to UNENCRYPTED — permanently
+// stranded BIP39-passphrase wallets, since they could never encrypt). The new contract
+// on a non-verifiable mnemonic is DEFER-AND-PRESERVE: encrypt the wallet + keys + seed,
+// PRESERVE the original mnemonic ciphertext byte-for-byte (the wrong phrase is NEVER
+// re-encrypted under the master key / committed as authoritative), set the
+// deferred-passphrase diagnostic, and SUCCEED. The crucial seed-loss invariant — wrong
+// phrase never committed as the authoritative mnemonic — is preserved, now via
+// "preserved + deferred" rather than "rolled back to unencrypted".
+//
+// MUTATION CHECK: if EncryptWallet were to (wrongly) re-encrypt the recovered phrase
+// under the master key here, the preserved-ciphertext-byte-for-byte assertion AND the
+// "mnemonic MAC stays empty (not master-key MAC'd)" assertion break. Load-bearing.
 // ---------------------------------------------------------------------------
-static void Test_F1_EncryptWalletAbortOnValidButWrongMnemonic() {
-    std::cout << COLOR_BLUE "\n[Test 9b] F1 FOLD (MED-2): EncryptWallet ABORTS on a valid-but-WRONG BIP39 mnemonic\n" COLOR_RESET;
+static void Test_F1_EncryptWalletDefersOnValidButWrongMnemonic() {
+    std::cout << COLOR_BLUE "\n[Test 9b] F1 r3: EncryptWallet DEFERS-AND-PRESERVES (never fails) on a valid-but-WRONG BIP39 mnemonic\n" COLOR_RESET;
 
     const std::string path = "lp7_f1_encwallet_wrongvalid.dat";
     const std::string pass = "F1EncWallet!WrongValid#2026";
@@ -2780,14 +2801,20 @@ static void Test_F1_EncryptWalletAbortOnValidButWrongMnemonic() {
     std::vector<uint8_t> ctBefore = LP7EncryptRollbackTester::MnemonicCiphertext(w);
 
     bool encrypted = w.EncryptWallet(pass);
-    CHECK(!encrypted,
-          "LOAD-BEARING (MED-2): EncryptWallet RETURNS FALSE — wrong-but-valid mnemonic rejected by identity check");
-    CHECK(!w.IsCrypted(),
-          "LOAD-BEARING (MED-2): wallet rolled back to UNENCRYPTED (original mnemonic ciphertext NOT discarded/re-encrypted)");
-    CHECK(LP7EncryptRollbackTester::SeedMatches(w, seed),
-          "LOAD-BEARING (MED-2): in-memory plaintext seed intact after rollback (wrong phrase never committed)");
+    CHECK(encrypted,
+          "LOAD-BEARING (r3): EncryptWallet SUCCEEDS (never fails on an unverifiable mnemonic)");
+    CHECK(w.IsCrypted(),
+          "LOAD-BEARING (r3): wallet IS encrypted (keys + seed encrypted)");
+    CHECK(LP7EncryptRollbackTester::HDSeedEncrypted(w),
+          "LOAD-BEARING (r3): HD seed encrypted at rest (fHDMasterKeyEncrypted == true)");
     CHECK(LP7EncryptRollbackTester::MnemonicCiphertextMatches(w, ctBefore),
-          "LOAD-BEARING (MED-2): mnemonic ciphertext preserved byte-for-byte (no master-key re-encrypt committed)");
+          "LOAD-BEARING (r3/MED-2): mnemonic ciphertext PRESERVED byte-for-byte (wrong phrase never re-encrypted/committed)");
+    CHECK(LP7EncryptRollbackTester::MnemonicMAC(w).empty(),
+          "LOAD-BEARING (r3): mnemonic MAC stays EMPTY (NOT master-key re-encrypted — still under obfuscation key)");
+    CHECK(w.MigrationDeferredForPassphrase(),
+          "LOAD-BEARING (r3): deferred-passphrase diagnostic set (distinct observable, not corruption)");
+    CHECK(w.NeedsSeedMigration(),
+          "LOAD-BEARING (r3): NeedsSeedMigration armed so a later unlock can complete migration");
 
     std::remove(path.c_str());
 }
@@ -2831,6 +2858,208 @@ static void Test_F1_ValidMnemonicStillMigrates() {
     std::remove(path.c_str());
 }
 
+// ===========================================================================
+// LP-7 F1 ROUND-3 — BIP39-passphrase cohort (Cursor HIGH)
+//
+// A wallet created with GenerateHDWallet(mnemonic, <bip39pp>) has
+// seed = ToSeed(mnemonic, <bip39pp>), and its mnemonic is stored under the
+// obfuscation key derived from THAT seed. So MnemonicReDerivesSeed(mnemonic, "")
+// CANNOT match (empty passphrase → different seed), but
+// MnemonicReDerivesSeed(mnemonic, <bip39pp>) DOES. The round-3 fix lets the user
+// thread the BIP39 passphrase into encrypt/migrate so these wallets are no longer
+// stranded — AND makes EncryptWallet never-fail (defer-and-preserve) when it can't
+// verify.
+// ===========================================================================
+static const char* kTrezorPP = "TREZOR";
+
+// (1) Passphrase wallet + CORRECT passphrase at encrypt time → migrates to v7
+//     (mnemonic re-encrypted under master, seed absent at rest).
+static void Test_F1R3_PassphraseWalletEncryptMigratesWithCorrectPassphrase() {
+    std::cout << COLOR_BLUE "\n[Test r3-1] Passphrase wallet + CORRECT bip39passphrase at EncryptWallet → migrates to v7\n" COLOR_RESET;
+    const std::string path = "lp7_r3_pp_encrypt_correct.dat";
+    const std::string pass = "R3PP!Encrypt#Correct2026";
+    std::remove(path.c_str());
+
+    std::string mnemonic;
+    CWallet w;
+    w.SetWalletFile(path);  // autosave on
+    CHECK(w.GenerateHDWallet(mnemonic, kTrezorPP), "Generated BIP39-passphrase HD wallet (TREZOR)");
+
+    // Precondition: empty-passphrase re-derive must FAIL; passphrase re-derive must MATCH.
+    CHECK(!LP7Reseed_Empty(w, mnemonic), "Precondition: empty-passphrase re-derive does NOT match (passphrase wallet)");
+
+    // Expected seed = ToSeed(mnemonic, TREZOR) → master seed.
+    uint8_t bip39seed[64];
+    CHECK(CMnemonic::ToSeed(mnemonic, kTrezorPP, bip39seed), "Derived BIP39 seed with passphrase");
+    CHDExtendedKey master; DeriveMaster(bip39seed, master); memory_cleanse(bip39seed, 64);
+    std::vector<uint8_t> expectedSeed(master.seed, master.seed + 32);
+
+    bool encrypted = w.EncryptWallet(pass, kTrezorPP);
+    CHECK(encrypted, "EncryptWallet SUCCEEDS with the correct BIP39 passphrase");
+    CHECK(w.IsCrypted(), "Wallet is encrypted");
+    CHECK(LP7EncryptRollbackTester::HDSeedEncrypted(w), "HD seed encrypted at rest");
+    CHECK(!LP7EncryptRollbackTester::MnemonicMAC(w).empty(),
+          "LOAD-BEARING: mnemonic re-encrypted UNDER MASTER (non-empty MAC) — migration completed");
+    CHECK(!w.MigrationDeferredForPassphrase(), "NOT deferred — verified + migrated");
+    CHECK(!w.NeedsSeedMigration(), "NeedsSeedMigration cleared — fully migrated");
+
+    // Mnemonic still round-trips (under master key now).
+    std::string exported;
+    CHECK(w.ExportMnemonic(exported), "ExportMnemonic works post-migration");
+    CHECK(exported == mnemonic, "Mnemonic round-trips identically");
+
+    // On disk: seed absent at rest.
+    std::vector<uint8_t> bytes = ReadFileBytes(path);
+    CHECK(!Contains(bytes, expectedSeed.data(), expectedSeed.size()),
+          "LOAD-BEARING: plaintext seed ABSENT on disk (seed encrypted, passphrase wallet migrated)");
+    CHECK(FileVersion(path) == WALLET_FILE_VERSION_7, "File at v7");
+
+    std::remove(path.c_str());
+}
+
+// (2) Passphrase wallet + WRONG/ABSENT passphrase → migration defers, original
+//     mnemonic ciphertext preserved byte-for-byte, EncryptWallet still SUCCEEDS.
+static void Test_F1R3_PassphraseWalletDefersPreservesEncryptsWithoutPassphrase() {
+    std::cout << COLOR_BLUE "\n[Test r3-2] Passphrase wallet + WRONG/ABSENT bip39passphrase → defers+preserves, EncryptWallet STILL SUCCEEDS\n" COLOR_RESET;
+    const std::string path = "lp7_r3_pp_encrypt_wrong.dat";
+    const std::string pass = "R3PP!Encrypt#Wrong2026";
+    std::remove(path.c_str());
+
+    std::string mnemonic;
+    CWallet w;
+    w.SetWalletFile(path);
+    CHECK(w.GenerateHDWallet(mnemonic, kTrezorPP), "Generated BIP39-passphrase HD wallet (TREZOR)");
+
+    // Snapshot the original obfuscation-key mnemonic ciphertext BEFORE encryption.
+    std::vector<uint8_t> ctBefore = LP7EncryptRollbackTester::MnemonicCiphertext(w);
+
+    // Encrypt with NO bip39 passphrase (the absent case) — must NOT fail.
+    bool encrypted = w.EncryptWallet(pass /* bip39Passphrase defaults to "" */);
+    CHECK(encrypted, "LOAD-BEARING: EncryptWallet STILL SUCCEEDS without the BIP39 passphrase (never fails)");
+    CHECK(w.IsCrypted(), "Wallet IS encrypted (keys + seed)");
+    CHECK(LP7EncryptRollbackTester::HDSeedEncrypted(w), "HD seed encrypted at rest");
+    CHECK(LP7EncryptRollbackTester::MnemonicCiphertextMatches(w, ctBefore),
+          "LOAD-BEARING: original mnemonic ciphertext PRESERVED byte-for-byte (not discarded/re-encrypted)");
+    CHECK(LP7EncryptRollbackTester::MnemonicMAC(w).empty(),
+          "LOAD-BEARING: mnemonic MAC still EMPTY (under obfuscation key, NOT master-key re-encrypted)");
+    CHECK(w.MigrationDeferredForPassphrase(),
+          "LOAD-BEARING: distinct deferred-passphrase diagnostic set (NOT corruption)");
+    CHECK(w.NeedsSeedMigration(), "Migration armed for a later passphrase-supplied unlock");
+
+    // Mnemonic is still recoverable in the deferred window (obfuscation-key fallback).
+    std::string exported;
+    CHECK(w.ExportMnemonic(exported), "Mnemonic still exportable in the deferred window (obfuscation-key fallback)");
+    CHECK(exported == mnemonic, "Exported mnemonic matches the original (preserved phrase)");
+
+    std::remove(path.c_str());
+}
+
+// (3) Passphrase wallet: encrypt WITHOUT passphrase (defers), then UNLOCK WITH the
+//     correct passphrase → migration completes (mnemonic re-encrypted under master).
+static void Test_F1R3_PassphraseWalletUnlockMigratesWithCorrectPassphrase() {
+    std::cout << COLOR_BLUE "\n[Test r3-3] Passphrase wallet: defer at encrypt, then unlock WITH bip39passphrase → completes migration\n" COLOR_RESET;
+    const std::string path = "lp7_r3_pp_unlock_correct.dat";
+    const std::string pass = "R3PP!Unlock#Correct2026";
+    std::remove(path.c_str());
+
+    std::string mnemonic;
+    {
+        CWallet w;
+        w.SetWalletFile(path);
+        CHECK(w.GenerateHDWallet(mnemonic, kTrezorPP), "Generated BIP39-passphrase HD wallet (TREZOR)");
+        CHECK(w.EncryptWallet(pass), "Encrypted without BIP39 passphrase (defers)");
+        CHECK(w.MigrationDeferredForPassphrase(), "Deferred-passphrase state set");
+    }
+
+    // Reload (lock), then unlock WITH the BIP39 passphrase → migration completes.
+    {
+        CWallet w;
+        w.SetWalletFile(path);
+        CHECK(w.Load(path), "Reloaded the deferred-passphrase wallet");
+        CHECK(w.NeedsSeedMigration(), "Reload re-armed migration (empty-MAC mnemonic detected)");
+        CHECK(w.MigrationDeferredForPassphrase(), "Reload surfaced deferred-passphrase observable");
+        // Unlock WITH the correct BIP39 passphrase.
+        CHECK(w.Unlock(pass, 0, kTrezorPP), "Unlock with correct bip39passphrase succeeds");
+        CHECK(!w.MigrationDeferredForPassphrase(), "LOAD-BEARING: migration COMPLETED (no longer deferred)");
+        CHECK(!w.NeedsSeedMigration(), "NeedsSeedMigration cleared");
+        CHECK(!LP7EncryptRollbackTester::MnemonicMAC(w).empty(),
+              "LOAD-BEARING: mnemonic now under MASTER key (non-empty MAC)");
+        std::string exported;
+        CHECK(w.ExportMnemonic(exported), "ExportMnemonic works post-migration");
+        CHECK(exported == mnemonic, "Mnemonic round-trips identically after passphrase-supplied migration");
+    }
+    CHECK(FileVersion(path) == WALLET_FILE_VERSION_7, "File at v7 after completed migration");
+
+    std::remove(path.c_str());
+}
+
+// (4) Empty-passphrase wallet (the common cohort) → unchanged: still migrates with "".
+static void Test_F1R3_EmptyPassphraseCohortUnchanged() {
+    std::cout << COLOR_BLUE "\n[Test r3-4] Empty-passphrase wallet → unchanged (still migrates with \"\")\n" COLOR_RESET;
+    const std::string path = "lp7_r3_emptypp.dat";
+    const std::string pass = "R3Empty!Cohort#2026";
+    std::remove(path.c_str());
+
+    std::string mnemonic;
+    CWallet w;
+    w.SetWalletFile(path);
+    CHECK(w.GenerateHDWallet(mnemonic /* empty passphrase */), "Generated empty-passphrase HD wallet");
+
+    bool encrypted = w.EncryptWallet(pass);  // no bip39 passphrase needed
+    CHECK(encrypted, "EncryptWallet succeeds");
+    CHECK(!w.MigrationDeferredForPassphrase(), "NOT deferred — empty-passphrase verifies with \"\"");
+    CHECK(!w.NeedsSeedMigration(), "NeedsSeedMigration cleared (fully migrated)");
+    CHECK(!LP7EncryptRollbackTester::MnemonicMAC(w).empty(),
+          "Mnemonic re-encrypted under master (non-empty MAC) — same as before round 3");
+    std::string exported;
+    CHECK(w.ExportMnemonic(exported), "ExportMnemonic works");
+    CHECK(exported == mnemonic, "Mnemonic round-trips");
+
+    std::remove(path.c_str());
+}
+
+// (5) The deferred state survives a reload (load gate accepts empty-MAC mnemonic on an
+//     encrypted v7 wallet and re-arms migration), and the WRONG passphrase on unlock
+//     keeps deferring + preserving while the wallet stays usable.
+static void Test_F1R3_DeferredStateReloadsAndCompletes() {
+    std::cout << COLOR_BLUE "\n[Test r3-5] Deferred state RELOADS (no brick), wrong passphrase keeps deferring, file usable\n" COLOR_RESET;
+    const std::string path = "lp7_r3_deferred_reload.dat";
+    const std::string pass = "R3Deferred!Reload#2026";
+    std::remove(path.c_str());
+
+    std::string mnemonic;
+    std::vector<uint8_t> ctOriginal;
+    {
+        CWallet w;
+        w.SetWalletFile(path);
+        CHECK(w.GenerateHDWallet(mnemonic, kTrezorPP), "Generated BIP39-passphrase HD wallet");
+        ctOriginal = LP7EncryptRollbackTester::MnemonicCiphertext(w);
+        CHECK(w.EncryptWallet(pass), "Encrypted (defers — no BIP39 passphrase)");
+    }
+
+    // Reload: the v7 ENCRYPTED + empty-MAC-mnemonic file must LOAD (not be rejected as
+    // corrupt) and re-arm migration.
+    {
+        CWallet w;
+        w.SetWalletFile(path);
+        CHECK(w.Load(path), "LOAD-BEARING: deferred-state v7 file LOADS (empty-MAC mnemonic accepted, not bricked)");
+        CHECK(w.IsCrypted(), "Loaded wallet is encrypted");
+        CHECK(w.NeedsSeedMigration(), "Migration re-armed on reload");
+        CHECK(w.MigrationDeferredForPassphrase(), "Deferred-passphrase observable re-surfaced");
+        CHECK(LP7EncryptRollbackTester::MnemonicCiphertextMatches(w, ctOriginal),
+              "Original mnemonic ciphertext preserved across the reload");
+
+        // Unlock with a WRONG BIP39 passphrase → keeps deferring + preserving.
+        std::vector<uint8_t> ctBeforeUnlock = LP7EncryptRollbackTester::MnemonicCiphertext(w);
+        CHECK(w.Unlock(pass, 0, "WRONG-PASSPHRASE"), "Unlock (AES pass correct) succeeds even with wrong bip39pp");
+        CHECK(w.MigrationDeferredForPassphrase(), "Still deferred after a WRONG bip39 passphrase");
+        CHECK(LP7EncryptRollbackTester::MnemonicCiphertextMatches(w, ctBeforeUnlock),
+              "LOAD-BEARING: original ciphertext preserved after a wrong-passphrase unlock (no destructive rewrite)");
+    }
+
+    std::remove(path.c_str());
+}
+
 int main() {
     std::cout << COLOR_BLUE "==== LP-7 wallet encryption-at-rest tests ====" COLOR_RESET "\n";
 
@@ -2851,7 +3080,14 @@ int main() {
     Test_ChangePassphraseLegacyNonHD();
     Test_ChangePassphraseLegacyV6WithMIK();
     Test_EncryptWalletRollback();
-    Test_F1_EncryptWalletAbortOnValidButWrongMnemonic();  // MED-2: valid-but-wrong, EncryptWallet path
+    Test_F1_EncryptWalletDefersOnValidButWrongMnemonic(); // r3: valid-but-wrong, EncryptWallet defers (never fails)
+    // LP-7 (F1 round 3): BIP39-passphrase cohort — encrypt/migrate WITH passphrase,
+    // defer-and-preserve WITHOUT, and the empty-passphrase cohort stays unchanged.
+    Test_F1R3_PassphraseWalletEncryptMigratesWithCorrectPassphrase();
+    Test_F1R3_PassphraseWalletDefersPreservesEncryptsWithoutPassphrase();
+    Test_F1R3_PassphraseWalletUnlockMigratesWithCorrectPassphrase();
+    Test_F1R3_EmptyPassphraseCohortUnchanged();
+    Test_F1R3_DeferredStateReloadsAndCompletes();
 
     std::cout << "\n=============================================\n";
     std::cout << "PASSED: " << g_pass << "   FAILED: " << g_fail << "\n";

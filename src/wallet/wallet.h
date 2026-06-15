@@ -307,6 +307,16 @@ private:
     // re-encryption + v7 rewrite on the next successful unlock.
     bool m_fNeedsSeedMigration{false};
 
+    // LP-7 (F1 round 3): set true when a seed migration was DEFERRED specifically
+    // because the mnemonic could not be identity-verified under the empty passphrase
+    // (and any supplied BIP39 passphrase was absent/wrong) — i.e. a BIP39-passphrase
+    // wallet that needs the user to supply the passphrase to complete migration.
+    // DISTINCT from corruption/abort: the wallet is fully encrypted + usable and its
+    // original mnemonic ciphertext is preserved byte-for-byte. Surfaced via
+    // MigrationDeferredForPassphrase() and the getmigrationstatus RPC so the UI can
+    // prompt for the BIP39 passphrase. Cleared the moment migration completes.
+    bool m_migrationDeferredPassphrase{false};
+
     // LP-7 L1 (opt-in, default OFF): when true, refuse to SIGN spends while the HD
     // seed is still plaintext-at-rest (NeedsSeedMigration()). Set once at node startup
     // from the --require-seed-migration CLI flag. Default OFF preserves the warn-only
@@ -329,7 +339,13 @@ private:
     // to disk via SaveUnlocked; the caller clears m_fNeedsSeedMigration / promotes
     // m_loadedFileVersion to v7 ONLY on that signal. Invariant: NeedsSeedMigration()
     // is true exactly while a plaintext seed is still at rest on disk.
-    bool MigrateToEncryptedSeedV7Unlocked(bool* persistedToDisk = nullptr);
+    // LP-7 (F1 round 3): bip39Passphrase is threaded through to the identity check
+    // so a BIP39-passphrase wallet can complete migration when the user supplies the
+    // passphrase. Default "" preserves the empty-passphrase behaviour. When the
+    // passphrase is wrong/absent the identity check fails and migration defers
+    // (file untouched, flag stays armed) — never a destructive rewrite.
+    bool MigrateToEncryptedSeedV7Unlocked(bool* persistedToDisk = nullptr,
+                                          const std::string& bip39Passphrase = "");
 
     // LP-7 (HIGH-2): CENTRALIZED authenticated-decrypt gate for ALL five at-rest
     // encrypted record types (master key, per-address spending keys, HD-master
@@ -516,8 +532,18 @@ private:
     // mnemonic is never allowed to overwrite the authoritative ciphertext; the
     // migration safely defers instead of destructively rewriting.
     //
+    // LP-7 (F1 round 3): the BIP39-passphrase cohort is no longer permanently
+    // stranded. The optional candidatePassphrase lets a caller (migrate/encrypt
+    // entry points, threaded from a user-supplied value) re-derive WITH the BIP39
+    // passphrase and positively verify a passphrase-protected seed. Default "" keeps
+    // the empty-passphrase cohort behaviour byte-identical. Still fail-closed: a
+    // wrong/absent candidate simply returns false → ABORT-AND-PRESERVE (the original
+    // ciphertext is never discarded unless the recovered phrase PROVABLY re-derives
+    // this wallet's seed under the supplied passphrase).
+    //
     // Caller must hold cs_wallet and have the plaintext hdMasterKey.seed available.
-    bool MnemonicReDerivesSeed(const std::string& mnemonic) const;
+    bool MnemonicReDerivesSeed(const std::string& mnemonic,
+                               const std::string& candidatePassphrase = "") const;
 
     // ============================================================================
     // BUG #56 FIX: Block processing helpers (Bitcoin Core pattern)
@@ -786,7 +812,17 @@ public:
      * @param passphrase User's wallet passphrase
      * @return true if successful, false if already encrypted or error
      */
-    bool EncryptWallet(const std::string& passphrase);
+    // LP-7 (F1 round 3): bip39Passphrase is the OPTIONAL BIP39 passphrase (distinct
+    // from the AES wallet `passphrase`). It lets a BIP39-passphrase wallet positively
+    // verify + migrate its mnemonic at encrypt time. EncryptWallet NEVER fails because
+    // the mnemonic cannot be verified: if the identity check cannot confirm (passphrase
+    // wallet with no/wrong passphrase, or a valid-but-wrong recovered phrase), the
+    // wallet + keys + HD seed are still encrypted, the ORIGINAL mnemonic ciphertext is
+    // PRESERVED byte-for-byte (not discarded, not re-encrypted), the call SUCCEEDS, and
+    // the migration defers (NeedsSeedMigration()/MigrationDeferredForPassphrase() stay
+    // armed). Default "" preserves the empty-passphrase-cohort behaviour.
+    bool EncryptWallet(const std::string& passphrase,
+                       const std::string& bip39Passphrase = "");
 
     /**
      * Unlock the wallet for a specified time
@@ -816,7 +852,12 @@ public:
      *         - PBKDF2 key derivation fails
      * @see Lock(), IsLocked(), EncryptWallet()
      */
-    bool Unlock(const std::string& passphrase, int64_t timeout = 0);
+    // LP-7 (F1 round 3): bip39Passphrase is the OPTIONAL BIP39 passphrase (distinct
+    // from the AES wallet `passphrase`), threaded only into the deferred v7 seed
+    // migration so a BIP39-passphrase wallet can complete migration on unlock.
+    // Default "" leaves the unlock + empty-passphrase-cohort migration unchanged.
+    bool Unlock(const std::string& passphrase, int64_t timeout = 0,
+                const std::string& bip39Passphrase = "");
 
     /**
      * Lock the wallet
@@ -856,6 +897,19 @@ public:
      * @return true if an encrypted wallet's seed is still plaintext-at-rest
      */
     bool NeedsSeedMigration() const;
+
+    /**
+     * LP-7 (F1 round 3): true when a seed migration is deferred specifically because
+     * the wallet's mnemonic is BIP39-passphrase-protected and the passphrase has not
+     * yet been supplied (or was wrong). DISTINCT from a corruption/abort: the wallet
+     * is fully encrypted and usable, and the original mnemonic ciphertext is
+     * preserved. The remedy is to re-run unlock (walletpassphrase) supplying the
+     * correct "bip39passphrase". Surfaced so the UI can prompt for it rather than
+     * presenting the wallet as fully migrated.
+     *
+     * @return true if migration is deferred pending a BIP39 passphrase
+     */
+    bool MigrationDeferredForPassphrase() const;
 
     /**
      * LP-7 L1 (opt-in): enable refuse-to-spend while NeedsSeedMigration() is true.

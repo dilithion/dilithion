@@ -4339,6 +4339,11 @@ std::string CRPCServer::RPC_GetWalletInfo(const std::string& params) {
     // plaintext on disk (pre-fix bug) and has not yet been migrated. While true the
     // wallet must NOT be presented as safely-encrypted.
     bool needsSeedMigration = m_wallet->NeedsSeedMigration();
+    // LP-7 (F1 round 3): DISTINCT observable for the BIP39-passphrase deferred state —
+    // the wallet IS fully encrypted and its recovery phrase is PRESERVED, but mnemonic
+    // migration is pending the user supplying the BIP39 passphrase. UI should prompt for
+    // it (walletpassphrase bip39passphrase) rather than treating the wallet as corrupt.
+    bool migrationDeferredPassphrase = m_wallet->MigrationDeferredForPassphrase();
 
     std::ostringstream oss;
     oss << "{"
@@ -4346,7 +4351,8 @@ std::string CRPCServer::RPC_GetWalletInfo(const std::string& params) {
         << "\"locked\":" << (isLocked ? "true" : "false") << ","
         << "\"unlocked_until\":" << (isLocked ? 0 : 1) << ","  // 0 if locked, 1 if unlocked
         << "\"needs_seed_migration\":" << (needsSeedMigration ? "true" : "false") << ","
-        << "\"seed_unencrypted_at_rest\":" << (needsSeedMigration ? "true" : "false")
+        << "\"seed_unencrypted_at_rest\":" << (needsSeedMigration ? "true" : "false") << ","
+        << "\"migration_deferred_bip39_passphrase\":" << (migrationDeferredPassphrase ? "true" : "false")
         << "}";
 
     return oss.str();
@@ -4369,6 +4375,20 @@ std::string CRPCServer::RPC_EncryptWallet(const std::string& params) {
         throw std::runtime_error("Error: Passphrase cannot be empty");
     }
 
+    // LP-7 (F1 round 3): OPTIONAL BIP39 passphrase (DISTINCT from the AES wallet
+    // `passphrase` above). A wallet created with GenerateHDWallet(mnemonic, <bip39pp>)
+    // can supply it here so EncryptWallet can positively verify + migrate the mnemonic
+    // at encrypt time. If omitted/wrong, encryption STILL SUCCEEDS — the mnemonic
+    // migration just defers (preserving the original phrase) and can be completed later
+    // by re-running walletpassphrase with the bip39passphrase. Length-capped to bound
+    // PBKDF2 work (same bound as the wallet passphrase).
+    std::string bip39passphrase = RPCUtil::GetOptionalString(j, "bip39passphrase", "");
+    static const size_t MAX_BIP39_PASSPHRASE_LENGTH = 1024;
+    if (bip39passphrase.length() > MAX_BIP39_PASSPHRASE_LENGTH) {
+        throw std::runtime_error("bip39passphrase too long (max " +
+                                 std::to_string(MAX_BIP39_PASSPHRASE_LENGTH) + " characters)");
+    }
+
     // Validate passphrase strength before attempting encryption
     PassphraseValidator validator;
     PassphraseValidationResult validation = validator.Validate(passphrase);
@@ -4379,8 +4399,10 @@ std::string CRPCServer::RPC_EncryptWallet(const std::string& params) {
         throw std::runtime_error(error_msg);
     }
 
-    // Attempt to encrypt wallet
-    if (!m_wallet->EncryptWallet(passphrase)) {
+    // Attempt to encrypt wallet. EncryptWallet is now never-fail for the mnemonic
+    // identity check: a false return here is a genuine encryption failure (rolled back),
+    // NOT a deferred mnemonic migration.
+    if (!m_wallet->EncryptWallet(passphrase, bip39passphrase)) {
         throw std::runtime_error("Error: Failed to encrypt wallet");
     }
 
@@ -4390,6 +4412,14 @@ std::string CRPCServer::RPC_EncryptWallet(const std::string& params) {
         << PassphraseValidator::GetStrengthDescription(validation.strength_score)
         << " (" << validation.strength_score << "/100). "
         << "Please backup your wallet and remember your passphrase!";
+
+    // LP-7 (F1 round 3): surface the deferred-passphrase state so a BIP39-passphrase
+    // wallet user is told the backup phrase is preserved but migration is pending.
+    if (m_wallet->MigrationDeferredForPassphrase()) {
+        oss << " NOTE: this wallet uses a BIP39 passphrase; its recovery phrase was "
+               "PRESERVED but seed migration is DEFERRED. Run walletpassphrase with the "
+               "correct \"bip39passphrase\" to complete migration. (This is not corruption.)";
+    }
 
     return "\"" + oss.str() + "\"";
 }
@@ -4421,12 +4451,31 @@ std::string CRPCServer::RPC_WalletPassphrase(const std::string& params) {
     // now 1 second; max remains 24 hours.
     int64_t timeout = RPCUtil::GetOptionalInt64(j, "timeout", 60, 1, 86400);
 
-    if (!m_wallet->Unlock(passphrase, timeout)) {
+    // LP-7 (F1 round 3): OPTIONAL BIP39 passphrase (DISTINCT from the AES wallet
+    // `passphrase`). Threaded only into the deferred v7 seed migration so a
+    // BIP39-passphrase wallet can COMPLETE its migration on unlock. Omitting it leaves
+    // the unlock + empty-passphrase migration unchanged. Length-capped like the wallet
+    // passphrase to bound PBKDF2 work.
+    std::string bip39passphrase = RPCUtil::GetOptionalString(j, "bip39passphrase", "");
+    if (bip39passphrase.length() > MAX_PASSPHRASE_LENGTH) {
+        throw std::runtime_error("bip39passphrase too long (max " +
+                                 std::to_string(MAX_PASSPHRASE_LENGTH) + " characters)");
+    }
+
+    if (!m_wallet->Unlock(passphrase, timeout, bip39passphrase)) {
         throw std::runtime_error("Error: The wallet passphrase entered was incorrect");
     }
 
     std::ostringstream oss;
-    oss << "\"Wallet unlocked for " << timeout << " seconds\"";
+    oss << "\"Wallet unlocked for " << timeout << " seconds";
+    // LP-7 (F1 round 3): if a BIP39-passphrase migration is still deferred after this
+    // unlock, tell the operator the phrase is preserved and how to complete migration.
+    if (m_wallet->MigrationDeferredForPassphrase()) {
+        oss << " | NOTE: BIP39-passphrase seed migration is still DEFERRED "
+               "(recovery phrase preserved). Re-run walletpassphrase with the correct "
+               "\\\"bip39passphrase\\\" to complete it.";
+    }
+    oss << "\"";
     return oss.str();
 }
 
