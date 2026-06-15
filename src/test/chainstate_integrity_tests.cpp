@@ -666,6 +666,87 @@ void test_retry_loop_confirms_reproducible_corruption() {
     std::cout << " OK\n";
 }
 
+// =============================================================================
+// Test 11 (extreview PR #120 B1 — Will's decision): a PERSISTENT IsIOError that
+// never clears is tolerated forever — NEVER writes the marker, NEVER shuts the
+// node down — but after kEscalateAfterCycles consecutive cycles it escalates the
+// observable degraded-health flag. And a healthy cycle clears that flag.
+// =============================================================================
+void test_persistent_ioerror_escalates_but_never_bricks() {
+    std::cout << "  test_persistent_ioerror_escalates_but_never_bricks..."
+              << std::flush;
+
+    namespace D = Dilithion;
+    constexpr int kN = D::ChainstateIntegrityMonitor::kEscalateAfterCycles;
+
+    TempDir td("persistent-ioerror");
+    CUTXOSet utxo;
+    assert(utxo.Open(td.str(), true));
+    std::vector<std::unique_ptr<CBlockIndex>> chain;
+    CBlockIndex* tip = BuildSyntheticChain(50, chain);
+    WriteValidUndoForChain(utxo, chain);  // chain is CLEAN on disk
+    CChainState cs;
+    cs.SetUTXOSet(&utxo);
+    cs.SetTipForTest(tip);
+
+    std::atomic<bool> running{true};
+    D::ChainstateIntegrityMonitor monitor(cs, utxo, td.str(), &running);
+    monitor.SetRevalidateBackoffForTesting(std::chrono::milliseconds::zero());
+    auto markerPath = std::filesystem::path(td.str()) / "auto_rebuild";
+
+    // Persistent (every-call) IsIOError at the fetch seam — never clears.
+    g_undo_fetch_fault_injector = []() {
+        return leveldb::Status::IOError("persistent EIO (failing disk)");
+    };
+
+    // Cycles 1..N-1: tolerated, NOT yet escalated, flag stays clean.
+    for (int cycle = 1; cycle < kN; ++cycle) {
+        bool cyclePass = monitor.RunOneCycleForTesting();
+        assert(cyclePass &&
+               "persistent IsIOError must be TOLERATED every cycle (cyclePass)");
+        assert(running.load() &&
+               "persistent IsIOError must NEVER flip running=false (no shutdown)");
+        assert(!std::filesystem::exists(markerPath) &&
+               "persistent IsIOError must NEVER write the auto_rebuild marker");
+        assert(!D::ChainstateIntegrityMonitor::IsIntegrityHealthDegraded() &&
+               "must NOT escalate before kEscalateAfterCycles consecutive cycles");
+        assert(monitor.GetConsecutiveTransientCyclesForTesting() == cycle &&
+               "consecutive-transient counter must increment each cycle");
+    }
+
+    // Cycle N: still tolerated + still running + still no marker, but NOW the
+    // observable degraded-health flag is raised.
+    {
+        bool cyclePass = monitor.RunOneCycleForTesting();
+        assert(cyclePass && "Nth persistent IsIOError still TOLERATED (no brick)");
+        assert(running.load() &&
+               "Nth persistent IsIOError must still NOT shut down");
+        assert(!std::filesystem::exists(markerPath) &&
+               "Nth persistent IsIOError must still NOT write the marker");
+        assert(D::ChainstateIntegrityMonitor::IsIntegrityHealthDegraded() &&
+               "after kEscalateAfterCycles consecutive cycles, health = degraded");
+        assert(monitor.GetConsecutiveTransientCyclesForTesting() == kN &&
+               "counter must equal kEscalateAfterCycles at escalation");
+    }
+
+    // Now let the fault clear: a healthy cycle must reset the counter AND clear
+    // the degraded-health flag.
+    g_undo_fetch_fault_injector = nullptr;  // reads now hit clean on-disk data
+    {
+        bool cyclePass = monitor.RunOneCycleForTesting();
+        assert(cyclePass && "healthy cycle passes");
+        assert(running.load() && "healthy cycle keeps running");
+        assert(!D::ChainstateIntegrityMonitor::IsIntegrityHealthDegraded() &&
+               "a healthy cycle MUST clear the degraded-health flag");
+        assert(monitor.GetConsecutiveTransientCyclesForTesting() == 0 &&
+               "a healthy cycle MUST reset the consecutive-transient counter");
+    }
+
+    g_undo_fetch_fault_injector = nullptr;  // belt-and-braces before destructors
+    (void)tip;
+    std::cout << " OK\n";
+}
+
 }  // namespace
 
 int main() {
@@ -691,8 +772,9 @@ int main() {
         test_classify_undo_fetch_status_mapping();
         test_monitor_routes_injected_faults();
         test_retry_loop_confirms_reproducible_corruption();
+        test_persistent_ioerror_escalates_but_never_bricks();
 
-        std::cout << "\n=== All 12 tests passed ===\n" << std::endl;
+        std::cout << "\n=== All 13 tests passed ===\n" << std::endl;
         return 0;
     } catch (const std::exception& e) {
         std::cerr << "Test failed: " << e.what() << std::endl;

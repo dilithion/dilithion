@@ -41,10 +41,31 @@
 //     non-transient. A genuinely-absent key on an active-chain block is real
 //     corruption; anything unexpected fails safe toward the corruption gate
 //     (shutdown) rather than tolerate.
-// v4.4 test-only fault-injection hook (see utxo_set.h). Production leaves null.
+// v4.4 test-only fault-injection hook (see utxo_set.h). Compiled OUT of
+// production builds — exists only when DILITHION_ENABLE_FAULT_INJECTION is
+// defined (the chainstate_integrity_tests object). extreview PR #120 HIGH.
+#ifdef DILITHION_ENABLE_FAULT_INJECTION
 std::function<leveldb::Status()> g_undo_fetch_fault_injector = nullptr;
+#endif
 
 void ClassifyUndoFetchStatus(const leveldb::Status& st, UndoIntegrityFailure& failure_out) {
+    // ORDERING IS SAFETY-CRITICAL (extreview PR #120, two models flagged this as
+    // non-obvious). IsCorruption() is checked FIRST, BEFORE IsIOError(). A
+    // leveldb::Status can in principle satisfy both predicates; checking
+    // corruption first guarantees any such overlapping status is hard-failed
+    // (transient=false -> corruption gate -> marker + shutdown), never
+    // mislabelled transient and tolerated. Do NOT reorder these branches: putting
+    // IsIOError() first would route a corruption-AND-ioerror status into the
+    // tolerate branch and mask real on-disk damage forever. The both-predicate
+    // case is locked by a regression test (chainstate_integrity_tests.cpp).
+    //
+    // The trailing else is the FAIL-CLOSED bucket: IsNotFound and EVERY other
+    // unmapped/unexpected non-ok status (NotSupported / InvalidArgument / Busy /
+    // future LevelDB statuses) fall here -> cause="missing", transient=false
+    // (hard-fail). We deliberately do NOT enumerate them: anything we did not
+    // explicitly classify as a recoverable IOError blip is treated as real
+    // corruption and routed to the shutdown/rebuild gate, never silently
+    // tolerated. New status classes are safe-by-default.
     if (st.IsCorruption()) {
         failure_out.cause = "io_corruption";
         failure_out.transient = false;
@@ -98,12 +119,18 @@ bool FetchAndVerifyUndo(leveldb::DB* db,
     undoKey.append(reinterpret_cast<const char*>(blockHash.data), 32);
 
     std::string undoValue;
-    // v4.4 test-only fault injection (g_undo_fetch_fault_injector is null in
-    // production). A non-ok injected Status simulates a storage-layer fault
-    // (IsCorruption / IsIOError) that real on-disk data can't easily produce, so
-    // the monitor's retry/tolerate/confirm routing is exercised end-to-end.
-    leveldb::Status st = g_undo_fetch_fault_injector ? g_undo_fetch_fault_injector()
-                                                     : leveldb::Status::OK();
+    leveldb::Status st = leveldb::Status::OK();
+#ifdef DILITHION_ENABLE_FAULT_INJECTION
+    // TEST-ONLY fault injection (extreview PR #120: the whole seam is compiled
+    // out of production via DILITHION_ENABLE_FAULT_INJECTION). A non-ok injected
+    // Status simulates a storage-layer fault (IsCorruption / IsIOError) that real
+    // on-disk data can't easily produce, so the monitor's retry/tolerate/confirm
+    // routing is exercised end-to-end. In a shipped binary this block, the global,
+    // and its declaration do not exist — there is no injectable seam.
+    if (g_undo_fetch_fault_injector) {
+        st = g_undo_fetch_fault_injector();
+    }
+#endif
     if (st.ok()) {
         st = db->Get(leveldb::ReadOptions(), undoKey, &undoValue);
     }

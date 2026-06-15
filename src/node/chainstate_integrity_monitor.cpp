@@ -14,6 +14,7 @@
 namespace Dilithion {
 
 std::atomic<bool> ChainstateIntegrityMonitor::s_instance_alive{false};
+std::atomic<bool> ChainstateIntegrityMonitor::s_health_degraded{false};
 
 ChainstateIntegrityMonitor::ChainstateIntegrityMonitor(
     CChainState& chainstate,
@@ -35,6 +36,9 @@ ChainstateIntegrityMonitor::ChainstateIntegrityMonitor(
         throw std::runtime_error(
             "ChainstateIntegrityMonitor: another instance is already alive in this process");
     }
+    // Fresh monitor starts from a clean health slate — defends against a stale
+    // s_health_degraded surviving a destroy/reconstruct within one process.
+    s_health_degraded.store(false, std::memory_order_seq_cst);
 }
 
 ChainstateIntegrityMonitor::~ChainstateIntegrityMonitor() {
@@ -92,6 +96,11 @@ bool ChainstateIntegrityMonitor::InterruptibleWait(std::chrono::milliseconds dur
     return !stopped;  // true => full duration elapsed without a stop.
 }
 
+void ChainstateIntegrityMonitor::MarkCycleHealthy() {
+    m_consecutive_transient_cycles = 0;
+    s_health_degraded.store(false, std::memory_order_seq_cst);
+}
+
 bool ChainstateIntegrityMonitor::RunSingleWalk(UndoIntegrityFailure& failure_out) {
     // Phase 1 — snapshot under cs_main (briefly).
     auto snapshot = m_chainstate.SnapshotIntegrityWindow(kWindowBlocks);
@@ -134,6 +143,8 @@ bool ChainstateIntegrityMonitor::ExecuteSingleCycle() {
                           << " — earlier failure was transient (node healthy)."
                           << std::endl;
             }
+            // Healthy cycle — clear any persistent-transient escalation state.
+            MarkCycleHealthy();
             return true;  // Healthy (possibly after a transient fault cleared).
         }
 
@@ -163,23 +174,57 @@ bool ChainstateIntegrityMonitor::ExecuteSingleCycle() {
     if (failure.transient) {
         // Still a transient-class storage fault after kRevalidateAttempts. This
         // is NOT confirmed corruption — bricking here would wipe a healthy chain
-        // because of a flaky disk. Log loudly + persistently and keep running.
+        // because of a flaky disk, and an auto-rebuild can't fix a dying disk.
+        // We NEVER write the marker or shut down for a transient/IsIOError fault.
+        //
+        // extreview PR #120 B1 (Will's decision): keep tolerating, but escalate
+        // a PERSISTENT fault from a per-cycle warning to a sustained, louder
+        // signal so it can't scroll past an operator unnoticed. Count consecutive
+        // cycles that end here; at kEscalateAfterCycles, promote to a sustained
+        // ERROR + raise the operator/RPC-observable degraded-health flag.
+        ++m_consecutive_transient_cycles;
+        const bool escalated =
+            m_consecutive_transient_cycles >= kEscalateAfterCycles;
+
         std::cerr << "\n=========================================================="
                   << std::endl;
-        std::cerr << "[WARNING] ChainstateIntegrityMonitor: persistent TRANSIENT "
+        std::cerr << (escalated ? "[ERROR] " : "[WARNING] ")
+                  << "ChainstateIntegrityMonitor: persistent TRANSIENT "
                   << "read fault (cause=" << failure.cause << ") at height "
                   << failure.height << " hash="
                   << failure.blockHash.GetHex() << " after "
-                  << kRevalidateAttempts << " attempts." << std::endl;
+                  << kRevalidateAttempts << " attempts (consecutive cycle "
+                  << m_consecutive_transient_cycles << ")." << std::endl;
         std::cerr << "This indicates a storage-layer problem (failing disk, "
                   << "fsync lag, or a file lock — e.g. antivirus on Windows), "
                   << "NOT chainstate corruption." << std::endl;
-        std::cerr << "Node will KEEP RUNNING and re-check next cycle. If this "
-                  << "recurs, inspect the disk / move the data directory off the "
-                  << "failing volume." << std::endl;
+        if (escalated) {
+            // Raise the durable, observable degraded-health signal. Sustained
+            // ERROR (re-emitted every cycle while the fault persists) + a flag
+            // the operator / an RPC (getblockchaininfo) can poll.
+            s_health_degraded.store(true, std::memory_order_seq_cst);
+            std::cerr << "[ERROR] This storage fault has now persisted across "
+                      << m_consecutive_transient_cycles << " consecutive monitor "
+                      << "cycles (~" << (kCycleInterval.count()
+                                         * m_consecutive_transient_cycles)
+                      << "h). The node is STILL RUNNING and will NOT auto-rebuild "
+                      << "(a rebuild cannot fix failing hardware), but the "
+                      << "chainstate-integrity monitor is now in a DEGRADED state "
+                      << "and requires operator attention." << std::endl;
+            std::cerr << "[ERROR] ACTION REQUIRED: inspect the disk (SMART), move "
+                      << "the data directory off the failing volume, or restore "
+                      << "from a known-good backup. integrity_health=degraded is "
+                      << "now visible via getblockchaininfo." << std::endl;
+        } else {
+            std::cerr << "Node will KEEP RUNNING and re-check next cycle. If this "
+                      << "recurs across " << kEscalateAfterCycles << " cycles it "
+                      << "will escalate to a sustained ERROR + degraded-health "
+                      << "flag. Inspect the disk / move the data directory off "
+                      << "the failing volume." << std::endl;
+        }
         std::cerr << "=========================================================="
                   << std::endl;
-        return true;  // Do NOT brick on a transient fault.
+        return true;  // Do NOT brick on a transient fault (ever).
     }
 
     // Phase 3 — revalidation gate (Inverse Adversarial traps 2A + 2B).
@@ -228,6 +273,8 @@ bool ChainstateIntegrityMonitor::ExecuteSingleCycle() {
                   << failure.blockHash.GetHex().substr(0, 16)
                   << "... was reorged out of active chain (no corruption)"
                   << std::endl;
+        // Not a storage fault — the chain is healthy. Clear escalation state.
+        MarkCycleHealthy();
         return true;
     }
 

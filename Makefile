@@ -765,7 +765,31 @@ auto_rebuild_marker_mode_symmetry_tests: $(CORE_OBJECTS) $(OBJ_DIR)/test/auto_re
 # block in [highest_checkpoint+1 .. tip] has a present, SHA3-checksummed undo
 # record. Detects the missing/corrupt undo-data corruption mode that crash-looped
 # NYC + LDN on 2026-04-25. See src/test/chainstate_integrity_tests.cpp.
-chainstate_integrity_tests: $(CORE_OBJECTS) $(OBJ_DIR)/test/chainstate_integrity_tests.o $(DILITHIUM_OBJECTS) $(CHIAVDF_OBJECTS)
+# extreview PR #120 (HIGH): the undo-fetch fault injector must NOT exist in any
+# shipped binary. It is guarded by DILITHION_ENABLE_FAULT_INJECTION, defined ONLY
+# for this private test recompile of utxo_set.cpp. The production CORE utxo_set.o
+# (linked by dilithion-node / dilv-node) is built WITHOUT the macro, so the
+# injectable seam is compiled out entirely. We substitute the fault-injection
+# object for the CORE one in this test's link line so there is exactly one
+# utxo_set definition (no duplicate-symbol clash).
+INTEGRITY_TEST_FAULT_OBJ := $(OBJ_DIR)/test/utxo_set_faultinject.o
+$(INTEGRITY_TEST_FAULT_OBJ): src/node/utxo_set.cpp | $(OBJ_DIR)/test
+	@echo "$(COLOR_BLUE)[CXX]$(COLOR_RESET)  $< (fault-injection enabled, test-only)"
+	@$(CXX) $(CXXFLAGS) -DDILITHION_ENABLE_FAULT_INJECTION $(INCLUDES) -c $< -o $@
+
+# The test driver references g_undo_fetch_fault_injector, so its own object must
+# also see DILITHION_ENABLE_FAULT_INJECTION. Built via a target-specific recompile
+# (distinct .o name) so it doesn't collide with the generic src/%.o rule.
+INTEGRITY_TEST_DRIVER_OBJ := $(OBJ_DIR)/test/chainstate_integrity_tests_faultinject.o
+$(INTEGRITY_TEST_DRIVER_OBJ): src/test/chainstate_integrity_tests.cpp | $(OBJ_DIR)/test
+	@echo "$(COLOR_BLUE)[CXX]$(COLOR_RESET)  $< (fault-injection enabled, test-only)"
+	@$(CXX) $(CXXFLAGS) -DDILITHION_ENABLE_FAULT_INJECTION $(INCLUDES) -c $< -o $@
+
+CHAINSTATE_INTEGRITY_CORE_OBJECTS := \
+	$(filter-out $(OBJ_DIR)/node/utxo_set.o,$(CORE_OBJECTS)) \
+	$(INTEGRITY_TEST_FAULT_OBJ)
+
+chainstate_integrity_tests: $(CHAINSTATE_INTEGRITY_CORE_OBJECTS) $(INTEGRITY_TEST_DRIVER_OBJ) $(DILITHIUM_OBJECTS) $(CHIAVDF_OBJECTS)
 	@echo "$(COLOR_BLUE)[LINK]$(COLOR_RESET) $@"
 	@$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS) $(LIBS)
 	@echo "$(COLOR_GREEN)✓ chainstate_integrity_tests built successfully$(COLOR_RESET)"

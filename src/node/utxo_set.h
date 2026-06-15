@@ -77,10 +77,23 @@ void ClassifyUndoFetchStatus(const leveldb::Status& st, UndoIntegrityFailure& fa
  * tests drive the full ChainstateIntegrityMonitor retry/tolerate/confirm
  * routing through a synthetic persistent-Corruption or transient-IOError fault.
  *
- * Production code MUST leave this null. It is a std::function so a test can
- * decrement a counter per call (persistent vs clears-on-retry).
+ * COMPILED OUT OF PRODUCTION (extreview PR #120 HIGH, unanimous 3/3 providers).
+ * The whole symbol — declaration, definition, and the FetchAndVerifyUndo call
+ * site — lives inside `#ifdef DILITHION_ENABLE_FAULT_INJECTION`. That macro is
+ * defined ONLY for the dedicated test object built by the Makefile's
+ * `chainstate_integrity_tests` target (a private recompile of utxo_set.cpp);
+ * the production `dilithion-node` / `dilv-node` link the normal CORE
+ * `utxo_set.o`, where this mutable `extern std::function` seam does not exist at
+ * all and therefore cannot be reassigned to steer the monitor's corruption
+ * routing. There is intentionally no runtime path that touches the injector in a
+ * shipped binary.
+ *
+ * It is a std::function so a test can decrement a counter per call (persistent
+ * vs clears-on-retry).
  */
+#ifdef DILITHION_ENABLE_FAULT_INJECTION
 extern std::function<leveldb::Status()> g_undo_fetch_fault_injector;
+#endif
 
 /**
  * UTXO (Unspent Transaction Output) entry
