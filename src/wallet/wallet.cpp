@@ -5746,6 +5746,34 @@ bool CWallet::MigrateToEncryptedSeedV7Unlocked(bool* persistedToDisk) {
         std::string mnemonicStr(mnemonicPlain.begin(), mnemonicPlain.end());
         memory_cleanse(mnemonicPlain.data(), mnemonicPlain.size());
 
+        // LP-7 (F1, BLOCKER): a successful Decrypt() only proves PKCS#7 padding
+        // was well-formed — NOT that the recovered bytes are a real seed phrase.
+        // Under a wrong-key edge case / partial corruption / format confusion the
+        // obfuscation-key or master-key decrypt can yield padding-valid garbage.
+        // If we re-encrypted that garbage as the authoritative v7 mnemonic and then
+        // rewrote the file at v7, the original mnemonic ciphertext would be gone =>
+        // PERMANENT, irreversible seed-phrase loss. So positively confirm the
+        // recovered plaintext is a well-formed BIP39 mnemonic (word count + wordlist
+        // membership + checksum, via the same CMnemonic::Validate the wallet uses on
+        // import/generate) BEFORE re-encrypting and discarding the original. On
+        // failure: ABORT migration loudly — do NOT call EncryptMnemonic (which would
+        // overwrite vchEncryptedMnemonic/IV/MAC), roll back to the pre-migration
+        // snapshot so the original ciphertext is preserved byte-for-byte, and leave
+        // the wallet in its prior valid state so the migration can be retried once
+        // the cause is understood. INVARIANT: the original seed ciphertext is NEVER
+        // discarded unless a valid mnemonic has been positively confirmed.
+        if (!CMnemonic::Validate(mnemonicStr)) {
+            memory_cleanse(&mnemonicStr[0], mnemonicStr.size());
+            std::cerr << "[Wallet] LP-7 CRITICAL: v7 seed migration ABORTED — the "
+                         "recovered mnemonic is not a valid BIP39 phrase "
+                         "(decrypt produced padding-valid but non-mnemonic bytes). "
+                         "The original seed ciphertext was NOT modified; the wallet "
+                         "remains loadable with its existing seed. Migration will be "
+                         "retried on the next unlock." << std::endl;
+            rollback();
+            return false;
+        }
+
         bool reOk = EncryptMnemonic(mnemonicStr);  // master-key branch + MAC
         memory_cleanse(&mnemonicStr[0], mnemonicStr.size());
         if (!reOk) {

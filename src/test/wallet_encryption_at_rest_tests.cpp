@@ -275,7 +275,16 @@ struct LegacyV6Result {
 
 static bool BuildLegacyV6Wallet(const std::string& path,
                                 const std::string& passphrase,
-                                LegacyV6Result& out) {
+                                LegacyV6Result& out,
+                                // LP-7 (F1) test hook: when non-empty, this string is
+                                // encrypted into the legacy obfuscated-mnemonic slot
+                                // INSTEAD of the real mnemonic. The obfuscation key and
+                                // plaintext seed are unchanged, so the fixed binary's
+                                // Step-1 decrypt SUCCEEDS (padding-valid) but yields
+                                // these bytes — letting a test prove migration ABORTS
+                                // when the recovered plaintext is not a valid BIP39
+                                // mnemonic. Empty (default) ⇒ encrypt the real mnemonic.
+                                const std::string& mnemonicPlaintextOverride = "") {
     // --- 1. Use a real CWallet to mint a consistent HD wallet, then read out the
     //        pieces we need (mnemonic, seed, chaincode, default address). ---
     std::string scratch = path + ".scratch";
@@ -339,7 +348,12 @@ static bool BuildLegacyV6Wallet(const std::string& path,
     if (!GenerateIV(mnIV)) return false;
     CCrypter mnCrypter;
     if (!mnCrypter.SetKey(obfKey, mnIV)) return false;
-    std::vector<uint8_t> mnemonicBytes(mnemonic.begin(), mnemonic.end());
+    // LP-7 (F1): optionally encrypt garbage plaintext instead of the real mnemonic,
+    // so the fixed binary's Step-1 decrypt round-trips (padding-valid) to non-BIP39
+    // bytes — the exact precondition F1 must catch and abort on.
+    const std::string& mnSource = mnemonicPlaintextOverride.empty()
+                                      ? mnemonic : mnemonicPlaintextOverride;
+    std::vector<uint8_t> mnemonicBytes(mnSource.begin(), mnSource.end());
     std::vector<uint8_t> mnCipher;
     if (!mnCrypter.Encrypt(mnemonicBytes, mnCipher)) return false;
 
@@ -2420,11 +2434,142 @@ static void Test_EncryptWalletRollback() {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Test 2e — F1 (BLOCKER): v7 migration MUST ABORT when the recovered mnemonic
+// plaintext is padding-valid but NOT a valid BIP39 mnemonic. A successful
+// CCrypter::Decrypt() only proves PKCS#7 padding was well-formed — it does NOT
+// prove the content is a real seed phrase. If migration re-encrypted that garbage
+// as the authoritative v7 mnemonic and rewrote the file at v7, the original seed
+// ciphertext would be GONE → permanent, irreversible seed-phrase loss.
+//
+// Fixture: a legacy v6 plaintext-seed wallet whose obfuscated-mnemonic slot holds
+// garbage (encrypted under the CORRECT obfuscation key, so Step-1 decrypt
+// succeeds). The guard must:
+//   (1) ABORT the migration for this record (no v7 rewrite is committed),
+//   (2) leave the on-disk file byte-for-byte unchanged (original ciphertext NOT
+//       discarded; file stays v6),
+//   (3) keep the wallet loadable in its prior valid state.
+//
+// NOTE on Unlock's return value: by EXISTING design (wallet.cpp Unlock ~1310-1345),
+// a migration failure does NOT fail the unlock — the wallet stays usable in memory
+// and migration retries on the next unlock, with the on-disk file left byte-
+// identical. So the F1-load-bearing assertion is NOT "Unlock returns false"; it is
+// "the file is byte-for-byte unchanged and stays v6 (original ciphertext preserved,
+// garbage NOT committed as the seed)". That is the irreversible-loss invariant.
+//
+// MUTATION CHECK: a no-op guard (one that proceeds to EncryptMnemonic(garbage))
+// FAILS this test — migration would commit, the file would be rewritten to v7, the
+// byte-identity assertion would break AND FileVersion would read v7. This proves the
+// assertions are load-bearing, not decorative.
+// ---------------------------------------------------------------------------
+static void Test_F1_AbortOnInvalidMnemonic() {
+    std::cout << COLOR_BLUE "\n[Test 2e] F1: v7 migration ABORTS on padding-valid non-BIP39 mnemonic\n" COLOR_RESET;
+
+    const std::string path = "lp7_f1_garbage_mnemonic_wallet.dat";
+    const std::string pass = "F1Abort!Garbage#2026";
+    std::remove(path.c_str());
+
+    // Padding-valid bytes that are NOT a valid BIP39 mnemonic (wrong word count and
+    // non-wordlist tokens → CMnemonic::Validate() must reject). AES-CBC+PKCS7
+    // round-trips ANY plaintext, so this decrypts cleanly under the obfuscation key.
+    const std::string garbage = "this is not a valid bip39 seed phrase zzz qqq xyzzy plugh";
+    CHECK(!CMnemonic::Validate(garbage),
+          "Precondition: the injected plaintext is NOT a valid BIP39 mnemonic");
+
+    LegacyV6Result legacy;
+    bool built = BuildLegacyV6Wallet(path, pass, legacy, /*mnemonicPlaintextOverride=*/garbage);
+    CHECK(built, "Built legacy v6 wallet with padding-valid garbage in the mnemonic slot");
+    if (!built) { std::remove(path.c_str()); return; }
+
+    // Sanity: file is v6 and the plaintext seed is present (the migration trigger).
+    CHECK(FileVersion(path) == WALLET_FILE_VERSION_6, "Fixture file is v6");
+    {
+        std::vector<uint8_t> bytes = ReadFileBytes(path);
+        CHECK(Contains(bytes, legacy.seed.data(), legacy.seed.size()),
+              "Fixture v6 file contains plaintext seed (migration would be attempted)");
+    }
+
+    // Capture exact bytes BEFORE the migration attempt.
+    std::vector<uint8_t> bytesBefore = ReadFileBytes(path);
+
+    // --- Unlock with autosave ON → would normally drive the atomic v7 rewrite.
+    //     The F1 guard must ABORT the migration (no v7 rewrite committed) because the
+    //     recovered mnemonic fails BIP39 validation. Unlock itself still returns true
+    //     by existing design (migration failure is non-fatal to the unlock). ---
+    {
+        CWallet w;
+        w.SetWalletFile(path);  // enables autosave
+        CHECK(w.Load(path), "Loaded the garbage-mnemonic legacy wallet (autosave on)");
+        bool unlocked = w.Unlock(pass);
+        CHECK(unlocked,
+              "Unlock still succeeds (migration failure is non-fatal to unlock, by design)");
+        // The load-bearing F1 assertions are the on-disk-invariant checks below.
+    }
+
+    // --- INVARIANT: original seed ciphertext NEVER discarded. The on-disk file must
+    //     be byte-for-byte unchanged (no v7 rewrite happened) and still be a v6 file. ---
+    std::vector<uint8_t> bytesAfter = ReadFileBytes(path);
+    CHECK(bytesBefore == bytesAfter,
+          "F1 INVARIANT: on-disk file is byte-for-byte UNCHANGED (original ciphertext preserved)");
+    CHECK(FileVersion(path) == WALLET_FILE_VERSION_6,
+          "F1: file was NOT promoted to v7 (migration did not commit)");
+
+    // --- The wallet remains in its prior valid, loadable state. ---
+    {
+        CWallet w;
+        CHECK(w.Load(path), "Wallet still LOADS in its prior valid state after the aborted migration");
+        CHECK(w.IsCrypted(), "Wallet still reports encrypted (unchanged)");
+    }
+
+    std::remove(path.c_str());
+}
+
+// ---------------------------------------------------------------------------
+// Test 2f — F1 happy path: a VALID mnemonic still migrates cleanly. Guards the
+// guard against being over-broad (i.e. the validation must NOT block legitimate
+// migrations). This is the same shape as Test_Migration but asserted alongside the
+// abort test so the pair pins both arms of the branch.
+// ---------------------------------------------------------------------------
+static void Test_F1_ValidMnemonicStillMigrates() {
+    std::cout << COLOR_BLUE "\n[Test 2f] F1 happy path: a VALID mnemonic still migrates to v7\n" COLOR_RESET;
+
+    const std::string path = "lp7_f1_valid_mnemonic_wallet.dat";
+    const std::string pass = "F1Valid!Migrate#2026";
+    std::remove(path.c_str());
+
+    LegacyV6Result legacy;
+    // No override → the real (valid) mnemonic is encrypted into the slot.
+    bool built = BuildLegacyV6Wallet(path, pass, legacy);
+    CHECK(built, "Built legacy v6 wallet with a VALID mnemonic");
+    if (!built) { std::remove(path.c_str()); return; }
+    CHECK(CMnemonic::Validate(legacy.mnemonic), "Precondition: fixture mnemonic IS valid BIP39");
+
+    std::string exported;
+    {
+        CWallet w;
+        w.SetWalletFile(path);  // autosave on
+        CHECK(w.Load(path), "Loaded valid-mnemonic legacy wallet (autosave on)");
+        CHECK(w.Unlock(pass), "F1: Unlock SUCCEEDS — valid mnemonic is not blocked by the guard");
+        CHECK(w.ExportMnemonic(exported), "ExportMnemonic works post-migration");
+    }
+    CHECK(exported == legacy.mnemonic, "Mnemonic round-trips identically after migration");
+    CHECK(FileVersion(path) == WALLET_FILE_VERSION_7, "File promoted to v7 (valid migration committed)");
+    {
+        std::vector<uint8_t> bytes = ReadFileBytes(path);
+        CHECK(!Contains(bytes, legacy.seed.data(), legacy.seed.size()),
+              "Post-migration: plaintext seed ABSENT (drive-to-safety still works for valid mnemonics)");
+    }
+
+    std::remove(path.c_str());
+}
+
 int main() {
     std::cout << COLOR_BLUE "==== LP-7 wallet encryption-at-rest tests ====" COLOR_RESET "\n";
 
     Test_Secrecy();
     Test_Migration();
+    Test_F1_AbortOnInvalidMnemonic();
+    Test_F1_ValidMnemonicStillMigrates();
     Test_NeedsSeedMigrationSurfaced();
     Test_V7PlaintextSeedArtifactMigrates();
     Test_M1_FlagTracksOnDiskNotInMemory();
