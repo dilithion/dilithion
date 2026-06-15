@@ -2332,6 +2332,37 @@ struct LP7EncryptRollbackTester {
         w.vchMnemonicMAC.clear();  // legacy obfuscation-key slot carries no MAC
         return true;
     }
+    // LP-7 (F1 round 4, red-team HIGH-1): in the DEFERRED-AND-PRESERVE state (seed
+    // encrypted at rest, empty mnemonic MAC), simulate on-disk tamper / bit-rot of the
+    // mnemonic ciphertext. We re-encrypt a GARBAGE non-mnemonic plaintext under the SAME
+    // obfuscation key the deferred export path derives (from the LIVE seed via
+    // DecryptHDMasterKey, since hdMasterKey.seed is scrubbed once encrypted). The garbage
+    // therefore DECRYPTS cleanly (PKCS#7 unpads) but FAILS CMnemonic::Validate — exactly
+    // the "valid padding, invalid mnemonic" attack the export gate must reject. Wallet
+    // must be encrypted + unlocked + deferred for this to be meaningful.
+    static bool TamperDeferredMnemonicWithGarbage(CWallet& w, const std::string& garbage) {
+        if (!w.m_migrationDeferredPassphrase || !w.vchMnemonicMAC.empty()) return false;
+        CHDExtendedKey live;
+        if (!w.DecryptHDMasterKey(live)) return false;  // need the live seed (unlocked)
+        std::vector<uint8_t> obfKey(WALLET_CRYPTO_KEY_SIZE);
+        std::vector<uint8_t> hdSeed(live.seed, live.seed + 32);
+        DeriveEncryptionKey(hdSeed, "mnemonic", obfKey);
+        memory_cleanse(hdSeed.data(), hdSeed.size());
+        live.Wipe();
+        std::vector<uint8_t> mnIV;
+        if (!GenerateIV(mnIV)) { memory_cleanse(obfKey.data(), obfKey.size()); return false; }
+        CCrypter mnCrypter;
+        if (!mnCrypter.SetKey(obfKey, mnIV)) { memory_cleanse(obfKey.data(), obfKey.size()); return false; }
+        std::vector<uint8_t> bytes(garbage.begin(), garbage.end());
+        std::vector<uint8_t> cipher;
+        bool ok = mnCrypter.Encrypt(bytes, cipher);
+        memory_cleanse(obfKey.data(), obfKey.size());
+        if (!ok) return false;
+        w.vchEncryptedMnemonic = std::move(cipher);
+        w.vchMnemonicIV.assign(mnIV.begin(), mnIV.end());
+        w.vchMnemonicMAC.clear();  // stays empty (deferred-state invariant)
+        return true;
+    }
     static bool MnemonicCiphertextMatches(const CWallet& w, const std::vector<uint8_t>& ct) {
         return w.vchEncryptedMnemonic == ct;
     }
@@ -3060,6 +3091,56 @@ static void Test_F1R3_DeferredStateReloadsAndCompletes() {
     std::remove(path.c_str());
 }
 
+// (6) LP-7 (F1 round 4, red-team HIGH-1 / extreview BLOCKER): the deferred-state
+//     mnemonic EXPORT must be gated by CMnemonic::Validate. A legit deferred
+//     passphrase wallet's VALID mnemonic still exports (NO re-break of the round-3
+//     cohort); a TAMPERED/garbage ciphertext that decrypts to a non-mnemonic must be
+//     REFUSED rather than handed to the user as their backup phrase.
+static void Test_F1R4_DeferredExportGatedByValidate() {
+    std::cout << COLOR_BLUE "\n[Test r4-1] Deferred mnemonic export GATED by Validate (tamper REFUSED, legit phrase OK)\n" COLOR_RESET;
+    const std::string path = "lp7_r4_export_gate.dat";
+    const std::string pass = "R4Export!Gate#2026";
+    std::remove(path.c_str());
+
+    std::string mnemonic;
+    CWallet w;
+    w.SetWalletFile(path);
+    CHECK(w.GenerateHDWallet(mnemonic, kTrezorPP), "Generated BIP39-passphrase HD wallet (TREZOR)");
+
+    // Encrypt WITHOUT the BIP39 passphrase → defer-and-preserve (seed encrypted, mnemonic
+    // under obfuscation key, empty MAC). EncryptWallet leaves the wallet UNLOCKED.
+    CHECK(w.EncryptWallet(pass), "EncryptWallet succeeds (defers BIP39-passphrase migration)");
+    CHECK(w.MigrationDeferredForPassphrase(), "Deferred-passphrase state set");
+    CHECK(LP7EncryptRollbackTester::HDSeedEncrypted(w), "Seed IS encrypted at rest (deferred)");
+    CHECK(LP7EncryptRollbackTester::MnemonicMAC(w).empty(), "Mnemonic MAC empty (obfuscation-key window)");
+
+    // NEGATIVE CONTROL (must NOT re-break round-3): the legit VALID mnemonic still exports
+    // in the deferred window. If the gate used MnemonicReDerivesSeed("") instead of
+    // CMnemonic::Validate, THIS assertion would FAIL for a passphrase wallet.
+    {
+        std::string exported;
+        CHECK(w.ExportMnemonic(exported),
+              "LOAD-BEARING (no re-break): legit passphrase-wallet mnemonic STILL exports in deferred window");
+        CHECK(exported == mnemonic, "Exported phrase matches the original (Validate passes a real mnemonic)");
+    }
+
+    // Now TAMPER: replace the deferred ciphertext with garbage that decrypts (clean PKCS#7)
+    // but is NOT a valid BIP39 mnemonic. Export MUST refuse.
+    {
+        const std::string garbage = "this is not a valid bip39 mnemonic phrase at all xyzzy";
+        CHECK(LP7EncryptRollbackTester::TamperDeferredMnemonicWithGarbage(w, garbage),
+              "Tampered the deferred mnemonic ciphertext with non-mnemonic garbage (decrypts cleanly)");
+        std::string exported = "SENTINEL";
+        bool ok = w.ExportMnemonic(exported);
+        CHECK(!ok,
+              "LOAD-BEARING (HIGH-1 closed): export REFUSES the tampered/garbage mnemonic (Validate gate)");
+        CHECK(exported != garbage,
+              "Garbage plaintext is NOT handed back to the user as a backup phrase");
+    }
+
+    std::remove(path.c_str());
+}
+
 int main() {
     std::cout << COLOR_BLUE "==== LP-7 wallet encryption-at-rest tests ====" COLOR_RESET "\n";
 
@@ -3088,6 +3169,8 @@ int main() {
     Test_F1R3_PassphraseWalletUnlockMigratesWithCorrectPassphrase();
     Test_F1R3_EmptyPassphraseCohortUnchanged();
     Test_F1R3_DeferredStateReloadsAndCompletes();
+    // LP-7 (F1 round 4): deferred-state export gated by Validate (tamper refused).
+    Test_F1R4_DeferredExportGatedByValidate();
 
     std::cout << "\n=============================================\n";
     std::cout << "PASSED: " << g_pass << "   FAILED: " << g_fail << "\n";

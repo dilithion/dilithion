@@ -4351,7 +4351,10 @@ std::string CRPCServer::RPC_GetWalletInfo(const std::string& params) {
         << "\"locked\":" << (isLocked ? "true" : "false") << ","
         << "\"unlocked_until\":" << (isLocked ? 0 : 1) << ","  // 0 if locked, 1 if unlocked
         << "\"needs_seed_migration\":" << (needsSeedMigration ? "true" : "false") << ","
-        << "\"seed_unencrypted_at_rest\":" << (needsSeedMigration ? "true" : "false") << ","
+        // LP-7 (F1 round 4, red-team MEDIUM-1): in the BIP39-passphrase deferred state the
+        // seed IS encrypted at rest (only the mnemonic migration is pending the passphrase),
+        // so it must NOT trip the plaintext-seed-leak signal. Gate on !migrationDeferred.
+        << "\"seed_unencrypted_at_rest\":" << ((needsSeedMigration && !migrationDeferredPassphrase) ? "true" : "false") << ","
         << "\"migration_deferred_bip39_passphrase\":" << (migrationDeferredPassphrase ? "true" : "false")
         << "}";
 
@@ -4403,8 +4406,19 @@ std::string CRPCServer::RPC_EncryptWallet(const std::string& params) {
     // identity check: a false return here is a genuine encryption failure (rolled back),
     // NOT a deferred mnemonic migration.
     if (!m_wallet->EncryptWallet(passphrase, bip39passphrase)) {
+        // LP-7 (F1 round 4, red-team LOW-1): wipe secret-bearing RPC-local strings before
+        // leaving scope so they don't linger on the heap (the BIP39 passphrase protects the
+        // seed; the AES passphrase protects the wallet). Done on the error path too.
+        memory_cleanse(&passphrase[0], passphrase.size());
+        memory_cleanse(&bip39passphrase[0], bip39passphrase.size());
         throw std::runtime_error("Error: Failed to encrypt wallet");
     }
+
+    // LP-7 (F1 round 4, red-team LOW-1): wipe the secret-bearing strings now that the
+    // wallet has consumed them; the std::string destructors free the buffer but do not
+    // scrub it, so memory_cleanse first.
+    memory_cleanse(&passphrase[0], passphrase.size());
+    memory_cleanse(&bip39passphrase[0], bip39passphrase.size());
 
     // Return success message with strength info
     std::ostringstream oss;
@@ -4462,7 +4476,12 @@ std::string CRPCServer::RPC_WalletPassphrase(const std::string& params) {
                                  std::to_string(MAX_PASSPHRASE_LENGTH) + " characters)");
     }
 
-    if (!m_wallet->Unlock(passphrase, timeout, bip39passphrase)) {
+    bool unlocked = m_wallet->Unlock(passphrase, timeout, bip39passphrase);
+    // LP-7 (F1 round 4, red-team LOW-1): wipe secret-bearing RPC-local strings on BOTH
+    // paths now that Unlock has consumed them (the BIP39 passphrase protects the seed).
+    memory_cleanse(&passphrase[0], passphrase.size());
+    memory_cleanse(&bip39passphrase[0], bip39passphrase.size());
+    if (!unlocked) {
         throw std::runtime_error("Error: The wallet passphrase entered was incorrect");
     }
 

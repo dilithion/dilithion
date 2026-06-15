@@ -6423,8 +6423,28 @@ bool CWallet::DecryptMnemonic(std::string& mnemonic) const {
             if (!ok) {
                 return false;
             }
-            mnemonic = std::string(decrypted.begin(), decrypted.end());
+            std::string candidate(decrypted.begin(), decrypted.end());
             memory_cleanse(decrypted.data(), decrypted.size());
+            // LP-7 (F1 round 4, red-team HIGH-1 / extreview BLOCKER): the deferred
+            // obfuscation-key branch has NO per-record MAC (empty by construction in
+            // this window), so a tampered/corrupt vchEncryptedMnemonic that happens to
+            // unpad cleanly would otherwise be handed back to the user via
+            // exportmnemonic as their authentic backup phrase. Gate on the BIP39
+            // checksum/wordlist before returning: garbage/corruption fails Validate and
+            // export REFUSES rather than emitting a useless "seed phrase".
+            //
+            // CRITICAL: this MUST be CMnemonic::Validate (the syntactic checksum gate),
+            // NOT MnemonicReDerivesSeed("") — a legitimate BIP39-passphrase wallet's real
+            // mnemonic does NOT re-derive the seed under an empty passphrase, so an
+            // empty-passphrase identity check would WRONGLY refuse legit passphrase-wallet
+            // exports (the exact cohort round-3 fixed). Validate catches tamper/corruption
+            // without needing the passphrase.
+            if (!CMnemonic::Validate(candidate)) {
+                memory_cleanse(candidate.data(), candidate.size());
+                return false;
+            }
+            mnemonic = candidate;
+            memory_cleanse(candidate.data(), candidate.size());
             return true;
         }
 
