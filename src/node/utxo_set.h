@@ -26,11 +26,20 @@ class CBlockIndex;
  * Populated by CUTXOSet::VerifyUndoDataInRange when the walk detects a missing
  * or corrupt undo record. The cause field distinguishes failure modes for
  * operator diagnostics + auto-rebuild marker reason text.
+ *
+ * `transient`: true when the underlying LevelDB read failed with an
+ * IsIOError()/IsCorruption() status (a recoverable storage-layer fault — flaky
+ * disk, fsync lag, AV file lock on Windows) rather than a clean IsNotFound()
+ * (key genuinely absent) or a data-level checksum/size mismatch. The periodic
+ * ChainstateIntegrityMonitor uses this flag to AVOID self-bricking a healthy
+ * node on a transient fault: a transient failure that does not clear across
+ * retries is logged + tolerated, never marker-written.
  */
 struct UndoIntegrityFailure {
     int height = -1;
     uint256 blockHash;
-    std::string cause;  // "missing" | "checksum_mismatch" | "size_invalid" | "db_not_open" | "block_index_missing"
+    std::string cause;  // "missing" | "checksum_mismatch" | "size_invalid" | "io_error" | "db_not_open" | "block_index_missing"
+    bool transient = false;  // true => recoverable storage-layer read fault (do NOT brick on it)
 };
 
 /**

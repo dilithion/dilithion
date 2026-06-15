@@ -57,7 +57,20 @@ bool FetchAndVerifyUndo(leveldb::DB* db,
     if (!st.ok()) {
         failure_out.height = height;
         failure_out.blockHash = blockHash;
-        failure_out.cause = "missing";
+        // Distinguish a TRANSIENT storage-layer fault (IsIOError / IsCorruption
+        // — flaky disk, fsync lag, AV file lock on Windows) from a clean
+        // IsNotFound() (key genuinely absent). Only the latter is real
+        // "missing undo data" corruption. The periodic monitor uses the
+        // transient flag to avoid self-bricking a healthy node on a recoverable
+        // read fault. A genuinely-missing key on an active-chain block is real
+        // corruption and still confirms after the monitor's retry loop.
+        if (st.IsIOError() || st.IsCorruption()) {
+            failure_out.cause = "io_error";
+            failure_out.transient = true;
+        } else {
+            failure_out.cause = "missing";
+            failure_out.transient = false;
+        }
         return false;
     }
     switch (VerifyUndoChecksum(undoValue)) {

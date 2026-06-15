@@ -80,7 +80,19 @@ bool ChainstateIntegrityMonitor::RunOneCycleForTesting() {
     return ExecuteSingleCycle();
 }
 
-bool ChainstateIntegrityMonitor::ExecuteSingleCycle() {
+bool ChainstateIntegrityMonitor::InterruptibleWait(std::chrono::milliseconds dur) {
+    if (dur <= std::chrono::milliseconds::zero()) {
+        return !m_stop_requested.load(std::memory_order_seq_cst);
+    }
+    std::unique_lock<std::mutex> lk(m_cv_mutex);
+    // Returns true if the predicate (stop requested) became true => interrupted.
+    const bool stopped = m_cv.wait_for(
+        lk, dur,
+        [this] { return m_stop_requested.load(std::memory_order_seq_cst); });
+    return !stopped;  // true => full duration elapsed without a stop.
+}
+
+bool ChainstateIntegrityMonitor::RunSingleWalk(UndoIntegrityFailure& failure_out) {
     // Phase 1 — snapshot under cs_main (briefly).
     auto snapshot = m_chainstate.SnapshotIntegrityWindow(kWindowBlocks);
     if (snapshot.empty()) {
@@ -89,14 +101,85 @@ bool ChainstateIntegrityMonitor::ExecuteSingleCycle() {
     }
 
     // Phase 2 — walk lock-free w.r.t. cs_main; uses cs_utxo internally.
-    UndoIntegrityFailure failure;
-    const bool walkPass = m_utxo_set.VerifyUndoDataFromSnapshot(
-        snapshot, failure, &m_stop_requested);
-    if (walkPass) return true;  // Healthy.
+    return m_utxo_set.VerifyUndoDataFromSnapshot(
+        snapshot, failure_out, &m_stop_requested);
+}
 
-    if (failure.cause == "aborted_for_shutdown") {
-        // Mid-walk shutdown — bail without any state change.
-        return true;
+bool ChainstateIntegrityMonitor::ExecuteSingleCycle() {
+    // ---------------------------------------------------------------------
+    // Self-heal retry loop (fix/integrity-monitor-self-heal).
+    //
+    // A single failed walk is NEVER sufficient to brick the node. We re-verify
+    // up to kRevalidateAttempts times with backoff. Rationale:
+    //   * A transient storage-layer fault (flaky disk, fsync lag, AV file lock
+    //     on Windows, a momentary LevelDB IsIOError) clears across retries — the
+    //     re-walk passes and we return healthy.
+    //   * Genuine corruption (a clean missing key on an active-chain block, or a
+    //     checksum/size mismatch) is reproducible — it fails every attempt.
+    // Only a reproducible failure that ALSO survives the cs_main revalidation
+    // gate (not a reorg orphan-skip) is allowed to write the marker + shut down.
+    // A failure that remains transient-class after all retries is logged loudly
+    // and TOLERATED — the node keeps running; next cycle re-checks. We must not
+    // wipe-and-resync a node whose disk is merely throwing transient IOErrors.
+    // ---------------------------------------------------------------------
+    UndoIntegrityFailure failure;
+    bool walkPass = false;
+    for (int attempt = 1; attempt <= kRevalidateAttempts; ++attempt) {
+        failure = UndoIntegrityFailure{};  // reset between attempts
+        walkPass = RunSingleWalk(failure);
+        if (walkPass) {
+            if (attempt > 1) {
+                std::cerr << "[IntegrityMonitor] walk passed on retry attempt "
+                          << attempt << "/" << kRevalidateAttempts
+                          << " — earlier failure was transient (node healthy)."
+                          << std::endl;
+            }
+            return true;  // Healthy (possibly after a transient fault cleared).
+        }
+
+        if (failure.cause == "aborted_for_shutdown") {
+            // Mid-walk shutdown — bail without any state change.
+            return true;
+        }
+
+        // Failed this attempt. If more attempts remain, back off and retry so a
+        // transient fault has time to clear. The wait is interruptible by Stop()
+        // so shutdown latency is not extended by the retry backoff.
+        if (attempt < kRevalidateAttempts) {
+            std::cerr << "[IntegrityMonitor] walk attempt " << attempt << "/"
+                      << kRevalidateAttempts << " failed (cause=" << failure.cause
+                      << ", transient=" << (failure.transient ? "yes" : "no")
+                      << ") at height " << failure.height
+                      << " — re-verifying after backoff before acting."
+                      << std::endl;
+            if (!InterruptibleWait(m_revalidate_backoff)) {
+                // Stop requested during backoff — bail without state change.
+                return true;
+            }
+        }
+    }
+
+    // All retries exhausted and every attempt failed.
+    if (failure.transient) {
+        // Still a transient-class storage fault after kRevalidateAttempts. This
+        // is NOT confirmed corruption — bricking here would wipe a healthy chain
+        // because of a flaky disk. Log loudly + persistently and keep running.
+        std::cerr << "\n=========================================================="
+                  << std::endl;
+        std::cerr << "[WARNING] ChainstateIntegrityMonitor: persistent TRANSIENT "
+                  << "read fault (cause=" << failure.cause << ") at height "
+                  << failure.height << " hash="
+                  << failure.blockHash.GetHex() << " after "
+                  << kRevalidateAttempts << " attempts." << std::endl;
+        std::cerr << "This indicates a storage-layer problem (failing disk, "
+                  << "fsync lag, or a file lock — e.g. antivirus on Windows), "
+                  << "NOT chainstate corruption." << std::endl;
+        std::cerr << "Node will KEEP RUNNING and re-check next cycle. If this "
+                  << "recurs, inspect the disk / move the data directory off the "
+                  << "failing volume." << std::endl;
+        std::cerr << "=========================================================="
+                  << std::endl;
+        return true;  // Do NOT brick on a transient fault.
     }
 
     // Phase 3 — revalidation gate (Inverse Adversarial traps 2A + 2B).

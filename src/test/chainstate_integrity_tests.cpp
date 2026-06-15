@@ -277,6 +277,10 @@ void test_periodic_monitor_fails_on_runtime_corruption() {
 
     std::atomic<bool> running{true};
     Dilithion::ChainstateIntegrityMonitor monitor(cs, utxo, td.str(), &running);
+    // Zero the retry backoff so the 3-attempt self-heal loop doesn't add 60s.
+    // A checksum mismatch is reproducible, so it still fails all 3 attempts and
+    // confirms corruption exactly as before the self-heal change.
+    monitor.SetRevalidateBackoffForTesting(std::chrono::milliseconds::zero());
 
     bool result = monitor.RunOneCycleForTesting();
     assert(!result && "corrupted chain cycle must return false");
@@ -422,6 +426,111 @@ void test_periodic_monitor_skips_orphan_on_reorg() {
     std::cout << " OK\n";
 }
 
+// =============================================================================
+// Test 9: transient-classification — genuine corruption modes (missing key,
+// checksum mismatch) must be classified transient=false so the self-heal loop
+// NEVER tolerates real corruption. (The inverse direction — a true IsIOError
+// being classified transient=true — cannot be exercised without LevelDB fault
+// injection; this test locks in the safety-critical direction: real corruption
+// is never mislabelled transient.)
+// =============================================================================
+void test_transient_classification_never_masks_real_corruption() {
+    std::cout << "  test_transient_classification_never_masks_real_corruption..."
+              << std::flush;
+    TempDir td("transient-class");
+    CUTXOSet utxo;
+    assert(utxo.Open(td.str(), true));
+
+    std::vector<std::unique_ptr<CBlockIndex>> chain;
+    CBlockIndex* tip = BuildSyntheticChain(20, chain);
+    WriteValidUndoForChain(utxo, chain);
+
+    // Case A: clean missing key (IsNotFound) — transient must be false.
+    {
+        const uint256 victim = chain[9]->phashBlock;
+        assert(utxo.DeleteUndoForTesting(victim));
+        std::vector<std::pair<int, uint256>> snapshot;
+        snapshot.emplace_back(chain[9]->nHeight, victim);
+        UndoIntegrityFailure failure;
+        bool ok = utxo.VerifyUndoDataFromSnapshot(snapshot, failure);
+        assert(!ok && "missing key must fail the walk");
+        assert(failure.cause == "missing" && "clean absent key => 'missing'");
+        assert(failure.transient == false &&
+               "a genuinely-missing key must NEVER be classified transient");
+        // restore for next case
+        WriteValidUndoForChain(utxo, chain);
+    }
+
+    // Case B: checksum mismatch — transient must be false.
+    {
+        const uint256 victim = chain[9]->phashBlock;
+        assert(utxo.CorruptUndoForTesting(victim));
+        std::vector<std::pair<int, uint256>> snapshot;
+        snapshot.emplace_back(chain[9]->nHeight, victim);
+        UndoIntegrityFailure failure;
+        bool ok = utxo.VerifyUndoDataFromSnapshot(snapshot, failure);
+        assert(!ok && "checksum mismatch must fail the walk");
+        assert(failure.cause == "checksum_mismatch");
+        assert(failure.transient == false &&
+               "a checksum mismatch must NEVER be classified transient");
+    }
+
+    (void)tip;
+    std::cout << " OK\n";
+}
+
+// =============================================================================
+// Test 10: retry loop confirms reproducible corruption only after exhausting
+// all attempts (with zeroed backoff) — and a clean chain still passes through
+// the multi-attempt loop with no false positive.
+// =============================================================================
+void test_retry_loop_confirms_reproducible_corruption() {
+    std::cout << "  test_retry_loop_confirms_reproducible_corruption..."
+              << std::flush;
+
+    // Clean chain: must pass even though the loop now runs up to 3 attempts.
+    {
+        TempDir td("retry-clean");
+        CUTXOSet utxo;
+        assert(utxo.Open(td.str(), true));
+        std::vector<std::unique_ptr<CBlockIndex>> chain;
+        CBlockIndex* tip = BuildSyntheticChain(50, chain);
+        WriteValidUndoForChain(utxo, chain);
+        CChainState cs;
+        cs.SetUTXOSet(&utxo);
+        cs.SetTipForTest(tip);
+        std::atomic<bool> running{true};
+        Dilithion::ChainstateIntegrityMonitor monitor(cs, utxo, td.str(), &running);
+        monitor.SetRevalidateBackoffForTesting(std::chrono::milliseconds::zero());
+        assert(monitor.RunOneCycleForTesting() && "clean chain must pass loop");
+        assert(running.load() && "running flag preserved on clean chain");
+    }
+
+    // Reproducible corruption: fails all attempts, confirms, writes marker.
+    {
+        TempDir td("retry-corrupt");
+        CUTXOSet utxo;
+        assert(utxo.Open(td.str(), true));
+        std::vector<std::unique_ptr<CBlockIndex>> chain;
+        CBlockIndex* tip = BuildSyntheticChain(50, chain);
+        WriteValidUndoForChain(utxo, chain);
+        assert(utxo.CorruptUndoForTesting(chain[24]->phashBlock));
+        CChainState cs;
+        cs.SetUTXOSet(&utxo);
+        cs.SetTipForTest(tip);
+        std::atomic<bool> running{true};
+        Dilithion::ChainstateIntegrityMonitor monitor(cs, utxo, td.str(), &running);
+        monitor.SetRevalidateBackoffForTesting(std::chrono::milliseconds::zero());
+        assert(!monitor.RunOneCycleForTesting() &&
+               "reproducible corruption must confirm after retries");
+        assert(!running.load() && "running flag flipped on confirmed corruption");
+        auto markerPath = std::filesystem::path(td.str()) / "auto_rebuild";
+        assert(std::filesystem::exists(markerPath) && "marker written");
+    }
+
+    std::cout << " OK\n";
+}
+
 }  // namespace
 
 int main() {
@@ -442,7 +551,11 @@ int main() {
         test_periodic_monitor_clean_shutdown();
         test_periodic_monitor_skips_orphan_on_reorg();
 
-        std::cout << "\n=== All 8 tests passed ===\n" << std::endl;
+        std::cout << "[self-heal / transient tolerance]" << std::endl;
+        test_transient_classification_never_masks_real_corruption();
+        test_retry_loop_confirms_reproducible_corruption();
+
+        std::cout << "\n=== All 10 tests passed ===\n" << std::endl;
         return 0;
     } catch (const std::exception& e) {
         std::cerr << "Test failed: " << e.what() << std::endl;

@@ -13,6 +13,7 @@
 
 class CChainState;
 class CUTXOSet;
+struct UndoIntegrityFailure;
 
 namespace Dilithion {
 
@@ -53,6 +54,17 @@ public:
     // Hardcoded operational constants (resolved decision (g)).
     static constexpr int kWindowBlocks = 500;
     static constexpr std::chrono::hours kCycleInterval{6};
+
+    // Self-heal / anti-false-positive (fix/integrity-monitor-self-heal).
+    // A first failed walk is re-verified up to kRevalidateAttempts-1 more times
+    // with backoff before the node is allowed to act. A transient storage-layer
+    // fault (flaky disk / fsync lag / AV file lock) clears across retries; only
+    // a reproducible, data-level failure on a still-active-chain block survives
+    // all attempts AND the cs_main revalidation gate, and only THAT writes the
+    // auto_rebuild marker + shuts down. A failure that is still transient-class
+    // after all retries is logged loudly + tolerated (node keeps running).
+    static constexpr int kRevalidateAttempts = 3;
+    static constexpr std::chrono::seconds kRevalidateBackoff{30};
 
     /**
      * @param chainstate     Shared chainstate; the monitor calls
@@ -100,14 +112,32 @@ public:
     /// Test hook: true iff the worker thread is alive.
     bool IsRunningForTesting() const { return m_worker.joinable(); }
 
+    /// Test-only: override the inter-retry backoff so retry-loop tests don't
+    /// stall for kRevalidateBackoff * (kRevalidateAttempts-1). Production never
+    /// calls this; the worker uses kRevalidateBackoff.
+    void SetRevalidateBackoffForTesting(std::chrono::milliseconds backoff) {
+        m_revalidate_backoff = backoff;
+    }
+
 private:
     void WorkerLoop();
     bool ExecuteSingleCycle();
+
+    /// Run one snapshot→walk attempt. Returns true on a clean/healthy walk;
+    /// false on failure (populating failure_out) or shutdown abort. Shared by
+    /// the retry loop inside ExecuteSingleCycle.
+    bool RunSingleWalk(UndoIntegrityFailure& failure_out);
+
+    /// Interruptible sleep used between retries. Returns immediately (false) if
+    /// stop was requested during the wait; true if the full duration elapsed.
+    bool InterruptibleWait(std::chrono::milliseconds dur);
 
     CChainState& m_chainstate;
     CUTXOSet& m_utxo_set;
     std::string m_datadir;
     std::atomic<bool>* m_running_flag;  // External; not owned. nullable for tests.
+    std::chrono::milliseconds m_revalidate_backoff{
+        std::chrono::duration_cast<std::chrono::milliseconds>(kRevalidateBackoff)};
 
     std::thread m_worker;
     std::mutex m_cv_mutex;
