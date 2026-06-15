@@ -496,6 +496,29 @@ private:
     bool EncryptMnemonic(const std::string& mnemonic);
     bool DecryptMnemonic(std::string& mnemonic) const;
 
+    // LP-7 (F1 fold, MED-1/MED-2): identity cross-check used before any code
+    // path discards the original mnemonic ciphertext and re-encrypts a recovered
+    // phrase. CMnemonic::Validate only proves the recovered bytes are SYNTACTIC
+    // BIP39 — NOT that they are THIS wallet's seed phrase. A wrong-but-valid BIP39
+    // string (decrypt under a confused/partial-corruption key) would pass Validate,
+    // get re-encrypted as the authoritative v7 mnemonic, and permanently replace
+    // the backup phrase with the WRONG one (latent seed loss on restore-from-phrase).
+    // This positively re-derives the master seed from the recovered mnemonic
+    // (BIP39 empty-passphrase) and compares it byte-for-byte against the wallet's
+    // authoritative in-memory hdMasterKey.seed. Returns true ONLY on an exact match.
+    //
+    // BIP39-passphrase cohort: Dilithion supports an optional BIP39 passphrase
+    // (transient param to InitializeHDWallet/GenerateHDWallet/RestoreHDWallet) that
+    // is NEVER persisted — so a passphrase-protected seed cannot be positively
+    // re-derived here. For that cohort this returns false (empty-passphrase derive
+    // won't match), which callers MUST treat as ABORT-AND-PRESERVE (never discard
+    // the original). That is the correct, conservative outcome: an unverifiable
+    // mnemonic is never allowed to overwrite the authoritative ciphertext; the
+    // migration safely defers instead of destructively rewriting.
+    //
+    // Caller must hold cs_wallet and have the plaintext hdMasterKey.seed available.
+    bool MnemonicReDerivesSeed(const std::string& mnemonic) const;
+
     // ============================================================================
     // BUG #56 FIX: Block processing helpers (Bitcoin Core pattern)
     // ============================================================================

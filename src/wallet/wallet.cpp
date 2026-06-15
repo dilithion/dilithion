@@ -1618,10 +1618,38 @@ bool CWallet::EncryptWallet(const std::string& passphrase) {
             std::string mnemonicStr(mnemonicPlain.begin(), mnemonicPlain.end());
             memory_cleanse(mnemonicPlain.data(), mnemonicPlain.size());
 
+            // LP-7 (F1 fold, MED-2): this re-encrypt path has the SAME discard-original
+            // shape as the v7 seed migration — recover under the obfuscation key, then
+            // EncryptMnemonic overwrites vchEncryptedMnemonic/IV/MAC. If the recovered
+            // plaintext were a valid-but-WRONG BIP39 phrase (confused/partial-corruption
+            // decrypt), we'd permanently replace the backup phrase with the wrong one.
+            // Apply the SAME identity guard: re-derive the master seed from the recovered
+            // mnemonic and require an exact match to the authoritative in-memory
+            // hdMasterKey.seed BEFORE re-encrypting. On any mismatch (valid-but-wrong, or
+            // a non-re-derivable BIP39-passphrase wallet) ABORT-AND-PRESERVE via rollback
+            // so the original mnemonic ciphertext is never discarded.
+            if (!MnemonicReDerivesSeed(mnemonicStr)) {
+                if (!mnemonicStr.empty()) {
+                    memory_cleanse(&mnemonicStr[0], mnemonicStr.size());
+                }
+                memory_cleanse(vMasterKeyPlain.data(), vMasterKeyPlain.size());
+                memory_cleanse(derivedKey.data(), derivedKey.size());
+                std::cerr << "[Wallet] LP-7 CRITICAL: wallet encryption ABORTED — the "
+                             "recovered mnemonic does not re-derive this wallet's seed "
+                             "(valid-but-wrong BIP39 phrase, or an unrecoverable BIP39 "
+                             "passphrase). The original seed ciphertext was NOT modified; "
+                             "encryption was rolled back to preserve the backup phrase."
+                          << std::endl;
+                rollback();
+                return false;
+            }
+
             // Re-encrypt under master key (masterKey.IsValid() is now true → master
             // branch → also computes the mnemonic MAC).
             bool ok = EncryptMnemonic(mnemonicStr);
-            memory_cleanse(&mnemonicStr[0], mnemonicStr.size());
+            if (!mnemonicStr.empty()) {
+                memory_cleanse(&mnemonicStr[0], mnemonicStr.size());
+            }
             if (!ok) {
                 memory_cleanse(vMasterKeyPlain.data(), vMasterKeyPlain.size());
                 memory_cleanse(derivedKey.data(), derivedKey.size());
@@ -5746,36 +5774,49 @@ bool CWallet::MigrateToEncryptedSeedV7Unlocked(bool* persistedToDisk) {
         std::string mnemonicStr(mnemonicPlain.begin(), mnemonicPlain.end());
         memory_cleanse(mnemonicPlain.data(), mnemonicPlain.size());
 
-        // LP-7 (F1, BLOCKER): a successful Decrypt() only proves PKCS#7 padding
-        // was well-formed — NOT that the recovered bytes are a real seed phrase.
-        // Under a wrong-key edge case / partial corruption / format confusion the
-        // obfuscation-key or master-key decrypt can yield padding-valid garbage.
-        // If we re-encrypted that garbage as the authoritative v7 mnemonic and then
-        // rewrote the file at v7, the original mnemonic ciphertext would be gone =>
-        // PERMANENT, irreversible seed-phrase loss. So positively confirm the
-        // recovered plaintext is a well-formed BIP39 mnemonic (word count + wordlist
-        // membership + checksum, via the same CMnemonic::Validate the wallet uses on
-        // import/generate) BEFORE re-encrypting and discarding the original. On
-        // failure: ABORT migration loudly — do NOT call EncryptMnemonic (which would
-        // overwrite vchEncryptedMnemonic/IV/MAC), roll back to the pre-migration
-        // snapshot so the original ciphertext is preserved byte-for-byte, and leave
-        // the wallet in its prior valid state so the migration can be retried once
-        // the cause is understood. INVARIANT: the original seed ciphertext is NEVER
-        // discarded unless a valid mnemonic has been positively confirmed.
-        if (!CMnemonic::Validate(mnemonicStr)) {
-            memory_cleanse(&mnemonicStr[0], mnemonicStr.size());
+        // LP-7 (F1, BLOCKER + fold MED-1): a successful Decrypt() only proves PKCS#7
+        // padding was well-formed — NOT that the recovered bytes are a real seed
+        // phrase, and CMnemonic::Validate only proves SYNTACTIC BIP39 — NOT that the
+        // phrase is THIS wallet's seed. Under a wrong-key edge case / partial
+        // corruption / format confusion the decrypt can yield a DIFFERENT but
+        // syntactically-valid BIP39 string. Re-encrypting that as the authoritative
+        // v7 mnemonic and rewriting the file at v7 would discard the original
+        // ciphertext => PERMANENT seed loss (the live wallet keeps spending via the
+        // in-memory seed, but a later restore-from-phrase yields the WRONG seed).
+        //
+        // So positively confirm IDENTITY, not just syntax: re-derive the master seed
+        // from the recovered mnemonic and compare it byte-for-byte to the wallet's
+        // authoritative in-memory hdMasterKey.seed (MnemonicReDerivesSeed, which folds
+        // in the CMnemonic::Validate structural gate). Only on an EXACT match do we
+        // re-encrypt and discard the original. On ANY mismatch — garbage that passed
+        // Validate, OR a legitimate but non-re-derivable BIP39-passphrase wallet —
+        // ABORT migration loudly: do NOT call EncryptMnemonic (which would overwrite
+        // vchEncryptedMnemonic/IV/MAC), roll back to the pre-migration snapshot so the
+        // original ciphertext is preserved byte-for-byte, and leave the wallet in its
+        // prior valid state. The migration safely defers and re-arms on the next
+        // unlock. INVARIANT (absolute): the original seed ciphertext is NEVER discarded
+        // unless the recovered phrase PROVABLY derives this wallet's seed.
+        if (!MnemonicReDerivesSeed(mnemonicStr)) {
+            // LOW-5: &mnemonicStr[0] on an empty string is UB; guard the cleanse.
+            if (!mnemonicStr.empty()) {
+                memory_cleanse(&mnemonicStr[0], mnemonicStr.size());
+            }
             std::cerr << "[Wallet] LP-7 CRITICAL: v7 seed migration ABORTED — the "
-                         "recovered mnemonic is not a valid BIP39 phrase "
-                         "(decrypt produced padding-valid but non-mnemonic bytes). "
-                         "The original seed ciphertext was NOT modified; the wallet "
-                         "remains loadable with its existing seed. Migration will be "
-                         "retried on the next unlock." << std::endl;
+                         "recovered mnemonic does not re-derive this wallet's seed "
+                         "(either decrypt produced a valid-but-wrong BIP39 phrase, or "
+                         "this wallet uses an optional BIP39 passphrase that cannot be "
+                         "re-derived). The original seed ciphertext was NOT modified; "
+                         "the wallet remains loadable with its existing seed. Migration "
+                         "will be retried on the next unlock." << std::endl;
             rollback();
             return false;
         }
 
         bool reOk = EncryptMnemonic(mnemonicStr);  // master-key branch + MAC
-        memory_cleanse(&mnemonicStr[0], mnemonicStr.size());
+        // LOW-5: guard against &mnemonicStr[0] UB on an empty string.
+        if (!mnemonicStr.empty()) {
+            memory_cleanse(&mnemonicStr[0], mnemonicStr.size());
+        }
         if (!reOk) {
             rollback();
             return false;
@@ -6053,6 +6094,50 @@ bool CWallet::DecryptHDMasterKey(CHDExtendedKey& decrypted) const {
     memory_cleanse(decrypted_data.data(), decrypted_data.size());
 
     return true;
+}
+
+bool CWallet::MnemonicReDerivesSeed(const std::string& mnemonic) const {
+    // Assumes caller holds cs_wallet lock and the plaintext hdMasterKey.seed is
+    // available (true on every legacy-migration / EncryptWallet re-encrypt path,
+    // where the obfuscation key itself is derived from that same plaintext seed).
+    //
+    // LP-7 (F1 fold, MED-1/MED-2): positively confirm the recovered phrase IS this
+    // wallet's seed before any caller discards the original mnemonic ciphertext.
+    // CMnemonic::Validate (the existing guard) only proves SYNTACTIC BIP39 — a
+    // wrong-but-valid phrase from a confused/partial-corruption decrypt would pass
+    // it. Re-derive the 32-byte master seed from the recovered mnemonic and compare
+    // it byte-for-byte against the authoritative in-memory hdMasterKey.seed. Only an
+    // EXACT match proves identity.
+    //
+    // Passphrase note: Dilithion's optional BIP39 passphrase is never persisted, so
+    // we can only re-derive with the empty passphrase. A passphrase-protected seed
+    // will (correctly) NOT match here and the caller must ABORT-AND-PRESERVE — an
+    // unverifiable mnemonic is never permitted to overwrite the authoritative
+    // ciphertext. This is the conservative outcome the seed-loss invariant requires.
+
+    // Cheap structural gate first (word count + wordlist + checksum). Keeps the
+    // expensive PBKDF2 derive off obviously-garbage input.
+    if (!CMnemonic::Validate(mnemonic)) {
+        return false;
+    }
+
+    // Re-derive the BIP39 seed (empty passphrase) then the HD master seed.
+    CKeyingMaterial bip39_seed(64);  // RAII: auto-wipes on scope exit
+    if (!CMnemonic::ToSeed(mnemonic, "", bip39_seed.data_ptr())) {
+        return false;
+    }
+
+    CHDExtendedKey rederived;
+    DeriveMaster(bip39_seed.data_ptr(), rederived);
+
+    // Constant-time-ish byte compare against the authoritative in-memory seed.
+    // (memcmp is acceptable here: a mismatch means abort, not a secret-leaking
+    //  timing oracle — both inputs are local and the decision is fail-closed.)
+    const bool match =
+        std::memcmp(rederived.seed, hdMasterKey.seed, sizeof(hdMasterKey.seed)) == 0;
+
+    rederived.Wipe();
+    return match;
 }
 
 bool CWallet::EncryptMnemonic(const std::string& mnemonic) {

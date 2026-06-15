@@ -284,7 +284,16 @@ static bool BuildLegacyV6Wallet(const std::string& path,
                                 // these bytes — letting a test prove migration ABORTS
                                 // when the recovered plaintext is not a valid BIP39
                                 // mnemonic. Empty (default) ⇒ encrypt the real mnemonic.
-                                const std::string& mnemonicPlaintextOverride = "") {
+                                const std::string& mnemonicPlaintextOverride = "",
+                                // LP-7 (F1 fold, LOW-3) test hook: when true, the mnemonic
+                                // slot is encrypted DIRECTLY under the wallet master key
+                                // (no MAC) instead of the seed-derived obfuscation key.
+                                // This is the legacy master-key-encrypted-mnemonic shape:
+                                // migration's Step-1 obfuscation decrypt FAILS (wrong key)
+                                // and the master-key FALLBACK arm (wallet.cpp ~5747)
+                                // recovers the plaintext — exercising the fallback arm's
+                                // path into the identity guard. Default false ⇒ Step-1.
+                                bool encryptMnemonicUnderMasterKey = false) {
     // --- 1. Use a real CWallet to mint a consistent HD wallet, then read out the
     //        pieces we need (mnemonic, seed, chaincode, default address). ---
     std::string scratch = path + ".scratch";
@@ -337,9 +346,15 @@ static bool BuildLegacyV6Wallet(const std::string& path,
     // (which uses legacy keying for v<7) passes.
     if (!mkCrypter.ComputeMAC(mkCipher, mkMAC, /*useLegacyKeying=*/true)) return false;
 
-    // --- 3. Build the legacy obfuscated mnemonic (key = HKDF(seed,"mnemonic")). ---
+    // --- 3. Build the legacy mnemonic slot. By default it is obfuscated under the
+    //        seed-derived key (HKDF(seed,"mnemonic")). For the LOW-3 fallback-arm
+    //        fixture it is encrypted DIRECTLY under the master key (no MAC), so the
+    //        migration's Step-1 obfuscation decrypt fails and the master-key fallback
+    //        arm engages. ---
     std::vector<uint8_t> obfKey(WALLET_CRYPTO_KEY_SIZE);
-    {
+    if (encryptMnemonicUnderMasterKey) {
+        obfKey = vMasterKeyPlain;  // legacy master-key-encrypted mnemonic (fallback arm)
+    } else {
         std::vector<uint8_t> hdSeed(master.seed, master.seed + 32);
         DeriveEncryptionKey(hdSeed, "mnemonic", obfKey);
         memory_cleanse(hdSeed.data(), hdSeed.size());
@@ -2288,6 +2303,41 @@ struct LP7EncryptRollbackTester {
     static bool SeedMatches(const CWallet& w, const std::vector<uint8_t>& seed) {
         return seed.size() == 32 && std::memcmp(w.hdMasterKey.seed, seed.data(), 32) == 0;
     }
+
+    // LP-7 (F1 fold, MED-2): replace the in-memory obfuscated-mnemonic slot with a
+    // DIFFERENT but syntactically-VALID BIP39 phrase, encrypted under the SAME
+    // obfuscation key the wallet derives from its (plaintext) seed. EncryptWallet's
+    // Step-1 decrypt then round-trips cleanly to a valid-but-WRONG phrase that passes
+    // CMnemonic::Validate — the exact MED-1/MED-2 precondition: only the identity
+    // cross-check (re-derive seed + compare) catches it. Returns false if the wallet
+    // isn't a plaintext-seed HD wallet (the only state where this injection is valid).
+    static bool InjectValidButWrongMnemonic(CWallet& w, const std::string& wrongValidPhrase) {
+        if (!w.fIsHDWallet || w.fHDMasterKeyEncrypted) return false;
+        if (!CMnemonic::Validate(wrongValidPhrase)) return false;  // must be VALID BIP39
+        std::vector<uint8_t> obfKey(WALLET_CRYPTO_KEY_SIZE);
+        std::vector<uint8_t> hdSeed(w.hdMasterKey.seed, w.hdMasterKey.seed + 32);
+        DeriveEncryptionKey(hdSeed, "mnemonic", obfKey);
+        memory_cleanse(hdSeed.data(), hdSeed.size());
+        std::vector<uint8_t> mnIV;
+        if (!GenerateIV(mnIV)) { memory_cleanse(obfKey.data(), obfKey.size()); return false; }
+        CCrypter mnCrypter;
+        if (!mnCrypter.SetKey(obfKey, mnIV)) { memory_cleanse(obfKey.data(), obfKey.size()); return false; }
+        std::vector<uint8_t> bytes(wrongValidPhrase.begin(), wrongValidPhrase.end());
+        std::vector<uint8_t> cipher;
+        bool ok = mnCrypter.Encrypt(bytes, cipher);
+        memory_cleanse(obfKey.data(), obfKey.size());
+        if (!ok) return false;
+        w.vchEncryptedMnemonic = std::move(cipher);
+        w.vchMnemonicIV.assign(mnIV.begin(), mnIV.end());
+        w.vchMnemonicMAC.clear();  // legacy obfuscation-key slot carries no MAC
+        return true;
+    }
+    static bool MnemonicCiphertextMatches(const CWallet& w, const std::vector<uint8_t>& ct) {
+        return w.vchEncryptedMnemonic == ct;
+    }
+    static std::vector<uint8_t> MnemonicCiphertext(const CWallet& w) {
+        return w.vchEncryptedMnemonic;
+    }
 };
 
 static void Test_EncryptWalletRollback() {
@@ -2525,6 +2575,224 @@ static void Test_F1_AbortOnInvalidMnemonic() {
 }
 
 // ---------------------------------------------------------------------------
+// Test 2e-2 — F1 FOLD (MED-1): v7 migration MUST ABORT when the recovered mnemonic
+// is a DIFFERENT but syntactically-VALID BIP39 phrase. This is the gap the original
+// F1 (CMnemonic::Validate-only) guard MISSED: Validate proves SYNTACTIC BIP39, NOT
+// that the phrase is THIS wallet's seed. A confused/partial-corruption decrypt that
+// yields a valid-but-wrong phrase would PASS Validate, get re-encrypted as the
+// authoritative v7 mnemonic, and permanently replace the backup phrase with the
+// WRONG one (latent seed loss: the live wallet keeps spending via the in-memory
+// seed, but a later restore-from-phrase yields the wrong seed). The identity
+// cross-check (re-derive the master seed from the recovered phrase, compare to the
+// authoritative hdMasterKey.seed) is what catches this.
+//
+// Fixture: a legacy v6 plaintext-seed wallet whose obfuscated-mnemonic slot holds a
+// VALID BIP39 phrase ("abandon"×11 + "absorb", the Dilithion-wordlist checksum-valid
+// all-abandon-prefix vector, asserted valid in mnemonic_tests.cpp:193) that is
+// NOT the wallet's actual mnemonic, encrypted under the CORRECT obfuscation key (so
+// Step-1 decrypt succeeds and Validate PASSES). The identity guard must ABORT.
+//
+// MUTATION CHECK: a Validate-ONLY guard (the pre-fold behavior) PASSES Validate here
+// and PROCEEDS to commit the wrong seed → the byte-identity / still-v6 assertions
+// would break. This proves the identity cross-check (not just Validate) is the
+// load-bearing element.
+// ---------------------------------------------------------------------------
+static void Test_F1_AbortOnValidButWrongMnemonic() {
+    std::cout << COLOR_BLUE "\n[Test 2e-2] F1 FOLD (MED-1): v7 migration ABORTS on a valid-but-WRONG BIP39 mnemonic\n" COLOR_RESET;
+
+    const std::string path = "lp7_f1_wrongvalid_mnemonic_wallet.dat";
+    const std::string pass = "F1Abort!WrongValid#2026";
+    std::remove(path.c_str());
+
+    // A VALID BIP39 phrase (canonical all-zeros vector) that is NOT this wallet's
+    // mnemonic. Passes CMnemonic::Validate → defeats the old Validate-only guard.
+    const std::string wrongValid =
+        "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon absorb";
+    CHECK(CMnemonic::Validate(wrongValid),
+          "Precondition: the injected phrase IS a syntactically-valid BIP39 mnemonic");
+
+    LegacyV6Result legacy;
+    bool built = BuildLegacyV6Wallet(path, pass, legacy, /*mnemonicPlaintextOverride=*/wrongValid);
+    CHECK(built, "Built legacy v6 wallet with a valid-but-WRONG mnemonic in the slot");
+    if (!built) { std::remove(path.c_str()); return; }
+    // The fixture mnemonic (the real seed source) must differ from the injected one.
+    CHECK(legacy.mnemonic != wrongValid,
+          "Precondition: the wallet's real mnemonic differs from the injected valid phrase");
+
+    CHECK(FileVersion(path) == WALLET_FILE_VERSION_6, "Fixture file is v6");
+    {
+        std::vector<uint8_t> bytes = ReadFileBytes(path);
+        CHECK(Contains(bytes, legacy.seed.data(), legacy.seed.size()),
+              "Fixture v6 file contains plaintext seed (migration would be attempted)");
+    }
+
+    std::vector<uint8_t> bytesBefore = ReadFileBytes(path);
+
+    {
+        CWallet w;
+        w.SetWalletFile(path);  // autosave on
+        CHECK(w.Load(path), "Loaded the wrong-valid-mnemonic legacy wallet (autosave on)");
+        bool unlocked = w.Unlock(pass);
+        CHECK(unlocked,
+              "Unlock still succeeds (migration failure is non-fatal to unlock, by design)");
+    }
+
+    // INVARIANT: original seed ciphertext NEVER discarded — file byte-for-byte
+    // unchanged and still v6. A pre-fold Validate-only guard would FAIL these
+    // (it would commit the wrong seed and promote the file to v7).
+    std::vector<uint8_t> bytesAfter = ReadFileBytes(path);
+    CHECK(bytesBefore == bytesAfter,
+          "MED-1 INVARIANT: on-disk file byte-for-byte UNCHANGED (original ciphertext preserved)");
+    CHECK(FileVersion(path) == WALLET_FILE_VERSION_6,
+          "MED-1: file was NOT promoted to v7 (wrong seed NOT committed)");
+
+    {
+        CWallet w;
+        CHECK(w.Load(path), "Wallet still LOADS in its prior valid state after the aborted migration");
+        CHECK(w.IsCrypted(), "Wallet still reports encrypted (unchanged)");
+    }
+
+    std::remove(path.c_str());
+}
+
+// ---------------------------------------------------------------------------
+// Test 2e-3 — F1 FOLD (LOW-3): exercise the master-key FALLBACK decrypt arm
+// (wallet.cpp ~5747), not just the Step-1 obfuscation arm. Fixture: a legacy wallet
+// whose mnemonic slot is encrypted DIRECTLY under the master key (no MAC) → Step-1
+// obfuscation decrypt fails, the fallback arm recovers the plaintext, and the
+// identity guard runs on the fallback-recovered phrase.
+//
+// Two sub-cases pin both outcomes through the fallback arm:
+//   (A) CORRECT mnemonic via the fallback arm → migration COMMITS (file → v7,
+//       plaintext seed gone). Proves the fallback arm reaches and passes the guard.
+//   (B) valid-but-WRONG mnemonic via the fallback arm → migration ABORTS, file
+//       byte-for-byte preserved at v6. Proves the identity guard catches a wrong
+//       phrase recovered through the fallback arm too (not only Step-1).
+// ---------------------------------------------------------------------------
+static void Test_F1_MasterKeyFallbackArm() {
+    std::cout << COLOR_BLUE "\n[Test 2e-3] F1 FOLD (LOW-3): master-key fallback decrypt arm reaches the identity guard\n" COLOR_RESET;
+
+    // --- (A) CORRECT mnemonic recovered via the fallback arm migrates cleanly. ---
+    {
+        const std::string path = "lp7_f1_fallback_correct.dat";
+        const std::string pass = "F1Fallback!Correct#2026";
+        std::remove(path.c_str());
+
+        LegacyV6Result legacy;
+        bool built = BuildLegacyV6Wallet(path, pass, legacy,
+                                         /*mnemonicPlaintextOverride=*/"",
+                                         /*encryptMnemonicUnderMasterKey=*/true);
+        CHECK(built, "Built legacy wallet with the CORRECT mnemonic under the master key (fallback arm)");
+        if (built) {
+            std::string exported;
+            {
+                CWallet w;
+                w.SetWalletFile(path);  // autosave on
+                CHECK(w.Load(path), "Loaded fallback-arm (correct) legacy wallet");
+                CHECK(w.Unlock(pass), "Unlock succeeds — correct mnemonic via fallback arm passes the guard");
+                CHECK(w.ExportMnemonic(exported), "ExportMnemonic works post-migration");
+            }
+            CHECK(exported == legacy.mnemonic, "Mnemonic round-trips identically (fallback arm, correct)");
+            CHECK(FileVersion(path) == WALLET_FILE_VERSION_7,
+                  "LOW-3 (A): file promoted to v7 (fallback-arm migration committed)");
+            {
+                std::vector<uint8_t> bytes = ReadFileBytes(path);
+                CHECK(!Contains(bytes, legacy.seed.data(), legacy.seed.size()),
+                      "LOW-3 (A): plaintext seed ABSENT post-migration (drive-to-safety via fallback arm)");
+            }
+        }
+        std::remove(path.c_str());
+    }
+
+    // --- (B) valid-but-WRONG mnemonic recovered via the fallback arm aborts. ---
+    {
+        const std::string path = "lp7_f1_fallback_wrongvalid.dat";
+        const std::string pass = "F1Fallback!WrongValid#2026";
+        std::remove(path.c_str());
+
+        const std::string wrongValid =
+            "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon absorb";
+        CHECK(CMnemonic::Validate(wrongValid), "Precondition: injected phrase IS valid BIP39");
+
+        LegacyV6Result legacy;
+        bool built = BuildLegacyV6Wallet(path, pass, legacy,
+                                         /*mnemonicPlaintextOverride=*/wrongValid,
+                                         /*encryptMnemonicUnderMasterKey=*/true);
+        CHECK(built, "Built legacy wallet with a valid-but-WRONG mnemonic under the master key (fallback arm)");
+        if (built) {
+            CHECK(legacy.mnemonic != wrongValid, "Precondition: real mnemonic differs from injected phrase");
+            std::vector<uint8_t> bytesBefore = ReadFileBytes(path);
+            {
+                CWallet w;
+                w.SetWalletFile(path);  // autosave on
+                CHECK(w.Load(path), "Loaded fallback-arm (wrong-valid) legacy wallet");
+                CHECK(w.Unlock(pass), "Unlock still succeeds (migration failure non-fatal)");
+            }
+            std::vector<uint8_t> bytesAfter = ReadFileBytes(path);
+            CHECK(bytesBefore == bytesAfter,
+                  "LOW-3 (B): on-disk file byte-for-byte UNCHANGED (fallback-arm wrong phrase aborted)");
+            CHECK(FileVersion(path) == WALLET_FILE_VERSION_6,
+                  "LOW-3 (B): file NOT promoted to v7 (wrong seed via fallback arm NOT committed)");
+        }
+        std::remove(path.c_str());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Test 9b — F1 FOLD (MED-2): the EncryptWallet re-encrypt path has the SAME
+// decrypt → EncryptMnemonic → discard-original shape as the v7 migration, and the
+// pre-fold code had NO identity guard there. Inject a valid-but-WRONG BIP39 phrase
+// into a fresh UNENCRYPTED HD wallet's obfuscated-mnemonic slot, then call
+// EncryptWallet. The identity cross-check must ABORT-AND-PRESERVE: EncryptWallet
+// returns false, the wallet rolls back to UNENCRYPTED, and the original (wrong but
+// not-yet-discarded) ciphertext is preserved unmodified — crucially, the wrong phrase
+// is NEVER re-encrypted under the master key and committed as the authoritative seed.
+//
+// MUTATION CHECK: removing the MnemonicReDerivesSeed guard at the EncryptWallet site
+// lets EncryptWallet SUCCEED and commit the wrong mnemonic → this test's "returns
+// false / rolled back to unencrypted" assertions break. Load-bearing.
+// ---------------------------------------------------------------------------
+static void Test_F1_EncryptWalletAbortOnValidButWrongMnemonic() {
+    std::cout << COLOR_BLUE "\n[Test 9b] F1 FOLD (MED-2): EncryptWallet ABORTS on a valid-but-WRONG BIP39 mnemonic\n" COLOR_RESET;
+
+    const std::string path = "lp7_f1_encwallet_wrongvalid.dat";
+    const std::string pass = "F1EncWallet!WrongValid#2026";
+    std::remove(path.c_str());
+
+    const std::string wrongValid =
+        "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon absorb";
+    CHECK(CMnemonic::Validate(wrongValid), "Precondition: injected phrase IS valid BIP39");
+
+    std::string mnemonic;
+    CWallet w;
+    w.SetWalletFile(path);  // autosave on → fresh v7 unencrypted HD wallet
+    CHECK(w.GenerateHDWallet(mnemonic), "Generated HD wallet (unencrypted)");
+    CHECK(mnemonic != wrongValid, "Precondition: real mnemonic differs from injected phrase");
+
+    std::vector<uint8_t> seed, chaincode;
+    CHECK(DeriveSeedChaincode(mnemonic, seed, chaincode), "Derived expected seed from real mnemonic");
+
+    // Inject the valid-but-WRONG phrase into the in-memory obfuscated-mnemonic slot
+    // (re-encrypted under the wallet's own obfuscation key → EncryptWallet's Step-1
+    // decrypt succeeds and CMnemonic::Validate passes; only the identity check fails).
+    CHECK(LP7EncryptRollbackTester::InjectValidButWrongMnemonic(w, wrongValid),
+          "Injected a valid-but-WRONG mnemonic under the wallet's obfuscation key");
+    std::vector<uint8_t> ctBefore = LP7EncryptRollbackTester::MnemonicCiphertext(w);
+
+    bool encrypted = w.EncryptWallet(pass);
+    CHECK(!encrypted,
+          "LOAD-BEARING (MED-2): EncryptWallet RETURNS FALSE — wrong-but-valid mnemonic rejected by identity check");
+    CHECK(!w.IsCrypted(),
+          "LOAD-BEARING (MED-2): wallet rolled back to UNENCRYPTED (original mnemonic ciphertext NOT discarded/re-encrypted)");
+    CHECK(LP7EncryptRollbackTester::SeedMatches(w, seed),
+          "LOAD-BEARING (MED-2): in-memory plaintext seed intact after rollback (wrong phrase never committed)");
+    CHECK(LP7EncryptRollbackTester::MnemonicCiphertextMatches(w, ctBefore),
+          "LOAD-BEARING (MED-2): mnemonic ciphertext preserved byte-for-byte (no master-key re-encrypt committed)");
+
+    std::remove(path.c_str());
+}
+
+// ---------------------------------------------------------------------------
 // Test 2f — F1 happy path: a VALID mnemonic still migrates cleanly. Guards the
 // guard against being over-broad (i.e. the validation must NOT block legitimate
 // migrations). This is the same shape as Test_Migration but asserted alongside the
@@ -2569,6 +2837,8 @@ int main() {
     Test_Secrecy();
     Test_Migration();
     Test_F1_AbortOnInvalidMnemonic();
+    Test_F1_AbortOnValidButWrongMnemonic();          // MED-1: valid-but-wrong, migration path
+    Test_F1_MasterKeyFallbackArm();                  // LOW-3: master-key fallback decrypt arm
     Test_F1_ValidMnemonicStillMigrates();
     Test_NeedsSeedMigrationSurfaced();
     Test_V7PlaintextSeedArtifactMigrates();
@@ -2581,6 +2851,7 @@ int main() {
     Test_ChangePassphraseLegacyNonHD();
     Test_ChangePassphraseLegacyV6WithMIK();
     Test_EncryptWalletRollback();
+    Test_F1_EncryptWalletAbortOnValidButWrongMnemonic();  // MED-2: valid-but-wrong, EncryptWallet path
 
     std::cout << "\n=============================================\n";
     std::cout << "PASSED: " << g_pass << "   FAILED: " << g_fail << "\n";
