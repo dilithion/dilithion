@@ -570,6 +570,8 @@ struct NodeConfig {
                                           // wallet's HD seed is still plaintext-at-rest (NeedsSeedMigration()).
                                           // DEFAULT OFF preserves warn-only behavior (operator is surfaced but
                                           // not blocked); SET requires unlocking once to migrate before mining.
+    bool generate_seed_key = false; // --generate-seed-key: LP-13 — explicitly permit minting a NEW seed attestation consensus key when none exists (first-time provision only; otherwise fail loud)
+    bool require_seed_key_encryption = false; // --require-seed-key-encryption: LP-13 H-1 — refuse to load/save a plaintext (v1) seed key; requires DILITHION_SEED_KEY_PASSPHRASE. Default OFF preserves backward-compatible loadable behavior.
     int max_connections = 0;         // --maxconnections: Maximum peer connections (0 = default 125)
     int max_connections_per_ip = 2;  // --max-connections-per-ip: Max inbound per IP (default 2, range 1-64)
     int attestation_rate_limit = 1;  // --attestation-rate-limit: Max attestations per /24 subnet per day
@@ -769,6 +771,19 @@ struct NodeConfig {
                 // seed is still plaintext-at-rest. Default behavior is warn-only.
                 require_seed_migration = true;
             }
+            else if (arg == "--generate-seed-key") {
+                // LP-13: explicit opt-in to mint a NEW seed attestation consensus
+                // key if none exists. Without this flag a missing key fails loud
+                // instead of silently minting an unrecognized signing key.
+                generate_seed_key = true;
+            }
+            else if (arg == "--require-seed-key-encryption") {
+                // LP-13 H-1: enforce encryption-at-rest for the seed consensus
+                // signing key. Refuses to load/save a plaintext (v1) key; the
+                // DILITHION_SEED_KEY_PASSPHRASE env MUST be set. Default OFF keeps
+                // the backward-compatible loadable behavior for rolling deploys.
+                require_seed_key_encryption = true;
+            }
             else if (arg.find("--rpcallowhost=") == 0) {
                 // wallet-rpc-login-restore: add an allowed Host header to the
                 // anti-DNS-rebinding allowlist. Repeatable. Loopback
@@ -899,6 +914,12 @@ struct NodeConfig {
         std::cout << "                          still stored UNENCRYPTED at rest (fixed bug LP-7)." << std::endl;
         std::cout << "                          Default is warn-only; this opt-in flag hard-gates the" << std::endl;
         std::cout << "                          node until you unlock once to complete the upgrade." << std::endl;
+        std::cout << "  --generate-seed-key   Permit minting a NEW seed attestation key if none exists" << std::endl;
+        std::cout << "                          (first-time provision only; otherwise the node fails loud)." << std::endl;
+        std::cout << "                          Set " << Attestation::SEED_KEY_PASSPHRASE_ENV << " to encrypt it at rest." << std::endl;
+        std::cout << "  --require-seed-key-encryption" << std::endl;
+        std::cout << "                          Refuse to load/save a plaintext (v1) seed key; requires" << std::endl;
+        std::cout << "                          " << Attestation::SEED_KEY_PASSPHRASE_ENV << ". Default OFF (backward compatible)." << std::endl;
         std::cout << "  --rpcallowhost=<host> Allow this Host header on the RPC/HTTP server" << std::endl;
         std::cout << "                          (anti-DNS-rebinding allowlist; repeatable)." << std::endl;
         std::cout << "                          Loopback (127.0.0.1/::1/localhost) is always" << std::endl;
@@ -6981,12 +7002,26 @@ load_genesis_block:  // Bug #29: Label for automatic retry after blockchain wipe
                 CRPCServer::NotifyBlockTipChanged();
             });
 
-        // Phase 2+3: Seed attestation initialization (relay-only seed nodes only)
+        // Phase 2+3: Seed attestation initialization (DIL seed-capable nodes)
         // Loads ASN database and attestation signing key so seeds can serve
         // getmikattestation RPC requests from miners.
+        //
+        // LP-13 (DIL parity with the dilv-node H-3 fix): gate on
+        // `relay_only || public_api`, NOT bare `relay_only`. Verified live
+        // 2026-06-14: NYC's DIL node runs `--public-api` WITHOUT `--relay-only`
+        // (it is the bridge host), so under the prior bare-relay_only gate NYC's
+        // seed_attestation_key.dat existed on disk but was never loaded —
+        // getmikattestation returned "only available on seed nodes" — leaving DIL
+        // at exactly 3-of-4 functional attestation (MIN_ATTESTATIONS=3) with ZERO
+        // margin. This is the SAME failure mode the DilV v4.3 fix (2026-05-04)
+        // addressed for DilV but which was never applied to DIL. Every DIL seed
+        // runs --public-api (NYC included) to serve light wallets; a plain miner
+        // runs neither flag. Bridge ops are unaffected: init only registers an RPC
+        // handler + loads keys.
+        const bool seedCapable = config.relay_only || config.public_api;
         static Attestation::CSeedAttestationKey seedAttestKey;
         static CASNDatabase asnDatabase;
-        if (config.relay_only && Dilithion::g_chainParams) {
+        if (seedCapable && Dilithion::g_chainParams) {
             std::string dataDir = Dilithion::g_chainParams->dataDir;
 
             // Load ASN database from data directory (or project root)
@@ -7010,8 +7045,42 @@ load_genesis_block:  // Bug #29: Label for automatic retry after blockchain wipe
                           << " datacenter ASNs)" << std::endl;
             }
 
-            // Load or generate attestation key
-            if (seedAttestKey.LoadOrGenerate(dataDir)) {
+            // Load or generate attestation key (LP-13: minting gated behind
+            // --generate-seed-key so a reprovisioned seed fails loud).
+            //
+            // LP-13 M-1 (fail-stop on GENUINE failure): a key file PRESENT but
+            // unusable (corrupt / decrypt-or-parse failure / wrong-or-missing
+            // passphrase / plaintext-when-encryption-required), OR a requested
+            // mint that could not be persisted, is a real attestation outage. On
+            // a seed-capable node we ABORT startup rather than run silently
+            // without attestation. genuineFailure also fires when
+            // --require-seed-key-encryption is set even with NO key file present:
+            // fail-closed is intended — an operator who demanded at-rest
+            // encryption must not be left running with no usable encrypted key.
+            // The ONLY benign (non-fatal) case is: NO key file, no
+            // --generate-seed-key, AND no --require-seed-key-encryption — the
+            // relay simply doesn't attest.
+            // LP-13 (extreview HIGH): PRESENCE test (stat), not ifstream::good()
+            // readability — a present-but-unreadable key must still be treated as
+            // present so genuineFailure fires (fail loud, M-1). See SeedKeyFilePresent.
+            bool keyFileExists = Attestation::SeedKeyFilePresent(dataDir);
+            bool attestOk = seedAttestKey.LoadOrGenerate(
+                dataDir, config.generate_seed_key, config.require_seed_key_encryption);
+            if (!attestOk) {
+                bool genuineFailure = keyFileExists || config.generate_seed_key
+                                      || config.require_seed_key_encryption;
+                if (genuineFailure) {
+                    std::cerr << "[Attestation] FATAL: seed attestation key initialization FAILED "
+                                 "(key file present but unreadable/corrupt, decrypt/parse failure, "
+                                 "wrong/missing " << Attestation::SEED_KEY_PASSPHRASE_ENV
+                              << ", plaintext key when --require-seed-key-encryption is set, or a "
+                                 "requested mint that could not be persisted). A seed must not run "
+                                 "without a usable consensus signing key. Aborting startup." << std::endl;
+                    return 1;
+                }
+                std::cerr << "[Attestation] No seed attestation key and minting not requested; "
+                             "this relay will not serve attestations." << std::endl;
+            } else {
                 int seedId = -1;
                 const auto& seedIPs = Dilithion::g_chainParams->seedAttestationIPs;
                 if (!config.external_ip.empty()) {

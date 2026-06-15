@@ -69,9 +69,49 @@ constexpr size_t ATTESTATION_ENTRY_SIZE = 1 + 4 + DFMP::MIK_SIGNATURE_SIZE;
 /** Seed attestation key file name (stored in data directory) */
 constexpr const char* SEED_KEY_FILENAME = "seed_attestation_key.dat";
 
+/** LP-13: Env var supplying the operator passphrase used to encrypt the seed
+ *  attestation private key at rest. When set, Save() writes the v2 encrypted
+ *  format and Load() requires it to decrypt v2 files. When unset, the legacy
+ *  v1 plaintext format is used (backward compatible). NEVER hardcode a value. */
+constexpr const char* SEED_KEY_PASSPHRASE_ENV = "DILITHION_SEED_KEY_PASSPHRASE";
+
 // ============================================================================
 // SEED ATTESTATION KEY
 // ============================================================================
+
+/** LP-13: securely zero a transient buffer that may hold plaintext key bytes
+ *  (used by CSeedAttestationKey::Save on every exit path). Declared here so the
+ *  test suite can verify the wipe; not intended for general use. */
+void CleanseSeedKeyBuffer(std::vector<uint8_t>& buf);
+
+/** LP-13 (extreview HIGH): true if the seed attestation key FILE is present in
+ *  dataDir, testing PRESENCE (stat) — NOT readability. The earlier node glue
+ *  used std::ifstream::good(), which returns false for a present-but-UNREADABLE
+ *  key, misclassifying a genuine key as absent and letting the node run WITHOUT
+ *  attestation (defeating the M-1 fail-loud guarantee). std::filesystem::exists()
+ *  stats the path, so a present-but-unreadable file still reports present.
+ *  Fail-closed: an indeterminate stat (e.g. EACCES traversing dataDir) also
+ *  reports present, so an unstattable-but-genuine key still drives fail-loud
+ *  startup. Both node binaries call this to classify a LoadOrGenerate failure. */
+bool SeedKeyFilePresent(const std::string& dataDir);
+
+/** LP-13 H-2 (atomic-save) TEST SEAM. When set to a non-null function, Save()
+ *  invokes it immediately after the temp file has been fully written + fsynced
+ *  but BEFORE the atomic rename over the target. If the hook returns true, Save
+ *  aborts as if the rename leg failed (returns false, removes the temp file) so
+ *  the test can assert the ORIGINAL key file survived byte-intact. nullptr in
+ *  production (no overhead, no behavior change). Not for general use. */
+extern bool (*g_seedKeySaveFailpoint)();
+
+/** LP-13 B-1 (fail-closed durability) TEST SEAM. When set to a non-null
+ *  function, Save() invokes it right after the temp file's fsync (POSIX) /
+ *  FlushFileBuffers (Windows) reports success. If the hook returns true, Save
+ *  treats it as a FATAL fsync/flush failure: it removes the temp and returns
+ *  false WITHOUT renaming, leaving the canonical key byte-intact — exactly the
+ *  power-loss-before-durable case. Lets the load-bearing B-1 test exercise that
+ *  branch without a real disk fault. nullptr in production (no overhead, no
+ *  behavior change). Not for general use. */
+extern bool (*g_seedKeyFsyncFailpoint)();
 
 /**
  * Seed node's Dilithium3 keypair for signing attestations.
@@ -103,17 +143,71 @@ public:
 
     /**
      * Save keypair to file in data directory.
+     *
+     * LP-13: The file is written with owner-only permissions (POSIX 0600;
+     * Windows best-effort — NTFS already confines the user profile dir).
+     * If the env var DILITHION_SEED_KEY_PASSPHRASE is set, the private key is
+     * encrypted at rest (AES-256-CBC, PBKDF2-SHA3, encrypt-then-MAC) in the v2
+     * file format. If absent, the legacy v1 plaintext format is written so
+     * existing un-passphrased operators are not silently broken.
+     *
+     * LP-13 H-2 / B-1: the write is ATOMIC and fail-closed-durable — the blob is
+     * written to "<file>.tmp", the prior key (if any) is copied to "<file>.bak",
+     * then the temp is atomically renamed over the target and the "<file>.bak"
+     * is removed on success. The guarantee that a crash / partial write / power
+     * loss cannot destroy the only copy of the consensus signing key rests on TWO
+     * fail-closed properties: (1) the temp's fsync (POSIX) / FlushFileBuffers
+     * (Windows) is FATAL — on failure Save removes the temp and returns false
+     * WITHOUT renaming, so un-flushed data is never published over the live key;
+     * (2) the publish is an atomic rename(2) / MoveFileExW(MOVEFILE_WRITE_THROUGH)
+     * replace, so an observer (and a post-crash reader) sees either the old key or
+     * the fully-flushed new key, never a partial/absent file. After the rename the
+     * POSIX path also fsync's the parent directory to make the rename metadata
+     * durable sooner; that step is best-effort (its failure is logged, not fatal)
+     * and is NOT load-bearing for the no-key-loss guarantee — rename atomicity
+     * already bounds the worst case to "old key still on disk." (Windows relies on
+     * MOVEFILE_WRITE_THROUGH for the same metadata durability; there is no
+     * directory-fsync on that path.)
+     *
+     * LP-13 M-4: if BOTH the create-time mode and the post-write chmod fail to
+     * set 0600 (POSIX), Save REFUSES to publish a possibly group/other-readable
+     * consensus key (fail-closed) and returns false.
+     *
+     * LP-13 H-1: when requireEncryption is true, Save REFUSES to write a v1
+     * (plaintext) key — the passphrase env MUST be set or Save fails loud.
+     *
      * @param dataDir Path to data directory
+     * @param requireEncryption If true, refuse to write a plaintext (v1) key.
      * @return true on success
      */
-    bool Save(const std::string& dataDir) const;
+    bool Save(const std::string& dataDir, bool requireEncryption = false) const;
 
     /**
      * Load or generate: tries Load first, generates + saves if not found.
+     *
+     * LP-13: Auto-minting a fresh consensus key is gated behind allowGenerate.
+     * On a production seed a missing key file with allowGenerate=false FAILS
+     * LOUD (returns false) instead of silently minting an unrecognized key.
+     *
+     * LP-13 M-2: if a fresh key is generated but cannot be PERSISTED, this
+     * returns false. The node must never run on an in-memory-only key that
+     * would not match chainparams after a restart.
+     *
+     * LP-13 H-1: when requireEncryption is true, a loaded v1 (plaintext) key is
+     * REJECTED (returns false) and a generated key is only saved encrypted —
+     * enforcing encryption-at-rest end to end.
+     *
      * @param dataDir Path to data directory
+     * @param allowGenerate If false and no key file exists, fail loudly instead
+     *        of generating a new keypair. Set true via the --generate-seed-key
+     *        operator flag for first-time key provisioning.
+     * @param requireEncryption If true, refuse to load/save a plaintext (v1)
+     *        key (--require-seed-key-encryption). Default false preserves the
+     *        backward-compatible loadable behavior.
      * @return true on success
      */
-    bool LoadOrGenerate(const std::string& dataDir);
+    bool LoadOrGenerate(const std::string& dataDir, bool allowGenerate = false,
+                        bool requireEncryption = false);
 
     /**
      * Sign an attestation message.
@@ -133,9 +227,15 @@ public:
     /** Get public key as hex string (for display/logging) */
     std::string GetPubKeyHex() const;
 
+    /** LP-13 H-1: true if the key currently in memory was loaded from a v1
+     *  (plaintext) on-disk file. Lets the node enforce
+     *  --require-seed-key-encryption end to end. */
+    bool LoadedPlaintext() const { return m_loadedV1Plaintext; }
+
 private:
     std::vector<uint8_t> m_pubkey;   // 1952 bytes
     std::vector<uint8_t> m_privkey;  // 4032 bytes (should use SecureAllocator in production)
+    bool m_loadedV1Plaintext = false;  // LP-13 H-1: provenance of the in-memory key
 
     void Clear();
 };

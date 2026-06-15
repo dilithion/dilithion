@@ -562,6 +562,8 @@ struct NodeConfig {
     bool upnp_prompted = false;     // True if user was already prompted or used explicit flag
     std::string external_ip = "";   // --externalip: Manual external IP (for manual port forwarding)
     bool public_api = false;        // --public-api: Enable public REST API for light wallets (seed nodes only)
+    bool generate_seed_key = false; // --generate-seed-key: LP-13 — explicitly permit minting a NEW seed attestation consensus key when none exists (first-time provision only; otherwise fail loud)
+    bool require_seed_key_encryption = false; // --require-seed-key-encryption: LP-13 H-1 — refuse to load/save a plaintext (v1) seed key; requires DILITHION_SEED_KEY_PASSPHRASE. Default OFF preserves backward-compatible loadable behavior.
     int max_connections = 0;         // --maxconnections: Maximum peer connections (0 = default 125)
     int max_connections_per_ip = 2;  // --max-connections-per-ip: Max inbound per IP (default 2, range 1-64)
     int attestation_rate_limit = 1;  // --attestation-rate-limit: Max attestations per /24 subnet per day (Sybil defense)
@@ -752,6 +754,19 @@ struct NodeConfig {
                 // Public REST API: bind to 0.0.0.0 for light wallet access (seed nodes only)
                 public_api = true;
             }
+            else if (arg == "--generate-seed-key") {
+                // LP-13: explicit opt-in to mint a NEW seed attestation consensus
+                // key if none exists. Without this flag a missing key fails loud
+                // instead of silently minting an unrecognized signing key.
+                generate_seed_key = true;
+            }
+            else if (arg == "--require-seed-key-encryption") {
+                // LP-13 H-1: enforce encryption-at-rest for the seed consensus
+                // signing key. Refuses to load/save a plaintext (v1) key; the
+                // DILITHION_SEED_KEY_PASSPHRASE env MUST be set. Default OFF keeps
+                // the backward-compatible loadable behavior for rolling deploys.
+                require_seed_key_encryption = true;
+            }
             else if (arg.find("--rpcallowhost=") == 0) {
                 // wallet-rpc-login-restore: anti-DNS-rebinding Host allowlist.
                 // Repeatable. Loopback is always allowed implicitly.
@@ -861,6 +876,12 @@ struct NodeConfig {
         std::cout << "                          Add --yes to skip the confirmation prompt." << std::endl;
         std::cout << "  --relay-only          Relay-only mode: skip wallet (for seed nodes)" << std::endl;
         std::cout << "  --public-api          Enable public REST API for light wallets (seed nodes)" << std::endl;
+        std::cout << "  --generate-seed-key   Permit minting a NEW seed attestation key if none exists" << std::endl;
+        std::cout << "                          (first-time provision only; otherwise the node fails loud)." << std::endl;
+        std::cout << "                          Set " << Attestation::SEED_KEY_PASSPHRASE_ENV << " to encrypt it at rest." << std::endl;
+        std::cout << "  --require-seed-key-encryption" << std::endl;
+        std::cout << "                          Refuse to load/save a plaintext (v1) seed key; requires" << std::endl;
+        std::cout << "                          " << Attestation::SEED_KEY_PASSPHRASE_ENV << ". Default OFF (backward compatible)." << std::endl;
         std::cout << "  --rpcallowhost=<host> Allow this Host header on the RPC/HTTP server" << std::endl;
         std::cout << "                          (anti-DNS-rebinding allowlist; repeatable)." << std::endl;
         std::cout << "                          Loopback is always allowed. Under --public-api," << std::endl;
@@ -6824,23 +6845,32 @@ load_genesis_block:  // Bug #29: Label for automatic retry after blockchain wipe
                 CRPCServer::NotifyBlockTipChanged();
             });
 
-        // Phase 2+3: Seed attestation initialization (ALL DilV mainnet seeds)
+        // Phase 2+3: Seed attestation initialization (DilV seed-capable nodes)
         // Loads ASN database and attestation signing key so seeds can serve
         // getmikattestation RPC requests from miners.
         //
-        // v4.3 fix 2026-05-04: removed `config.relay_only` gate. NYC runs
-        // without --relay-only because it's the bridge host. Under the prior
-        // gate, NYC's seed_attestation_key.dat existed on disk but was never
-        // loaded — RegisterSeedAttestation() never called — making NYC
+        // v4.3 fix 2026-05-04: removed the original `config.relay_only` gate. NYC
+        // runs WITHOUT --relay-only because it's the bridge host. Under the prior
+        // relay_only-only gate, NYC's seed_attestation_key.dat existed on disk but
+        // was never loaded — RegisterSeedAttestation() never called — making NYC
         // unable to serve getmikattestation RPCs ("is only available on seed
         // nodes" error). Network attestation capacity dropped from 4-of-4
-        // baked-in seed pubkeys to 3-of-4 functional. Fix: gate attestation
-        // init only on IsDilV() (the chain semantic), not on a CLI flag
-        // unrelated to attestation. Bridge ops are unaffected because
-        // attestation init only registers an RPC handler + loads keys.
+        // baked-in seed pubkeys to 3-of-4 functional.
+        //
+        // LP-13 H-3/L-3: gating purely on IsDilV() over-broadened the LP-13 FATAL
+        // abort below to EVERY DilV node, including miners — a DilV miner with a
+        // stray/corrupt seed_attestation_key.dat would abort on startup even
+        // though a miner never attests. We do NOT revert to relay_only-only (that
+        // re-introduces the v4.3 NYC outage: NYC is a non-relay-only seed). The
+        // correct seed-capability predicate that includes NYC and excludes plain
+        // miners is `relay_only || public_api` — every seed runs --public-api to
+        // serve light wallets (NYC included), while a miner runs neither. Init AND
+        // the abort are gated on that predicate. Bridge ops are unaffected: init
+        // only registers an RPC handler + loads keys.
+        const bool seedCapable = config.relay_only || config.public_api;
         static Attestation::CSeedAttestationKey seedAttestKey;
         static CASNDatabase asnDatabase;
-        if (Dilithion::g_chainParams && Dilithion::g_chainParams->IsDilV()) {
+        if (Dilithion::g_chainParams && Dilithion::g_chainParams->IsDilV() && seedCapable) {
             std::string dataDir = Dilithion::g_chainParams->dataDir;
 
             // Load ASN database from data directory (or project root)
@@ -6865,8 +6895,41 @@ load_genesis_block:  // Bug #29: Label for automatic retry after blockchain wipe
                           << " datacenter ASNs)" << std::endl;
             }
 
-            // Load or generate attestation key
-            if (seedAttestKey.LoadOrGenerate(dataDir)) {
+            // Load or generate attestation key (LP-13: minting gated behind
+            // --generate-seed-key so a reprovisioned seed fails loud).
+            // LP-13 M-1 (fail-stop on GENUINE failure): a key file PRESENT but
+            // unusable (corrupt / decrypt-or-parse failure / wrong-or-missing
+            // passphrase / plaintext-when-encryption-required), OR a requested
+            // mint that could not be persisted, is a real attestation outage. We
+            // ABORT startup rather than run silently without attestation.
+            // genuineFailure also fires when --require-seed-key-encryption is set
+            // even with NO key file present: fail-closed is intended — an operator
+            // who demanded at-rest encryption must not be left running with no
+            // usable encrypted key. The ONLY benign (non-fatal) case is: NO key
+            // file, no --generate-seed-key, AND no --require-seed-key-encryption —
+            // the seed-capable relay simply doesn't attest. (This whole block is
+            // already gated on `seedCapable` above, so miners never reach here.)
+            // LP-13 (extreview HIGH): PRESENCE test (stat), not ifstream::good()
+            // readability — a present-but-unreadable key must still be treated as
+            // present so genuineFailure fires (fail loud, M-1). See SeedKeyFilePresent.
+            bool keyFileExists = Attestation::SeedKeyFilePresent(dataDir);
+            bool attestOk = seedAttestKey.LoadOrGenerate(
+                dataDir, config.generate_seed_key, config.require_seed_key_encryption);
+            if (!attestOk) {
+                bool genuineFailure = keyFileExists || config.generate_seed_key
+                                      || config.require_seed_key_encryption;
+                if (genuineFailure) {
+                    std::cerr << "[Attestation] FATAL: seed attestation key initialization FAILED "
+                                 "(key file present but unreadable/corrupt, decrypt/parse failure, "
+                                 "wrong/missing " << Attestation::SEED_KEY_PASSPHRASE_ENV
+                              << ", plaintext key when --require-seed-key-encryption is set, or a "
+                                 "requested mint that could not be persisted). A seed must not run "
+                                 "without a usable consensus signing key. Aborting startup." << std::endl;
+                    return 1;
+                }
+                std::cerr << "[Attestation] No seed attestation key and minting not requested; "
+                             "this relay will not serve attestations." << std::endl;
+            } else {
                 // Determine seed ID by matching our IP against known seed IPs
                 // For now, use a simple index. In production, compare external IP.
                 int seedId = -1;
