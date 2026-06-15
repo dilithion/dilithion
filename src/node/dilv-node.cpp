@@ -6889,9 +6889,29 @@ load_genesis_block:  // Bug #29: Label for automatic retry after blockchain wipe
             }
 
             if (asnDatabase.IsLoaded()) {
+                // Finding B (extreview PR#121): the datacenter ASN list is a
+                // SEPARATE defense from attestation capacity — it powers the
+                // datacenter-IP Sybil ban, not MIK signing. A load failure here
+                // must NOT be silently swallowed: an empty datacenter set makes
+                // IsDatacenterIP() fail-open (always false), so the Sybil ban is
+                // silently OFF while the seed still REGISTERs healthy. Judgment
+                // (documented): this does NOT gate DEGRADED — datacenter-ban !=
+                // attestation capacity, so we keep attesting — but the failure is
+                // surfaced as a LOUD persistent ERROR with operator guidance so an
+                // operator notices the dropped defense (mirrors the ip2asn-v4.tsv
+                // loud treatment this PR added for the attestation side).
                 std::string dcPath = dataDir + "/datacenter-asns.txt";
                 if (!asnDatabase.LoadDatacenterList(dcPath)) {
                     asnDatabase.LoadDatacenterList("datacenter-asns.txt");
+                }
+                if (asnDatabase.DatacenterASNCount() == 0) {
+                    std::cerr << "[Attestation] ERROR: datacenter ASN list FAILED to load or is empty "
+                                 "(missing/unparseable " << dataDir << "/datacenter-asns.txt or "
+                                 "./datacenter-asns.txt). The datacenter-IP Sybil ban is DISABLED "
+                                 "(IsDatacenterIP fails open) — datacenter-hosted miners will NOT be "
+                                 "refused MIK attestation. Attestation itself continues normally. "
+                                 "Restore datacenter-asns.txt (e.g. after a data-dir rotation) and "
+                                 "restart to re-enable the datacenter Sybil ban." << std::endl;
                 }
                 std::cout << "  [OK] ASN database loaded (" << asnDatabase.RangeCount()
                           << " ranges, " << asnDatabase.DatacenterASNCount()

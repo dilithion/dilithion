@@ -7,6 +7,7 @@
 #include <wallet/crypter.h>  // For memory_cleanse() + CCrypter/DeriveKey (LP-13 encrypt-at-rest)
 
 #include <algorithm>
+#include <cctype>  // Finding C: std::tolower for IPv6 case canonicalization
 #include <cerrno>
 #include <cstdlib>
 #include <cstring>
@@ -116,28 +117,49 @@ bool SeedKeyFilePresent(const std::string& dataDir) {
 // LP-13 M-1/M-2 SEED-IDENTITY RESOLUTION (HIGH-1 / HIGH-2 fold)
 // ============================================================================
 
+// Finding C (extreview PR#121): lowercase an IPv6 literal so case-variant input
+// (e.g. "2001:DB8::1") canonicalizes to the configured form. Hex digits and the
+// ':' separator are the only characters in a textual IPv6 literal; lowercasing
+// is safe and idempotent. The configured seed set is IPv4-only today, so this is
+// forward-compat for when an IPv6 seed is added — it never affects IPv4 matching.
+static std::string LowercaseIPv6(std::string s) {
+    std::transform(s.begin(), s.end(), s.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    return s;
+}
+
 std::string NormalizeExternalIpForSeedMatch(const std::string& externalIp) {
     // 1) Trim surrounding whitespace (HIGH-2: quoting/templating artifacts).
+    //    Finding C: also collapse/strip any INTERIOR whitespace — a textual IP
+    //    literal (v4 or v6) never legitimately contains spaces/tabs, so removing
+    //    them lets "138.197. 68.128" or "[ 2001:db8::1 ]" style artifacts resolve
+    //    rather than silently SKIP. (Trailing-dot and case are handled below.)
     size_t b = externalIp.find_first_not_of(" \t\r\n");
     if (b == std::string::npos) return std::string();
     size_t e = externalIp.find_last_not_of(" \t\r\n");
     std::string s = externalIp.substr(b, e - b + 1);
+    s.erase(std::remove_if(s.begin(), s.end(),
+                           [](unsigned char c) { return c == ' ' || c == '\t' ||
+                                                        c == '\r' || c == '\n'; }),
+            s.end());
+    if (s.empty()) return std::string();
 
     // 2) IPv6 handling — do NOT strip on a raw IPv6 literal (it contains
     //    colons legitimately). Bracketed form "[addr]" or "[addr]:port" keeps
     //    the address inside the brackets; a bare value with >1 colon is treated
     //    as IPv6 and returned trimmed-only. The configured seed set is IPv4-only,
     //    so an IPv6 externalip simply fails to match -> SKIP_NOT_A_SEED, never a
-    //    false FATAL.
+    //    false FATAL. Finding C: lowercase the IPv6 result for case-insensitive
+    //    match (IPv6 hex digits are case-insensitive per RFC 5952).
     if (!s.empty() && s.front() == '[') {
         size_t rb = s.find(']');
         if (rb != std::string::npos) {
-            return s.substr(1, rb - 1);  // inside brackets, drop any ":port"
+            return LowercaseIPv6(s.substr(1, rb - 1));  // inside brackets, drop any ":port"
         }
-        return s;  // malformed; leave as-is (won't match IPv4 set)
+        return LowercaseIPv6(s);  // malformed; leave as-is (won't match IPv4 set)
     }
     if (std::count(s.begin(), s.end(), ':') > 1) {
-        return s;  // bare IPv6 literal; trimmed only, no port strip
+        return LowercaseIPv6(s);  // bare IPv6 literal; lowercased, no port strip
     }
 
     // 3) IPv4 / hostname: strip a single trailing ":port" suffix
@@ -145,6 +167,12 @@ std::string NormalizeExternalIpForSeedMatch(const std::string& externalIp) {
     size_t colon = s.find(':');
     if (colon != std::string::npos) {
         s = s.substr(0, colon);
+    }
+    // Finding C: strip a single trailing dot (a fully-qualified DNS name like
+    // "seed.example.com." or a dotted-quad written "138.197.68.128." is valid but
+    // would not string-equal the configured form). One trailing dot only.
+    if (!s.empty() && s.back() == '.') {
+        s.pop_back();
     }
     return s;
 }

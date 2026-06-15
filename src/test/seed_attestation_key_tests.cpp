@@ -14,6 +14,9 @@
 
 #include <attestation/seed_attestation.h>
 #include <dfmp/dfmp.h>
+#include <rpc/server.h>  // Finding E: end-to-end degraded getmikattestation error string
+
+#include <stdexcept>
 
 #include <cstdio>
 #include <cstdlib>
@@ -734,6 +737,27 @@ static void TestSeedIdentityResolutionGlue() {
     CHECK(NormalizeExternalIpForSeedMatch("[2001:db8::1]:8444") == "2001:db8::1",
           "normalize extracts address from bracketed IPv6:port");
 
+    // --- Finding C (extreview PR#121): normalization edge cases. -------------
+    // Trailing dot (FQDN form, or dotted-quad with a stray trailing dot) must be
+    // stripped so it string-equals the configured form.
+    CHECK(NormalizeExternalIpForSeedMatch("1.2.3.4.") == "1.2.3.4",
+          "Finding C: strip single trailing dot on dotted-quad");
+    CHECK(NormalizeExternalIpForSeedMatch("seed.example.com.") == "seed.example.com",
+          "Finding C: strip single trailing dot on FQDN form");
+    CHECK(NormalizeExternalIpForSeedMatch("1.2.3.4.:8444") == "1.2.3.4",
+          "Finding C: trailing dot stripped after :port removal");
+    // Uppercase IPv6 must canonicalize to lowercase (RFC 5952 case-insensitive).
+    CHECK(NormalizeExternalIpForSeedMatch("2001:DB8::1") == "2001:db8::1",
+          "Finding C: lowercase bare uppercase IPv6");
+    CHECK(NormalizeExternalIpForSeedMatch("[2001:DB8::1]:8444") == "2001:db8::1",
+          "Finding C: lowercase bracketed uppercase IPv6:port");
+    // Embedded whitespace (quoting/templating artifact) inside the literal must
+    // be stripped, not left to silently fail the match.
+    CHECK(NormalizeExternalIpForSeedMatch("138.197. 68.128") == "138.197.68.128",
+          "Finding C: strip interior whitespace in IPv4 literal");
+    CHECK(NormalizeExternalIpForSeedMatch("\t1.2.3.4\t") == "1.2.3.4",
+          "Finding C: tab-padded externalip trims");
+
     // --- Testnet (empty pubkey set): lenient default-0 register, with flag. --
     {
         std::vector<std::vector<uint8_t>> emptyPubkeys;
@@ -799,6 +823,52 @@ static void TestSeedIdentityResolutionGlue() {
     }
 }
 
+// Finding E (extreview PR#121): end-to-end RPC glue for the DEGRADED state.
+// TestSeedIdentityResolutionGlue covers the decision helper; this asserts the
+// other half — that a CRPCServer marked degraded returns the DISTINCT
+// "ASN database not loaded" error from getmikattestation (and NOT the generic
+// "only available on seed nodes"), so an operator can tell a degraded seed from
+// a plain non-seed. CRPCServer links into this test binary via CORE_OBJECTS and
+// default-constructs with null node deps, so no chainstate is needed.
+static void TestDegradedGetMikAttestationErrorString() {
+    std::cout << "[Test] Finding E: degraded getmikattestation error string (RPC glue)"
+              << std::endl;
+
+    // 1) A plain (un-registered, non-degraded) server: generic non-seed error.
+    {
+        CRPCServer rpc;  // default port; no node wired
+        std::string err;
+        try {
+            rpc.InvokeRPCForTest("getmikattestation", "{}");
+            err = "<no throw>";
+        } catch (const std::exception& e) {
+            err = e.what();
+        }
+        CHECK(err.find("only available on seed nodes") != std::string::npos,
+              "non-seed getmikattestation -> generic 'only available on seed nodes'");
+        CHECK(err.find("ASN database not loaded") == std::string::npos,
+              "non-seed error does NOT claim ASN-degraded");
+    }
+
+    // 2) A DEGRADED server (valid identity, ASN DB failed to load): distinct,
+    //    diagnosable ASN-DB error string.
+    {
+        CRPCServer rpc;
+        rpc.RegisterSeedAttestationDegraded(/*seedId=*/2);
+        std::string err;
+        try {
+            rpc.InvokeRPCForTest("getmikattestation", "{}");
+            err = "<no throw>";
+        } catch (const std::exception& e) {
+            err = e.what();
+        }
+        CHECK(err.find("ASN database not loaded") != std::string::npos,
+              "degraded getmikattestation -> distinct 'ASN database not loaded'");
+        CHECK(err.find("only available on seed nodes") == std::string::npos,
+              "degraded error is NOT the generic non-seed string (diagnosable apart)");
+    }
+}
+
 int main() {
     std::cout << "=== LP-13 seed_attestation_key_tests ===" << std::endl;
 
@@ -817,6 +887,7 @@ int main() {
     TestSeedKeyFilePresentDetectsUnreadable(); // extreview HIGH (presence vs readability)
     TestKeyIdentityComparison();             // M-1 (key-identity pubkey comparison)
     TestSeedIdentityResolutionGlue();        // HIGH-1/HIGH-2 (resolve+decide glue)
+    TestDegradedGetMikAttestationErrorString(); // Finding E (degraded RPC error string)
 #ifndef _WIN32
     TestLoadRepairsPerms();                  // M-3
     TestFailClosedPerms();                   // M-4 (best-effort/informational)
