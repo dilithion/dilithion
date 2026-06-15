@@ -1968,12 +1968,10 @@ int main(int argc, char* argv[]) {
     SetUnhandledExceptionFilter(CrashHandler);
 #endif
 
-    // Limit glibc malloc arenas to reduce memory fragmentation.
-    // Default is 8*ncpus which causes RSS to grow unboundedly on long-running
-    // multi-threaded nodes (OOM after ~4 days on 4GB servers).
-#ifdef __linux__
-    mallopt(M_ARENA_MAX, 4);
-#endif
+    // (The glibc M_ARENA_MAX cap is set once at the top of main() above — a single
+    //  __GLIBC__-guarded mallopt(M_ARENA_MAX, 2). The prior duplicate `=4` cap here was
+    //  removed (mallopt is last-write-wins; it overrode the =2). DIL churns slower than
+    //  DilV so it didn't OOM, but the consolidation keeps both nodes identical.)
 
     // Quick Start Mode: If no arguments provided, use beginner-friendly defaults
     bool quick_start_mode = (argc == 1);
