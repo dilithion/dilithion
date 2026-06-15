@@ -252,6 +252,14 @@ public:
     // Get collected DNA (only valid after latency + timing complete)
     std::optional<DigitalDNA> get_dna() const;
 
+    // Cheap accessor: the own 20-byte address + readiness, WITHOUT building/copying
+    // the full DigitalDNA. get_dna() deep-copies ~440KB (clock-drift sample vector,
+    // perspective snapshots, bandwidth, behavioral); callers that need only the
+    // address — e.g. the per-block-connect block-relay-credit check — MUST use this.
+    // Calling get_dna() on the hot connect path churned the allocator at DilV's
+    // block rate and fragmented the glibc arenas → OOM after 1–2 days (fix 2026-06-15).
+    std::optional<std::array<uint8_t, 20>> get_address_if_ready() const;
+
     // Peer hooks (call from peer manager)
     void on_peer_connected(const std::array<uint8_t, 20>& peer_id);
     void on_peer_disconnected(const std::array<uint8_t, 20>& peer_id);

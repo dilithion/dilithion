@@ -5970,12 +5970,15 @@ load_genesis_block:  // Bug #29: Label for automatic retry after blockchain wipe
                         minerAddr, static_cast<uint32_t>(height));
                 }
 
-                // Block relay credit for our own registered identity
+                // Block relay credit for our own registered identity.
+                // Cheap address-only accessor — NOT the full get_dna() (~440KB deep-copy).
+                // Same hot-path allocator-churn fix as dilv-node (DIL churns slower, but
+                // the waste — copying 440KB to read a 20-byte address — is identical).
                 if (collector) {
-                    auto my_dna = collector->get_dna();
-                    if (my_dna && g_node_context.dna_registry->is_registered(my_dna->address)) {
+                    auto my_addr = collector->get_address_if_ready();
+                    if (my_addr && g_node_context.dna_registry->is_registered(*my_addr)) {
                         g_node_context.trust_manager->on_block_relayed(
-                            my_dna->address, static_cast<uint32_t>(height));
+                            *my_addr, static_cast<uint32_t>(height));
                     }
                 }
             }
