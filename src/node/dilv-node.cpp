@@ -6955,12 +6955,32 @@ load_genesis_block:  // Bug #29: Label for automatic retry after blockchain wipe
                               << "Use --externalip=<IP> to set. Defaulting to seed_id=0" << std::endl;
                 }
 
-                if (asnDatabase.IsLoaded()) {
-                    rpc_server.RegisterSeedAttestation(&seedAttestKey, &asnDatabase, seedId);
-                    std::cout << "  [OK] Seed attestation ready (seed_id=" << seedId
-                              << ", key=" << seedAttestKey.GetPubKeyHex().substr(0, 16) << "...)"
-                              << std::endl;
+                // LP-13 H-3 (fail-loud on zero-capacity seed): we have a USABLE
+                // signing key (attestOk) but RegisterSeedAttestation is gated on
+                // a loaded ASN DB. If the ASN DB failed to load here, the seed
+                // would start "healthy" — key loaded — yet serve ZERO attestation
+                // capacity (getmikattestation throws "not available"). A loaded
+                // key on a seed-capable node is an explicit operator intent to
+                // attest; silently running with no capacity is the same class of
+                // hidden attestation outage that M-1 makes fatal for a bad key.
+                // Treat ASN-load-failure-with-a-loaded-key as fatal: abort with
+                // the same idiom as the M-1 key-init abort above. (The benign
+                // no-key path falls through the outer `else` and never reaches
+                // here, so a relay that simply doesn't attest is unaffected.)
+                if (!asnDatabase.IsLoaded()) {
+                    std::cerr << "[Attestation] FATAL: seed attestation signing key loaded but the "
+                                 "ASN database failed to load (expected " << dataDir
+                              << "/ip2asn-v4.tsv or ./ip2asn-v4.tsv). A seed with a usable key but "
+                                 "no ASN database has ZERO attestation capacity (getmikattestation "
+                                 "would be unavailable). A seed must not run silently without "
+                                 "attestation capacity. Aborting startup." << std::endl;
+                    return 1;
                 }
+
+                rpc_server.RegisterSeedAttestation(&seedAttestKey, &asnDatabase, seedId);
+                std::cout << "  [OK] Seed attestation ready (seed_id=" << seedId
+                          << ", key=" << seedAttestKey.GetPubKeyHex().substr(0, 16) << "...)"
+                          << std::endl;
             }
         }
 
