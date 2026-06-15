@@ -2,6 +2,7 @@
 // Distributed under the MIT software license
 
 #include <api/http_server.h>
+#include <api/http_path_gate.h>
 #include <api/wallet_html.h>
 #include <net/sock.h>
 #include <rpc/host_validator.h>
@@ -339,16 +340,46 @@ void CHttpServer::HandleRequest(SOCKET client_socket) {
     buffer[bytes_read] = '\0';
     std::string request(buffer);
 
+    // LP-12 (gate-bypass fold, MEDIUM) — TRUNCATION FAIL-CLOSED. We read at most
+    // one 4095-byte chunk. If it came back completely full, the request may be
+    // truncated mid-header, and a Host value cut at the buffer boundary
+    // ("Host: 127.0.0.1<cut>.evil.com" -> "127.0.0.1") could spuriously match
+    // the allowlist while the FULL header would not. We cannot see the complete
+    // headers, so treat the request as untrusted: it is gated like any sensitive
+    // path below and rejected unless the (possibly partial) Host still passes.
+    // Rather than rely on that, force the gate's fail-closed branch.
+    const bool requestMaybeTruncated =
+        (static_cast<size_t>(bytes_read) >= sizeof(buffer) - 1);
+
     // Parse request
-    std::string method, path;
-    if (!ParseRequest(request, method, path)) {
+    std::string method, rawPath;
+    if (!ParseRequest(request, method, rawPath)) {
         Send500(client_socket);
         return;
     }
 
-    // STRESS TEST FIX: Handle GET /api/health - simple health check that NEVER blocks
-    // This endpoint is always available, even during high load
-    if (method == "GET" && path == "/api/health") {
+    // ========================================================================
+    // LP-12 (gate-bypass fold) — NORMALIZE THE PATH BEFORE ANY DECISION.
+    //
+    // The external-consensus review found the H-01 gate decided on the RAW
+    // request path, so every alternate spelling of a sensitive path evaded it
+    // (`/wallet?x`, `/wallet/`, `/API/v1/`, `/%61pi/v1/`, `/api/v1/../x402/`,
+    // `//api//v1//`). We now canonicalize ONCE here — strip query/fragment,
+    // percent-decode, collapse `//`, resolve `.`/`..`, drop the trailing slash —
+    // and drive BOTH the gate AND handler dispatch off the SAME normalized path,
+    // so a spelling can never reach a node-touching handler while skipping the
+    // gate. A path that will not normalize (bad %-escape, `..` above root, an
+    // embedded NUL) is treated as sensitive AND not routed — fail-closed.
+    // ========================================================================
+    const api::NormalizedPath norm = api::NormalizeRequestPath(rawPath);
+    const std::string& path = norm.path;  // canonical; dispatch uses this below
+
+    // STRESS TEST FIX: Handle GET /api/health - simple health check that NEVER
+    // blocks. Stays ABOVE the Host gate as an intentional load-balancer probe;
+    // it returns a STATIC liveness string only (no node/identity data). Matched
+    // on the normalized path so a disguised spelling cannot smuggle something
+    // else through this pre-gate branch. A non-normalizable path never matches.
+    if (norm.ok && method == "GET" && path == "/api/health") {
         SendResponse(client_socket, 200, "application/json", R"({"status":"ok"})");
         return;
     }
@@ -391,16 +422,26 @@ void CHttpServer::HandleRequest(SOCKET client_socket) {
     // production ConfigureHostAllowlist() runs before Start() spawns workers.
     // ========================================================================
     {
+        // Fail-closed: a path that would not normalize (bad %-escape, traversal
+        // above root, embedded NUL) is treated as sensitive — it must NOT slip
+        // past the Host gate. Otherwise classify the canonical path.
         const bool sensitive_surface =
-            path.rfind("/api/v1/", 0) == 0 ||
-            path.rfind("/x402/", 0) == 0 ||
-            path == "/wallet" || path == "/wallet.html" || path == "/" ||
-            path == "/api/stats" || path == "/metrics";
+            !norm.ok || api::IsSensitiveSurface(path);
         if (sensitive_surface &&
-            (!m_host_validator_ready.load() ||
+            (requestMaybeTruncated ||
+             !m_host_validator_ready.load() ||
              !m_host_validator.IsRequestHostAllowed(request))) {
             SendResponse(client_socket, 403, "application/json",
                 R"({"error":"Forbidden: Host header not allowed (DNS-rebinding protection). Connect via 127.0.0.1/localhost or configure --rpcallowhost.","code":-32600})");
+            return;
+        }
+        // A non-normalizable path that somehow passed the Host check (e.g. a
+        // loopback operator hitting a malformed URL) is still never routed to a
+        // node-touching handler: every dispatch branch below keys on the
+        // canonical `path`, which is empty/garbage when !norm.ok, so it falls
+        // through to 404. Make that explicit and fail-closed.
+        if (!norm.ok) {
+            Send404(client_socket);
             return;
         }
     }
@@ -465,6 +506,18 @@ void CHttpServer::HandleRequest(SOCKET client_socket) {
                 R"({"error":"Forbidden: the wallet UI is disabled on a public-API node. SSH-tunnel to a loopback RPC to use the wallet.","code":-32600})");
             return;
         }
+        // LP-12 (gate-bypass fold, finding #3) — IPv4-mapped-IPv6 loopback spoof
+        // is NOT exploitable here. clientIP is GetPeerIP(), which calls
+        // getpeername() (kernel-reported peer, not attacker-supplied) and then
+        // CSock::ExtractAddress(), which UNWRAPS any IPv4-mapped v6 source
+        // (IN6_IS_ADDR_V4MAPPED -> dotted IPv4) BEFORE it reaches IsLoopbackIP.
+        // So a REMOTE peer can never present "::ffff:127.0.0.1" to this check:
+        // the kernel reports the peer's real address, and a real remote address
+        // unwraps to its real (non-127) IPv4. A 127.x source on a remote socket
+        // would be a martian packet rejected by the OS network stack. Belt-and-
+        // suspenders: on --public-api nodes the wallet UI is already disabled
+        // entirely above (the public-node branch), so this loopback gate is only
+        // reached on a localhost-bound server in the first place.
         if (!rpc::HostValidator::IsLoopbackIP(clientIP)) {
             SendResponse(client_socket, 403, "application/json",
                 R"({"error":"Forbidden: the wallet UI is served to loopback connections only. Use an SSH tunnel for remote access.","code":-32600})");
@@ -478,7 +531,8 @@ void CHttpServer::HandleRequest(SOCKET client_socket) {
         // belt-and-suspenders anti-rebinding layer. Fail-closed if the validator
         // is not ready. Either failing rejects the token-minting page.
         // ====================================================================
-        if (!m_host_validator_ready.load() ||
+        if (requestMaybeTruncated ||
+            !m_host_validator_ready.load() ||
             !m_host_validator.IsRequestLoopbackHost(request)) {
             SendResponse(client_socket, 403, "application/json",
                 R"({"error":"Forbidden: the wallet UI is served on loopback only (127.0.0.1/localhost). Use an SSH tunnel for remote access.","code":-32600})");

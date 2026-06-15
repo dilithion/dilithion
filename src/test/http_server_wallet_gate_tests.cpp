@@ -20,6 +20,7 @@
 // http_server.cpp calls the same predicate in the same order.
 
 #include <rpc/host_validator.h>
+#include <api/http_path_gate.h>
 
 #include <cstdint>
 #include <iostream>
@@ -300,6 +301,130 @@ static void TestRateLimiterRecordsStayBounded() {
     CHECK(recs.empty());
 }
 
+// ==========================================================================
+// 7. GATE-BYPASS FOLD (PR #112 extreview, finding #1) — the H-01 gate's
+//    sensitive-surface decision, exercised through the REAL production
+//    functions api::NormalizeRequestPath + api::IsSensitiveSurface (NOT a
+//    re-model). CHttpServer::HandleRequest computes exactly:
+//
+//        const api::NormalizedPath norm = api::NormalizeRequestPath(rawPath);
+//        const bool sensitive = !norm.ok || api::IsSensitiveSurface(norm.path);
+//
+//    GateSensitive() below calls those SAME functions, so if the normalization
+//    is deleted or weakened the must-gate assertions here FAIL — this is the
+//    mutation-resistance the review demanded (it caught that the OLD test
+//    re-implemented the gate and was blind to every bypass vector).
+// ==========================================================================
+
+// The live gate decision, verbatim from http_server.cpp's gate block.
+static bool GateSensitive(const std::string& rawPath) {
+    const api::NormalizedPath norm = api::NormalizeRequestPath(rawPath);
+    return !norm.ok || api::IsSensitiveSurface(norm.path);
+}
+
+static void TestPathNormalizationGateBypassMatrix() {
+    std::cout << "LP-12 fold: every spelling of a sensitive path is gated..." << std::endl;
+
+    // ---- Canonical sensitive surfaces are gated. ----
+    CHECK(GateSensitive("/wallet"));
+    CHECK(GateSensitive("/wallet.html"));
+    CHECK(GateSensitive("/"));
+    CHECK(GateSensitive("/api/stats"));
+    CHECK(GateSensitive("/metrics"));
+    CHECK(GateSensitive("/api/v1/broadcast"));
+    CHECK(GateSensitive("/api/v1/info"));
+    CHECK(GateSensitive("/x402/pay"));
+
+    // ---- Finding #1 bypass vectors — ALL must now be gated. ----
+    // Query string on an exact-match path (the original headline bypass).
+    CHECK(GateSensitive("/wallet?x"));
+    CHECK(GateSensitive("/wallet?a=b&c=d"));
+    CHECK(GateSensitive("/api/stats?x"));
+    CHECK(GateSensitive("/metrics?format=prom"));
+    // Fragment.
+    CHECK(GateSensitive("/wallet#frag"));
+    CHECK(GateSensitive("/api/stats#x"));
+    // Trailing slash.
+    CHECK(GateSensitive("/wallet/"));
+    CHECK(GateSensitive("/api/stats/"));
+    CHECK(GateSensitive("/metrics/"));
+    CHECK(GateSensitive("/api/v1/"));
+    CHECK(GateSensitive("/x402/"));
+    // Mixed / upper case.
+    CHECK(GateSensitive("/API/v1/broadcast"));
+    CHECK(GateSensitive("/Api/V1/Broadcast"));
+    CHECK(GateSensitive("/X402/pay"));
+    CHECK(GateSensitive("/WALLET"));
+    CHECK(GateSensitive("/Metrics"));
+    CHECK(GateSensitive("/API/STATS"));
+    // Percent-encoding (/%61pi/ == /api/, %2f == '/', %2e == '.').
+    CHECK(GateSensitive("/%61pi/v1/broadcast"));     // %61 = 'a'
+    CHECK(GateSensitive("/api/v1%2fbroadcast"));     // encoded slash -> /api/v1/broadcast
+    CHECK(GateSensitive("/%77allet"));               // %77 = 'w'
+    // Dot-segment traversal that resolves ONTO a sensitive surface IS gated.
+    // (NOTE: /api/v1/../x402/pay canonicalizes to /api/x402/pay — the '..' pops
+    //  the v1 segment, NOT 'api' — so it is NOT sensitive and 404s; covered in
+    //  the negative cases below. The protection is gate/dispatch agreement on
+    //  the SAME canonical path, whatever that path is.)
+    CHECK(GateSensitive("/x402/../wallet"));         // -> /wallet
+    CHECK(GateSensitive("/api/v1/../../wallet"));    // -> /wallet
+    CHECK(GateSensitive("/foo/../wallet"));          // -> /wallet
+    CHECK(GateSensitive("/api/v1/%2e%2e/v1/broadcast")); // -> /api/v1/broadcast
+    CHECK(GateSensitive("/api/v1/./broadcast"));     // -> /api/v1/broadcast
+    CHECK(GateSensitive("/./wallet"));               // -> /wallet
+    // Duplicate slashes.
+    CHECK(GateSensitive("//api//v1//broadcast"));
+    CHECK(GateSensitive("///wallet"));
+    CHECK(GateSensitive("//metrics"));
+    CHECK(GateSensitive("/api//stats"));
+
+    // ---- Fail-closed: non-normalizable paths are gated (treated sensitive). ----
+    CHECK(GateSensitive("/api/v1/%zz"));   // malformed %-escape
+    CHECK(GateSensitive("/wallet%2"));     // truncated %-escape
+    CHECK(GateSensitive("/%2e%2e/etc"));   // '..' traversing above root
+    CHECK(GateSensitive("/../etc/passwd"));
+    CHECK(GateSensitive("/wallet%00.html")); // embedded NUL via %00
+
+    // ---- Genuinely public paths are NOT gated (gate must not over-block to
+    //      the point of breaking the LB health probe handling order). These are
+    //      paths the server would 404 or treat as health; none are sensitive. ----
+    CHECK(!GateSensitive("/favicon.ico"));
+    CHECK(!GateSensitive("/robots.txt"));
+    CHECK(!GateSensitive("/api/health"));   // health is matched ABOVE the gate
+    CHECK(!GateSensitive("/api/v2/info"));  // not a known sensitive prefix
+    CHECK(!GateSensitive("/walletx"));      // not /wallet (no false prefix)
+    CHECK(!GateSensitive("/metricsx"));
+    CHECK(!GateSensitive("/api/statsx"));
+    CHECK(!GateSensitive("/x402x/pay"));
+    CHECK(!GateSensitive("/nope"));
+    // /api/v1/../x402/pay -> /api/x402/pay ('..' cancels v1): NOT sensitive.
+    // The gate and the live REST dispatch agree it is unrouted -> 404.
+    CHECK(!GateSensitive("/api/v1/../x402/pay"));
+    CHECK(!GateSensitive("/api/v1/%2e%2e/x402/pay"));  // same, percent-encoded
+}
+
+// Direct assertions on the normalizer's canonical output (pins the contract
+// the gate relies on — also mutation-resistant: weakening any step shows here).
+static void TestNormalizerCanonicalForm() {
+    std::cout << "LP-12 fold: NormalizeRequestPath canonical-form contract..." << std::endl;
+    auto norm = [](const std::string& p) { return api::NormalizeRequestPath(p); };
+
+    CHECK(norm("/wallet?x").ok && norm("/wallet?x").path == "/wallet");
+    CHECK(norm("/wallet/").path == "/wallet");
+    CHECK(norm("//api//v1//broadcast").path == "/api/v1/broadcast");
+    CHECK(norm("/api/v1/../x402/pay").path == "/api/x402/pay"); // '..' pops v1
+    CHECK(norm("/x402/../wallet").path == "/wallet");           // '..' pops x402
+    CHECK(norm("/%61pi/v1/info").path == "/api/v1/info");
+    CHECK(norm("/").ok && norm("/").path == "/");
+    CHECK(norm("/foo/./bar").path == "/foo/bar");
+    // Fail-closed cases report ok == false.
+    CHECK(!norm("/%zz").ok);
+    CHECK(!norm("/wallet%2").ok);
+    CHECK(!norm("/../escape").ok);
+    CHECK(!norm("/a/../../escape").ok);
+    CHECK(!norm("/x%00y").ok);
+}
+
 int main() {
     std::cout << "=== LP-12 CHttpServer wallet-HTML gate tests ===" << std::endl;
     TestPublicApiDisablesWalletEntirely();
@@ -308,6 +433,8 @@ int main() {
     TestRestHostAllowlistGate();             // H-01
     TestWalletGateSecondaryHostCheck();      // M-03
     TestRateLimiterRecordsStayBounded();     // M-01
+    TestPathNormalizationGateBypassMatrix(); // gate-bypass fold (finding #1+#2)
+    TestNormalizerCanonicalForm();           // gate-bypass fold (normalizer contract)
     std::cout << "All " << g_checks << " checks passed." << std::endl;
     return 0;
 }
