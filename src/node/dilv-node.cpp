@@ -1911,6 +1911,14 @@ std::optional<CBlockTemplate> BuildMiningTemplate(CBlockchainDB& blockchain, CWa
 }
 
 int main(int argc, char* argv[]) {
+#if defined(__linux__) && defined(__GLIBC__)
+    // DilV OOM fix (2026-06-15): bound the glibc allocator arenas. High-frequency
+    // alloc/free churn (the per-block DNA path, mining) fragments the default
+    // per-thread arenas → RSS climbs to OOM over 1–2 days. M_ARENA_MAX=2 caps that
+    // fragmentation (belt-and-braces alongside the get_dna() hot-path fix); trades a
+    // little multi-thread malloc contention for bounded RSS — a standard mitigation.
+    mallopt(M_ARENA_MAX, 2);
+#endif
 #ifdef _WIN32
     // Register crash handler to log crash info before terminating
     SetUnhandledExceptionFilter(CrashHandler);
@@ -6006,12 +6014,15 @@ load_genesis_block:  // Bug #29: Label for automatic retry after blockchain wipe
                         minerAddr, static_cast<uint32_t>(height));
                 }
 
-                // Block relay credit for our own registered identity
+                // Block relay credit for our own registered identity.
+                // Use the cheap address-only accessor — NOT the full get_dna(), which
+                // deep-copies ~440KB. This runs on EVERY block-connect; at DilV's block
+                // rate the full copy churned + fragmented the allocator → OOM (fix 2026-06-15).
                 if (collector) {
-                    auto my_dna = collector->get_dna();
-                    if (my_dna && g_node_context.dna_registry->is_registered(my_dna->address)) {
+                    auto my_addr = collector->get_address_if_ready();
+                    if (my_addr && g_node_context.dna_registry->is_registered(*my_addr)) {
                         g_node_context.trust_manager->on_block_relayed(
-                            my_dna->address, static_cast<uint32_t>(height));
+                            *my_addr, static_cast<uint32_t>(height));
                     }
                 }
             }
