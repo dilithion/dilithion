@@ -217,6 +217,13 @@ private:
     Attestation::CSeedAttestationKey* m_seedAttestationKey{nullptr};
     CASNDatabase* m_asnDatabase{nullptr};
     int m_seedId{-1};  // This seed's index (0-3), or -1 if not a seed
+    // H-3 (consolidated): set on a valid seed whose ASN database failed to load.
+    // The node stays online for relay/P2P but attestation is NOT registered
+    // (m_seedAttestationKey stays null). This flag lets getmikattestation return
+    // a DISTINCT "ASN database not loaded" diagnostic instead of the generic
+    // "only available on seed nodes", so the degraded state is queryable.
+    bool m_seedAttestationAsnDegraded{false};
+    int m_seedAttestationDegradedSeedId{-1};  // resolved seed_id for the degraded diagnostic
 
     // Attestation rate limiting (Sybil defense Phase 0)
     // Rate limits NEW MIK registrations per /24 subnet per day.
@@ -626,6 +633,20 @@ public:
         m_seedAttestationKey = key;
         m_asnDatabase = asnDb;
         m_seedId = seedId;
+        m_seedAttestationAsnDegraded = false;
+    }
+
+    /**
+     * H-3 (consolidated): mark this seed as ATTESTATION-DEGRADED because its ASN
+     * database failed to load. Does NOT register a signing key — the node stays
+     * online for relay/P2P, attestation stays unavailable — but flips
+     * getmikattestation's error from the generic "only available on seed nodes"
+     * to a distinct, diagnosable "ASN database not loaded" so an operator can
+     * tell a degraded seed apart from a plain non-seed.
+     */
+    void RegisterSeedAttestationDegraded(int seedId) {
+        m_seedAttestationAsnDegraded = true;
+        m_seedAttestationDegradedSeedId = seedId;
     }
 
     /**

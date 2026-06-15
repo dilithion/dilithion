@@ -127,6 +127,24 @@ enum class SeedIdentityDecision {
     // key cannot produce consensus-accepted attestations for this seed_id —
     // fail loud (caller returns 1).
     FATAL_MISMATCH,
+    // H-3 (consolidated): this node WOULD register (identity is valid — either a
+    // mainnet seed whose key matches its slot, or a testnet seed), but the ASN
+    // database failed to load, so RegisterSeedAttestation cannot run and the seed
+    // has ZERO attestation capacity. This is NEITHER fatal NOR a silent skip:
+    //  - NOT fatal (the rejected H-3 over-correction): an ASN failure only
+    //    disables ATTESTATION; aborting would also take relay/P2P/--public-api
+    //    offline. On the known ASN-file-lost-on-rotation incident, with a
+    //    3-of-4 zero-spare quorum, that bricks a live seed for an attestation-only
+    //    fault. So the node stays ONLINE.
+    //  - NOT a silent skip (the original H-3 target bug): the seed would start
+    //    "healthy" with a loaded key yet serve zero attestation capacity, and
+    //    getmikattestation would return only the generic "only available on seed
+    //    nodes". So the caller logs a LOUD persistent ERROR and registers a
+    //    DEGRADED marker that makes getmikattestation return a DISTINCT,
+    //    diagnosable "ASN database not loaded" error.
+    // Net: relay stays up, attestation stays UNregistered, the degraded state is
+    // loud at startup AND queryable at the RPC.
+    DEGRADED_NO_ASN,
 };
 
 struct SeedIdentityResult {
@@ -150,17 +168,27 @@ std::string NormalizeExternalIpForSeedMatch(const std::string& externalIp);
 /**
  * Pure resolve+validate decision for the seed-attestation startup glue.
  *
+ * The decision is the FINAL 4-way disposition the node-startup glue dispatches
+ * on (REGISTER / SKIP_NOT_A_SEED / FATAL_MISMATCH / DEGRADED_NO_ASN), so the
+ * whole decision — including the ASN-DB-failure degradation — is unit-testable
+ * in one place. asnLoaded folds in last: it can only turn a would-be REGISTER
+ * into DEGRADED_NO_ASN; it never overrides FATAL_MISMATCH (a trust failure
+ * stays fatal regardless of ASN state) or SKIP_NOT_A_SEED (a non-seed has
+ * nothing to register, ASN-loaded or not).
+ *
  * @param seedIPs       chainparams seedAttestationIPs (index-aligned w/ pubkeys)
  * @param seedPubkeys   chainparams seedAttestationPubkeys (empty => testnet)
  * @param externalIp    raw --externalip value (normalized internally)
  * @param loadedPubkey  the loaded/minted key's GetPubKey()
+ * @param asnLoaded     whether the ASN database loaded (asnDatabase.IsLoaded())
  * @return decision + resolved seedId; see SeedIdentityDecision.
  */
 SeedIdentityResult ResolveSeedIdentity(
     const std::vector<std::string>& seedIPs,
     const std::vector<std::vector<uint8_t>>& seedPubkeys,
     const std::string& externalIp,
-    const std::vector<uint8_t>& loadedPubkey);
+    const std::vector<uint8_t>& loadedPubkey,
+    bool asnLoaded);
 
 /** LP-13 H-2 (atomic-save) TEST SEAM. When set to a non-null function, Save()
  *  invokes it immediately after the temp file has been fully written + fsynced

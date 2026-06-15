@@ -153,7 +153,8 @@ SeedIdentityResult ResolveSeedIdentity(
     const std::vector<std::string>& seedIPs,
     const std::vector<std::vector<uint8_t>>& seedPubkeys,
     const std::string& externalIp,
-    const std::vector<uint8_t>& loadedPubkey) {
+    const std::vector<uint8_t>& loadedPubkey,
+    bool asnLoaded) {
     SeedIdentityResult r;
 
     // Resolve seedId by matching our normalized --externalip against the known
@@ -177,13 +178,17 @@ SeedIdentityResult ResolveSeedIdentity(
         // Testnet: no consensus pubkey to enforce. Preserve the prior lenient
         // behavior — register under the resolved index, or default 0 with a
         // WARN when unresolved.
-        r.decision = SeedIdentityDecision::REGISTER;
         if (seedId < 0) {
             r.seedId = 0;
             r.usedTestnetDefault = true;
         } else {
             r.seedId = seedId;
         }
+        // H-3: a valid (testnet) identity that would register, but with the ASN
+        // DB down, has zero attestation capacity -> DEGRADED (stay online, don't
+        // register, make the state loud + diagnosable). Otherwise REGISTER.
+        r.decision = asnLoaded ? SeedIdentityDecision::REGISTER
+                               : SeedIdentityDecision::DEGRADED_NO_ASN;
         return r;
     }
 
@@ -210,8 +215,14 @@ SeedIdentityResult ResolveSeedIdentity(
         return r;
     }
 
-    r.decision = SeedIdentityDecision::REGISTER;
+    // Identity is valid for this seed slot. H-3: fold in ASN-DB state LAST — a
+    // valid identity with the ASN DB down has zero attestation capacity, so it
+    // DEGRADES (stay online, don't register, loud + diagnosable) rather than
+    // registering. A trust failure (FATAL_MISMATCH above) is never reached here,
+    // so ASN state can only ever soften a would-be REGISTER, never a FATAL.
     r.seedId = seedId;
+    r.decision = asnLoaded ? SeedIdentityDecision::REGISTER
+                           : SeedIdentityDecision::DEGRADED_NO_ASN;
     return r;
 }
 

@@ -662,9 +662,9 @@ static void TestSeedIdentityResolutionGlue() {
     // --- REGISTER: externalip resolves to a slot AND key matches that slot. ---
     {
         SeedIdentityResult r = ResolveSeedIdentity(
-            seedIPs, seedPubkeys, "10.0.0.3", keys[2].GetPubKey());
+            seedIPs, seedPubkeys, "10.0.0.3", keys[2].GetPubKey(), /*asnLoaded=*/true);
         CHECK(r.decision == SeedIdentityDecision::REGISTER,
-              "matching key at resolved slot -> REGISTER");
+              "matching key at resolved slot + ASN ok -> REGISTER");
         CHECK(r.seedId == 2, "REGISTER resolves to seed_id=2");
         CHECK(!r.usedTestnetDefault, "REGISTER on mainnet is not a testnet default");
     }
@@ -673,7 +673,7 @@ static void TestSeedIdentityResolutionGlue() {
     // (Drives the abort path; a no-op decision helper would NOT return this.)
     {
         SeedIdentityResult r = ResolveSeedIdentity(
-            seedIPs, seedPubkeys, "10.0.0.1", keys[3].GetPubKey());
+            seedIPs, seedPubkeys, "10.0.0.1", keys[3].GetPubKey(), /*asnLoaded=*/true);
         CHECK(r.decision == SeedIdentityDecision::FATAL_MISMATCH,
               "resolved slot + mismatched pubkey -> FATAL_MISMATCH (abort path)");
         CHECK(r.seedId == 0, "FATAL_MISMATCH reports the resolved seed_id");
@@ -683,7 +683,7 @@ static void TestSeedIdentityResolutionGlue() {
     // HIGH-1: must NOT abort even though a usable key is present.
     {
         SeedIdentityResult r = ResolveSeedIdentity(
-            seedIPs, seedPubkeys, "203.0.113.7", keys[0].GetPubKey());
+            seedIPs, seedPubkeys, "203.0.113.7", keys[0].GetPubKey(), /*asnLoaded=*/true);
         CHECK(r.decision == SeedIdentityDecision::SKIP_NOT_A_SEED,
               "non-seed externalip + key present -> SKIP_NOT_A_SEED (NOT abort, HIGH-1)");
         CHECK(r.seedId == -1, "SKIP leaves seed_id unresolved");
@@ -691,7 +691,7 @@ static void TestSeedIdentityResolutionGlue() {
     // Empty externalip is also "not a seed" -> SKIP, not FATAL.
     {
         SeedIdentityResult r = ResolveSeedIdentity(
-            seedIPs, seedPubkeys, "", keys[0].GetPubKey());
+            seedIPs, seedPubkeys, "", keys[0].GetPubKey(), /*asnLoaded=*/true);
         CHECK(r.decision == SeedIdentityDecision::SKIP_NOT_A_SEED,
               "empty externalip on mainnet -> SKIP_NOT_A_SEED (HIGH-1)");
     }
@@ -699,14 +699,14 @@ static void TestSeedIdentityResolutionGlue() {
     // --- HIGH-2: :port suffix and whitespace must still resolve. -------------
     {
         SeedIdentityResult r = ResolveSeedIdentity(
-            seedIPs, seedPubkeys, "10.0.0.4:8444", keys[3].GetPubKey());
+            seedIPs, seedPubkeys, "10.0.0.4:8444", keys[3].GetPubKey(), /*asnLoaded=*/true);
         CHECK(r.decision == SeedIdentityDecision::REGISTER,
               "externalip with :port resolves -> REGISTER (HIGH-2)");
         CHECK(r.seedId == 3, ":port-stripped externalip resolves to correct seed_id");
     }
     {
         SeedIdentityResult r = ResolveSeedIdentity(
-            seedIPs, seedPubkeys, "  10.0.0.2  ", keys[1].GetPubKey());
+            seedIPs, seedPubkeys, "  10.0.0.2  ", keys[1].GetPubKey(), /*asnLoaded=*/true);
         CHECK(r.decision == SeedIdentityDecision::REGISTER,
               "whitespace-padded externalip resolves -> REGISTER (HIGH-2)");
         CHECK(r.seedId == 1, "trimmed externalip resolves to correct seed_id");
@@ -715,7 +715,7 @@ static void TestSeedIdentityResolutionGlue() {
     // resolved slot (normalization must not mask a genuine key mismatch).
     {
         SeedIdentityResult r = ResolveSeedIdentity(
-            seedIPs, seedPubkeys, " 10.0.0.1:8444 ", keys[2].GetPubKey());
+            seedIPs, seedPubkeys, " 10.0.0.1:8444 ", keys[2].GetPubKey(), /*asnLoaded=*/true);
         CHECK(r.decision == SeedIdentityDecision::FATAL_MISMATCH,
               "normalized resolve still enforces pubkey match -> FATAL_MISMATCH");
         CHECK(r.seedId == 0, "normalized externalip resolved to seed_id=0");
@@ -738,20 +738,64 @@ static void TestSeedIdentityResolutionGlue() {
     {
         std::vector<std::vector<uint8_t>> emptyPubkeys;
         SeedIdentityResult r = ResolveSeedIdentity(
-            seedIPs, emptyPubkeys, "203.0.113.7", keys[0].GetPubKey());
+            seedIPs, emptyPubkeys, "203.0.113.7", keys[0].GetPubKey(), /*asnLoaded=*/true);
         CHECK(r.decision == SeedIdentityDecision::REGISTER,
-              "testnet empty set + unresolved ip -> REGISTER (lenient)");
+              "testnet empty set + unresolved ip + ASN ok -> REGISTER (lenient)");
         CHECK(r.seedId == 0, "testnet unresolved defaults to seed_id=0");
         CHECK(r.usedTestnetDefault, "testnet default flagged for legacy WARN");
     }
     {
         std::vector<std::vector<uint8_t>> emptyPubkeys;
         SeedIdentityResult r = ResolveSeedIdentity(
-            seedIPs, emptyPubkeys, "10.0.0.2", keys[0].GetPubKey());
+            seedIPs, emptyPubkeys, "10.0.0.2", keys[0].GetPubKey(), /*asnLoaded=*/true);
         CHECK(r.decision == SeedIdentityDecision::REGISTER,
               "testnet empty set + resolved ip -> REGISTER at resolved index");
         CHECK(r.seedId == 1, "testnet resolved ip keeps its index");
         CHECK(!r.usedTestnetDefault, "testnet resolved ip is not a default");
+    }
+
+    // --- H-3 (consolidated): DEGRADED_NO_ASN — valid identity, ASN DB down. ---
+    // The load-bearing new case. A no-op DEGRADED helper (one that still returns
+    // REGISTER when asnLoaded=false) would FAIL all four of these.
+    {
+        // Mainnet seed, key MATCHES its slot, but ASN failed to load -> DEGRADED,
+        // NOT REGISTER (stay online, don't register) and NOT FATAL (don't abort).
+        SeedIdentityResult r = ResolveSeedIdentity(
+            seedIPs, seedPubkeys, "10.0.0.3", keys[2].GetPubKey(), /*asnLoaded=*/false);
+        CHECK(r.decision == SeedIdentityDecision::DEGRADED_NO_ASN,
+              "valid mainnet seed + ASN DB FAILED -> DEGRADED_NO_ASN (online, unregistered)");
+        CHECK(r.decision != SeedIdentityDecision::REGISTER,
+              "DEGRADED must NOT register (kills original silent-zero-capacity bug)");
+        CHECK(r.decision != SeedIdentityDecision::FATAL_MISMATCH,
+              "DEGRADED must NOT abort (kills the brick over-correction)");
+        CHECK(r.seedId == 2, "DEGRADED still reports the resolved seed_id (for diagnostics)");
+    }
+    {
+        // ASN state must NOT override a TRUST failure: resolved slot + WRONG key
+        // is still FATAL_MISMATCH even with the ASN DB down. A wrong-key signer
+        // must never run, regardless of ASN state.
+        SeedIdentityResult r = ResolveSeedIdentity(
+            seedIPs, seedPubkeys, "10.0.0.1", keys[3].GetPubKey(), /*asnLoaded=*/false);
+        CHECK(r.decision == SeedIdentityDecision::FATAL_MISMATCH,
+              "mismatched pubkey stays FATAL_MISMATCH even with ASN DB down (trust > ASN)");
+    }
+    {
+        // ASN state must NOT turn a non-seed into a degraded seed: a non-matching
+        // externalip is SKIP_NOT_A_SEED whether or not the ASN DB loaded.
+        SeedIdentityResult r = ResolveSeedIdentity(
+            seedIPs, seedPubkeys, "203.0.113.7", keys[0].GetPubKey(), /*asnLoaded=*/false);
+        CHECK(r.decision == SeedIdentityDecision::SKIP_NOT_A_SEED,
+              "non-seed externalip stays SKIP_NOT_A_SEED even with ASN DB down (no false degrade)");
+    }
+    {
+        // Testnet (empty pubkey set): a would-be lenient REGISTER also degrades
+        // when the ASN DB is down — same online-but-unregistered semantics.
+        std::vector<std::vector<uint8_t>> emptyPubkeys;
+        SeedIdentityResult r = ResolveSeedIdentity(
+            seedIPs, emptyPubkeys, "10.0.0.2", keys[0].GetPubKey(), /*asnLoaded=*/false);
+        CHECK(r.decision == SeedIdentityDecision::DEGRADED_NO_ASN,
+              "testnet would-be REGISTER + ASN DB down -> DEGRADED_NO_ASN");
+        CHECK(r.seedId == 1, "testnet DEGRADED keeps the resolved seed_id");
     }
 }
 

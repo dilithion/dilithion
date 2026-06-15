@@ -6944,7 +6944,8 @@ load_genesis_block:  // Bug #29: Label for automatic retry after blockchain wipe
                 const auto& seedIPs = Dilithion::g_chainParams->seedAttestationIPs;
                 const auto& seedPubkeys = Dilithion::g_chainParams->seedAttestationPubkeys;
                 Attestation::SeedIdentityResult ident = Attestation::ResolveSeedIdentity(
-                    seedIPs, seedPubkeys, config.external_ip, seedAttestKey.GetPubKey());
+                    seedIPs, seedPubkeys, config.external_ip, seedAttestKey.GetPubKey(),
+                    asnDatabase.IsLoaded());
 
                 bool registerSeed = false;
                 switch (ident.decision) {
@@ -6974,6 +6975,27 @@ load_genesis_block:  // Bug #29: Label for automatic retry after blockchain wipe
                                      "configured public IP> only if this node IS one of the seeds."
                                   << std::endl;
                         break;
+                    case Attestation::SeedIdentityDecision::DEGRADED_NO_ASN:
+                        // H-3 (consolidated): identity is VALID for this seed, but the
+                        // ASN database failed to load -> zero attestation capacity.
+                        // Do NOT abort (that would take relay/P2P/--public-api offline
+                        // for an attestation-only fault — the rejected over-correction,
+                        // fatal on the known ASN-file-lost-on-rotation incident). Do NOT
+                        // silently skip (the original H-3 bug — a "healthy"-looking seed
+                        // with zero capacity). Instead: log a LOUD persistent ERROR with
+                        // operator guidance, keep the node ONLINE, leave attestation
+                        // UNregistered, and register a degraded marker so
+                        // getmikattestation returns a DISTINCT diagnosable error.
+                        std::cerr << "[Attestation] ERROR: seed identity is valid (seed_id="
+                                  << ident.seedId << ") but the ASN database FAILED to load "
+                                     "(missing/unparseable " << dataDir << "/ip2asn-v4.tsv or "
+                                     "./ip2asn-v4.tsv). Attestation is DISABLED — this seed has zero "
+                                     "attestation capacity and getmikattestation will report "
+                                     "\"ASN database not loaded\". The node continues to run for "
+                                     "relay/P2P. Fix ip2asn-v4.tsv (e.g. restore after a data-dir "
+                                     "rotation) and restart to restore attestation." << std::endl;
+                        rpc_server.RegisterSeedAttestationDegraded(ident.seedId);
+                        break;
                     case Attestation::SeedIdentityDecision::REGISTER:
                         if (ident.usedTestnetDefault) {
                             std::cerr << "[Attestation] WARNING: Could not determine seed ID "
@@ -6983,7 +7005,10 @@ load_genesis_block:  // Bug #29: Label for automatic retry after blockchain wipe
                         break;
                 }
 
-                if (registerSeed && asnDatabase.IsLoaded()) {
+                // REGISTER already implies asnDatabase.IsLoaded() — the helper folds
+                // the ASN-DB state into the decision, routing a valid identity with a
+                // failed ASN DB to DEGRADED_NO_ASN above. So no extra IsLoaded() guard.
+                if (registerSeed) {
                     rpc_server.RegisterSeedAttestation(&seedAttestKey, &asnDatabase, ident.seedId);
                     std::cout << "  [OK] Seed attestation ready (seed_id=" << ident.seedId
                               << ", key=" << seedAttestKey.GetPubKeyHex().substr(0, 16) << "...)"

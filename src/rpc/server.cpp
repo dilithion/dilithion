@@ -9182,8 +9182,18 @@ std::string CRPCServer::RPC_ListSwaps(const std::string& params) {
 // ============================================================================
 
 std::string CRPCServer::RPC_GetMIKAttestation(const std::string& params) {
-    // This RPC is only available on seed nodes with attestation key loaded
+    // This RPC is only available on seed nodes with attestation key loaded.
     if (!m_seedAttestationKey || m_seedId < 0) {
+        // H-3 (consolidated): distinguish a DEGRADED seed (valid identity, but the
+        // ASN DB failed to load so attestation was never registered) from a plain
+        // non-seed. A degraded seed returns a DISTINCT, diagnosable error string
+        // so the operator can see the ASN-DB cause instead of the generic
+        // "only available on seed nodes" (which would hide the degraded state).
+        if (m_seedAttestationAsnDegraded) {
+            throw std::runtime_error(
+                "attestation unavailable: ASN database not loaded "
+                "(seed running degraded for relay only; fix ip2asn-v4.tsv and restart)");
+        }
         throw std::runtime_error("getmikattestation is only available on seed nodes");
     }
 
