@@ -604,6 +604,40 @@ static void TestSeedKeyFilePresentDetectsUnreadable() {
 #endif
 }
 
+// M-1 (seed key-identity validation): the node's startup check compares the
+// loaded/minted key's GetPubKey() against the consensus pubkey for the resolved
+// seedId, aborting on mismatch. This test exercises that exact comparison
+// primitive: a key matches the pubkey it was generated/saved/loaded with (the
+// "accept" leg), and two independently-generated keys have DIFFERENT pubkeys, so
+// a wrong key bound to a seedId is detected (the "reject"/fail-loud leg).
+static void TestKeyIdentityComparison() {
+    std::cout << "[Test] M-1 seed key-identity pubkey comparison" << std::endl;
+    std::string dir = MakeTempDir();
+    SetPass(nullptr);  // v1 plaintext path is fine for a pubkey-equality test
+
+    CSeedAttestationKey kReal;
+    CHECK(kReal.Generate(), "generate the 'correct' seed key");
+    std::vector<uint8_t> realPub = kReal.GetPubKey();
+    CHECK(realPub.size() == DFMP::MIK_PUBKEY_SIZE, "pubkey is full Dilithium3 size");
+
+    // Accept leg: the same key (and a save/load round-trip of it) matches the
+    // consensus pubkey it would be registered under.
+    CHECK(kReal.GetPubKey() == realPub, "same key: GetPubKey() == consensus pubkey (ACCEPT)");
+    CHECK(kReal.Save(dir), "save the correct key");
+    CSeedAttestationKey kReloaded;
+    CHECK(kReloaded.Load(dir), "reload the correct key");
+    CHECK(kReloaded.GetPubKey() == realPub,
+          "reloaded key still matches consensus pubkey (ACCEPT survives persist)");
+
+    // Reject leg: a DIFFERENT key (what a misconfigured seed would load/mint —
+    // any Dilithium3 key, but not THIS seedId's consensus key) does NOT match,
+    // so the node's GetPubKey() != seedPubkeys[seedId] check fires (fail-loud).
+    CSeedAttestationKey kWrong;
+    CHECK(kWrong.Generate(), "generate a 'wrong' (mismatched) seed key");
+    CHECK(kWrong.GetPubKey() != realPub,
+          "different key: GetPubKey() != consensus pubkey (REJECT -> fail-loud)");
+}
+
 int main() {
     std::cout << "=== LP-13 seed_attestation_key_tests ===" << std::endl;
 
@@ -620,6 +654,7 @@ int main() {
     TestSaveFailMakesLoadOrGenerateFail();   // M-2
     TestRequireEncryptionPolicy();           // H-1
     TestSeedKeyFilePresentDetectsUnreadable(); // extreview HIGH (presence vs readability)
+    TestKeyIdentityComparison();             // M-1 (key-identity pubkey comparison)
 #ifndef _WIN32
     TestLoadRepairsPerms();                  // M-3
     TestFailClosedPerms();                   // M-4 (best-effort/informational)
