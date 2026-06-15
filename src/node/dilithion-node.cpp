@@ -1957,21 +1957,17 @@ std::optional<CBlockTemplate> BuildMiningTemplate(CBlockchainDB& blockchain, CWa
 }
 
 int main(int argc, char* argv[]) {
-#if defined(__linux__) && defined(__GLIBC__)
-    // Parity with dilv-node (2026-06-15): bound the glibc allocator arenas to cap
-    // fragmentation from high-frequency alloc/free churn. DIL churns slower than DilV
-    // so it doesn't OOM, but the mitigation is cheap and identical.
-    mallopt(M_ARENA_MAX, 2);
-#endif
 #ifdef _WIN32
     // Register crash handler to log crash info before terminating
     SetUnhandledExceptionFilter(CrashHandler);
 #endif
 
-    // (The glibc M_ARENA_MAX cap is set once at the top of main() above — a single
-    //  __GLIBC__-guarded mallopt(M_ARENA_MAX, 2). The prior duplicate `=4` cap here was
-    //  removed (mallopt is last-write-wins; it overrode the =2). DIL churns slower than
-    //  DilV so it didn't OOM, but the consolidation keeps both nodes identical.)
+    // Limit glibc malloc arenas to reduce memory fragmentation.
+    // Default is 8*ncpus which causes RSS to grow unboundedly on long-running
+    // multi-threaded nodes (OOM after ~4 days on 4GB servers).
+#ifdef __linux__
+    mallopt(M_ARENA_MAX, 4);
+#endif
 
     // Quick Start Mode: If no arguments provided, use beginner-friendly defaults
     bool quick_start_mode = (argc == 1);

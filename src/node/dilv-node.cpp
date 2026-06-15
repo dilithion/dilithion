@@ -1911,24 +1911,17 @@ std::optional<CBlockTemplate> BuildMiningTemplate(CBlockchainDB& blockchain, CWa
 }
 
 int main(int argc, char* argv[]) {
-#if defined(__linux__) && defined(__GLIBC__)
-    // DilV OOM fix (2026-06-15): bound the glibc allocator arenas. High-frequency
-    // alloc/free churn (the per-block DNA path, mining) fragments the default
-    // per-thread arenas → RSS climbs to OOM over 1–2 days. M_ARENA_MAX=2 caps that
-    // fragmentation (belt-and-braces alongside the get_dna() hot-path fix); trades a
-    // little multi-thread malloc contention for bounded RSS — a standard mitigation.
-    mallopt(M_ARENA_MAX, 2);
-#endif
 #ifdef _WIN32
     // Register crash handler to log crash info before terminating
     SetUnhandledExceptionFilter(CrashHandler);
 #endif
 
-    // (The glibc M_ARENA_MAX cap is set once at the top of main() above — a single
-    //  __GLIBC__-guarded mallopt(M_ARENA_MAX, 2). A prior duplicate `=4` cap here was
-    //  removed: mallopt is last-write-wins so it overrode the =2, AND =4 did not hold
-    //  once the per-block-connect 440KB get_dna() churn overwhelmed it — that churn is
-    //  the real fix, eliminated via get_address_if_ready().)
+    // Limit glibc malloc arenas to reduce memory fragmentation.
+    // Default is 8*ncpus which causes RSS to grow unboundedly on long-running
+    // multi-threaded nodes (OOM after ~4 days on 4GB servers).
+#ifdef __linux__
+    mallopt(M_ARENA_MAX, 4);
+#endif
 
     // Quick Start Mode: If no arguments provided, use beginner-friendly defaults
     bool quick_start_mode = (argc == 1);
