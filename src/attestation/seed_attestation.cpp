@@ -112,6 +112,109 @@ bool SeedKeyFilePresent(const std::string& dataDir) {
     return present;
 }
 
+// ============================================================================
+// LP-13 M-1/M-2 SEED-IDENTITY RESOLUTION (HIGH-1 / HIGH-2 fold)
+// ============================================================================
+
+std::string NormalizeExternalIpForSeedMatch(const std::string& externalIp) {
+    // 1) Trim surrounding whitespace (HIGH-2: quoting/templating artifacts).
+    size_t b = externalIp.find_first_not_of(" \t\r\n");
+    if (b == std::string::npos) return std::string();
+    size_t e = externalIp.find_last_not_of(" \t\r\n");
+    std::string s = externalIp.substr(b, e - b + 1);
+
+    // 2) IPv6 handling — do NOT strip on a raw IPv6 literal (it contains
+    //    colons legitimately). Bracketed form "[addr]" or "[addr]:port" keeps
+    //    the address inside the brackets; a bare value with >1 colon is treated
+    //    as IPv6 and returned trimmed-only. The configured seed set is IPv4-only,
+    //    so an IPv6 externalip simply fails to match -> SKIP_NOT_A_SEED, never a
+    //    false FATAL.
+    if (!s.empty() && s.front() == '[') {
+        size_t rb = s.find(']');
+        if (rb != std::string::npos) {
+            return s.substr(1, rb - 1);  // inside brackets, drop any ":port"
+        }
+        return s;  // malformed; leave as-is (won't match IPv4 set)
+    }
+    if (std::count(s.begin(), s.end(), ':') > 1) {
+        return s;  // bare IPv6 literal; trimmed only, no port strip
+    }
+
+    // 3) IPv4 / hostname: strip a single trailing ":port" suffix
+    //    (HIGH-2: --externalip=138.197.68.128:8444 must resolve).
+    size_t colon = s.find(':');
+    if (colon != std::string::npos) {
+        s = s.substr(0, colon);
+    }
+    return s;
+}
+
+SeedIdentityResult ResolveSeedIdentity(
+    const std::vector<std::string>& seedIPs,
+    const std::vector<std::vector<uint8_t>>& seedPubkeys,
+    const std::string& externalIp,
+    const std::vector<uint8_t>& loadedPubkey) {
+    SeedIdentityResult r;
+
+    // Resolve seedId by matching our normalized --externalip against the known
+    // seed IPs. seedAttestationIPs[i] and seedAttestationPubkeys[i] are
+    // index-aligned (same NYC/London/Singapore/Sydney order), so the resolved
+    // index is also the index into the consensus pubkey set.
+    int seedId = -1;
+    if (!externalIp.empty()) {
+        std::string normIp = NormalizeExternalIpForSeedMatch(externalIp);
+        if (!normIp.empty()) {
+            for (size_t i = 0; i < seedIPs.size(); i++) {
+                if (seedIPs[i] == normIp) {
+                    seedId = static_cast<int>(i);
+                    break;
+                }
+            }
+        }
+    }
+
+    if (seedPubkeys.empty()) {
+        // Testnet: no consensus pubkey to enforce. Preserve the prior lenient
+        // behavior — register under the resolved index, or default 0 with a
+        // WARN when unresolved.
+        r.decision = SeedIdentityDecision::REGISTER;
+        if (seedId < 0) {
+            r.seedId = 0;
+            r.usedTestnetDefault = true;
+        } else {
+            r.seedId = seedId;
+        }
+        return r;
+    }
+
+    // Mainnet (configured seed set present).
+    if (seedId < 0) {
+        // HIGH-1 fix: externalip matches no configured seed slot. This node is
+        // NOT one of the seeds (even if a key file is on disk). Skip
+        // registration rather than abort: consensus rejects a non-seed's
+        // attestations anyway, so aborting is a pure availability regression
+        // with zero security gain. This still fixes the original M-2 bug — a
+        // non-seed never silently registers under wrong-index-0.
+        r.decision = SeedIdentityDecision::SKIP_NOT_A_SEED;
+        r.seedId = -1;
+        return r;
+    }
+
+    // seedId resolved to a real seed slot: the key MUST match that slot's
+    // consensus pubkey (M-1). A mismatch (or out-of-range index) is a genuine
+    // misconfig — fail loud.
+    if (static_cast<size_t>(seedId) >= seedPubkeys.size() ||
+        loadedPubkey != seedPubkeys[seedId]) {
+        r.decision = SeedIdentityDecision::FATAL_MISMATCH;
+        r.seedId = seedId;
+        return r;
+    }
+
+    r.decision = SeedIdentityDecision::REGISTER;
+    r.seedId = seedId;
+    return r;
+}
+
 // LP-13 H-2 atomic-save test seam (see header). nullptr in production.
 bool (*g_seedKeySaveFailpoint)() = nullptr;
 // LP-13 B-1 fsync-failure test seam (see header). nullptr in production.

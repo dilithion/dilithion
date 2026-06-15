@@ -95,6 +95,73 @@ void CleanseSeedKeyBuffer(std::vector<uint8_t>& buf);
  *  startup. Both node binaries call this to classify a LoadOrGenerate failure. */
 bool SeedKeyFilePresent(const std::string& dataDir);
 
+// ============================================================================
+// LP-13 M-1/M-2 SEED-IDENTITY RESOLUTION (fail-loud, pure helper)
+// ============================================================================
+
+/**
+ * Disposition of the startup seed-identity check. The node glue (both
+ * dilithion-node and dilv-node) factors its resolve+validate decision into
+ * ResolveSeedIdentity() so the load-bearing FATAL/SKIP/REGISTER glue is unit
+ * testable independently of process startup (the prior test exercised only the
+ * pubkey-equality PRIMITIVE, not this decision).
+ */
+enum class SeedIdentityDecision {
+    // Proceed: register as an attestation seed under .seedId.
+    //  - mainnet: externalip resolved to a configured seed AND the loaded key's
+    //    pubkey matches seedAttestationPubkeys[seedId].
+    //  - testnet (empty pubkey set): no consensus pubkey to enforce; seedId is
+    //    the resolved index, or the lenient default 0 when unresolved
+    //    (.usedTestnetDefault is set so the caller can emit the legacy WARN).
+    REGISTER,
+    // HIGH-1 fix: a configured seed set IS present but this node's externalip
+    // matches NO configured seed slot. This is NOT a seed (e.g. a third-party
+    // --public-api explorer/exchange/former-seed that merely carries a key
+    // file). Do NOT abort and do NOT register: a non-seed's attestations are
+    // rejected by consensus anyway, so skipping is the correct, available
+    // behavior (zero security loss). Caller logs a clear WARN and continues.
+    SKIP_NOT_A_SEED,
+    // Genuine misconfiguration: a configured seed set is present AND externalip
+    // resolved to a real seed slot, but the loaded/minted key's pubkey does NOT
+    // match seedAttestationPubkeys[seedId] (or the index is out of range). This
+    // key cannot produce consensus-accepted attestations for this seed_id —
+    // fail loud (caller returns 1).
+    FATAL_MISMATCH,
+};
+
+struct SeedIdentityResult {
+    SeedIdentityDecision decision;
+    int seedId = -1;            // resolved index (REGISTER), or -1 (SKIP)
+    bool usedTestnetDefault = false;  // testnet, unresolved -> defaulted to 0
+};
+
+/**
+ * Normalize a user-supplied --externalip value for comparison against the bare
+ * dotted-quad strings in chainparams (HIGH-2 fix). Strips surrounding
+ * whitespace and a trailing ":port" suffix for IPv4 / hostnames. IPv6 literals
+ * (which legitimately contain colons) are left intact: a bracketed "[..]:port"
+ * form keeps the address inside the brackets, and a bare "::"-containing value
+ * is returned trimmed-only (port stripping on raw IPv6 is ambiguous and the
+ * configured seed set is IPv4-only, so an IPv6 externalip simply won't match —
+ * which correctly routes to SKIP_NOT_A_SEED, never a false FATAL).
+ */
+std::string NormalizeExternalIpForSeedMatch(const std::string& externalIp);
+
+/**
+ * Pure resolve+validate decision for the seed-attestation startup glue.
+ *
+ * @param seedIPs       chainparams seedAttestationIPs (index-aligned w/ pubkeys)
+ * @param seedPubkeys   chainparams seedAttestationPubkeys (empty => testnet)
+ * @param externalIp    raw --externalip value (normalized internally)
+ * @param loadedPubkey  the loaded/minted key's GetPubKey()
+ * @return decision + resolved seedId; see SeedIdentityDecision.
+ */
+SeedIdentityResult ResolveSeedIdentity(
+    const std::vector<std::string>& seedIPs,
+    const std::vector<std::vector<uint8_t>>& seedPubkeys,
+    const std::string& externalIp,
+    const std::vector<uint8_t>& loadedPubkey);
+
 /** LP-13 H-2 (atomic-save) TEST SEAM. When set to a non-null function, Save()
  *  invokes it immediately after the temp file has been fully written + fsynced
  *  but BEFORE the atomic rename over the target. If the hook returns true, Save

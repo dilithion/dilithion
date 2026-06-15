@@ -638,6 +638,123 @@ static void TestKeyIdentityComparison() {
           "different key: GetPubKey() != consensus pubkey (REJECT -> fail-loud)");
 }
 
+// HIGH-1 / HIGH-2 fold: the production seed-identity GLUE (resolve --externalip
+// -> seed_id, then decide FATAL / SKIP / REGISTER) is factored into the pure
+// helper ResolveSeedIdentity so it is unit-testable. The prior test exercised
+// only the pubkey-equality PRIMITIVE; these tests drive the actual decision the
+// node startup makes, and would FAIL if that decision logic were a no-op.
+static void TestSeedIdentityResolutionGlue() {
+    std::cout << "[Test] HIGH-1/HIGH-2 seed-identity resolution glue (ResolveSeedIdentity)"
+              << std::endl;
+
+    // A 4-seed mainnet-shaped configuration. Pubkeys must be full Dilithium3
+    // size so the byte-compare mirrors production; build a real key per slot.
+    const std::vector<std::string> seedIPs = {
+        "10.0.0.1", "10.0.0.2", "10.0.0.3", "10.0.0.4"};
+
+    std::vector<CSeedAttestationKey> keys(4);
+    std::vector<std::vector<uint8_t>> seedPubkeys;
+    for (int i = 0; i < 4; i++) {
+        CHECK(keys[i].Generate(), "generate seed-slot key");
+        seedPubkeys.push_back(keys[i].GetPubKey());
+    }
+
+    // --- REGISTER: externalip resolves to a slot AND key matches that slot. ---
+    {
+        SeedIdentityResult r = ResolveSeedIdentity(
+            seedIPs, seedPubkeys, "10.0.0.3", keys[2].GetPubKey());
+        CHECK(r.decision == SeedIdentityDecision::REGISTER,
+              "matching key at resolved slot -> REGISTER");
+        CHECK(r.seedId == 2, "REGISTER resolves to seed_id=2");
+        CHECK(!r.usedTestnetDefault, "REGISTER on mainnet is not a testnet default");
+    }
+
+    // --- FATAL_MISMATCH: externalip resolves to a real slot, WRONG key. ------
+    // (Drives the abort path; a no-op decision helper would NOT return this.)
+    {
+        SeedIdentityResult r = ResolveSeedIdentity(
+            seedIPs, seedPubkeys, "10.0.0.1", keys[3].GetPubKey());
+        CHECK(r.decision == SeedIdentityDecision::FATAL_MISMATCH,
+              "resolved slot + mismatched pubkey -> FATAL_MISMATCH (abort path)");
+        CHECK(r.seedId == 0, "FATAL_MISMATCH reports the resolved seed_id");
+    }
+
+    // --- SKIP_NOT_A_SEED: externalip matches NO configured slot. ------------
+    // HIGH-1: must NOT abort even though a usable key is present.
+    {
+        SeedIdentityResult r = ResolveSeedIdentity(
+            seedIPs, seedPubkeys, "203.0.113.7", keys[0].GetPubKey());
+        CHECK(r.decision == SeedIdentityDecision::SKIP_NOT_A_SEED,
+              "non-seed externalip + key present -> SKIP_NOT_A_SEED (NOT abort, HIGH-1)");
+        CHECK(r.seedId == -1, "SKIP leaves seed_id unresolved");
+    }
+    // Empty externalip is also "not a seed" -> SKIP, not FATAL.
+    {
+        SeedIdentityResult r = ResolveSeedIdentity(
+            seedIPs, seedPubkeys, "", keys[0].GetPubKey());
+        CHECK(r.decision == SeedIdentityDecision::SKIP_NOT_A_SEED,
+              "empty externalip on mainnet -> SKIP_NOT_A_SEED (HIGH-1)");
+    }
+
+    // --- HIGH-2: :port suffix and whitespace must still resolve. -------------
+    {
+        SeedIdentityResult r = ResolveSeedIdentity(
+            seedIPs, seedPubkeys, "10.0.0.4:8444", keys[3].GetPubKey());
+        CHECK(r.decision == SeedIdentityDecision::REGISTER,
+              "externalip with :port resolves -> REGISTER (HIGH-2)");
+        CHECK(r.seedId == 3, ":port-stripped externalip resolves to correct seed_id");
+    }
+    {
+        SeedIdentityResult r = ResolveSeedIdentity(
+            seedIPs, seedPubkeys, "  10.0.0.2  ", keys[1].GetPubKey());
+        CHECK(r.decision == SeedIdentityDecision::REGISTER,
+              "whitespace-padded externalip resolves -> REGISTER (HIGH-2)");
+        CHECK(r.seedId == 1, "trimmed externalip resolves to correct seed_id");
+    }
+    // :port + whitespace combined, but with a WRONG key -> still FATAL at the
+    // resolved slot (normalization must not mask a genuine key mismatch).
+    {
+        SeedIdentityResult r = ResolveSeedIdentity(
+            seedIPs, seedPubkeys, " 10.0.0.1:8444 ", keys[2].GetPubKey());
+        CHECK(r.decision == SeedIdentityDecision::FATAL_MISMATCH,
+              "normalized resolve still enforces pubkey match -> FATAL_MISMATCH");
+        CHECK(r.seedId == 0, "normalized externalip resolved to seed_id=0");
+    }
+
+    // --- NormalizeExternalIpForSeedMatch direct cases. ----------------------
+    CHECK(NormalizeExternalIpForSeedMatch("1.2.3.4:8444") == "1.2.3.4",
+          "normalize strips :port");
+    CHECK(NormalizeExternalIpForSeedMatch("  1.2.3.4 ") == "1.2.3.4",
+          "normalize trims whitespace");
+    CHECK(NormalizeExternalIpForSeedMatch("1.2.3.4") == "1.2.3.4",
+          "normalize leaves bare IPv4 intact");
+    // IPv6 must NOT be port-stripped at the colons (would corrupt the address).
+    CHECK(NormalizeExternalIpForSeedMatch("2001:db8::1") == "2001:db8::1",
+          "normalize leaves bare IPv6 literal intact (no false :port strip)");
+    CHECK(NormalizeExternalIpForSeedMatch("[2001:db8::1]:8444") == "2001:db8::1",
+          "normalize extracts address from bracketed IPv6:port");
+
+    // --- Testnet (empty pubkey set): lenient default-0 register, with flag. --
+    {
+        std::vector<std::vector<uint8_t>> emptyPubkeys;
+        SeedIdentityResult r = ResolveSeedIdentity(
+            seedIPs, emptyPubkeys, "203.0.113.7", keys[0].GetPubKey());
+        CHECK(r.decision == SeedIdentityDecision::REGISTER,
+              "testnet empty set + unresolved ip -> REGISTER (lenient)");
+        CHECK(r.seedId == 0, "testnet unresolved defaults to seed_id=0");
+        CHECK(r.usedTestnetDefault, "testnet default flagged for legacy WARN");
+    }
+    {
+        std::vector<std::vector<uint8_t>> emptyPubkeys;
+        SeedIdentityResult r = ResolveSeedIdentity(
+            seedIPs, emptyPubkeys, "10.0.0.2", keys[0].GetPubKey());
+        CHECK(r.decision == SeedIdentityDecision::REGISTER,
+              "testnet empty set + resolved ip -> REGISTER at resolved index");
+        CHECK(r.seedId == 1, "testnet resolved ip keeps its index");
+        CHECK(!r.usedTestnetDefault, "testnet resolved ip is not a default");
+    }
+}
+
 int main() {
     std::cout << "=== LP-13 seed_attestation_key_tests ===" << std::endl;
 
@@ -655,6 +772,7 @@ int main() {
     TestRequireEncryptionPolicy();           // H-1
     TestSeedKeyFilePresentDetectsUnreadable(); // extreview HIGH (presence vs readability)
     TestKeyIdentityComparison();             // M-1 (key-identity pubkey comparison)
+    TestSeedIdentityResolutionGlue();        // HIGH-1/HIGH-2 (resolve+decide glue)
 #ifndef _WIN32
     TestLoadRepairsPerms();                  // M-3
     TestFailClosedPerms();                   // M-4 (best-effort/informational)

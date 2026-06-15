@@ -6933,61 +6933,59 @@ load_genesis_block:  // Bug #29: Label for automatic retry after blockchain wipe
                 std::cerr << "[Attestation] No seed attestation key and minting not requested; "
                              "this relay will not serve attestations." << std::endl;
             } else {
-                // Determine seed ID by matching our --externalip against the known
-                // seed IPs. seedAttestationIPs[i] and seedAttestationPubkeys[i] are
-                // index-aligned (same NYC/London/Singapore/Sydney order), so the
-                // resolved seedId is also the index into the consensus pubkey set.
-                int seedId = -1;
+                // M-1/M-2 (seed key-identity validation, fail-LOUD) + HIGH-1/HIGH-2
+                // fold. Resolve our --externalip to a seed_id and decide the
+                // disposition. seedAttestationIPs[i] and seedAttestationPubkeys[i]
+                // are index-aligned (NYC/London/Singapore/Sydney), so a resolved
+                // index is also the index into the consensus pubkey set. The
+                // resolve+validate decision is a pure, unit-tested helper
+                // (ResolveSeedIdentity) so the FATAL/SKIP/REGISTER glue is covered
+                // by tests, not only the pubkey-equality primitive.
                 const auto& seedIPs = Dilithion::g_chainParams->seedAttestationIPs;
                 const auto& seedPubkeys = Dilithion::g_chainParams->seedAttestationPubkeys;
-                if (!config.external_ip.empty()) {
-                    for (size_t i = 0; i < seedIPs.size(); i++) {
-                        if (seedIPs[i] == config.external_ip) {
-                            seedId = static_cast<int>(i);
-                            break;
-                        }
-                    }
-                }
+                Attestation::SeedIdentityResult ident = Attestation::ResolveSeedIdentity(
+                    seedIPs, seedPubkeys, config.external_ip, seedAttestKey.GetPubKey());
 
-                // M-1/M-2 (seed key-identity validation, fail-LOUD): only enforced
-                // when a known seed set is configured (seedAttestationPubkeys
-                // non-empty — i.e. mainnet/DIL, not the empty-set testnet config).
-                // For a configured seed set we MUST NOT silently default seedId to 0
-                // (M-2) and MUST NOT register a key whose pubkey does not match the
-                // consensus pubkey for the resolved seedId (M-1) — either case makes
-                // the seed sign attestations that consensus rejects while the node
-                // looks healthy. Abort startup, matching the FATAL idiom the
-                // key-init failure above already uses (return 1).
-                if (!seedPubkeys.empty()) {
-                    if (seedId < 0) {
-                        std::cerr << "[Attestation] FATAL: could not resolve this seed's seed_id "
-                                     "from --externalip against the known seed set. Refusing to "
-                                     "act as a seed with an unknown/defaulted index (would sign "
-                                     "attestations consensus rejects). Set --externalip=<IP> to "
-                                     "this seed's configured public IP. Aborting startup." << std::endl;
-                        return 1;
-                    }
-                    if (static_cast<size_t>(seedId) >= seedPubkeys.size() ||
-                        seedAttestKey.GetPubKey() != seedPubkeys[seedId]) {
+                bool registerSeed = false;
+                switch (ident.decision) {
+                    case Attestation::SeedIdentityDecision::FATAL_MISMATCH:
+                        // Genuine misconfig: externalip resolved to a real seed slot
+                        // but the loaded/minted key's pubkey does NOT match
+                        // seedAttestationPubkeys[seed_id]. This key cannot produce
+                        // attestations consensus accepts for this seed_id. Fail loud.
                         std::cerr << "[Attestation] FATAL: loaded/minted seed key pubkey does NOT "
-                                     "match seedAttestationPubkeys[" << seedId << "] for the resolved "
-                                     "seed_id. This key cannot produce attestations consensus accepts "
-                                     "for this seed_id (wrong key file, wrong seed_id, or a minted key "
-                                     "not registered in chainparams). Aborting startup." << std::endl;
+                                     "match seedAttestationPubkeys[" << ident.seedId << "] for the "
+                                     "resolved seed_id. This key cannot produce attestations consensus "
+                                     "accepts for this seed_id (wrong key file, wrong seed_id, or a "
+                                     "minted key not registered in chainparams). Aborting startup."
+                                  << std::endl;
                         return 1;
-                    }
-                } else if (seedId < 0) {
-                    // No configured seed set (testnet): no consensus pubkey to match
-                    // against. Preserve the prior lenient behavior — default index 0,
-                    // warn only. There is no attestation correctness to enforce here.
-                    seedId = 0;
-                    std::cerr << "[Attestation] WARNING: Could not determine seed ID "
-                                 "(no configured seed set). Defaulting to seed_id=0" << std::endl;
+                    case Attestation::SeedIdentityDecision::SKIP_NOT_A_SEED:
+                        // HIGH-1 fix: a configured seed set is present but this node's
+                        // --externalip matches no configured seed slot. This node is
+                        // NOT one of the seeds (e.g. a third-party --public-api
+                        // explorer/exchange/former-seed that merely carries a key
+                        // file). Do NOT register and do NOT abort — a non-seed's
+                        // attestations are rejected by consensus anyway, so skipping
+                        // is correct and keeps the node available (zero security loss).
+                        std::cerr << "[Attestation] WARNING: this node's --externalip does not match a "
+                                     "configured seed; not registering as an attestation seed "
+                                     "(continuing to run normally). Set --externalip=<this seed's "
+                                     "configured public IP> only if this node IS one of the seeds."
+                                  << std::endl;
+                        break;
+                    case Attestation::SeedIdentityDecision::REGISTER:
+                        if (ident.usedTestnetDefault) {
+                            std::cerr << "[Attestation] WARNING: Could not determine seed ID "
+                                         "(no configured seed set). Defaulting to seed_id=0" << std::endl;
+                        }
+                        registerSeed = true;
+                        break;
                 }
 
-                if (asnDatabase.IsLoaded()) {
-                    rpc_server.RegisterSeedAttestation(&seedAttestKey, &asnDatabase, seedId);
-                    std::cout << "  [OK] Seed attestation ready (seed_id=" << seedId
+                if (registerSeed && asnDatabase.IsLoaded()) {
+                    rpc_server.RegisterSeedAttestation(&seedAttestKey, &asnDatabase, ident.seedId);
+                    std::cout << "  [OK] Seed attestation ready (seed_id=" << ident.seedId
                               << ", key=" << seedAttestKey.GetPubKeyHex().substr(0, 16) << "...)"
                               << std::endl;
                 }
