@@ -497,12 +497,27 @@ ChainParams ChainParams::DilV() {
     // room for the new header.
     //
     // Why 500K (lowered from a prior 5M): at ~420 B/CBlockIndex entry, 500K
-    // caps pre-saturation attacker header-headroom at ~210 MB (vs ~2.1 GB at
-    // 5M) — the memory blast-radius that matters most in the early-launch
-    // window before the honest chain has grown. It also keeps the O(cap)
-    // per-header eviction scan (a linear walk of the std::map / red-black
-    // tree, chain.cpp:210) ~10x cheaper than 5M under a sustained header
-    // flood.
+    // caps pre-saturation mapBlockIndex growth at ~210 MB (vs ~2.1 GB at 5M)
+    // — the memory blast-radius that matters most in the early-launch window
+    // before the honest chain has grown. It also keeps the O(cap) per-header
+    // eviction scan (a linear walk of the std::map / red-black tree,
+    // chain.cpp:210) ~10x cheaper than 5M under a sustained header flood.
+    //
+    // SCOPE OF THIS BOUND (do not overstate): this cap bounds ONLY the
+    // consensus mapBlockIndex (consensus/chain.cpp). It does NOT bound the
+    // P2P header-sync store CHeadersManager::mapHeaders
+    // (net/headers_manager.cpp), which is UNBOUNDED — it is only ever shrunk
+    // by reset/ClearAboveHeight/InvalidateHeader, never lowest-work-evicted.
+    // So the TOTAL header-memory blast radius under a sustained header flood
+    // is larger than the ~210 MB above (mapHeaders grows separately). That is
+    // a DoS / availability surface, NOT a consensus divergence: an unbounded
+    // mapHeaders does not change any node's best-chain decision, and in fact
+    // it is what makes this cap consensus-safe — an evicted mapBlockIndex
+    // entry's header survives in mapHeaders and is re-fetchable as a block,
+    // which rebuilds the evicted CBlockIndex via the direct block-arrival
+    // path (block_validation_queue.cpp AddBlockIndex), independent of the
+    // header-dedup short-circuit. Bounding mapHeaders is tracked as a
+    // separate availability/DoS hardening item, not gated on this cap.
     //
     // Honest-path cost (stated honestly): at DilV's 45s block time, 500K
     // entries is reached after ~8.7 MONTHS of honest operation (500K * 45s
@@ -510,7 +525,9 @@ ChainParams ChainParams::DilV() {
     // past saturation the node runs the O(cap) eviction scan once per
     // connected block as steady state. A ~500K-node red-black-tree walk is
     // negligible against a 45s block interval, so this is an accepted cost,
-    // not a regression.
+    // not a regression. PERF WATCH-ITEM: confirm the post-saturation
+    // per-block eviction-scan wall-time against a live chain near the cap
+    // before relying on this in the >8mo steady-state regime.
     //
     // NOTE: not justified by "matching DIL's 500K". DIL has 240s blocks, so
     // its identical 500K cap saturates in ~3.8 years — same number, very

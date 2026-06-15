@@ -1187,6 +1187,133 @@ void test_v4_3_1_chainwork_gate_blocks_strictly_lesser_candidate()
     std::cout << " OK\n";
 }
 
+// ============================================================================
+// PR6.1 cap-fold (2026-06-15): verify-the-verifier on the consensus surface.
+//
+// CONSENSUS_REFETCH_FINDINGS.md adjudicated the 5M->500K nMapBlockIndexCap
+// lowering as (A) CONSENSUS-SAFE by code-trace: an evicted low-work FORK
+// header is recoverable because (1) eviction only ever removes a non-active,
+// lowest-work entry (never an active ancestor), and (2) the evicted entry is
+// rebuilt in mapBlockIndex via the DIRECT block-arrival path
+// (block_validation_queue.cpp AddBlockIndex), independent of the header-dedup
+// short-circuit — after which a higher-work branch building on it wins
+// FindMostWorkChainImpl (the reorg-target decision).
+//
+// This test converts that code-traced recovery into an EXECUTED proof. It
+// drives the recovery sequence through the real CChainState consensus API
+// (EvictLowestWorkNotOnBestChain -> AddBlockIndex rebuild -> extend ->
+// FindMostWorkChainImpl), asserting the evicted fork is recovered AND becomes
+// the selected reorg target.
+//
+// SCOPE / what this covers vs. does not:
+//   * COVERS: the eviction policy (lowest-work-not-on-active), the block-path
+//     rebuild of an evicted CBlockIndex via AddBlockIndex (the exact call the
+//     block-arrival code makes), and that the rebuilt+extended branch is
+//     selected as the most-work chain (the reorg DECISION point). This is the
+//     load-bearing evict->recover->reorg-target chain.
+//   * DOES NOT cover (deliberately, too heavy for a unit test): a full P2P
+//     E2E with real header/block wire delivery and a real ConnectTip reorg via
+//     ActivateBestChainStep (which needs block data on disk / a wired pdb and
+//     the DILITHION_USE_NEW_CHAIN_SELECTOR=1 path). The selection decision
+//     (FindMostWorkChainImpl) is the deterministic point that DETERMINES the
+//     reorg target; asserting it picks the recovered branch is the tightest
+//     proof of "the node would reorg to the evicted-then-recovered fork".
+//
+// Cap is exercised via the public EvictLowestWorkNotOnBestChain() directly
+// (rather than saturating to 500K through ProcessNewHeader) so the test is a
+// fast, deterministic O(few-entries) unit test while exercising the IDENTICAL
+// eviction + rebuild + selection code the production cap-trigger invokes.
+void test_pr61_cap_evicted_fork_recovers_and_becomes_reorg_target()
+{
+    std::cout << "  test_pr61_cap_evicted_fork_recovers_and_becomes_reorg_target..."
+              << std::flush;
+
+    CChainState chainstate;
+
+    // Active chain: A(genesis, work=5) -> M(work=20). M is the active tip.
+    auto pA = MakePreValidationLeaf(0x40, nullptr, 0,
+                                    CBlockIndex::BLOCK_VALID_TRANSACTIONS, 5, 1);
+    uint256 hA = pA->GetBlockHash();
+    assert(chainstate.AddBlockIndex(hA, std::move(pA)));
+    CBlockIndex* A = chainstate.GetBlockIndex(hA);
+
+    auto pM = MakePreValidationLeaf(0x41, A, 1,
+                                    CBlockIndex::BLOCK_VALID_TRANSACTIONS, 20, 2);
+    uint256 hM = pM->GetBlockHash();
+    assert(chainstate.AddBlockIndex(hM, std::move(pM)));
+    CBlockIndex* M = chainstate.GetBlockIndex(hM);
+    chainstate.SetTip(M);  // active tip = M (work=20)
+
+    // Low-work FORK header F off genesis A (work=3 < active tip work=20),
+    // NOT on the active chain. This is the eviction victim.
+    auto pF = MakePreValidationLeaf(0x42, A, 1,
+                                    CBlockIndex::BLOCK_VALID_TRANSACTIONS, 3, 3);
+    uint256 hF = pF->GetBlockHash();
+    assert(chainstate.AddBlockIndex(hF, std::move(pF)));
+    assert(chainstate.GetBlockIndex(hF) != nullptr &&
+           "fork header F must be present before eviction");
+
+    // --- (1) EVICT: the cap-trigger's eviction must pick the lowest-work
+    //         NON-active entry. With A(5) and M(20) on the active chain and
+    //         F(3) off-chain, F is the unique lowest-work-not-on-active entry.
+    size_t size_before = chainstate.GetBlockIndexSize();
+    bool evicted = chainstate.EvictLowestWorkNotOnBestChain();
+    assert(evicted && "eviction must succeed when a non-active entry exists");
+    assert(chainstate.GetBlockIndex(hF) == nullptr &&
+           "the low-work FORK header F must be the evicted entry (gone from mapBlockIndex)");
+    // Active-chain ancestors must survive eviction (never evict an ancestor).
+    assert(chainstate.GetBlockIndex(hA) != nullptr &&
+           "genesis A (active ancestor) must NOT be evicted");
+    assert(chainstate.GetBlockIndex(hM) != nullptr &&
+           "active tip M must NOT be evicted");
+    assert(chainstate.GetBlockIndexSize() == size_before - 1);
+
+    // --- (2) RECOVER via the DIRECT block-arrival path. This is exactly what
+    //         block_validation_queue.cpp does when the re-requested fork BLOCK
+    //         arrives: build a fresh CBlockIndex linked to its (un-evicted)
+    //         parent and call AddBlockIndex — NOT ProcessNewHeader, so the
+    //         header-dedup short-circuit is bypassed. AddBlockIndex's
+    //         first-time-add branch re-creates the evicted entry from scratch.
+    //         (Reuse the same synthetic hash-seed 0x42 so the rebuilt entry is
+    //         byte-identical to the evicted one — proving recovery of THAT
+    //         hash, not a different fork.)
+    auto pF_rebuilt = MakePreValidationLeaf(0x42, A, 1,
+                                            CBlockIndex::BLOCK_VALID_TRANSACTIONS, 3, 3);
+    uint256 hF_rebuilt = pF_rebuilt->GetBlockHash();
+    assert(std::memcmp(hF.data, hF_rebuilt.data, 32) == 0 &&
+           "rebuilt entry must have the SAME hash as the evicted fork header");
+    assert(chainstate.AddBlockIndex(hF_rebuilt, std::move(pF_rebuilt)) &&
+           "block-path AddBlockIndex must re-create the evicted CBlockIndex");
+    CBlockIndex* F = chainstate.GetBlockIndex(hF);
+    assert(F != nullptr && "evicted fork entry must be back in mapBlockIndex after block-path rebuild");
+
+    // --- (3) The competing chain builds a HIGHER-work block G on the recovered
+    //         fork F. Cumulative work: A(5)->F(3 leaf) then G with work=99,
+    //         exceeding the active tip M (work=20). G is a fully-validated leaf
+    //         (BLOCK_HAVE_DATA auto-set), so it is reorg-eligible.
+    auto pG = MakePreValidationLeaf(0x43, F, 2,
+                                    CBlockIndex::BLOCK_VALID_TRANSACTIONS, 99, 4);
+    uint256 hG = pG->GetBlockHash();
+    assert(chainstate.AddBlockIndex(hG, std::move(pG)));
+    CBlockIndex* G = chainstate.GetBlockIndex(hG);
+
+    // --- (4) REORG-TARGET DECISION: seed the candidate set and assert
+    //         FindMostWorkChainImpl selects G (the recovered branch's leaf) over
+    //         the current tip M. This is the deterministic decision that DRIVES
+    //         the reorg in ActivateBestChain's connect-loop (chain.cpp:521) —
+    //         proving the node would reorg ONTO the evicted-then-recovered fork.
+    chainstate.RecomputeCandidates();
+    CBlockIndex* picked = chainstate.FindMostWorkChainImpl();
+    assert(picked == G &&
+           "EVICT->RECOVER->REORG: the node must select the higher-work branch "
+           "built on the recovered (previously-evicted) fork as its reorg target");
+    // Sanity: G genuinely outweighs the active tip M (a real reorg, not a no-op).
+    assert(ChainWorkGreaterThan(G->nChainWork, M->nChainWork) &&
+           "recovered-branch leaf G must have strictly greater work than active tip M");
+
+    std::cout << " OK\n";
+}
+
 int main()
 {
     std::cout << "\n=== Phase 5 PR5.1 + 5.3-prereq + 5.3 Day 3 AM: ChainSelector Tests ===\n"
@@ -1237,7 +1364,11 @@ int main()
         test_blocker2_mark_block_as_valid_independent_failure_is_barrier();
         test_blocker3_checkpoint_violation_in_ancestry_rejects_candidate();
 
-        std::cout << "\n=== All chain_selector_tests passed (24 tests: 4 + 5 + 5 + 2 + 2 + 3 + 3) ==="
+        std::cout << "\n--- PR6.1 cap-fold: evicted-fork recovery -> reorg target ---"
+                  << std::endl;
+        test_pr61_cap_evicted_fork_recovers_and_becomes_reorg_target();
+
+        std::cout << "\n=== All chain_selector_tests passed (25 tests: 4 + 5 + 5 + 2 + 2 + 3 + 3 + 1) ==="
                   << std::endl;
         return 0;
     } catch (const std::exception& e) {
