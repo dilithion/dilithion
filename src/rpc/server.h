@@ -224,6 +224,18 @@ private:
     // "only available on seed nodes", so the degraded state is queryable.
     bool m_seedAttestationAsnDegraded{false};
     int m_seedAttestationDegradedSeedId{-1};  // resolved seed_id for the degraded diagnostic
+public:
+    // Fix 1 (extreview PR#121): WHY a valid seed is running attestation-degraded.
+    // Surfaced by getmikattestation so an operator can tell the two distinct
+    // degraded causes apart (and from a plain non-seed).
+    enum class SeedDegradedReason {
+        NONE,             // not degraded
+        NO_ASN,           // ip2asn-v4.tsv failed to load (zero attestation capacity)
+        NO_DATACENTER_LIST,  // datacenter-asns.txt empty on a datacenter-ban chain
+                             // (IsDatacenterIP would fail open -> datacenter Sybil ban off)
+    };
+private:
+    SeedDegradedReason m_seedAttestationDegradedReason{SeedDegradedReason::NONE};
 
     // Attestation rate limiting (Sybil defense Phase 0)
     // Rate limits NEW MIK registrations per /24 subnet per day.
@@ -634,19 +646,23 @@ public:
         m_asnDatabase = asnDb;
         m_seedId = seedId;
         m_seedAttestationAsnDegraded = false;
+        m_seedAttestationDegradedReason = SeedDegradedReason::NONE;
     }
 
     /**
-     * H-3 (consolidated): mark this seed as ATTESTATION-DEGRADED because its ASN
-     * database failed to load. Does NOT register a signing key — the node stays
-     * online for relay/P2P, attestation stays unavailable — but flips
-     * getmikattestation's error from the generic "only available on seed nodes"
-     * to a distinct, diagnosable "ASN database not loaded" so an operator can
-     * tell a degraded seed apart from a plain non-seed.
+     * H-3 (consolidated) + Fix 1: mark this seed as ATTESTATION-DEGRADED. Does NOT
+     * register a signing key — the node stays online for relay/P2P, attestation
+     * stays unavailable — but flips getmikattestation's error from the generic
+     * "only available on seed nodes" to a distinct, diagnosable error keyed on
+     * `reason`, so an operator can tell a degraded seed apart from a plain
+     * non-seed AND tell the two degraded causes apart. Defaults to NO_ASN to keep
+     * existing callers/tests that pass only a seed_id unchanged.
      */
-    void RegisterSeedAttestationDegraded(int seedId) {
+    void RegisterSeedAttestationDegraded(
+        int seedId, SeedDegradedReason reason = SeedDegradedReason::NO_ASN) {
         m_seedAttestationAsnDegraded = true;
         m_seedAttestationDegradedSeedId = seedId;
+        m_seedAttestationDegradedReason = reason;
     }
 
     /**

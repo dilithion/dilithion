@@ -13,6 +13,7 @@
 //   - (POSIX) saved key file is chmod 0600
 
 #include <attestation/seed_attestation.h>
+#include <attestation/seed_pubkeys_mainnet.h>  // Fix 3: consensus-equivalence assertion
 #include <dfmp/dfmp.h>
 #include <rpc/server.h>  // Finding E: end-to-end degraded getmikattestation error string
 
@@ -35,6 +36,22 @@
 #endif
 
 using namespace Attestation;
+
+// Test-only thin wrapper: most legacy cases predate the Fix 1 datacenter-gate
+// params and exercise non-ban / inert behavior. Default datacenterBanChain=false
+// (DIL-shaped) + datacenterListLoaded=true so the gate is INERT, preserving the
+// prior REGISTER/DEGRADE outcomes for those cases. Cases that exercise the new
+// gate call the full Attestation::ResolveSeedIdentity directly.
+static SeedIdentityResult ResolveSeedIdentity(
+    const std::vector<std::string>& seedIPs,
+    const std::vector<std::vector<uint8_t>>& seedPubkeys,
+    const std::string& externalIp,
+    const std::vector<uint8_t>& loadedPubkey,
+    bool asnLoaded) {
+    return Attestation::ResolveSeedIdentity(
+        seedIPs, seedPubkeys, externalIp, loadedPubkey, asnLoaded,
+        /*datacenterBanChain=*/false, /*datacenterListLoaded=*/true);
+}
 
 // Dilithium3 verify (same extern the production .cpp uses) — lets us prove the
 // private key round-tripped by checking a signature it produced verifies under
@@ -821,6 +838,108 @@ static void TestSeedIdentityResolutionGlue() {
               "testnet would-be REGISTER + ASN DB down -> DEGRADED_NO_ASN");
         CHECK(r.seedId == 1, "testnet DEGRADED keeps the resolved seed_id");
     }
+
+    // --- Fix 1 (extreview PR#121): datacenter-over-attestation gate. ----------
+    // Calls the FULL Attestation::ResolveSeedIdentity (the wrapper above forces
+    // the inert defaults). Mutation self-check: disabling the gate (always
+    // returning REGISTER from registerOrDegrade for the ban+no-list case) makes
+    // case (a) FAIL.
+    {
+        // (a) ban chain + datacenter list NOT loaded + valid identity ->
+        //     DEGRADED_NO_DATACENTER_LIST (NOT register, NOT fatal). ASN DB IS
+        //     loaded, so this isolates the datacenter condition from DEGRADED_NO_ASN.
+        SeedIdentityResult r = Attestation::ResolveSeedIdentity(
+            seedIPs, seedPubkeys, "10.0.0.3", keys[2].GetPubKey(),
+            /*asnLoaded=*/true, /*datacenterBanChain=*/true,
+            /*datacenterListLoaded=*/false);
+        CHECK(r.decision == SeedIdentityDecision::DEGRADED_NO_DATACENTER_LIST,
+              "(a) ban chain + empty datacenter list + valid id -> DEGRADED_NO_DATACENTER_LIST");
+        CHECK(r.decision != SeedIdentityDecision::REGISTER,
+              "(a) ban chain + empty datacenter list must NOT REGISTER (the security gate)");
+        CHECK(r.decision != SeedIdentityDecision::FATAL_MISMATCH,
+              "(a) datacenter-list gate must NOT abort (stay online for relay)");
+        CHECK(r.seedId == 2, "(a) DEGRADED_NO_DATACENTER_LIST keeps the resolved seed_id");
+    }
+    {
+        // (b) ban chain + datacenter list LOADED -> REGISTER (correctly-provisioned
+        //     DilV seed is NOT demoted).
+        SeedIdentityResult r = Attestation::ResolveSeedIdentity(
+            seedIPs, seedPubkeys, "10.0.0.3", keys[2].GetPubKey(),
+            /*asnLoaded=*/true, /*datacenterBanChain=*/true,
+            /*datacenterListLoaded=*/true);
+        CHECK(r.decision == SeedIdentityDecision::REGISTER,
+              "(b) ban chain + datacenter list loaded -> REGISTER (provisioned seed not demoted)");
+        CHECK(r.seedId == 2, "(b) REGISTER resolves to seed_id=2");
+    }
+    {
+        // (c) NON-ban chain (DIL) + datacenter list NOT loaded -> REGISTER.
+        //     Proves DIL is never demoted by a missing datacenter list.
+        SeedIdentityResult r = Attestation::ResolveSeedIdentity(
+            seedIPs, seedPubkeys, "10.0.0.3", keys[2].GetPubKey(),
+            /*asnLoaded=*/true, /*datacenterBanChain=*/false,
+            /*datacenterListLoaded=*/false);
+        CHECK(r.decision == SeedIdentityDecision::REGISTER,
+              "(c) NON-ban chain (DIL) + empty datacenter list -> REGISTER (DIL not demoted)");
+        CHECK(r.seedId == 2, "(c) DIL REGISTER resolves to seed_id=2");
+    }
+    {
+        // (d) FATAL_MISMATCH on a ban chain with empty datacenter list is STILL
+        //     fatal (trust > datacenter — the gate can only soften a REGISTER).
+        SeedIdentityResult r = Attestation::ResolveSeedIdentity(
+            seedIPs, seedPubkeys, "10.0.0.1", keys[3].GetPubKey(),
+            /*asnLoaded=*/true, /*datacenterBanChain=*/true,
+            /*datacenterListLoaded=*/false);
+        CHECK(r.decision == SeedIdentityDecision::FATAL_MISMATCH,
+              "(d) wrong key stays FATAL_MISMATCH on ban chain + empty list (trust > datacenter)");
+    }
+    {
+        // ASN-down takes precedence over the datacenter list (documented fold
+        // order): ban chain + ASN DB down + empty datacenter list -> DEGRADED_NO_ASN.
+        SeedIdentityResult r = Attestation::ResolveSeedIdentity(
+            seedIPs, seedPubkeys, "10.0.0.3", keys[2].GetPubKey(),
+            /*asnLoaded=*/false, /*datacenterBanChain=*/true,
+            /*datacenterListLoaded=*/false);
+        CHECK(r.decision == SeedIdentityDecision::DEGRADED_NO_ASN,
+              "ASN-down reported before datacenter-list (documented fold order)");
+    }
+    {
+        // A non-seed externalip stays SKIP even on a ban chain with empty list
+        // (the gate never promotes a non-seed into a degraded seed).
+        SeedIdentityResult r = Attestation::ResolveSeedIdentity(
+            seedIPs, seedPubkeys, "203.0.113.7", keys[0].GetPubKey(),
+            /*asnLoaded=*/true, /*datacenterBanChain=*/true,
+            /*datacenterListLoaded=*/false);
+        CHECK(r.decision == SeedIdentityDecision::SKIP_NOT_A_SEED,
+              "non-seed stays SKIP_NOT_A_SEED even on ban chain + empty datacenter list");
+    }
+}
+
+// Fix 3 (extreview PR#121): consensus-equivalence assertion. The other identity
+// tests build their OWN local keys and check only self-consistency + size — they
+// never assert the loaded key equals the REAL consensus set. The FATAL_MISMATCH
+// design (a seed whose key != seedAttestationPubkeys[seedId] aborts) rests on the
+// baked-in mainnet pubkeys being well-formed and stable, so pin them here.
+static void TestMainnetSeedPubkeyConsensusEquivalence() {
+    std::cout << "[Test] Fix 3: mainnet seed pubkeys are consensus-shaped + stable"
+              << std::endl;
+    std::vector<std::vector<uint8_t>> pubs = Attestation::GetMainnetSeedPubkeys();
+    CHECK(pubs.size() == (size_t)Attestation::NUM_SEEDS,
+          "mainnet seed pubkey set has NUM_SEEDS entries");
+    for (size_t i = 0; i < pubs.size(); i++) {
+        CHECK(pubs[i].size() == DFMP::MIK_PUBKEY_SIZE,
+              "seed pubkey is full Dilithium3 size");
+        // Self-consistency of the accessor: GetMainnetSeedPubkeys()[i] equals
+        // itself on a fresh call (the value consensus verification reads). This is
+        // the exact comparison the node's FATAL_MISMATCH gate performs against the
+        // loaded key (loadedPubkey != seedPubkeys[seedId]).
+        CHECK(Attestation::GetMainnetSeedPubkeys()[i] == pubs[i],
+              "GetMainnetSeedPubkeys()[i] is stable across calls (consensus value)");
+    }
+    // All four seed pubkeys must be DISTINCT — a duplicate would let one seed's
+    // key satisfy two slots and collapse the 3-of-4 Byzantine assumption.
+    for (size_t i = 0; i < pubs.size(); i++)
+        for (size_t j = i + 1; j < pubs.size(); j++)
+            CHECK(pubs[i] != pubs[j], "seed pubkeys are pairwise distinct");
 }
 
 // Finding E (extreview PR#121): end-to-end RPC glue for the DEGRADED state.
@@ -866,6 +985,30 @@ static void TestDegradedGetMikAttestationErrorString() {
               "degraded getmikattestation -> distinct 'ASN database not loaded'");
         CHECK(err.find("only available on seed nodes") == std::string::npos,
               "degraded error is NOT the generic non-seed string (diagnosable apart)");
+        // Fix 2: the resolved seed_id is surfaced in the degraded string.
+        CHECK(err.find("seed_id=2") != std::string::npos,
+              "Fix 2: degraded string surfaces the resolved seed_id");
+    }
+
+    // 3) Fix 1/Fix 3(e): a server degraded for the NO_DATACENTER_LIST reason
+    //    returns a DISTINCT datacenter-specific string, NOT the ASN-DB one.
+    {
+        CRPCServer rpc;
+        rpc.RegisterSeedAttestationDegraded(
+            /*seedId=*/1, CRPCServer::SeedDegradedReason::NO_DATACENTER_LIST);
+        std::string err;
+        try {
+            rpc.InvokeRPCForTest("getmikattestation", "{}");
+            err = "<no throw>";
+        } catch (const std::exception& e) {
+            err = e.what();
+        }
+        CHECK(err.find("datacenter ASN list not loaded") != std::string::npos,
+              "NO_DATACENTER_LIST degraded -> distinct 'datacenter ASN list not loaded'");
+        CHECK(err.find("ASN database not loaded") == std::string::npos,
+              "datacenter-list degraded is NOT the ip2asn 'ASN database not loaded' string");
+        CHECK(err.find("seed_id=1") != std::string::npos,
+              "Fix 2: datacenter-list degraded string surfaces the resolved seed_id");
     }
 }
 
@@ -886,8 +1029,9 @@ int main() {
     TestRequireEncryptionPolicy();           // H-1
     TestSeedKeyFilePresentDetectsUnreadable(); // extreview HIGH (presence vs readability)
     TestKeyIdentityComparison();             // M-1 (key-identity pubkey comparison)
-    TestSeedIdentityResolutionGlue();        // HIGH-1/HIGH-2 (resolve+decide glue)
-    TestDegradedGetMikAttestationErrorString(); // Finding E (degraded RPC error string)
+    TestSeedIdentityResolutionGlue();        // HIGH-1/HIGH-2 + Fix 1 datacenter gate
+    TestMainnetSeedPubkeyConsensusEquivalence(); // Fix 3 (consensus-equivalence)
+    TestDegradedGetMikAttestationErrorString(); // Finding E + Fix 1/2 (degraded RPC strings)
 #ifndef _WIN32
     TestLoadRepairsPerms();                  // M-3
     TestFailClosedPerms();                   // M-4 (best-effort/informational)

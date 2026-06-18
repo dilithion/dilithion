@@ -145,6 +145,24 @@ enum class SeedIdentityDecision {
     // Net: relay stays up, attestation stays UNregistered, the degraded state is
     // loud at startup AND queryable at the RPC.
     DEGRADED_NO_ASN,
+    // Datacenter-over-attestation gate (extreview PR#121 Fix 1): on a chain whose
+    // consensus BANS datacenter miners (DilV: attestationDatacenterBan==true), the
+    // datacenter-IP refusal is enforced by IsDatacenterIP(), which consults the
+    // datacenter-ASN set. If that set is EMPTY (DatacenterASNCount()==0) — e.g. a
+    // missing/unparseable datacenter-asns.txt after a data-dir rotation —
+    // IsDatacenterIP() fails OPEN (always false), so the seed would REGISTER and
+    // then sign attestations for datacenter miners it is required to reject. That
+    // silently defeats the datacenter Sybil ban while the seed looks healthy.
+    // Like DEGRADED_NO_ASN, this is NEITHER fatal NOR a silent skip: the node
+    // stays ONLINE for relay/P2P but does NOT register attestation (so it never
+    // hands out an under-defended attestation), and the state is loud at startup
+    // and queryable at getmikattestation. Folded LAST, exactly where asnLoaded is:
+    // it can only soften a would-be REGISTER, never override FATAL_MISMATCH (trust
+    // failure stays fatal) or SKIP_NOT_A_SEED (a non-seed has nothing to register).
+    // INERT on a non-ban chain (DIL: attestationDatacenterBan==false) — there the
+    // datacenter list is not a consensus input, so a missing list never demotes a
+    // would-be REGISTER.
+    DEGRADED_NO_DATACENTER_LIST,
 };
 
 struct SeedIdentityResult {
@@ -181,14 +199,27 @@ std::string NormalizeExternalIpForSeedMatch(const std::string& externalIp);
  * @param externalIp    raw --externalip value (normalized internally)
  * @param loadedPubkey  the loaded/minted key's GetPubKey()
  * @param asnLoaded     whether the ASN database loaded (asnDatabase.IsLoaded())
+ * @param datacenterBanChain   this chain bans datacenter miners
+ *        (g_chainParams->attestationDatacenterBan; DilV true, DIL false)
+ * @param datacenterListLoaded the datacenter-ASN set is non-empty
+ *        (asnDatabase.DatacenterASNCount() > 0)
  * @return decision + resolved seedId; see SeedIdentityDecision.
+ *
+ * Fold order for a would-be REGISTER (each can only SOFTEN, never override a
+ * FATAL_MISMATCH or SKIP_NOT_A_SEED): asnLoaded first (DEGRADED_NO_ASN), then
+ * datacenterBanChain && !datacenterListLoaded (DEGRADED_NO_DATACENTER_LIST). A
+ * down ASN DB is reported before a missing datacenter list because the ASN DB is
+ * the harder dependency (no attestation at all without it), but either alone is
+ * enough to withhold registration on a ban chain.
  */
 SeedIdentityResult ResolveSeedIdentity(
     const std::vector<std::string>& seedIPs,
     const std::vector<std::vector<uint8_t>>& seedPubkeys,
     const std::string& externalIp,
     const std::vector<uint8_t>& loadedPubkey,
-    bool asnLoaded);
+    bool asnLoaded,
+    bool datacenterBanChain,
+    bool datacenterListLoaded);
 
 /** LP-13 H-2 (atomic-save) TEST SEAM. When set to a non-null function, Save()
  *  invokes it immediately after the temp file has been fully written + fsynced

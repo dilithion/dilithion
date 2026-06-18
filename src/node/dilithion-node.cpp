@@ -7039,29 +7039,20 @@ load_genesis_block:  // Bug #29: Label for automatic retry after blockchain wipe
             }
 
             if (asnDatabase.IsLoaded()) {
-                // Finding B (extreview PR#121): the datacenter ASN list is a
+                // Finding B + Fix 1 (extreview PR#121): the datacenter ASN list is a
                 // SEPARATE defense from attestation capacity — it powers the
-                // datacenter-IP Sybil ban, not MIK signing. A load failure here
-                // must NOT be silently swallowed: an empty datacenter set makes
-                // IsDatacenterIP() fail-open (always false), so the Sybil ban is
-                // silently OFF while the seed still REGISTERs healthy. Judgment
-                // (documented): this does NOT gate DEGRADED — datacenter-ban !=
-                // attestation capacity, so we keep attesting — but the failure is
-                // surfaced as a LOUD persistent ERROR with operator guidance so an
-                // operator notices the dropped defense (mirrors the ip2asn-v4.tsv
-                // loud treatment this PR added for the attestation side).
+                // datacenter-IP Sybil ban via IsDatacenterIP(). An EMPTY datacenter
+                // set makes IsDatacenterIP() fail OPEN (always false). On a
+                // datacenter-ban chain a seed would then sign attestations for
+                // datacenter miners it must reject; the gate folded into
+                // ResolveSeedIdentity below DEGRADES that case instead. DIL is a
+                // NON-ban chain (attestationDatacenterBan==false), so the datacenter
+                // list is not a consensus input here and a missing list is inert —
+                // the gate never demotes a DIL seed. We load the list (no-op effect
+                // on DIL) and let ResolveSeedIdentity decide.
                 std::string dcPath = dataDir + "/datacenter-asns.txt";
                 if (!asnDatabase.LoadDatacenterList(dcPath)) {
                     asnDatabase.LoadDatacenterList("datacenter-asns.txt");
-                }
-                if (asnDatabase.DatacenterASNCount() == 0) {
-                    std::cerr << "[Attestation] ERROR: datacenter ASN list FAILED to load or is empty "
-                                 "(missing/unparseable " << dataDir << "/datacenter-asns.txt or "
-                                 "./datacenter-asns.txt). The datacenter-IP Sybil ban is DISABLED "
-                                 "(IsDatacenterIP fails open) — datacenter-hosted miners will NOT be "
-                                 "refused MIK attestation. Attestation itself continues normally. "
-                                 "Restore datacenter-asns.txt (e.g. after a data-dir rotation) and "
-                                 "restart to re-enable the datacenter Sybil ban." << std::endl;
                 }
                 std::cout << "  [OK] ASN database loaded (" << asnDatabase.RangeCount()
                           << " ranges, " << asnDatabase.DatacenterASNCount()
@@ -7114,9 +7105,15 @@ load_genesis_block:  // Bug #29: Label for automatic retry after blockchain wipe
                 // by tests, not only the pubkey-equality primitive.
                 const auto& seedIPs = Dilithion::g_chainParams->seedAttestationIPs;
                 const auto& seedPubkeys = Dilithion::g_chainParams->seedAttestationPubkeys;
+                // Fix 1: pass the datacenter-ban chain flag and whether the
+                // datacenter ASN list actually loaded. On DIL (non-ban) the flag is
+                // false, so this is inert and a DIL seed REGISTERs on identity match
+                // exactly as before.
                 Attestation::SeedIdentityResult ident = Attestation::ResolveSeedIdentity(
                     seedIPs, seedPubkeys, config.external_ip, seedAttestKey.GetPubKey(),
-                    asnDatabase.IsLoaded());
+                    asnDatabase.IsLoaded(),
+                    Dilithion::g_chainParams->attestationDatacenterBan,
+                    asnDatabase.DatacenterASNCount() > 0);
 
                 bool registerSeed = false;
                 switch (ident.decision) {
@@ -7165,7 +7162,31 @@ load_genesis_block:  // Bug #29: Label for automatic retry after blockchain wipe
                                      "\"ASN database not loaded\". The node continues to run for "
                                      "relay/P2P. Fix ip2asn-v4.tsv (e.g. restore after a data-dir "
                                      "rotation) and restart to restore attestation." << std::endl;
-                        rpc_server.RegisterSeedAttestationDegraded(ident.seedId);
+                        rpc_server.RegisterSeedAttestationDegraded(
+                            ident.seedId, CRPCServer::SeedDegradedReason::NO_ASN);
+                        break;
+                    case Attestation::SeedIdentityDecision::DEGRADED_NO_DATACENTER_LIST:
+                        // Fix 1 (extreview PR#121): valid identity, ASN DB loaded,
+                        // but a datacenter-ban chain with an EMPTY datacenter ASN list
+                        // (IsDatacenterIP would fail OPEN). Mirror DEGRADED_NO_ASN: do
+                        // NOT abort, do NOT register attestation, loud ERROR, distinct
+                        // diagnosable marker. INERT on DIL (non-ban) — this case is
+                        // unreachable there because ResolveSeedIdentity never returns
+                        // it when attestationDatacenterBan==false; present for parity
+                        // with dilv-node so the two glues stay identical.
+                        std::cerr << "[Attestation] ERROR: seed identity is valid (seed_id="
+                                  << ident.seedId << ") and ip2asn loaded, but the datacenter "
+                                     "ASN list is EMPTY on a datacenter-ban chain "
+                                     "(missing/unparseable " << dataDir << "/datacenter-asns.txt "
+                                     "or ./datacenter-asns.txt). IsDatacenterIP() would fail OPEN, "
+                                     "so attestation is DISABLED rather than sign attestations for "
+                                     "datacenter miners that the datacenter Sybil ban must reject. "
+                                     "getmikattestation will report \"datacenter ASN list not "
+                                     "loaded\". The node continues to run for relay/P2P. Restore "
+                                     "datacenter-asns.txt (e.g. after a data-dir rotation) and "
+                                     "restart to restore attestation." << std::endl;
+                        rpc_server.RegisterSeedAttestationDegraded(
+                            ident.seedId, CRPCServer::SeedDegradedReason::NO_DATACENTER_LIST);
                         break;
                     case Attestation::SeedIdentityDecision::REGISTER:
                         if (ident.usedTestnetDefault) {

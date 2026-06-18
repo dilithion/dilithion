@@ -182,8 +182,26 @@ SeedIdentityResult ResolveSeedIdentity(
     const std::vector<std::vector<uint8_t>>& seedPubkeys,
     const std::string& externalIp,
     const std::vector<uint8_t>& loadedPubkey,
-    bool asnLoaded) {
+    bool asnLoaded,
+    bool datacenterBanChain,
+    bool datacenterListLoaded) {
     SeedIdentityResult r;
+
+    // Final disposition for a would-be REGISTER (valid identity). Folds the
+    // availability dependencies LAST and in the documented order: a down ASN DB
+    // degrades first (DEGRADED_NO_ASN — no attestation capacity at all), then a
+    // ban-chain-with-empty-datacenter-list degrades
+    // (DEGRADED_NO_DATACENTER_LIST — IsDatacenterIP() would fail open and let
+    // datacenter miners through the Sybil ban). On a non-ban chain (DIL) the
+    // datacenter condition is inert, so the result is REGISTER unchanged. Each can
+    // only SOFTEN a REGISTER; this helper is only ever reached after
+    // FATAL_MISMATCH / SKIP_NOT_A_SEED have already been ruled out.
+    auto registerOrDegrade = [&]() -> SeedIdentityDecision {
+        if (!asnLoaded) return SeedIdentityDecision::DEGRADED_NO_ASN;
+        if (datacenterBanChain && !datacenterListLoaded)
+            return SeedIdentityDecision::DEGRADED_NO_DATACENTER_LIST;
+        return SeedIdentityDecision::REGISTER;
+    };
 
     // Resolve seedId by matching our normalized --externalip against the known
     // seed IPs. seedAttestationIPs[i] and seedAttestationPubkeys[i] are
@@ -212,11 +230,11 @@ SeedIdentityResult ResolveSeedIdentity(
         } else {
             r.seedId = seedId;
         }
-        // H-3: a valid (testnet) identity that would register, but with the ASN
-        // DB down, has zero attestation capacity -> DEGRADED (stay online, don't
-        // register, make the state loud + diagnosable). Otherwise REGISTER.
-        r.decision = asnLoaded ? SeedIdentityDecision::REGISTER
-                               : SeedIdentityDecision::DEGRADED_NO_ASN;
+        // H-3 + Fix 1: a valid (testnet) identity that would register degrades if
+        // the ASN DB is down, or (on a ban chain) if the datacenter list is empty.
+        // Otherwise REGISTER. (Testnet typically runs DIL-shaped non-ban params, so
+        // the datacenter condition is normally inert here.)
+        r.decision = registerOrDegrade();
         return r;
     }
 
@@ -243,14 +261,14 @@ SeedIdentityResult ResolveSeedIdentity(
         return r;
     }
 
-    // Identity is valid for this seed slot. H-3: fold in ASN-DB state LAST — a
-    // valid identity with the ASN DB down has zero attestation capacity, so it
-    // DEGRADES (stay online, don't register, loud + diagnosable) rather than
-    // registering. A trust failure (FATAL_MISMATCH above) is never reached here,
-    // so ASN state can only ever soften a would-be REGISTER, never a FATAL.
+    // Identity is valid for this seed slot. H-3 + Fix 1: fold the availability
+    // dependencies in LAST — a valid identity with the ASN DB down, or (on a ban
+    // chain) with an empty datacenter list, DEGRADES (stay online, don't register,
+    // loud + diagnosable) rather than registering. A trust failure (FATAL_MISMATCH
+    // above) is never reached here, so these can only ever soften a would-be
+    // REGISTER, never a FATAL.
     r.seedId = seedId;
-    r.decision = asnLoaded ? SeedIdentityDecision::REGISTER
-                           : SeedIdentityDecision::DEGRADED_NO_ASN;
+    r.decision = registerOrDegrade();
     return r;
 }
 

@@ -9190,9 +9190,21 @@ std::string CRPCServer::RPC_GetMIKAttestation(const std::string& params) {
         // so the operator can see the ASN-DB cause instead of the generic
         // "only available on seed nodes" (which would hide the degraded state).
         if (m_seedAttestationAsnDegraded) {
+            // Fix 2: surface the resolved seed_id (m_seedAttestationDegradedSeedId,
+            // previously written-but-never-read) so the degraded state is fully
+            // diagnosable. Fix 1: distinct string per degraded reason.
+            std::string seedIdStr = std::to_string(m_seedAttestationDegradedSeedId);
+            if (m_seedAttestationDegradedReason == SeedDegradedReason::NO_DATACENTER_LIST) {
+                throw std::runtime_error(
+                    "attestation unavailable: datacenter ASN list not loaded on a "
+                    "datacenter-ban chain (seed_id=" + seedIdStr + " running degraded "
+                    "for relay only; restore datacenter-asns.txt and restart)");
+            }
+            // Default / NO_ASN: ip2asn-v4.tsv missing -> zero attestation capacity.
             throw std::runtime_error(
                 "attestation unavailable: ASN database not loaded "
-                "(seed running degraded for relay only; fix ip2asn-v4.tsv and restart)");
+                "(seed_id=" + seedIdStr + " running degraded for relay only; "
+                "fix ip2asn-v4.tsv and restart)");
         }
         throw std::runtime_error("getmikattestation is only available on seed nodes");
     }
