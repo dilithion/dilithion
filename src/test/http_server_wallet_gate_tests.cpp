@@ -425,6 +425,163 @@ static void TestNormalizerCanonicalForm() {
     CHECK(!norm("/x%00y").ok);
 }
 
+// ==========================================================================
+// 9. QUERY-PRESERVATION (x402 functional-regression fix) — the gate strips the
+//    query for CLASSIFICATION, but the handler must still RECEIVE it. This
+//    models CHttpServer::HandleRequest's dispatch exactly:
+//
+//        const NormalizedPath norm = NormalizeRequestPath(rawPath);   // gate path
+//        const std::string rawQuery = ExtractRawQuery(rawPath);       // carried query
+//        dispatchPath = rawQuery.empty() ? norm.path
+//                                        : norm.path + "?" + rawQuery; // handler input
+//
+//    using the REAL production functions (NormalizeRequestPath + ExtractRawQuery),
+//    so a regression in either shows up here. We then run the facilitator's OWN
+//    query-extraction (subpath.find('?'), verbatim from facilitator.cpp:73) and
+//    the REST handler's OWN query-strip on the dispatch path to prove the handler
+//    recovers `address=ADDR`.
+// ==========================================================================
+
+// Build the dispatch path EXACTLY as the live server does (only on norm.ok).
+static std::string DispatchPathForRoutedRequest(const std::string& rawPath) {
+    const api::NormalizedPath norm = api::NormalizeRequestPath(rawPath);
+    // The live server only reaches handler dispatch when norm.ok; a non-ok path
+    // is rejected before this point. Mirror that: callers below use only ok paths.
+    const std::string rawQuery = api::ExtractRawQuery(rawPath);
+    return rawQuery.empty() ? norm.path : (norm.path + "?" + rawQuery);
+}
+
+// Verbatim model of CFacilitator::HandleRequest's query carve-out
+// (facilitator.cpp:64-78): strip "/x402/", then split the FIRST '?' into
+// pathPart + query. Returns the `query` the handler would parse `address=` from.
+static std::string FacilitatorQueryFor(const std::string& dispatchPath) {
+    std::string subpath = dispatchPath.substr(6);  // Skip "/x402/"
+    size_t qmark = subpath.find('?');
+    if (qmark != std::string::npos) return subpath.substr(qmark + 1);
+    return std::string();
+}
+
+// Verbatim model of CFacilitator::HandleDnaAttest's address parse
+// (facilitator.cpp:243-257): pull `address=` out of the query, trim at '&'.
+static std::string ParsedAddressFor(const std::string& query) {
+    size_t pos = query.find("address=");
+    if (pos == std::string::npos) return std::string();
+    std::string address = query.substr(pos + 8);
+    size_t amp = address.find('&');
+    if (amp != std::string::npos) address = address.substr(0, amp);
+    return address;
+}
+
+// Verbatim model of CRestAPI::HandleRequest's subpath/param parse INCLUDING the
+// new query-strip: skip "/api/v1/", drop a trailing '?...', split first '/'.
+// Returns the `param` the REST handler would treat as e.g. the address/txid.
+static std::string RestParamFor(const std::string& dispatchPath) {
+    std::string subpath = dispatchPath.substr(8);  // Skip "/api/v1/"
+    size_t qmark = subpath.find('?');
+    if (qmark != std::string::npos) subpath = subpath.substr(0, qmark);
+    size_t slash = subpath.find('/');
+    if (slash != std::string::npos) return subpath.substr(slash + 1);
+    return std::string();  // no param segment
+}
+
+static void TestQueryPreservationForHandlers() {
+    std::cout << "LP-12 fix: handlers receive the query (x402 dna-attest regression)..." << std::endl;
+
+    // ---- THE REGRESSION: /x402/dna-attest?address=ADDR must reach the handler
+    //      with the query (and thus address=ADDR) intact. ----
+    {
+        const std::string dp = DispatchPathForRoutedRequest("/x402/dna-attest?address=DvWxyzADDR123");
+        // The gate path used for dispatch is canonical /x402/dna-attest...
+        CHECK(dp.rfind("/x402/dna-attest", 0) == 0);
+        // ...but the query rode along for the handler.
+        const std::string q = FacilitatorQueryFor(dp);
+        CHECK(q == "address=DvWxyzADDR123");
+        CHECK(ParsedAddressFor(q) == "DvWxyzADDR123");
+    }
+    // Multi-param query: address= still parsed, trimmed at '&'.
+    {
+        const std::string dp = DispatchPathForRoutedRequest("/x402/dna-attest?address=ADDR42&foo=bar");
+        const std::string q = FacilitatorQueryFor(dp);
+        CHECK(q == "address=ADDR42&foo=bar");
+        CHECK(ParsedAddressFor(q) == "ADDR42");
+    }
+    // address= not first in the query is still found (find, not prefix).
+    {
+        const std::string dp = DispatchPathForRoutedRequest("/x402/dna-attest?foo=1&address=ADDR9");
+        CHECK(ParsedAddressFor(FacilitatorQueryFor(dp)) == "ADDR9");
+    }
+    // A duplicate-slash / case spelling normalizes for dispatch but STILL carries
+    // the query (gate path canonical, handler input query-preserved).
+    {
+        const std::string dp = DispatchPathForRoutedRequest("//x402//dna-attest?address=ADDRdup");
+        CHECK(dp.rfind("/x402/dna-attest", 0) == 0);
+        CHECK(ParsedAddressFor(FacilitatorQueryFor(dp)) == "ADDRdup");
+    }
+    // No-query x402 request: dispatch path is just the canonical path (no stray '?').
+    {
+        const std::string dp = DispatchPathForRoutedRequest("/x402/supported");
+        CHECK(dp == "/x402/supported");
+        CHECK(FacilitatorQueryFor(dp).empty());
+    }
+
+    // ---- REST path-param handlers are UNAFFECTED: their argument is a path
+    //      segment, and the new query-strip means a stray query never corrupts it. ----
+    {
+        // Pure path-segment param (the normal case) — no query.
+        const std::string dp = DispatchPathForRoutedRequest("/api/v1/balance/SomeAddress");
+        CHECK(dp == "/api/v1/balance/SomeAddress");
+        CHECK(RestParamFor(dp) == "SomeAddress");
+    }
+    {
+        // A query tacked onto a REST path must NOT bleed into the param.
+        const std::string dp = DispatchPathForRoutedRequest("/api/v1/balance/SomeAddress?foo=bar");
+        CHECK(RestParamFor(dp) == "SomeAddress");   // NOT "SomeAddress?foo=bar"
+    }
+
+    // ---- SECURITY: query-preservation must NOT open a gate bypass. The query is
+    //      carried for the HANDLER only; the gate/dispatch keys on the query-
+    //      stripped canonical path. A query can neither un-gate a sensitive path
+    //      nor smuggle a sensitive path past the gate. ----
+    {
+        // /wallet?x is STILL sensitive (gate sees /wallet); the query is irrelevant
+        // to classification. (Re-assert against the live gate predicate.)
+        CHECK(GateSensitive("/wallet?x"));
+        // ExtractRawQuery pulls "x" off /wallet?x, but that value never feeds the gate.
+        CHECK(api::ExtractRawQuery("/wallet?x") == "x");
+        // The classification depends ONLY on the normalized path, never the query:
+        // identical normalized path => identical verdict regardless of query.
+        CHECK(GateSensitive("/wallet") == GateSensitive("/wallet?anything=here"));
+        CHECK(GateSensitive("/x402/dna-attest") == GateSensitive("/x402/dna-attest?address=ADDR"));
+        CHECK(GateSensitive("/nope") == GateSensitive("/nope?address=ADDR"));
+    }
+    {
+        // A query cannot carry a '/' that smuggles a NEW path: ExtractRawQuery
+        // returns only the post-'?' bytes; the dispatch path's ROUTING prefix is
+        // the canonical pre-'?' path. The handler's own '?' split discards it.
+        const std::string dp = DispatchPathForRoutedRequest("/x402/dna-attest?address=ADDR&next=/wallet");
+        // Dispatch still routes as /x402/... (the canonical gate path), and the
+        // facilitator's pathPart is "dna-attest" — the "/wallet" in the query is
+        // inert query data, never a route.
+        CHECK(dp.rfind("/x402/", 0) == 0);
+        CHECK(FacilitatorQueryFor(dp) == "address=ADDR&next=/wallet");
+        CHECK(ParsedAddressFor(FacilitatorQueryFor(dp)) == "ADDR");
+    }
+
+    // ---- ExtractRawQuery contract: raw '?' only; %3f is NOT a delimiter;
+    //      fragment dropped; first '#' before '?' => no query. ----
+    CHECK(api::ExtractRawQuery("/x402/dna-attest?address=A") == "address=A");
+    CHECK(api::ExtractRawQuery("/wallet").empty());                 // no query
+    CHECK(api::ExtractRawQuery("/wallet#frag").empty());            // fragment, no query
+    CHECK(api::ExtractRawQuery("/p?a=b#frag") == "a=b");            // fragment trimmed off query
+    CHECK(api::ExtractRawQuery("/p#x?a=b").empty());                // '#' before '?' => no query
+    // %3f is a literal byte, NOT a query delimiter — unchanged prior behavior.
+    // /wallet%3fx normalizes to a single segment "wallet?x" (NOT /wallet) and has
+    // NO raw '?', so ExtractRawQuery returns "" and it is NOT classified sensitive.
+    CHECK(api::ExtractRawQuery("/wallet%3fx").empty());
+    CHECK(!GateSensitive("/wallet%3fx"));   // prior %3f behavior unchanged
+    CHECK(api::NormalizeRequestPath("/wallet%3fx").path == "/wallet?x");
+}
+
 int main() {
     std::cout << "=== LP-12 CHttpServer wallet-HTML gate tests ===" << std::endl;
     TestPublicApiDisablesWalletEntirely();
@@ -435,6 +592,7 @@ int main() {
     TestRateLimiterRecordsStayBounded();     // M-01
     TestPathNormalizationGateBypassMatrix(); // gate-bypass fold (finding #1+#2)
     TestNormalizerCanonicalForm();           // gate-bypass fold (normalizer contract)
+    TestQueryPreservationForHandlers();      // x402 dna-attest query-preservation fix
     std::cout << "All " << g_checks << " checks passed." << std::endl;
     return 0;
 }

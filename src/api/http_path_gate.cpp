@@ -129,6 +129,24 @@ NormalizedPath NormalizeRequestPath(const std::string& rawPath) {
     return result;
 }
 
+std::string ExtractRawQuery(const std::string& rawPath) {
+    // Mirror NormalizeRequestPath step 1's split EXACTLY: find the first raw
+    // '?' or '#'. If the first such char is '?', the query is everything after
+    // it up to (but not including) any later '#'. If a '#' comes first (or there
+    // is no '?'), there is no query.
+    size_t cut = rawPath.find_first_of("?#");
+    if (cut == std::string::npos || rawPath[cut] != '?') {
+        return std::string();
+    }
+    std::string afterQ = rawPath.substr(cut + 1);
+    // Drop a fragment if present (everything from the first '#').
+    size_t frag = afterQ.find('#');
+    if (frag != std::string::npos) {
+        afterQ = afterQ.substr(0, frag);
+    }
+    return afterQ;
+}
+
 bool IsSensitiveSurface(const std::string& normalizedPath) {
     // Case-fold for the comparison. Gating a superset of what the live handler
     // routes (which is case-sensitive) is safe: a gated-but-unrouted path 404s

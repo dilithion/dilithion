@@ -57,6 +57,24 @@ NormalizedPath NormalizeRequestPath(const std::string& rawPath);
 // would not normalize is sensitive by definition.
 bool IsSensitiveSurface(const std::string& normalizedPath);
 
+// Extract the RAW query string from a raw request-target path: the bytes after
+// the FIRST raw '?' and before any '#' fragment. Returns "" if there is no raw
+// '?'. This is the EXACT delimiter NormalizeRequestPath strips in its step 1, so
+// the query carved out here is precisely the part the gate path dropped — no
+// more, no less.
+//
+// Why raw, not decoded: a percent-encoded '?' (%3f) is a LITERAL path byte, not
+// a query delimiter (e.g. "/wallet%3fx" is the single path segment "wallet?x",
+// never the path "/wallet" with query "x"). Keying on the raw '?' keeps this
+// query-extraction in lockstep with the gate's query-strip, so the same byte
+// the gate treats as a query delimiter is the byte that begins the query here —
+// a percent-encoded '?' is never mistaken for a delimiter on either side.
+//
+// SECURITY: this value is used ONLY to reconstruct a handler's input AFTER the
+// gate and dispatch decision have already been made on the normalized, query-
+// stripped path. It can never influence the sensitivity classification.
+std::string ExtractRawQuery(const std::string& rawPath);
+
 } // namespace api
 
 #endif // DILITHION_API_HTTP_PATH_GATE_H

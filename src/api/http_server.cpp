@@ -372,7 +372,25 @@ void CHttpServer::HandleRequest(SOCKET client_socket) {
     // embedded NUL) is treated as sensitive AND not routed — fail-closed.
     // ========================================================================
     const api::NormalizedPath norm = api::NormalizeRequestPath(rawPath);
-    const std::string& path = norm.path;  // canonical; dispatch uses this below
+    const std::string& path = norm.path;  // canonical; gate + dispatch DECISION use this
+
+    // LP-12 (x402 query-preservation, MEDIUM functional regression fix).
+    // NormalizeRequestPath STRIPS the `?...` query — correct for the gate and for
+    // choosing WHICH handler runs, but the x402 endpoint
+    // `GET /x402/dna-attest?address=ADDR` parses `address=` from that query
+    // (CFacilitator::HandleDnaAttest). Carving the query off the gate path made
+    // every such request fail with "Missing address parameter". We therefore
+    // carry the ORIGINAL raw query forward and hand the handlers a query-
+    // preserving path — WITHOUT ever feeding the query back into the gate.
+    //
+    // INVARIANT (do NOT weaken): the query is extracted from the RAW path and is
+    // used ONLY to rebuild a handler's input. The sensitivity classification and
+    // the which-handler dispatch decision below both key on the normalized,
+    // query-stripped `path`. A query string can never reach IsSensitiveSurface
+    // and so can never smuggle a sensitive path past the gate, nor un-gate one.
+    // It is also reconstructed ONLY on the norm.ok path: a non-normalizable
+    // request is rejected (403/404) before this value is ever consulted.
+    const std::string rawQuery = api::ExtractRawQuery(rawPath);
 
     // STRESS TEST FIX: Handle GET /api/health - simple health check that NEVER
     // blocks. Stays ABOVE the Host gate as an intentional load-balancer probe;
@@ -446,7 +464,10 @@ void CHttpServer::HandleRequest(SOCKET client_socket) {
         }
     }
 
-    // Handle REST API requests for light wallet (/api/v1/*) and x402 facilitator (/x402/*)
+    // Handle REST API requests for light wallet (/api/v1/*) and x402 facilitator
+    // (/x402/*). The which-handler DISPATCH DECISION keys on the normalized,
+    // query-stripped `path` (so the gate's normalize-once-drives-both invariant
+    // holds); only the handler's INPUT regains the original query, below.
     if (path.rfind("/api/v1/", 0) == 0 || path.rfind("/x402/", 0) == 0) {
         if (m_rest_api_handler) {
             try {
@@ -460,12 +481,21 @@ void CHttpServer::HandleRequest(SOCKET client_socket) {
                     }
                 }
 
+                // LP-12 query-preservation: hand the handler the canonical path
+                // with the ORIGINAL query re-attached, so query-parsing endpoints
+                // (x402 /dna-attest reads `address=` from the query) work again.
+                // The dispatch decision above already used the query-stripped
+                // `path`; this only restores the handler's own input. Downstream
+                // handlers (CFacilitator / CRestAPI) strip the query themselves.
+                const std::string dispatchPath =
+                    rawQuery.empty() ? path : (path + "?" + rawQuery);
+
                 // Call REST API handler (returns full HTTP response).
                 // LP-12: pass the REAL peer IP (was hardcoded "0.0.0.0", which
                 // collapsed every client onto one rate-limit bucket and erased
                 // attribution). Per-IP limiting on the REST broadcast path now
                 // keys on the actual connection.
-                std::string response = m_rest_api_handler(method, path, body, clientIP);
+                std::string response = m_rest_api_handler(method, dispatchPath, body, clientIP);
 
                 // Send raw response (handler builds complete HTTP response)
 #ifdef _WIN32
