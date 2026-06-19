@@ -21,6 +21,7 @@
 #include <node/mempool.h>
 #include <node/blockchain_storage.h>
 #include <node/utxo_set.h>
+#include <node/chainstate_integrity_monitor.h>  // extreview PR #120 B1: integrity_health field
 #include <x402/facilitator.h>  // x402 payment facilitator
 #include <consensus/params.h>
 #include <consensus/chain.h>
@@ -3728,7 +3729,17 @@ std::string CRPCServer::RPC_GetBlockchainInfo(const std::string& params) {
     oss << "\"bestblockhash\":\"" << bestBlockHash.GetHex() << "\",";
     oss << "\"difficulty\":" << std::fixed << std::setprecision(8) << difficulty << ",";
     oss << "\"mediantime\":" << mediantime << ",";
-    oss << "\"chainwork\":\"" << m_chainstate->GetChainWork().GetHex() << "\"";
+    oss << "\"chainwork\":\"" << m_chainstate->GetChainWork().GetHex() << "\",";
+    // extreview PR #120 B1: operator-observable chainstate-integrity health.
+    // "degraded" once a persistent storage IsIOError has been tolerated across
+    // kEscalateAfterCycles consecutive monitor cycles (a sustained disk/file-lock
+    // fault that the node keeps limping through and will NOT auto-rebuild).
+    // "ok" otherwise. Lets operators / monitoring poll for a silent hardware
+    // fault without scraping stderr.
+    oss << "\"integrity_health\":\""
+        << (Dilithion::ChainstateIntegrityMonitor::IsIntegrityHealthDegraded()
+                ? "degraded" : "ok")
+        << "\"";
     oss << "}";
     return oss.str();
 }

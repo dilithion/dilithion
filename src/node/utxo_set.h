@@ -17,6 +17,7 @@
 #include <cstdint>
 #include <atomic>
 #include <utility>
+#include <functional>
 
 // Forward declaration — VerifyUndoDataInRange takes CBlockIndex* without needing the full type.
 class CBlockIndex;
@@ -26,12 +27,73 @@ class CBlockIndex;
  * Populated by CUTXOSet::VerifyUndoDataInRange when the walk detects a missing
  * or corrupt undo record. The cause field distinguishes failure modes for
  * operator diagnostics + auto-rebuild marker reason text.
+ *
+ * `transient`: true ONLY when the underlying LevelDB read failed with an
+ * IsIOError() status (a recoverable storage-layer fault — open-file-handle
+ * exhaustion, an EIO blip, an AV file lock on Windows) that may clear across
+ * the monitor's retry loop. The periodic ChainstateIntegrityMonitor uses this
+ * flag to AVOID self-bricking a healthy node on a transient fault: a transient
+ * failure that does not clear across retries is logged + tolerated, never
+ * marker-written.
+ *
+ * IsCorruption() is deliberately NOT transient. It is LevelDB's signal for REAL
+ * on-disk data damage (a failed SST CRC32C checksum, a bad block handle, a
+ * corrupt manifest); it reproduces on every read, so it survives the retry loop
+ * and must route through the corruption gate -> marker + shutdown + rebuild.
+ * Treating it as transient would mask genuine corruption forever (the inverse,
+ * more-dangerous failure mode). It is hard-fail, like checksum_mismatch /
+ * size_invalid.
  */
 struct UndoIntegrityFailure {
     int height = -1;
     uint256 blockHash;
-    std::string cause;  // "missing" | "checksum_mismatch" | "size_invalid" | "db_not_open" | "block_index_missing"
+    std::string cause;  // "missing" | "checksum_mismatch" | "size_invalid" | "io_error" | "io_corruption" | "db_not_open" | "block_index_missing"
+    bool transient = false;  // true => recoverable IsIOError storage blip (do NOT brick); false => hard-fail
 };
+
+/**
+ * v4.4: Classify a non-ok leveldb::Status from an undo-record Get() into the
+ * (cause, transient) taxonomy. Extracted as a free, side-effect-free function so
+ * the safety-critical mapping can be unit-tested directly with synthetic
+ * leveldb::Status values (a real on-disk IsCorruption is otherwise impractical
+ * to inject). Sets failure_out.cause and failure_out.transient; callers fill in
+ * height/blockHash. MUST be called only when st is NOT ok.
+ *
+ * Mapping (see definition for full rationale):
+ *   IsCorruption() -> cause="io_corruption", transient=false  (real on-disk damage; hard-fail)
+ *   IsIOError()    -> cause="io_error",      transient=true   (recoverable storage blip)
+ *   else           -> cause="missing",       transient=false  (absent key / fail-safe default)
+ */
+void ClassifyUndoFetchStatus(const leveldb::Status& st, UndoIntegrityFailure& failure_out);
+
+/**
+ * v4.4 test-only fault injection for the undo-fetch seam.
+ *
+ * When g_undo_fetch_fault_injector is non-null, FetchAndVerifyUndo consults it
+ * BEFORE the real db->Get(): the hook may return a non-ok leveldb::Status to
+ * simulate a storage-layer fault (IsCorruption / IsIOError) that is otherwise
+ * impractical to produce on real on-disk data. Returning an ok() Status means
+ * "no injected fault — proceed with the real read". This lets the integrity
+ * tests drive the full ChainstateIntegrityMonitor retry/tolerate/confirm
+ * routing through a synthetic persistent-Corruption or transient-IOError fault.
+ *
+ * COMPILED OUT OF PRODUCTION (extreview PR #120 HIGH, unanimous 3/3 providers).
+ * The whole symbol — declaration, definition, and the FetchAndVerifyUndo call
+ * site — lives inside `#ifdef DILITHION_ENABLE_FAULT_INJECTION`. That macro is
+ * defined ONLY for the dedicated test object built by the Makefile's
+ * `chainstate_integrity_tests` target (a private recompile of utxo_set.cpp);
+ * the production `dilithion-node` / `dilv-node` link the normal CORE
+ * `utxo_set.o`, where this mutable `extern std::function` seam does not exist at
+ * all and therefore cannot be reassigned to steer the monitor's corruption
+ * routing. There is intentionally no runtime path that touches the injector in a
+ * shipped binary.
+ *
+ * It is a std::function so a test can decrement a counter per call (persistent
+ * vs clears-on-retry).
+ */
+#ifdef DILITHION_ENABLE_FAULT_INJECTION
+extern std::function<leveldb::Status()> g_undo_fetch_fault_injector;
+#endif
 
 /**
  * UTXO (Unspent Transaction Output) entry
