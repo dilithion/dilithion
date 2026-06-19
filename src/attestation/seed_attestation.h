@@ -95,6 +95,38 @@ void CleanseSeedKeyBuffer(std::vector<uint8_t>& buf);
  *  startup. Both node binaries call this to classify a LoadOrGenerate failure. */
 bool SeedKeyFilePresent(const std::string& dataDir);
 
+/** LP-13 round-3: the seed-intent decision, classifying what a node must do at
+ *  startup given (a) whether the operator explicitly declared --attestation-seed
+ *  and (b) whether external_ip resolves to a configured seat (seedId >= 0). The
+ *  fatal-vs-silent startup decision derives from this, NOT from a bare external_ip
+ *  match — closing the round-2 silent-non-attest gap where a real seat with a
+ *  wrong external_ip silently demoted itself to a "community relay".
+ *
+ *  Pure + side-effect-free so BOTH node binaries call the SAME classifier (byte
+ *  consistency guaranteed by construction) and unit tests can mutation-check it. */
+enum class SeedIntent {
+    /** No --attestation-seed flag AND external_ip not in the seed set. A community
+     *  relay/public-API node: boots fine, NON-attesting, NEVER fatal on key state. */
+    COMMUNITY,
+    /** external_ip resolves to a seat (isConfiguredSeed) — MUST attest; a missing/
+     *  corrupt key is FATAL, a transient key fault is warn+continue. This covers
+     *  both "flag set + IP matches" and the backward-compat "IP matches, no flag". */
+    CONFIGURED_SEED,
+    /** --attestation-seed declared but external_ip does NOT resolve to a seat: a
+     *  misconfigured declared seed. FATAL before key load (the silent-gap closer) —
+     *  a declared seed must resolve or it would silently non-attest. */
+    DECLARED_BUT_UNRESOLVED,
+};
+
+/** Classify seed intent. attestationSeedFlag == --attestation-seed was passed;
+ *  seedId >= 0 iff external_ip matched a configured seat. Pure function. */
+SeedIntent ClassifySeedIntent(bool attestationSeedFlag, int seedId);
+
+/** True when the node MUST attest (CONFIGURED_SEED): the explicit flag was set OR
+ *  external_ip matched a seat. Equivalent to (attestationSeedFlag || seedId >= 0)
+ *  but routed through ClassifySeedIntent so the disjunct lives in ONE place. */
+bool IsConfiguredSeed(bool attestationSeedFlag, int seedId);
+
 /** LP-13 H-2 (atomic-save) TEST SEAM. When set to a non-null function, Save()
  *  invokes it immediately after the temp file has been fully written + fsynced
  *  but BEFORE the atomic rename over the target. If the hook returns true, Save

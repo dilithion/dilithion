@@ -20,6 +20,10 @@
 //   - MEDIUM-1 (round-2): migration re-save failure is NON-FATAL, v1 byte-intact
 //   - round-2: LoadOrGenerate classifies MISSING / CORRUPT / TRANSIENT (the
 //     classification that drives the node's actual-seed SM-5 scope + warn-vs-fatal)
+//   - round-3: ClassifySeedIntent / IsConfiguredSeed — the EXPLICIT
+//     --attestation-seed seed-intent decision both node binaries route through,
+//     replacing the fragile external_ip-as-seed-intent signal (mutation-checked:
+//     drop the flag-disjunct or the declared-but-unresolved FATAL => a CHECK fails)
 
 #include <attestation/seed_attestation.h>
 #include <dfmp/dfmp.h>
@@ -869,6 +873,51 @@ static void TestSeedKeyFilePresentDetectsUnreadable() {
 #endif
 }
 
+// LP-13 round-3: the EXPLICIT --attestation-seed seed-intent classifier. This is
+// the single source of truth both node binaries route through for the fatal-vs-
+// silent startup decision, replacing the fragile bare external_ip-match signal.
+// Mutation-checked: each assertion below KILLS a specific mutation of
+// ClassifySeedIntent (drop the flag-disjunct, drop the declared-but-unresolved
+// FATAL, swap the COMMUNITY fall-through, etc.). seedId >= 0 means external_ip
+// resolved to a configured seat; seedId == -1 means it did not.
+static void TestSeedIntentClassifier() {
+    std::cout << "[Test] round-3: --attestation-seed seed-intent classifier" << std::endl;
+
+    // (1) Flag SET + IP IN set (seedId>=0): CONFIGURED_SEED (must attest; missing
+    //     key => fatal). Explicit + resolved is the canonical seed.
+    CHECK(ClassifySeedIntent(/*flag=*/true, /*seedId=*/0) == SeedIntent::CONFIGURED_SEED,
+          "flag SET + IP-in-set => CONFIGURED_SEED");
+    CHECK(IsConfiguredSeed(true, 3) == true,
+          "flag SET + IP-in-set => IsConfiguredSeed (must attest)");
+
+    // (2) Flag SET + IP NOT in set (seedId==-1): DECLARED_BUT_UNRESOLVED => FATAL.
+    //     THE silent-gap closer. Mutation: if the declared-but-unresolved branch is
+    //     removed, this falls through to COMMUNITY and the assertion fails.
+    CHECK(ClassifySeedIntent(/*flag=*/true, /*seedId=*/-1) == SeedIntent::DECLARED_BUT_UNRESOLVED,
+          "flag SET + IP-NOT-in-set => DECLARED_BUT_UNRESOLVED (declared-but-unresolved FATAL; "
+          "mutation: removing this branch silently demotes a misconfigured seat to COMMUNITY)");
+    CHECK(IsConfiguredSeed(true, -1) == false,
+          "declared-but-unresolved is NOT a (bootable) CONFIGURED_SEED — it is FATAL at the node");
+
+    // (3) NO flag + IP IN set (seedId>=0): CONFIGURED_SEED (backward-compat — live
+    //     seeds keep attesting by IP-match through the rolling deploy). Mutation:
+    //     if the IP-match disjunct is removed, this becomes COMMUNITY and the live
+    //     seeds would silently stop attesting — the assertion fails.
+    CHECK(ClassifySeedIntent(/*flag=*/false, /*seedId=*/2) == SeedIntent::CONFIGURED_SEED,
+          "NO flag + IP-in-set => CONFIGURED_SEED (backward-compat; mutation: dropping the "
+          "IP-match disjunct stops the live seeds attesting)");
+    CHECK(IsConfiguredSeed(false, 2) == true,
+          "NO flag + IP-in-set => IsConfiguredSeed (backward-compat attest)");
+
+    // (4) NO flag + IP NOT in set (seedId==-1): COMMUNITY (boots fine, non-attesting,
+    //     never fatal on key state). Mutation: classifying this CONFIGURED_SEED would
+    //     make every community relay/public-API node fatal-on-missing-key.
+    CHECK(ClassifySeedIntent(/*flag=*/false, /*seedId=*/-1) == SeedIntent::COMMUNITY,
+          "NO flag + IP-NOT-in-set => COMMUNITY (community node; never fatal on keys)");
+    CHECK(IsConfiguredSeed(false, -1) == false,
+          "community node is NOT a configured seed (boots non-attesting)");
+}
+
 int main() {
     std::cout << "=== LP-13 seed_attestation_key_tests ===" << std::endl;
 
@@ -887,6 +936,7 @@ int main() {
     TestV1ToV2Migration();                   // CL-1 (migration; original key preserved)
     TestMigrationSaveFailIsNonFatal();       // MEDIUM-1 (round-2: migration save-fail non-fatal)
     TestLoadStatusClassification();          // round-2 (MISSING/CORRUPT/TRANSIENT classification)
+    TestSeedIntentClassifier();              // round-3 (--attestation-seed seed-intent; mutation-checked)
     TestNoPlaintextBak();                    // CL-2 (no plaintext .bak)
     TestSeedKeyFilePresentDetectsUnreadable(); // extreview HIGH (presence vs readability)
 #ifndef _WIN32

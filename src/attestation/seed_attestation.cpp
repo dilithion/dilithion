@@ -112,6 +112,32 @@ bool SeedKeyFilePresent(const std::string& dataDir) {
     return present;
 }
 
+// LP-13 round-3: the seed-intent classifier (see header). Pure; both node
+// binaries call this SAME function so the fatal-vs-silent decision is identical
+// by construction and unit tests can mutation-check the disjunct + the
+// declared-but-unresolved FATAL. The IP-match disjunct (seedId >= 0) is the
+// BACKWARD-COMPAT path that keeps the 4 live seeds attesting through a rolling
+// deploy with no wrapper change; --attestation-seed makes seed-intent explicit.
+SeedIntent ClassifySeedIntent(bool attestationSeedFlag, int seedId) {
+    const bool ipMatchesSeed = (seedId >= 0);
+    if (attestationSeedFlag && !ipMatchesSeed) {
+        // Declared a seed but external_ip resolves to no seat: FATAL (silent-gap
+        // closer). Must come BEFORE the COMMUNITY fall-through so a wrong-IP
+        // declared seat can never silently demote to a non-attesting community node.
+        return SeedIntent::DECLARED_BUT_UNRESOLVED;
+    }
+    if (attestationSeedFlag || ipMatchesSeed) {
+        // Explicit declaration OR backward-compat IP-match => MUST attest.
+        return SeedIntent::CONFIGURED_SEED;
+    }
+    // No flag AND IP not in the seed set => community node, never fatal on keys.
+    return SeedIntent::COMMUNITY;
+}
+
+bool IsConfiguredSeed(bool attestationSeedFlag, int seedId) {
+    return ClassifySeedIntent(attestationSeedFlag, seedId) == SeedIntent::CONFIGURED_SEED;
+}
+
 // LP-13 H-2 atomic-save test seam (see header). nullptr in production.
 bool (*g_seedKeySaveFailpoint)() = nullptr;
 // LP-13 B-1 fsync-failure test seam (see header). nullptr in production.
@@ -167,29 +193,51 @@ SeedKeyLoadStatus CSeedAttestationKey::LoadClassified(const std::string& dataDir
     }
 #endif
 
-    // LP-13 (round-2 fold, transient-vs-permanent): classify open failures.
-    // ENOENT (file genuinely absent) => MISSING (permanent, the SM-5 loud-fatal
-    // case on an actual seed). Any OTHER open errno on a file that statted as
-    // PRESENT (EACCES/EBUSY/EIO/EMFILE/…) => TRANSIENT: a momentary fault that a
-    // retry/reboot may clear, so the node warns-and-continues rather than entering
-    // a crash-loop. We use the SAME presence oracle (SeedKeyFilePresent / stat)
-    // the node already trusts, then read errno from the actual open() attempt.
-    // Read the whole file up front so v2 length/format checks are robust against
-    // truncation, and so we never leave a half-read secret in memory on error.
+    // LP-13 (round-2 fold + extreview round-2, transient-vs-permanent):
+    // classify open failures from the open() errno itself, NOT from a separate
+    // prior stat. The previous shape stat()ed (SeedKeyFilePresent) and THEN
+    // open()ed — a TOCTOU window where the file could be removed/created between
+    // the two syscalls. Here the SINGLE open() attempt is the authority: its
+    // errno classifies the result, and the stat-based presence oracle is only a
+    // FAIL-CLOSED secondary (covers the case where the platform left errno
+    // unset / 0 on a failed ifstream open). Read the whole file up front so v2
+    // length/format checks are robust against truncation, and so we never leave
+    // a half-read secret in memory on error.
+    //
+    // Classification:
+    //   ENOENT (file genuinely absent) => MISSING (permanent; the SM-5 loud-fatal
+    //     case on a configured seed).
+    //   A transient/contended errno (EAGAIN/EWOULDBLOCK/ENOSPC/EDQUOT/EBUSY,
+    //     and Windows ERROR_SHARING_VIOLATION) => TRANSIENT: a momentary fault a
+    //     retry/reboot may clear, so the node warns-and-continues rather than
+    //     entering the wrapper's crash-loop. Other non-ENOENT errors on a
+    //     present file (EACCES/EIO/EMFILE/…) are also treated as TRANSIENT here
+    //     (the file IS present, so re-reading it later may succeed; we never
+    //     destroy a present key over an ambiguous read error).
     errno = 0;
     std::ifstream file(path, std::ios::binary);
     if (!file.is_open()) {
         int openErrno = errno;
-        // SeedKeyFilePresent fails CLOSED (reports present on an indeterminate
-        // stat), so "not present" here means a clean ENOENT-class absence.
-        bool present = SeedKeyFilePresent(dataDir);
-        if (!present || openErrno == ENOENT) {
+        // PRIMARY signal: the open() errno. ENOENT => the file is genuinely
+        // absent => MISSING. SeedKeyFilePresent fails CLOSED (reports present on
+        // an indeterminate stat), so its "not present" verdict is a fail-closed
+        // SECONDARY confirmation of absence for the case the platform left
+        // errno == 0 on a failed open.
+        if (openErrno == ENOENT) {
             return SeedKeyLoadStatus::MISSING;
         }
-        // Present but unopenable for a non-ENOENT reason => transient/permission.
-        std::cerr << "[Attestation] WARNING: seed key file present at " << path
-                  << " but could not be opened (errno " << openErrno
-                  << "); treating as a TRANSIENT read error." << std::endl;
+        if (openErrno == 0 && !SeedKeyFilePresent(dataDir)) {
+            // Failed open with no errno AND the file cannot be statted as
+            // present => clean absence => MISSING (fail-closed secondary).
+            return SeedKeyLoadStatus::MISSING;
+        }
+        // Present (or indeterminate) but unopenable for a non-ENOENT reason.
+        // The file is NOT proven absent, so this is a TRANSIENT read fault — we
+        // warn-and-continue and NEVER overwrite/mint over a present key.
+        std::cerr << "[Attestation] WARNING: seed key file at " << path
+                  << " could not be opened (errno " << openErrno
+                  << "); treating as a TRANSIENT read error (present key not "
+                     "proven absent)." << std::endl;
         return SeedKeyLoadStatus::TRANSIENT;
     }
     std::vector<uint8_t> buf((std::istreambuf_iterator<char>(file)),
