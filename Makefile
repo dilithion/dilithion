@@ -300,6 +300,7 @@ RPC_SOURCES := src/rpc/server.cpp \
                src/rpc/host_validator.cpp
 
 API_SOURCES := src/api/http_server.cpp \
+               src/api/http_path_gate.cpp \
                src/api/cached_stats.cpp
 
 X402_SOURCES := src/x402/x402_types.cpp \
@@ -526,7 +527,7 @@ rpc_host_header_tests: $(OBJ_DIR)/rpc/host_validator.o $(OBJ_DIR)/test/rpc_host_
 # LP-12: CHttpServer wallet-HTML serving-gate unit tests. Self-contained — links
 # ONLY host_validator.o (the IsLoopbackIP SSoT predicate), so it builds and runs
 # WITHOUT the node's depends/ (libzmq/randomx/chiavdf). No CORE_OBJECTS dependency.
-http_server_wallet_gate_tests: $(OBJ_DIR)/rpc/host_validator.o $(OBJ_DIR)/test/http_server_wallet_gate_tests.o
+http_server_wallet_gate_tests: $(OBJ_DIR)/rpc/host_validator.o $(OBJ_DIR)/api/http_path_gate.o $(OBJ_DIR)/test/http_server_wallet_gate_tests.o
 	@echo "$(COLOR_BLUE)[LINK]$(COLOR_RESET) $@"
 	@$(CXX) $(CXXFLAGS) -o $@ $^
 
@@ -765,7 +766,31 @@ auto_rebuild_marker_mode_symmetry_tests: $(CORE_OBJECTS) $(OBJ_DIR)/test/auto_re
 # block in [highest_checkpoint+1 .. tip] has a present, SHA3-checksummed undo
 # record. Detects the missing/corrupt undo-data corruption mode that crash-looped
 # NYC + LDN on 2026-04-25. See src/test/chainstate_integrity_tests.cpp.
-chainstate_integrity_tests: $(CORE_OBJECTS) $(OBJ_DIR)/test/chainstate_integrity_tests.o $(DILITHIUM_OBJECTS) $(CHIAVDF_OBJECTS)
+# extreview PR #120 (HIGH): the undo-fetch fault injector must NOT exist in any
+# shipped binary. It is guarded by DILITHION_ENABLE_FAULT_INJECTION, defined ONLY
+# for this private test recompile of utxo_set.cpp. The production CORE utxo_set.o
+# (linked by dilithion-node / dilv-node) is built WITHOUT the macro, so the
+# injectable seam is compiled out entirely. We substitute the fault-injection
+# object for the CORE one in this test's link line so there is exactly one
+# utxo_set definition (no duplicate-symbol clash).
+INTEGRITY_TEST_FAULT_OBJ := $(OBJ_DIR)/test/utxo_set_faultinject.o
+$(INTEGRITY_TEST_FAULT_OBJ): src/node/utxo_set.cpp | $(OBJ_DIR)/test
+	@echo "$(COLOR_BLUE)[CXX]$(COLOR_RESET)  $< (fault-injection enabled, test-only)"
+	@$(CXX) $(CXXFLAGS) -DDILITHION_ENABLE_FAULT_INJECTION $(INCLUDES) -c $< -o $@
+
+# The test driver references g_undo_fetch_fault_injector, so its own object must
+# also see DILITHION_ENABLE_FAULT_INJECTION. Built via a target-specific recompile
+# (distinct .o name) so it doesn't collide with the generic src/%.o rule.
+INTEGRITY_TEST_DRIVER_OBJ := $(OBJ_DIR)/test/chainstate_integrity_tests_faultinject.o
+$(INTEGRITY_TEST_DRIVER_OBJ): src/test/chainstate_integrity_tests.cpp | $(OBJ_DIR)/test
+	@echo "$(COLOR_BLUE)[CXX]$(COLOR_RESET)  $< (fault-injection enabled, test-only)"
+	@$(CXX) $(CXXFLAGS) -DDILITHION_ENABLE_FAULT_INJECTION $(INCLUDES) -c $< -o $@
+
+CHAINSTATE_INTEGRITY_CORE_OBJECTS := \
+	$(filter-out $(OBJ_DIR)/node/utxo_set.o,$(CORE_OBJECTS)) \
+	$(INTEGRITY_TEST_FAULT_OBJ)
+
+chainstate_integrity_tests: $(CHAINSTATE_INTEGRITY_CORE_OBJECTS) $(INTEGRITY_TEST_DRIVER_OBJ) $(DILITHIUM_OBJECTS) $(CHIAVDF_OBJECTS)
 	@echo "$(COLOR_BLUE)[LINK]$(COLOR_RESET) $@"
 	@$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS) $(LIBS)
 	@echo "$(COLOR_GREEN)✓ chainstate_integrity_tests built successfully$(COLOR_RESET)"
@@ -933,6 +958,7 @@ BOOST_TEST_OBJECTS := $(OBJ_DIR)/test/test_dilithion.o \
 	$(OBJ_DIR)/test/fee_persist_tests.o \
 	$(OBJ_DIR)/test/fee_wiring_tests.o \
 	$(OBJ_DIR)/test/zmq_tests.o \
+	$(OBJ_DIR)/test/seed_attestation_glue_tests.o \
 	$(CRYPTO_PROPERTY_OBJECTS)
 
 # Link test objects + full library (CORE_OBJECTS) to avoid hand-picked object drift

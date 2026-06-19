@@ -13,6 +13,7 @@
 
 class CChainState;
 class CUTXOSet;
+struct UndoIntegrityFailure;
 
 namespace Dilithion {
 
@@ -53,6 +54,38 @@ public:
     // Hardcoded operational constants (resolved decision (g)).
     static constexpr int kWindowBlocks = 500;
     static constexpr std::chrono::hours kCycleInterval{6};
+
+    // Self-heal / anti-false-positive (fix/integrity-monitor-self-heal).
+    // A first failed walk is re-verified up to kRevalidateAttempts-1 more times
+    // with backoff before the node is allowed to act. A transient storage-layer
+    // fault (flaky disk / fsync lag / AV file lock) clears across retries; only
+    // a reproducible, data-level failure on a still-active-chain block survives
+    // all attempts AND the cs_main revalidation gate, and only THAT writes the
+    // auto_rebuild marker + shuts down. A failure that is still transient-class
+    // after all retries is logged loudly + tolerated (node keeps running).
+    static constexpr int kRevalidateAttempts = 3;
+    static constexpr std::chrono::seconds kRevalidateBackoff{30};
+
+    // Persistent-IsIOError escalation (extreview PR #120 B1 — Will's decision).
+    // A persistent storage IsIOError (a dying disk, a stuck file lock) survives
+    // the intra-cycle retry loop above and is TOLERATED every cycle — we never
+    // brick or auto-rebuild on a hardware fault (an auto-rebuild can't fix a
+    // failing disk). But silent per-cycle warnings can scroll past an operator
+    // forever. So we count CONSECUTIVE cycles that end in a persistent
+    // transient-class fault; once the count reaches kEscalateAfterCycles we
+    // promote the per-cycle warning to a sustained ERROR and raise an
+    // operator/RPC-observable degraded-health flag (IsIntegrityHealthDegraded()).
+    // The counter resets to zero the moment any cycle comes back healthy.
+    //
+    // N = 4 at the 6h cycle cadence ≈ 24h of *uninterrupted* reproducible
+    // IsIOError before escalation. A genuinely transient blip clears inside a
+    // single cycle's 3-attempt retry loop, so it never even increments this
+    // counter; reaching 4 consecutive whole-cycle persistent faults means the
+    // fault has reproduced across ~24h and ~12 underlying read attempts — well
+    // past any plausible momentary disk/AV hiccup, yet still surfaced within a
+    // day rather than buried in scrollback. Tolerate forever, but make a
+    // sustained hardware fault impossible to miss.
+    static constexpr int kEscalateAfterCycles = 4;
 
     /**
      * @param chainstate     Shared chainstate; the monitor calls
@@ -100,21 +133,77 @@ public:
     /// Test hook: true iff the worker thread is alive.
     bool IsRunningForTesting() const { return m_worker.joinable(); }
 
+    /**
+     * Operator/RPC-observable health signal (extreview PR #120 B1).
+     *
+     * Returns true once the monitor has tolerated kEscalateAfterCycles
+     * CONSECUTIVE cycles of a persistent transient-class (IsIOError) read fault
+     * — i.e. a sustained storage-layer problem (a failing disk, a stuck file
+     * lock) that is NOT chainstate corruption and will NOT trigger an
+     * auto-rebuild. The node keeps running; this flag lets an operator (or an
+     * RPC such as getblockchaininfo) observe that the chainstate-integrity
+     * monitor is in a degraded, attention-required state. Cleared automatically
+     * the next time a cycle completes healthy.
+     *
+     * Static (process-wide, the monitor is a singleton) so it is reachable from
+     * the RPC layer without threading a monitor handle through. Lock-free atomic.
+     */
+    static bool IsIntegrityHealthDegraded() {
+        return s_health_degraded.load(std::memory_order_seq_cst);
+    }
+
+    /// Test-only: read the current consecutive-persistent-transient cycle count.
+    int GetConsecutiveTransientCyclesForTesting() const {
+        return m_consecutive_transient_cycles;
+    }
+
+    /// Test-only: override the inter-retry backoff so retry-loop tests don't
+    /// stall for kRevalidateBackoff * (kRevalidateAttempts-1). Production never
+    /// calls this; the worker uses kRevalidateBackoff.
+    void SetRevalidateBackoffForTesting(std::chrono::milliseconds backoff) {
+        m_revalidate_backoff = backoff;
+    }
+
 private:
     void WorkerLoop();
     bool ExecuteSingleCycle();
+
+    /// Run one snapshot→walk attempt. Returns true on a clean/healthy walk;
+    /// false on failure (populating failure_out) or shutdown abort. Shared by
+    /// the retry loop inside ExecuteSingleCycle.
+    bool RunSingleWalk(UndoIntegrityFailure& failure_out);
+
+    /// Interruptible sleep used between retries. Returns immediately (false) if
+    /// stop was requested during the wait; true if the full duration elapsed.
+    bool InterruptibleWait(std::chrono::milliseconds dur);
+
+    /// Reset persistent-transient escalation state after a genuinely-healthy
+    /// cycle (clean walk or orphan-skip): zero the consecutive-cycle counter and
+    /// clear the observable degraded-health flag.
+    void MarkCycleHealthy();
 
     CChainState& m_chainstate;
     CUTXOSet& m_utxo_set;
     std::string m_datadir;
     std::atomic<bool>* m_running_flag;  // External; not owned. nullable for tests.
+    std::chrono::milliseconds m_revalidate_backoff{
+        std::chrono::duration_cast<std::chrono::milliseconds>(kRevalidateBackoff)};
 
     std::thread m_worker;
     std::mutex m_cv_mutex;
     std::condition_variable m_cv;
     std::atomic<bool> m_stop_requested{false};
 
+    // Count of CONSECUTIVE cycles ending in a persistent transient-class fault.
+    // Only ExecuteSingleCycle (the worker thread, or RunOneCycleForTesting on a
+    // single thread) touches it, so a plain int suffices — no cross-thread races.
+    int m_consecutive_transient_cycles{0};
+
     static std::atomic<bool> s_instance_alive;
+    // Process-wide degraded-health flag (extreview PR #120 B1). Set when the
+    // consecutive-persistent-transient count reaches kEscalateAfterCycles;
+    // cleared when a cycle completes healthy. Read by IsIntegrityHealthDegraded().
+    static std::atomic<bool> s_health_degraded;
 };
 
 }  // namespace Dilithion

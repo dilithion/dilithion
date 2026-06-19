@@ -21,6 +21,7 @@
 #include <node/mempool.h>
 #include <node/blockchain_storage.h>
 #include <node/utxo_set.h>
+#include <node/chainstate_integrity_monitor.h>  // extreview PR #120 B1: integrity_health field
 #include <x402/facilitator.h>  // x402 payment facilitator
 #include <consensus/params.h>
 #include <consensus/chain.h>
@@ -3728,7 +3729,17 @@ std::string CRPCServer::RPC_GetBlockchainInfo(const std::string& params) {
     oss << "\"bestblockhash\":\"" << bestBlockHash.GetHex() << "\",";
     oss << "\"difficulty\":" << std::fixed << std::setprecision(8) << difficulty << ",";
     oss << "\"mediantime\":" << mediantime << ",";
-    oss << "\"chainwork\":\"" << m_chainstate->GetChainWork().GetHex() << "\"";
+    oss << "\"chainwork\":\"" << m_chainstate->GetChainWork().GetHex() << "\",";
+    // extreview PR #120 B1: operator-observable chainstate-integrity health.
+    // "degraded" once a persistent storage IsIOError has been tolerated across
+    // kEscalateAfterCycles consecutive monitor cycles (a sustained disk/file-lock
+    // fault that the node keeps limping through and will NOT auto-rebuild).
+    // "ok" otherwise. Lets operators / monitoring poll for a silent hardware
+    // fault without scraping stderr.
+    oss << "\"integrity_health\":\""
+        << (Dilithion::ChainstateIntegrityMonitor::IsIntegrityHealthDegraded()
+                ? "degraded" : "ok")
+        << "\"";
     oss << "}";
     return oss.str();
 }
@@ -4339,6 +4350,11 @@ std::string CRPCServer::RPC_GetWalletInfo(const std::string& params) {
     // plaintext on disk (pre-fix bug) and has not yet been migrated. While true the
     // wallet must NOT be presented as safely-encrypted.
     bool needsSeedMigration = m_wallet->NeedsSeedMigration();
+    // LP-7 (F1 round 3): DISTINCT observable for the BIP39-passphrase deferred state —
+    // the wallet IS fully encrypted and its recovery phrase is PRESERVED, but mnemonic
+    // migration is pending the user supplying the BIP39 passphrase. UI should prompt for
+    // it (walletpassphrase bip39passphrase) rather than treating the wallet as corrupt.
+    bool migrationDeferredPassphrase = m_wallet->MigrationDeferredForPassphrase();
 
     std::ostringstream oss;
     oss << "{"
@@ -4346,7 +4362,11 @@ std::string CRPCServer::RPC_GetWalletInfo(const std::string& params) {
         << "\"locked\":" << (isLocked ? "true" : "false") << ","
         << "\"unlocked_until\":" << (isLocked ? 0 : 1) << ","  // 0 if locked, 1 if unlocked
         << "\"needs_seed_migration\":" << (needsSeedMigration ? "true" : "false") << ","
-        << "\"seed_unencrypted_at_rest\":" << (needsSeedMigration ? "true" : "false")
+        // LP-7 (F1 round 4, red-team MEDIUM-1): in the BIP39-passphrase deferred state the
+        // seed IS encrypted at rest (only the mnemonic migration is pending the passphrase),
+        // so it must NOT trip the plaintext-seed-leak signal. Gate on !migrationDeferred.
+        << "\"seed_unencrypted_at_rest\":" << ((needsSeedMigration && !migrationDeferredPassphrase) ? "true" : "false") << ","
+        << "\"migration_deferred_bip39_passphrase\":" << (migrationDeferredPassphrase ? "true" : "false")
         << "}";
 
     return oss.str();
@@ -4369,6 +4389,20 @@ std::string CRPCServer::RPC_EncryptWallet(const std::string& params) {
         throw std::runtime_error("Error: Passphrase cannot be empty");
     }
 
+    // LP-7 (F1 round 3): OPTIONAL BIP39 passphrase (DISTINCT from the AES wallet
+    // `passphrase` above). A wallet created with GenerateHDWallet(mnemonic, <bip39pp>)
+    // can supply it here so EncryptWallet can positively verify + migrate the mnemonic
+    // at encrypt time. If omitted/wrong, encryption STILL SUCCEEDS — the mnemonic
+    // migration just defers (preserving the original phrase) and can be completed later
+    // by re-running walletpassphrase with the bip39passphrase. Length-capped to bound
+    // PBKDF2 work (same bound as the wallet passphrase).
+    std::string bip39passphrase = RPCUtil::GetOptionalString(j, "bip39passphrase", "");
+    static const size_t MAX_BIP39_PASSPHRASE_LENGTH = 1024;
+    if (bip39passphrase.length() > MAX_BIP39_PASSPHRASE_LENGTH) {
+        throw std::runtime_error("bip39passphrase too long (max " +
+                                 std::to_string(MAX_BIP39_PASSPHRASE_LENGTH) + " characters)");
+    }
+
     // Validate passphrase strength before attempting encryption
     PassphraseValidator validator;
     PassphraseValidationResult validation = validator.Validate(passphrase);
@@ -4379,10 +4413,23 @@ std::string CRPCServer::RPC_EncryptWallet(const std::string& params) {
         throw std::runtime_error(error_msg);
     }
 
-    // Attempt to encrypt wallet
-    if (!m_wallet->EncryptWallet(passphrase)) {
+    // Attempt to encrypt wallet. EncryptWallet is now never-fail for the mnemonic
+    // identity check: a false return here is a genuine encryption failure (rolled back),
+    // NOT a deferred mnemonic migration.
+    if (!m_wallet->EncryptWallet(passphrase, bip39passphrase)) {
+        // LP-7 (F1 round 4, red-team LOW-1): wipe secret-bearing RPC-local strings before
+        // leaving scope so they don't linger on the heap (the BIP39 passphrase protects the
+        // seed; the AES passphrase protects the wallet). Done on the error path too.
+        memory_cleanse(&passphrase[0], passphrase.size());
+        memory_cleanse(&bip39passphrase[0], bip39passphrase.size());
         throw std::runtime_error("Error: Failed to encrypt wallet");
     }
+
+    // LP-7 (F1 round 4, red-team LOW-1): wipe the secret-bearing strings now that the
+    // wallet has consumed them; the std::string destructors free the buffer but do not
+    // scrub it, so memory_cleanse first.
+    memory_cleanse(&passphrase[0], passphrase.size());
+    memory_cleanse(&bip39passphrase[0], bip39passphrase.size());
 
     // Return success message with strength info
     std::ostringstream oss;
@@ -4390,6 +4437,14 @@ std::string CRPCServer::RPC_EncryptWallet(const std::string& params) {
         << PassphraseValidator::GetStrengthDescription(validation.strength_score)
         << " (" << validation.strength_score << "/100). "
         << "Please backup your wallet and remember your passphrase!";
+
+    // LP-7 (F1 round 3): surface the deferred-passphrase state so a BIP39-passphrase
+    // wallet user is told the backup phrase is preserved but migration is pending.
+    if (m_wallet->MigrationDeferredForPassphrase()) {
+        oss << " NOTE: this wallet uses a BIP39 passphrase; its recovery phrase was "
+               "PRESERVED but seed migration is DEFERRED. Run walletpassphrase with the "
+               "correct \"bip39passphrase\" to complete migration. (This is not corruption.)";
+    }
 
     return "\"" + oss.str() + "\"";
 }
@@ -4421,12 +4476,36 @@ std::string CRPCServer::RPC_WalletPassphrase(const std::string& params) {
     // now 1 second; max remains 24 hours.
     int64_t timeout = RPCUtil::GetOptionalInt64(j, "timeout", 60, 1, 86400);
 
-    if (!m_wallet->Unlock(passphrase, timeout)) {
+    // LP-7 (F1 round 3): OPTIONAL BIP39 passphrase (DISTINCT from the AES wallet
+    // `passphrase`). Threaded only into the deferred v7 seed migration so a
+    // BIP39-passphrase wallet can COMPLETE its migration on unlock. Omitting it leaves
+    // the unlock + empty-passphrase migration unchanged. Length-capped like the wallet
+    // passphrase to bound PBKDF2 work.
+    std::string bip39passphrase = RPCUtil::GetOptionalString(j, "bip39passphrase", "");
+    if (bip39passphrase.length() > MAX_PASSPHRASE_LENGTH) {
+        throw std::runtime_error("bip39passphrase too long (max " +
+                                 std::to_string(MAX_PASSPHRASE_LENGTH) + " characters)");
+    }
+
+    bool unlocked = m_wallet->Unlock(passphrase, timeout, bip39passphrase);
+    // LP-7 (F1 round 4, red-team LOW-1): wipe secret-bearing RPC-local strings on BOTH
+    // paths now that Unlock has consumed them (the BIP39 passphrase protects the seed).
+    memory_cleanse(&passphrase[0], passphrase.size());
+    memory_cleanse(&bip39passphrase[0], bip39passphrase.size());
+    if (!unlocked) {
         throw std::runtime_error("Error: The wallet passphrase entered was incorrect");
     }
 
     std::ostringstream oss;
-    oss << "\"Wallet unlocked for " << timeout << " seconds\"";
+    oss << "\"Wallet unlocked for " << timeout << " seconds";
+    // LP-7 (F1 round 3): if a BIP39-passphrase migration is still deferred after this
+    // unlock, tell the operator the phrase is preserved and how to complete migration.
+    if (m_wallet->MigrationDeferredForPassphrase()) {
+        oss << " | NOTE: BIP39-passphrase seed migration is still DEFERRED "
+               "(recovery phrase preserved). Re-run walletpassphrase with the correct "
+               "\\\"bip39passphrase\\\" to complete it.";
+    }
+    oss << "\"";
     return oss.str();
 }
 
@@ -9182,8 +9261,30 @@ std::string CRPCServer::RPC_ListSwaps(const std::string& params) {
 // ============================================================================
 
 std::string CRPCServer::RPC_GetMIKAttestation(const std::string& params) {
-    // This RPC is only available on seed nodes with attestation key loaded
+    // This RPC is only available on seed nodes with attestation key loaded.
     if (!m_seedAttestationKey || m_seedId < 0) {
+        // H-3 (consolidated): distinguish a DEGRADED seed (valid identity, but the
+        // ASN DB failed to load so attestation was never registered) from a plain
+        // non-seed. A degraded seed returns a DISTINCT, diagnosable error string
+        // so the operator can see the ASN-DB cause instead of the generic
+        // "only available on seed nodes" (which would hide the degraded state).
+        if (m_seedAttestationAsnDegraded) {
+            // Fix 2: surface the resolved seed_id (m_seedAttestationDegradedSeedId,
+            // previously written-but-never-read) so the degraded state is fully
+            // diagnosable. Fix 1: distinct string per degraded reason.
+            std::string seedIdStr = std::to_string(m_seedAttestationDegradedSeedId);
+            if (m_seedAttestationDegradedReason == SeedDegradedReason::NO_DATACENTER_LIST) {
+                throw std::runtime_error(
+                    "attestation unavailable: datacenter ASN list not loaded on a "
+                    "datacenter-ban chain (seed_id=" + seedIdStr + " running degraded "
+                    "for relay only; restore datacenter-asns.txt and restart)");
+            }
+            // Default / NO_ASN: ip2asn-v4.tsv missing -> zero attestation capacity.
+            throw std::runtime_error(
+                "attestation unavailable: ASN database not loaded "
+                "(seed_id=" + seedIdStr + " running degraded for relay only; "
+                "fix ip2asn-v4.tsv and restart)");
+        }
         throw std::runtime_error("getmikattestation is only available on seed nodes");
     }
 

@@ -7,6 +7,7 @@
 #include <wallet/crypter.h>  // For memory_cleanse() + CCrypter/DeriveKey (LP-13 encrypt-at-rest)
 
 #include <algorithm>
+#include <cctype>  // Finding C: std::tolower for IPv6 case canonicalization
 #include <cerrno>
 #include <cstdlib>
 #include <cstring>
@@ -110,6 +111,165 @@ bool SeedKeyFilePresent(const std::string& dataDir) {
     // present) so an unstattable-but-genuine key still drives fail-loud startup.
     if (ec) return true;
     return present;
+}
+
+// ============================================================================
+// LP-13 M-1/M-2 SEED-IDENTITY RESOLUTION (HIGH-1 / HIGH-2 fold)
+// ============================================================================
+
+// Finding C (extreview PR#121): lowercase an IPv6 literal so case-variant input
+// (e.g. "2001:DB8::1") canonicalizes to the configured form. Hex digits and the
+// ':' separator are the only characters in a textual IPv6 literal; lowercasing
+// is safe and idempotent. The configured seed set is IPv4-only today, so this is
+// forward-compat for when an IPv6 seed is added — it never affects IPv4 matching.
+static std::string LowercaseIPv6(std::string s) {
+    std::transform(s.begin(), s.end(), s.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    return s;
+}
+
+std::string NormalizeExternalIpForSeedMatch(const std::string& externalIp) {
+    // 1) Trim surrounding whitespace (HIGH-2: quoting/templating artifacts).
+    //    Finding C: also collapse/strip any INTERIOR whitespace — a textual IP
+    //    literal (v4 or v6) never legitimately contains spaces/tabs, so removing
+    //    them lets "138.197. 68.128" or "[ 2001:db8::1 ]" style artifacts resolve
+    //    rather than silently SKIP. (Trailing-dot and case are handled below.)
+    size_t b = externalIp.find_first_not_of(" \t\r\n");
+    if (b == std::string::npos) return std::string();
+    size_t e = externalIp.find_last_not_of(" \t\r\n");
+    std::string s = externalIp.substr(b, e - b + 1);
+    s.erase(std::remove_if(s.begin(), s.end(),
+                           [](unsigned char c) { return c == ' ' || c == '\t' ||
+                                                        c == '\r' || c == '\n'; }),
+            s.end());
+    if (s.empty()) return std::string();
+
+    // 2) IPv6 handling — do NOT strip on a raw IPv6 literal (it contains
+    //    colons legitimately). Bracketed form "[addr]" or "[addr]:port" keeps
+    //    the address inside the brackets; a bare value with >1 colon is treated
+    //    as IPv6 and returned trimmed-only. The configured seed set is IPv4-only,
+    //    so an IPv6 externalip simply fails to match -> SKIP_NOT_A_SEED, never a
+    //    false FATAL. Finding C: lowercase the IPv6 result for case-insensitive
+    //    match (IPv6 hex digits are case-insensitive per RFC 5952).
+    if (!s.empty() && s.front() == '[') {
+        size_t rb = s.find(']');
+        if (rb != std::string::npos) {
+            return LowercaseIPv6(s.substr(1, rb - 1));  // inside brackets, drop any ":port"
+        }
+        return LowercaseIPv6(s);  // malformed; leave as-is (won't match IPv4 set)
+    }
+    if (std::count(s.begin(), s.end(), ':') > 1) {
+        return LowercaseIPv6(s);  // bare IPv6 literal; lowercased, no port strip
+    }
+
+    // 3) IPv4 / hostname: strip a single trailing ":port" suffix
+    //    (HIGH-2: --externalip=138.197.68.128:8444 must resolve).
+    size_t colon = s.find(':');
+    if (colon != std::string::npos) {
+        s = s.substr(0, colon);
+    }
+    // Finding C: strip a single trailing dot (a fully-qualified DNS name like
+    // "seed.example.com." or a dotted-quad written "138.197.68.128." is valid but
+    // would not string-equal the configured form). One trailing dot only.
+    if (!s.empty() && s.back() == '.') {
+        s.pop_back();
+    }
+    return s;
+}
+
+SeedIdentityResult ResolveSeedIdentity(
+    const std::vector<std::string>& seedIPs,
+    const std::vector<std::vector<uint8_t>>& seedPubkeys,
+    const std::string& externalIp,
+    const std::vector<uint8_t>& loadedPubkey,
+    bool asnLoaded,
+    bool datacenterBanChain,
+    bool datacenterListLoaded) {
+    SeedIdentityResult r;
+
+    // Final disposition for a would-be REGISTER (valid identity). Folds the
+    // availability dependencies LAST and in the documented order: a down ASN DB
+    // degrades first (DEGRADED_NO_ASN — no attestation capacity at all), then a
+    // ban-chain-with-empty-datacenter-list degrades
+    // (DEGRADED_NO_DATACENTER_LIST — IsDatacenterIP() would fail open and let
+    // datacenter miners through the Sybil ban). On a non-ban chain (DIL) the
+    // datacenter condition is inert, so the result is REGISTER unchanged. Each can
+    // only SOFTEN a REGISTER; this helper is only ever reached after
+    // FATAL_MISMATCH / SKIP_NOT_A_SEED have already been ruled out.
+    auto registerOrDegrade = [&]() -> SeedIdentityDecision {
+        if (!asnLoaded) return SeedIdentityDecision::DEGRADED_NO_ASN;
+        if (datacenterBanChain && !datacenterListLoaded)
+            return SeedIdentityDecision::DEGRADED_NO_DATACENTER_LIST;
+        return SeedIdentityDecision::REGISTER;
+    };
+
+    // Resolve seedId by matching our normalized --externalip against the known
+    // seed IPs. seedAttestationIPs[i] and seedAttestationPubkeys[i] are
+    // index-aligned (same NYC/London/Singapore/Sydney order), so the resolved
+    // index is also the index into the consensus pubkey set.
+    int seedId = -1;
+    if (!externalIp.empty()) {
+        std::string normIp = NormalizeExternalIpForSeedMatch(externalIp);
+        if (!normIp.empty()) {
+            for (size_t i = 0; i < seedIPs.size(); i++) {
+                if (seedIPs[i] == normIp) {
+                    seedId = static_cast<int>(i);
+                    break;
+                }
+            }
+        }
+    }
+
+    if (seedPubkeys.empty()) {
+        // Testnet: no consensus pubkey to enforce. Preserve the prior lenient
+        // behavior — register under the resolved index, or default 0 with a
+        // WARN when unresolved.
+        if (seedId < 0) {
+            r.seedId = 0;
+            r.usedTestnetDefault = true;
+        } else {
+            r.seedId = seedId;
+        }
+        // H-3 + Fix 1: a valid (testnet) identity that would register degrades if
+        // the ASN DB is down, or (on a ban chain) if the datacenter list is empty.
+        // Otherwise REGISTER. (Testnet typically runs DIL-shaped non-ban params, so
+        // the datacenter condition is normally inert here.)
+        r.decision = registerOrDegrade();
+        return r;
+    }
+
+    // Mainnet (configured seed set present).
+    if (seedId < 0) {
+        // HIGH-1 fix: externalip matches no configured seed slot. This node is
+        // NOT one of the seeds (even if a key file is on disk). Skip
+        // registration rather than abort: consensus rejects a non-seed's
+        // attestations anyway, so aborting is a pure availability regression
+        // with zero security gain. This still fixes the original M-2 bug — a
+        // non-seed never silently registers under wrong-index-0.
+        r.decision = SeedIdentityDecision::SKIP_NOT_A_SEED;
+        r.seedId = -1;
+        return r;
+    }
+
+    // seedId resolved to a real seed slot: the key MUST match that slot's
+    // consensus pubkey (M-1). A mismatch (or out-of-range index) is a genuine
+    // misconfig — fail loud.
+    if (static_cast<size_t>(seedId) >= seedPubkeys.size() ||
+        loadedPubkey != seedPubkeys[seedId]) {
+        r.decision = SeedIdentityDecision::FATAL_MISMATCH;
+        r.seedId = seedId;
+        return r;
+    }
+
+    // Identity is valid for this seed slot. H-3 + Fix 1: fold the availability
+    // dependencies in LAST — a valid identity with the ASN DB down, or (on a ban
+    // chain) with an empty datacenter list, DEGRADES (stay online, don't register,
+    // loud + diagnosable) rather than registering. A trust failure (FATAL_MISMATCH
+    // above) is never reached here, so these can only ever soften a would-be
+    // REGISTER, never a FATAL.
+    r.seedId = seedId;
+    r.decision = registerOrDegrade();
+    return r;
 }
 
 // LP-13 H-2 atomic-save test seam (see header). nullptr in production.

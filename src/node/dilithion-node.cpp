@@ -7058,6 +7058,17 @@ load_genesis_block:  // Bug #29: Label for automatic retry after blockchain wipe
             }
 
             if (asnDatabase.IsLoaded()) {
+                // Finding B + Fix 1 (extreview PR#121): the datacenter ASN list is a
+                // SEPARATE defense from attestation capacity — it powers the
+                // datacenter-IP Sybil ban via IsDatacenterIP(). An EMPTY datacenter
+                // set makes IsDatacenterIP() fail OPEN (always false). On a
+                // datacenter-ban chain a seed would then sign attestations for
+                // datacenter miners it must reject; the gate folded into
+                // ResolveSeedIdentity below DEGRADES that case instead. DIL is a
+                // NON-ban chain (attestationDatacenterBan==false), so the datacenter
+                // list is not a consensus input here and a missing list is inert —
+                // the gate never demotes a DIL seed. We load the list (no-op effect
+                // on DIL) and let ResolveSeedIdentity decide.
                 std::string dcPath = dataDir + "/datacenter-asns.txt";
                 if (!asnDatabase.LoadDatacenterList(dcPath)) {
                     asnDatabase.LoadDatacenterList("datacenter-asns.txt");
@@ -7103,25 +7114,114 @@ load_genesis_block:  // Bug #29: Label for automatic retry after blockchain wipe
                 std::cerr << "[Attestation] No seed attestation key and minting not requested; "
                              "this relay will not serve attestations." << std::endl;
             } else {
-                int seedId = -1;
+                // M-1/M-2 (seed key-identity validation, fail-LOUD) + HIGH-1/HIGH-2
+                // fold. Resolve our --externalip to a seed_id and decide the
+                // disposition. seedAttestationIPs[i] and seedAttestationPubkeys[i]
+                // are index-aligned (NYC/London/Singapore/Sydney), so a resolved
+                // index is also the index into the consensus pubkey set. The
+                // resolve+validate decision is a pure, unit-tested helper
+                // (ResolveSeedIdentity) so the FATAL/SKIP/REGISTER glue is covered
+                // by tests, not only the pubkey-equality primitive.
                 const auto& seedIPs = Dilithion::g_chainParams->seedAttestationIPs;
-                if (!config.external_ip.empty()) {
-                    for (size_t i = 0; i < seedIPs.size(); i++) {
-                        if (seedIPs[i] == config.external_ip) {
-                            seedId = static_cast<int>(i);
-                            break;
+                const auto& seedPubkeys = Dilithion::g_chainParams->seedAttestationPubkeys;
+                // Fix 1: pass the datacenter-ban chain flag and whether the
+                // datacenter ASN list actually loaded. On DIL (non-ban) the flag is
+                // false, so this is inert and a DIL seed REGISTERs on identity match
+                // exactly as before.
+                Attestation::SeedIdentityResult ident = Attestation::ResolveSeedIdentity(
+                    seedIPs, seedPubkeys, config.external_ip, seedAttestKey.GetPubKey(),
+                    asnDatabase.IsLoaded(),
+                    Dilithion::g_chainParams->attestationDatacenterBan,
+                    asnDatabase.DatacenterASNCount() > 0);
+
+                bool registerSeed = false;
+                switch (ident.decision) {
+                    case Attestation::SeedIdentityDecision::FATAL_MISMATCH:
+                        // Genuine misconfig: externalip resolved to a real seed slot
+                        // but the loaded/minted key's pubkey does NOT match
+                        // seedAttestationPubkeys[seed_id]. This key cannot produce
+                        // attestations consensus accepts for this seed_id. Fail loud.
+                        std::cerr << "[Attestation] FATAL: loaded/minted seed key pubkey does NOT "
+                                     "match seedAttestationPubkeys[" << ident.seedId << "] for the "
+                                     "resolved seed_id. This key cannot produce attestations consensus "
+                                     "accepts for this seed_id (wrong key file, wrong seed_id, or a "
+                                     "minted key not registered in chainparams). Aborting startup."
+                                  << std::endl;
+                        return 1;
+                    case Attestation::SeedIdentityDecision::SKIP_NOT_A_SEED:
+                        // HIGH-1 fix: a configured seed set is present but this node's
+                        // --externalip matches no configured seed slot. This node is
+                        // NOT one of the seeds (e.g. a third-party --public-api
+                        // explorer/exchange/former-seed that merely carries a key
+                        // file). Do NOT register and do NOT abort — a non-seed's
+                        // attestations are rejected by consensus anyway, so skipping
+                        // is correct and keeps the node available (zero security loss).
+                        std::cerr << "[Attestation] WARNING: this node's --externalip does not match a "
+                                     "configured seed; not registering as an attestation seed "
+                                     "(continuing to run normally). Set --externalip=<this seed's "
+                                     "configured public IP> only if this node IS one of the seeds."
+                                  << std::endl;
+                        break;
+                    case Attestation::SeedIdentityDecision::DEGRADED_NO_ASN:
+                        // H-3 (consolidated): identity is VALID for this seed, but the
+                        // ASN database failed to load -> zero attestation capacity.
+                        // Do NOT abort (that would take relay/P2P/--public-api offline
+                        // for an attestation-only fault — the rejected over-correction,
+                        // fatal on the known ASN-file-lost-on-rotation incident). Do NOT
+                        // silently skip (the original H-3 bug — a "healthy"-looking seed
+                        // with zero capacity). Instead: log a LOUD persistent ERROR with
+                        // operator guidance, keep the node ONLINE, leave attestation
+                        // UNregistered, and register a degraded marker so
+                        // getmikattestation returns a DISTINCT diagnosable error.
+                        std::cerr << "[Attestation] ERROR: seed identity is valid (seed_id="
+                                  << ident.seedId << ") but the ASN database FAILED to load "
+                                     "(missing/unparseable " << dataDir << "/ip2asn-v4.tsv or "
+                                     "./ip2asn-v4.tsv). Attestation is DISABLED — this seed has zero "
+                                     "attestation capacity and getmikattestation will report "
+                                     "\"ASN database not loaded\". The node continues to run for "
+                                     "relay/P2P. Fix ip2asn-v4.tsv (e.g. restore after a data-dir "
+                                     "rotation) and restart to restore attestation." << std::endl;
+                        rpc_server.RegisterSeedAttestationDegraded(
+                            ident.seedId, CRPCServer::SeedDegradedReason::NO_ASN);
+                        break;
+                    case Attestation::SeedIdentityDecision::DEGRADED_NO_DATACENTER_LIST:
+                        // Fix 1 (extreview PR#121): valid identity, ASN DB loaded,
+                        // but a datacenter-ban chain with an EMPTY datacenter ASN list
+                        // (IsDatacenterIP would fail OPEN). Mirror DEGRADED_NO_ASN: do
+                        // NOT abort, do NOT register attestation, loud ERROR, distinct
+                        // diagnosable marker. INERT on DIL (non-ban) — this case is
+                        // unreachable there because ResolveSeedIdentity never returns
+                        // it when attestationDatacenterBan==false; present for parity
+                        // with dilv-node so the two glues stay identical.
+                        std::cerr << "[Attestation] ERROR: seed identity is valid (seed_id="
+                                  << ident.seedId << ") and ip2asn loaded, but the datacenter "
+                                     "ASN list is EMPTY on a datacenter-ban chain "
+                                     "(missing/unparseable " << dataDir << "/datacenter-asns.txt "
+                                     "or ./datacenter-asns.txt). IsDatacenterIP() would fail OPEN, "
+                                     "so attestation is DISABLED rather than sign attestations for "
+                                     "datacenter miners that the datacenter Sybil ban must reject. "
+                                     "getmikattestation will report \"datacenter ASN list not "
+                                     "loaded\". The node continues to run for relay/P2P. Restore "
+                                     "datacenter-asns.txt (e.g. after a data-dir rotation) and "
+                                     "restart to restore attestation." << std::endl;
+                        rpc_server.RegisterSeedAttestationDegraded(
+                            ident.seedId, CRPCServer::SeedDegradedReason::NO_DATACENTER_LIST);
+                        break;
+                    case Attestation::SeedIdentityDecision::REGISTER:
+                        if (ident.usedTestnetDefault) {
+                            std::cerr << "[Attestation] WARNING: Could not determine seed ID "
+                                         "(no configured seed set). Defaulting to seed_id=0" << std::endl;
                         }
-                    }
-                }
-                if (seedId < 0) {
-                    seedId = 0;
-                    std::cerr << "[Attestation] WARNING: Could not determine seed ID. "
-                              << "Use --externalip=<IP> to set. Defaulting to seed_id=0" << std::endl;
+                        registerSeed = true;
+                        break;
                 }
 
-                if (asnDatabase.IsLoaded()) {
-                    rpc_server.RegisterSeedAttestation(&seedAttestKey, &asnDatabase, seedId);
-                    std::cout << "  [OK] Seed attestation ready (seed_id=" << seedId
+                // REGISTER already implies asnDatabase.IsLoaded() — the helper folds
+                // the ASN-DB state into the decision, routing a valid identity with a
+                // failed ASN DB to DEGRADED_NO_ASN above. So no extra IsLoaded() guard.
+                if (registerSeed) {
+                    rpc_server.RegisterSeedAttestation(&seedAttestKey, &asnDatabase, ident.seedId);
+                    std::cout << "  [OK] Seed attestation ready (seed_id=" << ident.seedId
                               << ", key=" << seedAttestKey.GetPubKeyHex().substr(0, 16) << "...)"
                               << std::endl;
                 }
