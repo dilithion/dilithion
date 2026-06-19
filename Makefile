@@ -300,6 +300,7 @@ RPC_SOURCES := src/rpc/server.cpp \
                src/rpc/host_validator.cpp
 
 API_SOURCES := src/api/http_server.cpp \
+               src/api/http_path_gate.cpp \
                src/api/cached_stats.cpp
 
 X402_SOURCES := src/x402/x402_types.cpp \
@@ -526,7 +527,7 @@ rpc_host_header_tests: $(OBJ_DIR)/rpc/host_validator.o $(OBJ_DIR)/test/rpc_host_
 # LP-12: CHttpServer wallet-HTML serving-gate unit tests. Self-contained — links
 # ONLY host_validator.o (the IsLoopbackIP SSoT predicate), so it builds and runs
 # WITHOUT the node's depends/ (libzmq/randomx/chiavdf). No CORE_OBJECTS dependency.
-http_server_wallet_gate_tests: $(OBJ_DIR)/rpc/host_validator.o $(OBJ_DIR)/test/http_server_wallet_gate_tests.o
+http_server_wallet_gate_tests: $(OBJ_DIR)/rpc/host_validator.o $(OBJ_DIR)/api/http_path_gate.o $(OBJ_DIR)/test/http_server_wallet_gate_tests.o
 	@echo "$(COLOR_BLUE)[LINK]$(COLOR_RESET) $@"
 	@$(CXX) $(CXXFLAGS) -o $@ $^
 

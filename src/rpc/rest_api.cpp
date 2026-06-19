@@ -61,6 +61,17 @@ std::string CRestAPI::HandleRequest(const std::string& method,
     // Remove /api/v1/ prefix
     std::string subpath = path.substr(8);  // Skip "/api/v1/"
 
+    // Strip any query string. REST endpoints take their argument as a PATH
+    // segment (e.g. /api/v1/balance/{address}), not as a query, so a trailing
+    // `?...` must not bleed into the path param. The standalone CHttpServer now
+    // hands this handler a query-preserving path (to keep x402's /dna-attest
+    // query intact); strip it here so /api/v1/balance/ADDR?foo parses ADDR, not
+    // "ADDR?foo". (The RPC server passes the raw target through too — same fix.)
+    size_t qmark = subpath.find('?');
+    if (qmark != std::string::npos) {
+        subpath = subpath.substr(0, qmark);
+    }
+
     // Find first slash to separate endpoint from parameter
     size_t slash = subpath.find('/');
     if (slash != std::string::npos) {
