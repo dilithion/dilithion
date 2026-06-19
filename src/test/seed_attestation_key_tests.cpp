@@ -3,7 +3,7 @@
 //
 // LP-13: seed-attestation private key at-rest hardening tests.
 //
-// Covers (per contract AC2-AC6, AC9):
+// Covers (per contract AC2-AC6, AC9 + LP-13 hardening CL-1/CL-2):
 //   - v2 encrypt -> decrypt round-trip (private key usable after reload)
 //   - tampered ciphertext rejected (MAC fail)
 //   - truncated file / empty MAC rejected
@@ -11,6 +11,12 @@
 //   - v1 plaintext backward-compat load
 //   - LoadOrGenerate auto-mint REFUSED without the flag, allowed with it
 //   - (POSIX) saved key file is chmod 0600
+//   - CL-1 default-on encryption: Save refuses plaintext without a passphrase
+//     unless allowPlaintext is explicitly set (mutation-kills the inverted gate)
+//   - CL-1 migration: an existing v1 key loads and is re-saved as v2 in place,
+//     the original keypair is preserved (never lost); refused (fail loud) with
+//     no passphrase + no opt-out
+//   - CL-2: no plaintext .bak copy survives a save
 
 #include <attestation/seed_attestation.h>
 #include <dfmp/dfmp.h>
@@ -214,11 +220,11 @@ static void TestTruncatedAndEmptyMac() {
 static void TestV1BackwardCompat() {
     std::cout << "[Test] v1 plaintext backward-compat load (AC5)" << std::endl;
     std::string dir = MakeTempDir();
-    SetPass(nullptr);  // no passphrase => Save writes v1 plaintext
+    SetPass(nullptr);  // no passphrase => Save writes v1 ONLY with allowPlaintext
     CSeedAttestationKey k1;
     k1.Generate();
     std::vector<uint8_t> pub = k1.GetPubKey();
-    CHECK(k1.Save(dir), "save v1 (no passphrase)");
+    CHECK(k1.Save(dir, /*allowPlaintext=*/true), "save v1 (no passphrase, explicit opt-out)");
 
     std::vector<uint8_t> raw = ReadFileBytes(KeyPath(dir));
     CHECK(raw.size() > 5 && raw[4] == 1, "file version byte == 1 (plaintext)");
@@ -242,14 +248,16 @@ static void TestAutoMintGate() {
     std::ifstream chk(KeyPath(dir), std::ios::binary);
     CHECK(!chk.good(), "no key file written when flag absent");
 
+    // No passphrase here, so minting must explicitly opt out of default-on
+    // encryption (allowPlaintext=true) or Save would fail-loud (CL-1).
     CSeedAttestationKey k2;
-    CHECK(k2.LoadOrGenerate(dir, /*allowGenerate=*/true),
+    CHECK(k2.LoadOrGenerate(dir, /*allowGenerate=*/true, /*allowPlaintext=*/true),
           "LoadOrGenerate(true) mints + saves");
     CHECK(k2.IsValid(), "key valid after permitted mint");
 
-    // Second call now LOADS the persisted key even without the flag.
+    // Second call now LOADS the persisted key even without the generate flag.
     CSeedAttestationKey k3;
-    CHECK(k3.LoadOrGenerate(dir, /*allowGenerate=*/false),
+    CHECK(k3.LoadOrGenerate(dir, /*allowGenerate=*/false, /*allowPlaintext=*/true),
           "subsequent LoadOrGenerate(false) loads the existing key");
     CHECK(k3.GetPubKey() == k2.GetPubKey(), "loaded key matches minted key");
 }
@@ -388,8 +396,10 @@ static void TestSaveFailMakesLoadOrGenerateFail() {
     g_seedKeySaveFailpoint = SaveFailpoint;
     g_failpointActive = true;
 
+    // allowPlaintext=true so we reach the save path under no passphrase (the
+    // failpoint then forces the save to fail — that is what this test exercises).
     CSeedAttestationKey k;
-    CHECK(!k.LoadOrGenerate(dir, /*allowGenerate=*/true),
+    CHECK(!k.LoadOrGenerate(dir, /*allowGenerate=*/true, /*allowPlaintext=*/true),
           "LoadOrGenerate returns false when the freshly minted key can't be saved");
     CHECK(!k.IsValid(), "no ephemeral key left valid in memory after save failure");
 
@@ -401,54 +411,152 @@ static void TestSaveFailMakesLoadOrGenerateFail() {
     CHECK(!chk.good(), "no key file persisted after save failure");
 }
 
-// LP-13 H-1: --require-seed-key-encryption refuses plaintext (v1) keys, while the
-// DEFAULT (off) still loads a v1 file unchanged (backward-compatible rolling deploy).
-static void TestRequireEncryptionPolicy() {
-    std::cout << "[Test] H-1: require-encryption refuses plaintext; default-off still loads v1" << std::endl;
-    std::string dir = MakeTempDir();
+// LP-13 CL-1 (DEFAULT-ON ENCRYPTION): the seed key is encrypted at rest BY
+// DEFAULT. With no passphrase Save FAILS LOUD (no plaintext) unless allowPlaintext
+// is explicitly set; with a passphrase Save always writes v2. This is the
+// mutation-killing test for the inverted gate — reverting the gate to write
+// plaintext-by-default makes the "Save(default) refuses ... no plaintext file
+// written" assertions fail.
+static void TestDefaultOnEncryptionGate() {
+    std::cout << "[Test] CL-1: default-on encryption — Save refuses plaintext w/o passphrase" << std::endl;
 
-    // Write a v1 plaintext key (no passphrase).
+    // (1) DEFAULT (no allowPlaintext), passphrase UNSET => Save FAILS, NO file.
+    std::string dir = MakeTempDir();
     SetPass(nullptr);
     CSeedAttestationKey k1;
     CHECK(k1.Generate(), "generate key");
-    CHECK(k1.Save(dir), "save v1 plaintext");
-    std::vector<uint8_t> raw = ReadFileBytes(KeyPath(dir));
-    CHECK(raw.size() > 5 && raw[4] == 1, "on-disk file is v1 plaintext");
+    CHECK(!k1.Save(dir),
+          "Save(default) REFUSES to write plaintext when passphrase unset (CL-1 inversion)");
+    {
+        std::ifstream chk(KeyPath(dir), std::ios::binary);
+        CHECK(!chk.good(), "NO key file written on the default refusal (no plaintext on disk)");
+    }
 
-    // Default OFF: a v1 file still loads (backward-compatible).
-    CSeedAttestationKey kDefault;
-    CHECK(kDefault.LoadOrGenerate(dir, /*allowGenerate=*/false, /*requireEncryption=*/false),
-          "default-off LoadOrGenerate loads the v1 key");
-    CHECK(kDefault.IsValid(), "v1 key valid under default policy");
+    // (2) DEFAULT, passphrase SET => Save writes v2 encrypted.
+    std::string dir2 = MakeTempDir();
+    SetPass("default-on-pass");
+    CSeedAttestationKey k2;
+    CHECK(k2.Generate(), "generate key");
+    CHECK(k2.Save(dir2), "Save(default) writes v2 when passphrase set");
+    std::vector<uint8_t> raw2 = ReadFileBytes(KeyPath(dir2));
+    CHECK(raw2.size() > 5 && raw2[4] == 2, "on-disk file is v2 encrypted by default");
 
-    // require-encryption ON: refuse the v1 key (fail loud).
-    CSeedAttestationKey kReq;
-    CHECK(!kReq.LoadOrGenerate(dir, /*allowGenerate=*/false, /*requireEncryption=*/true),
-          "require-encryption refuses the plaintext v1 key");
-    CHECK(!kReq.IsValid(), "no key loaded when require-encryption rejects v1");
+    // (3) EXPLICIT opt-out (allowPlaintext=true), passphrase UNSET => v1 written.
+    std::string dir3 = MakeTempDir();
+    SetPass(nullptr);
+    CSeedAttestationKey k3;
+    CHECK(k3.Generate(), "generate key");
+    CHECK(k3.Save(dir3, /*allowPlaintext=*/true),
+          "Save(allowPlaintext) writes v1 plaintext when passphrase unset (explicit opt-out)");
+    std::vector<uint8_t> raw3 = ReadFileBytes(KeyPath(dir3));
+    CHECK(raw3.size() > 5 && raw3[4] == 1, "on-disk file is v1 plaintext under explicit opt-out");
+    SetPass(nullptr);
+}
 
-    // require-encryption ON, passphrase UNSET, on Save: refuse to write plaintext.
+// LP-13 CL-1 (MIGRATION): an existing v1 plaintext key LOADS (no upgrade brick),
+// and when a passphrase is available LoadOrGenerate MIGRATES it in place to v2.
+// With no passphrase and no opt-out, a loaded v1 key is REFUSED (fail loud). The
+// CRITICAL safety assertion: the original key is NEVER lost — the migrated key is
+// the SAME keypair, usable for signing.
+static void TestV1ToV2Migration() {
+    std::cout << "[Test] CL-1: v1->v2 in-place migration, original key preserved" << std::endl;
+    std::string dir = MakeTempDir();
+
+    // Establish a live v1 plaintext key (explicit opt-out to write it).
+    SetPass(nullptr);
+    CSeedAttestationKey k1;
+    CHECK(k1.Generate(), "generate v1 key");
+    std::vector<uint8_t> origPub = k1.GetPubKey();
+    CHECK(k1.Save(dir, /*allowPlaintext=*/true), "save v1 plaintext (legacy live key)");
+    std::vector<uint8_t> v1raw = ReadFileBytes(KeyPath(dir));
+    CHECK(v1raw.size() > 5 && v1raw[4] == 1, "on-disk file is v1 before migration");
+
+    // Now provision a passphrase (simulating the deploy step) and LoadOrGenerate
+    // with the default policy: it must load the v1 key AND re-save it as v2.
+    SetPass("migration-pass");
+    CSeedAttestationKey k2;
+    CHECK(k2.LoadOrGenerate(dir, /*allowGenerate=*/false, /*allowPlaintext=*/false),
+          "LoadOrGenerate loads + migrates the v1 key under default-on policy");
+    CHECK(k2.IsValid(), "migrated key valid");
+    CHECK(k2.GetPubKey() == origPub, "migrated key is the SAME keypair (original not lost)");
+    CHECK(PrivKeyRoundTrips(k2, origPub), "migrated private key still signs/verifies");
+    CHECK(!k2.LoadedPlaintext(), "in-memory key no longer flagged as plaintext after migration");
+
+    // On disk the file is now v2 encrypted.
+    std::vector<uint8_t> v2raw = ReadFileBytes(KeyPath(dir));
+    CHECK(v2raw.size() > 5 && v2raw[4] == 2, "on-disk file is v2 encrypted after migration");
+
+    // Reload under default policy with the passphrase: loads the v2 key cleanly.
+    CSeedAttestationKey k3;
+    CHECK(k3.LoadOrGenerate(dir, false, false), "reload migrated v2 key under default policy");
+    CHECK(k3.GetPubKey() == origPub, "reloaded v2 key matches original keypair");
+
+    // Default policy, v1 on disk, NO passphrase, NO opt-out => REFUSE (fail loud),
+    // and the original v1 file is NOT destroyed.
     std::string dir2 = MakeTempDir();
     SetPass(nullptr);
-    CSeedAttestationKey k2;
-    CHECK(k2.Generate(), "generate key for save-refusal");
-    CHECK(!k2.Save(dir2, /*requireEncryption=*/true),
-          "Save(requireEncryption=true) refuses to write plaintext when passphrase unset");
-    std::ifstream chk(KeyPath(dir2), std::ios::binary);
-    CHECK(!chk.good(), "no plaintext file written when encryption required but unset");
-
-    // require-encryption ON, passphrase SET: Save writes v2 and load enforces it.
-    SetPass("enc-required-pass");
-    std::string dir3 = MakeTempDir();
-    CSeedAttestationKey k3;
-    CHECK(k3.Generate(), "generate key for encrypted save");
-    CHECK(k3.Save(dir3, /*requireEncryption=*/true), "Save(requireEncryption) writes v2 when passphrase set");
-    std::vector<uint8_t> raw3 = ReadFileBytes(KeyPath(dir3));
-    CHECK(raw3.size() > 5 && raw3[4] == 2, "on-disk file is v2 encrypted");
     CSeedAttestationKey k4;
-    CHECK(k4.LoadOrGenerate(dir3, false, /*requireEncryption=*/true),
-          "require-encryption accepts the v2 key");
-    CHECK(k4.IsValid(), "v2 key valid under require-encryption");
+    CHECK(k4.Generate(), "generate v1 key for refusal case");
+    std::vector<uint8_t> origPub2 = k4.GetPubKey();
+    CHECK(k4.Save(dir2, /*allowPlaintext=*/true), "save v1 plaintext");
+    std::vector<uint8_t> beforeRefuse = ReadFileBytes(KeyPath(dir2));
+    CSeedAttestationKey k5;
+    CHECK(!k5.LoadOrGenerate(dir2, false, /*allowPlaintext=*/false),
+          "default-on REFUSES a v1 key when no passphrase + no opt-out (fail loud)");
+    std::vector<uint8_t> afterRefuse = ReadFileBytes(KeyPath(dir2));
+    CHECK(afterRefuse == beforeRefuse, "refused v1 key file is byte-intact (not destroyed)");
+
+    // Same v1 file, NO passphrase, but EXPLICIT opt-out => loads unchanged.
+    CSeedAttestationKey k6;
+    CHECK(k6.LoadOrGenerate(dir2, false, /*allowPlaintext=*/true),
+          "explicit opt-out loads the v1 key unchanged (no passphrase)");
+    CHECK(k6.GetPubKey() == origPub2, "opt-out loaded key matches");
+    std::vector<uint8_t> afterOptOut = ReadFileBytes(KeyPath(dir2));
+    CHECK(afterOptOut.size() > 5 && afterOptOut[4] == 1, "stays v1 under opt-out (no migration)");
+    SetPass(nullptr);
+}
+
+// LP-13 CL-2: Save leaves NO plaintext .bak behind. The prior implementation
+// staged a copy of the existing (possibly plaintext) key at "<file>.bak" in a
+// crash window; CL-2 removes it. After an UPDATE save (a prior key existed) the
+// .bak must NOT exist on disk. Mutation self-check: restoring the .bak write
+// makes the "no .bak" assertion fail.
+static void TestNoPlaintextBak() {
+    std::cout << "[Test] CL-2: no plaintext .bak survives a save" << std::endl;
+    std::string dir = MakeTempDir();
+    std::string bakPath = KeyPath(dir) + ".bak";
+
+    // First save (v1 via opt-out) establishes a prior key on disk.
+    SetPass(nullptr);
+    CSeedAttestationKey k1;
+    CHECK(k1.Generate(), "generate key");
+    CHECK(k1.Save(dir, /*allowPlaintext=*/true), "first save (establishes prior key)");
+    {
+        std::ifstream b(bakPath, std::ios::binary);
+        CHECK(!b.good(), "no .bak after the first save");
+    }
+
+    // Second (UPDATE) save: this is where the old code staged a plaintext .bak.
+    CSeedAttestationKey k2;
+    CHECK(k2.Generate(), "generate replacement key");
+    CHECK(k2.Save(dir, /*allowPlaintext=*/true), "update save (would have staged .bak in old code)");
+    {
+        std::ifstream b(bakPath, std::ios::binary);
+        CHECK(!b.good(), "NO plaintext .bak left behind after an update save (CL-2)");
+    }
+
+    // And an UPDATE save on the encrypted path leaves no .bak either.
+    std::string dir2 = MakeTempDir();
+    std::string bakPath2 = KeyPath(dir2) + ".bak";
+    SetPass("bak-pass");
+    CSeedAttestationKey k3; k3.Generate();
+    CHECK(k3.Save(dir2), "first v2 save");
+    CSeedAttestationKey k4; k4.Generate();
+    CHECK(k4.Save(dir2), "second v2 (update) save");
+    {
+        std::ifstream b(bakPath2, std::ios::binary);
+        CHECK(!b.good(), "no .bak after an encrypted update save either");
+    }
     SetPass(nullptr);
 }
 
@@ -461,7 +569,7 @@ static void TestLoadRepairsPerms() {
     SetPass(nullptr);
     CSeedAttestationKey k1;
     k1.Generate();
-    CHECK(k1.Save(dir), "save v1 key");
+    CHECK(k1.Save(dir, /*allowPlaintext=*/true), "save v1 key");
 
     // Deliberately loosen perms to simulate a legacy 0644 file.
     CHECK(chmod(KeyPath(dir).c_str(), S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH) == 0,
@@ -505,12 +613,12 @@ static void TestPosixPerms() {
     mode_t perms = st.st_mode & 0777;
     CHECK(perms == (S_IRUSR | S_IWUSR), "perms == 0600");
 
-    // Also verify v1 path sets 0600.
+    // Also verify v1 path sets 0600 (explicit plaintext opt-out, no passphrase).
     SetPass(nullptr);
     std::string dir2 = MakeTempDir();
     CSeedAttestationKey k2;
     k2.Generate();
-    CHECK(k2.Save(dir2), "save v1");
+    CHECK(k2.Save(dir2, /*allowPlaintext=*/true), "save v1");
     struct stat st2;
     CHECK(stat(KeyPath(dir2).c_str(), &st2) == 0, "stat v1 key file");
     CHECK((st2.st_mode & 0777) == (S_IRUSR | S_IWUSR), "v1 perms == 0600");
@@ -582,7 +690,7 @@ static void TestSeedKeyFilePresentDetectsUnreadable() {
     SetPass(nullptr);
     CSeedAttestationKey k1;
     CHECK(k1.Generate(), "generate key");
-    CHECK(k1.Save(dir), "save key file");
+    CHECK(k1.Save(dir, /*allowPlaintext=*/true), "save key file");
     CHECK(SeedKeyFilePresent(dir), "readable key file => present");
 
 #ifndef _WIN32
@@ -618,7 +726,9 @@ int main() {
     TestAtomicSaveOriginalSurvives();        // H-2 (THE load-bearing test)
     TestFsyncFailureIsFatalBeforeRename();   // B-1 (THE load-bearing test)
     TestSaveFailMakesLoadOrGenerateFail();   // M-2
-    TestRequireEncryptionPolicy();           // H-1
+    TestDefaultOnEncryptionGate();           // CL-1 (default-on; mutation-kills the gate)
+    TestV1ToV2Migration();                   // CL-1 (migration; original key preserved)
+    TestNoPlaintextBak();                    // CL-2 (no plaintext .bak)
     TestSeedKeyFilePresentDetectsUnreadable(); // extreview HIGH (presence vs readability)
 #ifndef _WIN32
     TestLoadRepairsPerms();                  // M-3

@@ -563,7 +563,11 @@ struct NodeConfig {
     std::string external_ip = "";   // --externalip: Manual external IP (for manual port forwarding)
     bool public_api = false;        // --public-api: Enable public REST API for light wallets (seed nodes only)
     bool generate_seed_key = false; // --generate-seed-key: LP-13 — explicitly permit minting a NEW seed attestation consensus key when none exists (first-time provision only; otherwise fail loud)
-    bool require_seed_key_encryption = false; // --require-seed-key-encryption: LP-13 H-1 — refuse to load/save a plaintext (v1) seed key; requires DILITHION_SEED_KEY_PASSPHRASE. Default OFF preserves backward-compatible loadable behavior.
+    // LP-13 CL-1: seed-key encryption-at-rest is now MANDATORY BY DEFAULT
+    // (DILITHION_SEED_KEY_PASSPHRASE provisioned at deploy). --allow-plaintext-seed-key
+    // is the explicit opt-out; --require-seed-key-encryption is kept as a no-op
+    // alias (it now matches the default) so deploy scripts don't break.
+    bool allow_plaintext_seed_key = false; // --allow-plaintext-seed-key: LP-13 CL-1 opt-out of default-on encryption
     int max_connections = 0;         // --maxconnections: Maximum peer connections (0 = default 125)
     int max_connections_per_ip = 2;  // --max-connections-per-ip: Max inbound per IP (default 2, range 1-64)
     int attestation_rate_limit = 1;  // --attestation-rate-limit: Max attestations per /24 subnet per day (Sybil defense)
@@ -761,11 +765,16 @@ struct NodeConfig {
                 generate_seed_key = true;
             }
             else if (arg == "--require-seed-key-encryption") {
-                // LP-13 H-1: enforce encryption-at-rest for the seed consensus
-                // signing key. Refuses to load/save a plaintext (v1) key; the
-                // DILITHION_SEED_KEY_PASSPHRASE env MUST be set. Default OFF keeps
-                // the backward-compatible loadable behavior for rolling deploys.
-                require_seed_key_encryption = true;
+                // LP-13 CL-1: encryption-at-rest is now the DEFAULT, so this flag
+                // is a no-op accepted for backward compatibility with existing
+                // deploy scripts. (It used to be the opt-IN; the default inverted.)
+            }
+            else if (arg == "--allow-plaintext-seed-key") {
+                // LP-13 CL-1: explicit opt-out of default-on seed-key encryption.
+                // Permits writing/running a plaintext (v1) key when no passphrase
+                // is set. Without this flag a missing passphrase is FATAL — the
+                // node refuses to persist or run on an unencrypted consensus key.
+                allow_plaintext_seed_key = true;
             }
             else if (arg.find("--rpcallowhost=") == 0) {
                 // wallet-rpc-login-restore: anti-DNS-rebinding Host allowlist.
@@ -879,9 +888,12 @@ struct NodeConfig {
         std::cout << "  --generate-seed-key   Permit minting a NEW seed attestation key if none exists" << std::endl;
         std::cout << "                          (first-time provision only; otherwise the node fails loud)." << std::endl;
         std::cout << "                          Set " << Attestation::SEED_KEY_PASSPHRASE_ENV << " to encrypt it at rest." << std::endl;
+        std::cout << "  --allow-plaintext-seed-key" << std::endl;
+        std::cout << "                          Opt out of default-on seed-key encryption: permit a" << std::endl;
+        std::cout << "                          plaintext (v1) key when " << Attestation::SEED_KEY_PASSPHRASE_ENV << " is unset." << std::endl;
+        std::cout << "                          Default: encryption is MANDATORY (no passphrase => fail loud)." << std::endl;
         std::cout << "  --require-seed-key-encryption" << std::endl;
-        std::cout << "                          Refuse to load/save a plaintext (v1) seed key; requires" << std::endl;
-        std::cout << "                          " << Attestation::SEED_KEY_PASSPHRASE_ENV << ". Default OFF (backward compatible)." << std::endl;
+        std::cout << "                          Deprecated no-op (encryption is now the default)." << std::endl;
         std::cout << "  --rpcallowhost=<host> Allow this Host header on the RPC/HTTP server" << std::endl;
         std::cout << "                          (anti-DNS-rebinding allowlist; repeatable)." << std::endl;
         std::cout << "                          Loopback is always allowed. Under --public-api," << std::endl;
@@ -6900,38 +6912,41 @@ load_genesis_block:  // Bug #29: Label for automatic retry after blockchain wipe
 
             // Load or generate attestation key (LP-13: minting gated behind
             // --generate-seed-key so a reprovisioned seed fails loud).
-            // LP-13 M-1 (fail-stop on GENUINE failure): a key file PRESENT but
-            // unusable (corrupt / decrypt-or-parse failure / wrong-or-missing
-            // passphrase / plaintext-when-encryption-required), OR a requested
-            // mint that could not be persisted, is a real attestation outage. We
-            // ABORT startup rather than run silently without attestation.
-            // genuineFailure also fires when --require-seed-key-encryption is set
-            // even with NO key file present: fail-closed is intended — an operator
-            // who demanded at-rest encryption must not be left running with no
-            // usable encrypted key. The ONLY benign (non-fatal) case is: NO key
-            // file, no --generate-seed-key, AND no --require-seed-key-encryption —
-            // the seed-capable relay simply doesn't attest. (This whole block is
-            // already gated on `seedCapable` above, so miners never reach here.)
+            //
+            // LP-13 SM-5 (FATAL on missing/unreadable key for a node configured to
+            // attest): this whole block only runs when seedCapable (--relay-only or
+            // --public-api), i.e. the operator HAS configured this node to attest.
+            // On such a node ANY attestation-key init failure is FATAL — including a
+            // totally-MISSING key file. We no longer start silently keyless +
+            // non-attesting (the prior benign carve-out): a seed booting without a
+            // usable consensus signing key is a silent attestation outage that
+            // weakens the 3-of-4 quorum. Escape hatches are explicit:
+            // --generate-seed-key (mint+save a first-time key) and
+            // --allow-plaintext-seed-key (run without a passphrase).
+            //
+            // LP-13 CL-1: LoadOrGenerate enforces default-on encryption — a loaded
+            // v1 plaintext key is migrated to v2 when the passphrase is set, and
+            // refused (fatal) with no passphrase + no --allow-plaintext-seed-key.
+            //
             // LP-13 (extreview HIGH): PRESENCE test (stat), not ifstream::good()
-            // readability — a present-but-unreadable key must still be treated as
-            // present so genuineFailure fires (fail loud, M-1). See SeedKeyFilePresent.
+            // readability — see SeedKeyFilePresent; still drives the diagnostic.
             bool keyFileExists = Attestation::SeedKeyFilePresent(dataDir);
             bool attestOk = seedAttestKey.LoadOrGenerate(
-                dataDir, config.generate_seed_key, config.require_seed_key_encryption);
+                dataDir, config.generate_seed_key, config.allow_plaintext_seed_key);
             if (!attestOk) {
-                bool genuineFailure = keyFileExists || config.generate_seed_key
-                                      || config.require_seed_key_encryption;
-                if (genuineFailure) {
-                    std::cerr << "[Attestation] FATAL: seed attestation key initialization FAILED "
-                                 "(key file present but unreadable/corrupt, decrypt/parse failure, "
-                                 "wrong/missing " << Attestation::SEED_KEY_PASSPHRASE_ENV
-                              << ", plaintext key when --require-seed-key-encryption is set, or a "
-                                 "requested mint that could not be persisted). A seed must not run "
-                                 "without a usable consensus signing key. Aborting startup." << std::endl;
-                    return 1;
-                }
-                std::cerr << "[Attestation] No seed attestation key and minting not requested; "
-                             "this relay will not serve attestations." << std::endl;
+                // SM-5: on a seed-capable node, a failed attestation-key init is
+                // ALWAYS fatal (missing, unreadable/corrupt, decrypt/parse failure,
+                // wrong/missing passphrase, plaintext-when-encryption-required, or a
+                // requested mint that could not be persisted). No silent keyless run.
+                std::cerr << "[Attestation] FATAL: seed attestation key initialization FAILED on a "
+                             "seed-capable node (key " << (keyFileExists ? "present but unreadable/"
+                             "corrupt, decrypt/parse failure, wrong/missing " : "MISSING; not minted — ")
+                          << (keyFileExists ? std::string(Attestation::SEED_KEY_PASSPHRASE_ENV) +
+                             ", plaintext key without --allow-plaintext-seed-key, or a mint that could "
+                             "not be persisted" : "pass --generate-seed-key to provision one")
+                          << "). A seed must not run without a usable consensus signing key. "
+                             "Aborting startup." << std::endl;
+                return 1;
             } else {
                 // Determine seed ID by matching our IP against known seed IPs
                 // For now, use a simple index. In production, compare external IP.

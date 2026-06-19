@@ -148,14 +148,20 @@ public:
      * Windows best-effort — NTFS already confines the user profile dir).
      * If the env var DILITHION_SEED_KEY_PASSPHRASE is set, the private key is
      * encrypted at rest (AES-256-CBC, PBKDF2-SHA3, encrypt-then-MAC) in the v2
-     * file format. If absent, the legacy v1 plaintext format is written so
-     * existing un-passphrased operators are not silently broken.
+     * file format.
      *
-     * LP-13 H-2 / B-1: the write is ATOMIC and fail-closed-durable — the blob is
-     * written to "<file>.tmp", the prior key (if any) is copied to "<file>.bak",
-     * then the temp is atomically renamed over the target and the "<file>.bak"
-     * is removed on success. The guarantee that a crash / partial write / power
-     * loss cannot destroy the only copy of the consensus signing key rests on TWO
+     * LP-13 CL-1 (DEFAULT-ON ENCRYPTION): encryption-at-rest is mandatory by
+     * default. If the passphrase env is UNSET, Save writes a plaintext (v1) key
+     * ONLY when the caller explicitly opts out via allowPlaintext=true
+     * (--allow-plaintext-seed-key); otherwise it FAILS LOUD (returns false)
+     * rather than silently persisting an unencrypted consensus signing key.
+     *
+     * LP-13 H-2 / B-1 / CL-2: the write is ATOMIC and fail-closed-durable — the
+     * blob is written to "<file>.tmp", then atomically renamed over the target.
+     * LP-13 CL-2: there is NO plaintext "<file>.bak" staging copy (it was a second,
+     * possibly plaintext, copy of the consensus key at rest); the atomic rename
+     * alone preserves the live key. The guarantee that a crash / partial write /
+     * power loss cannot destroy the only copy of the consensus signing key rests on TWO
      * fail-closed properties: (1) the temp's fsync (POSIX) / FlushFileBuffers
      * (Windows) is FATAL — on failure Save removes the temp and returns false
      * WITHOUT renaming, so un-flushed data is never published over the live key;
@@ -173,14 +179,14 @@ public:
      * set 0600 (POSIX), Save REFUSES to publish a possibly group/other-readable
      * consensus key (fail-closed) and returns false.
      *
-     * LP-13 H-1: when requireEncryption is true, Save REFUSES to write a v1
-     * (plaintext) key — the passphrase env MUST be set or Save fails loud.
-     *
      * @param dataDir Path to data directory
-     * @param requireEncryption If true, refuse to write a plaintext (v1) key.
+     * @param allowPlaintext If true, permit writing a plaintext (v1) key when no
+     *        passphrase is configured (explicit opt-out of default-on encryption).
+     *        Default false => encryption is mandatory: with no passphrase Save
+     *        fails loud instead of writing plaintext.
      * @return true on success
      */
-    bool Save(const std::string& dataDir, bool requireEncryption = false) const;
+    bool Save(const std::string& dataDir, bool allowPlaintext = false) const;
 
     /**
      * Load or generate: tries Load first, generates + saves if not found.
@@ -193,21 +199,28 @@ public:
      * returns false. The node must never run on an in-memory-only key that
      * would not match chainparams after a restart.
      *
-     * LP-13 H-1: when requireEncryption is true, a loaded v1 (plaintext) key is
-     * REJECTED (returns false) and a generated key is only saved encrypted —
-     * enforcing encryption-at-rest end to end.
+     * LP-13 CL-1 (DEFAULT-ON ENCRYPTION + MIGRATION): encryption-at-rest is the
+     * default. An existing v1 (plaintext) key still LOADS (no rolling-upgrade
+     * brick) and is MIGRATED in place: if a passphrase is available the loaded
+     * key is re-saved as v2 encrypted (atomic; the original v1 stays byte-intact
+     * until the encrypted write is confirmed; a failed migration is non-fatal and
+     * keeps running on the loaded key). If a v1 key is loaded with NO passphrase
+     * and allowPlaintext=false (default), LoadOrGenerate REFUSES (fail loud). Pass
+     * allowPlaintext=true (--allow-plaintext-seed-key) to run on a plaintext key
+     * without a passphrase. A freshly generated key is saved under the same
+     * default-on policy.
      *
      * @param dataDir Path to data directory
      * @param allowGenerate If false and no key file exists, fail loudly instead
      *        of generating a new keypair. Set true via the --generate-seed-key
      *        operator flag for first-time key provisioning.
-     * @param requireEncryption If true, refuse to load/save a plaintext (v1)
-     *        key (--require-seed-key-encryption). Default false preserves the
-     *        backward-compatible loadable behavior.
+     * @param allowPlaintext If true, permit loading/saving a plaintext (v1) key
+     *        with no passphrase (explicit opt-out of default-on encryption).
+     *        Default false => encryption mandatory.
      * @return true on success
      */
     bool LoadOrGenerate(const std::string& dataDir, bool allowGenerate = false,
-                        bool requireEncryption = false);
+                        bool allowPlaintext = false);
 
     /**
      * Sign an attestation message.
