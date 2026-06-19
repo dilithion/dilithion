@@ -112,32 +112,6 @@ bool SeedKeyFilePresent(const std::string& dataDir) {
     return present;
 }
 
-// LP-13 round-3: the seed-intent classifier (see header). Pure; both node
-// binaries call this SAME function so the fatal-vs-silent decision is identical
-// by construction and unit tests can mutation-check the disjunct + the
-// declared-but-unresolved FATAL. The IP-match disjunct (seedId >= 0) is the
-// BACKWARD-COMPAT path that keeps the 4 live seeds attesting through a rolling
-// deploy with no wrapper change; --attestation-seed makes seed-intent explicit.
-SeedIntent ClassifySeedIntent(bool attestationSeedFlag, int seedId) {
-    const bool ipMatchesSeed = (seedId >= 0);
-    if (attestationSeedFlag && !ipMatchesSeed) {
-        // Declared a seed but external_ip resolves to no seat: FATAL (silent-gap
-        // closer). Must come BEFORE the COMMUNITY fall-through so a wrong-IP
-        // declared seat can never silently demote to a non-attesting community node.
-        return SeedIntent::DECLARED_BUT_UNRESOLVED;
-    }
-    if (attestationSeedFlag || ipMatchesSeed) {
-        // Explicit declaration OR backward-compat IP-match => MUST attest.
-        return SeedIntent::CONFIGURED_SEED;
-    }
-    // No flag AND IP not in the seed set => community node, never fatal on keys.
-    return SeedIntent::COMMUNITY;
-}
-
-bool IsConfiguredSeed(bool attestationSeedFlag, int seedId) {
-    return ClassifySeedIntent(attestationSeedFlag, seedId) == SeedIntent::CONFIGURED_SEED;
-}
-
 // LP-13 H-2 atomic-save test seam (see header). nullptr in production.
 bool (*g_seedKeySaveFailpoint)() = nullptr;
 // LP-13 B-1 fsync-failure test seam (see header). nullptr in production.
@@ -172,10 +146,7 @@ bool CSeedAttestationKey::Generate() {
     return true;
 }
 
-// LP-13 (round-2 fold): internal Load that ALSO classifies the failure reason
-// (MISSING vs CORRUPT vs TRANSIENT) so the node can pick FATAL vs warn-continue.
-// The public Load() forwards to this and discards the status (behavior unchanged).
-SeedKeyLoadStatus CSeedAttestationKey::LoadClassified(const std::string& dataDir) {
+bool CSeedAttestationKey::Load(const std::string& dataDir) {
     std::string path = dataDir + "/" + SEED_KEY_FILENAME;
     m_loadedV1Plaintext = false;
 
@@ -193,70 +164,27 @@ SeedKeyLoadStatus CSeedAttestationKey::LoadClassified(const std::string& dataDir
     }
 #endif
 
-    // LP-13 (round-2 fold + extreview round-2, transient-vs-permanent):
-    // classify open failures from the open() errno itself, NOT from a separate
-    // prior stat. The previous shape stat()ed (SeedKeyFilePresent) and THEN
-    // open()ed — a TOCTOU window where the file could be removed/created between
-    // the two syscalls. Here the SINGLE open() attempt is the authority: its
-    // errno classifies the result, and the stat-based presence oracle is only a
-    // FAIL-CLOSED secondary (covers the case where the platform left errno
-    // unset / 0 on a failed ifstream open). Read the whole file up front so v2
-    // length/format checks are robust against truncation, and so we never leave
-    // a half-read secret in memory on error.
-    //
-    // Classification:
-    //   ENOENT (file genuinely absent) => MISSING (permanent; the SM-5 loud-fatal
-    //     case on a configured seed).
-    //   A transient/contended errno (EAGAIN/EWOULDBLOCK/ENOSPC/EDQUOT/EBUSY,
-    //     and Windows ERROR_SHARING_VIOLATION) => TRANSIENT: a momentary fault a
-    //     retry/reboot may clear, so the node warns-and-continues rather than
-    //     entering the wrapper's crash-loop. Other non-ENOENT errors on a
-    //     present file (EACCES/EIO/EMFILE/…) are also treated as TRANSIENT here
-    //     (the file IS present, so re-reading it later may succeed; we never
-    //     destroy a present key over an ambiguous read error).
-    errno = 0;
+    // Read the whole file up front so v2 length/format checks are robust against
+    // truncation, and so we never leave a half-read secret in memory on error.
     std::ifstream file(path, std::ios::binary);
     if (!file.is_open()) {
-        int openErrno = errno;
-        // PRIMARY signal: the open() errno. ENOENT => the file is genuinely
-        // absent => MISSING. SeedKeyFilePresent fails CLOSED (reports present on
-        // an indeterminate stat), so its "not present" verdict is a fail-closed
-        // SECONDARY confirmation of absence for the case the platform left
-        // errno == 0 on a failed open.
-        if (openErrno == ENOENT) {
-            return SeedKeyLoadStatus::MISSING;
-        }
-        if (openErrno == 0 && !SeedKeyFilePresent(dataDir)) {
-            // Failed open with no errno AND the file cannot be statted as
-            // present => clean absence => MISSING (fail-closed secondary).
-            return SeedKeyLoadStatus::MISSING;
-        }
-        // Present (or indeterminate) but unopenable for a non-ENOENT reason.
-        // The file is NOT proven absent, so this is a TRANSIENT read fault — we
-        // warn-and-continue and NEVER overwrite/mint over a present key.
-        std::cerr << "[Attestation] WARNING: seed key file at " << path
-                  << " could not be opened (errno " << openErrno
-                  << "); treating as a TRANSIENT read error (present key not "
-                     "proven absent)." << std::endl;
-        return SeedKeyLoadStatus::TRANSIENT;
+        return false;
     }
     std::vector<uint8_t> buf((std::istreambuf_iterator<char>(file)),
                               std::istreambuf_iterator<char>());
     file.close();
 
-    // magic(4) + version(1) header. Past this point the file is PRESENT and
-    // OPENED — any failure is a PERMANENT content/format/passphrase problem
-    // (CORRUPT), not a transient one: re-running yields the identical failure.
+    // magic(4) + version(1) header
     if (buf.size() < 5) {
         std::cerr << "[Attestation] Key file too short" << std::endl;
-        return SeedKeyLoadStatus::CORRUPT;
+        return false;
     }
 
     uint32_t magic = 0;
     std::memcpy(&magic, buf.data(), 4);
     if (magic != KEY_FILE_MAGIC) {
         std::cerr << "[Attestation] Invalid key file magic" << std::endl;
-        return SeedKeyLoadStatus::CORRUPT;
+        return false;
     }
 
     uint8_t version = buf[4];
@@ -267,7 +195,7 @@ SeedKeyLoadStatus CSeedAttestationKey::LoadClassified(const std::string& dataDir
         //   magic(4) version(1) pubkey(1952) privkey(4032)
         if (buf.size() < off + DFMP::MIK_PUBKEY_SIZE + DFMP::MIK_PRIVKEY_SIZE) {
             std::cerr << "[Attestation] v1 key file truncated" << std::endl;
-            return SeedKeyLoadStatus::CORRUPT;
+            return false;
         }
         m_pubkey.assign(buf.begin() + off, buf.begin() + off + DFMP::MIK_PUBKEY_SIZE);
         off += DFMP::MIK_PUBKEY_SIZE;
@@ -279,7 +207,7 @@ SeedKeyLoadStatus CSeedAttestationKey::LoadClassified(const std::string& dataDir
                   << GetPubKeyHex().substr(0, 16) << "..." << std::endl;
         std::cerr << "[Attestation] NOTE: key file is unencrypted (v1). Set "
                   << SEED_KEY_PASSPHRASE_ENV << " to re-save it encrypted (v2)." << std::endl;
-        return SeedKeyLoadStatus::OK;
+        return true;
     }
 
     if (version == KEY_FILE_VERSION_V2) {
@@ -290,7 +218,7 @@ SeedKeyLoadStatus CSeedAttestationKey::LoadClassified(const std::string& dataDir
                            SEED_KEY_IV_SIZE + SEED_KEY_MAC_SIZE + 4;
         if (buf.size() < headerEnd) {
             std::cerr << "[Attestation] v2 key file truncated (header)" << std::endl;
-            return SeedKeyLoadStatus::CORRUPT;
+            return false;
         }
 
         m_pubkey.assign(buf.begin() + off, buf.begin() + off + DFMP::MIK_PUBKEY_SIZE);
@@ -311,7 +239,7 @@ SeedKeyLoadStatus CSeedAttestationKey::LoadClassified(const std::string& dataDir
 
         if (buf.size() != off + ctlen || ctlen == 0 || (ctlen % 16) != 0) {
             std::cerr << "[Attestation] v2 key file truncated or malformed ciphertext" << std::endl;
-            return SeedKeyLoadStatus::CORRUPT;
+            return false;
         }
         std::vector<uint8_t> ciphertext(buf.begin() + off, buf.begin() + off + ctlen);
 
@@ -320,7 +248,7 @@ SeedKeyLoadStatus CSeedAttestationKey::LoadClassified(const std::string& dataDir
             std::cerr << "[Attestation] ERROR: key file is encrypted (v2) but "
                       << SEED_KEY_PASSPHRASE_ENV << " is not set. Cannot decrypt." << std::endl;
             Clear();
-            return SeedKeyLoadStatus::CORRUPT;
+            return false;
         }
 
         // LP-13 M-3 (Cursor): RAII exception-safe wipe of the v2 decrypt secrets —
@@ -344,7 +272,7 @@ SeedKeyLoadStatus CSeedAttestationKey::LoadClassified(const std::string& dataDir
             std::cerr << "[Attestation] ERROR: key derivation failed" << std::endl;
             memory_cleanse(&passphrase[0], passphrase.size());
             Clear();
-            return SeedKeyLoadStatus::CORRUPT;
+            return false;
         }
         memory_cleanse(&passphrase[0], passphrase.size());
 
@@ -353,7 +281,7 @@ SeedKeyLoadStatus CSeedAttestationKey::LoadClassified(const std::string& dataDir
             std::cerr << "[Attestation] ERROR: failed to set decryption key" << std::endl;
             memory_cleanse(aesKey.data(), aesKey.size());
             Clear();
-            return SeedKeyLoadStatus::CORRUPT;
+            return false;
         }
         memory_cleanse(aesKey.data(), aesKey.size());
 
@@ -363,32 +291,25 @@ SeedKeyLoadStatus CSeedAttestationKey::LoadClassified(const std::string& dataDir
             std::cerr << "[Attestation] ERROR: key file MAC verification failed "
                       << "(wrong passphrase or tampered/corrupt file)." << std::endl;
             Clear();
-            return SeedKeyLoadStatus::CORRUPT;
+            return false;
         }
 
         if (!crypter.Decrypt(ciphertext, plain) || plain.size() != DFMP::MIK_PRIVKEY_SIZE) {
             std::cerr << "[Attestation] ERROR: key file decryption failed" << std::endl;
             if (!plain.empty()) memory_cleanse(plain.data(), plain.size());
             Clear();
-            return SeedKeyLoadStatus::CORRUPT;
+            return false;
         }
         m_privkey.assign(plain.begin(), plain.end());
         memory_cleanse(plain.data(), plain.size());
 
         std::cout << "[Attestation] Loaded seed attestation key (v2 encrypted): "
                   << GetPubKeyHex().substr(0, 16) << "..." << std::endl;
-        return SeedKeyLoadStatus::OK;
+        return true;
     }
 
     std::cerr << "[Attestation] Unsupported key file version: " << (int)version << std::endl;
-    return SeedKeyLoadStatus::CORRUPT;
-}
-
-// LP-13: public Load() preserves the original bool contract (true == OK), now a
-// thin wrapper over the classifying LoadClassified(). All existing callers and
-// tests are unaffected.
-bool CSeedAttestationKey::Load(const std::string& dataDir) {
-    return LoadClassified(dataDir) == SeedKeyLoadStatus::OK;
+    return false;
 }
 
 // LP-13 MEDIUM-1: zero a transient buffer that may hold the plaintext private
@@ -772,19 +693,7 @@ bool CSeedAttestationKey::Save(const std::string& dataDir, bool allowPlaintext) 
 
 bool CSeedAttestationKey::LoadOrGenerate(const std::string& dataDir, bool allowGenerate,
                                          bool allowPlaintext) {
-    SeedKeyLoadStatus ignored = SeedKeyLoadStatus::OK;
-    return LoadOrGenerate(dataDir, allowGenerate, allowPlaintext, &ignored);
-}
-
-bool CSeedAttestationKey::LoadOrGenerate(const std::string& dataDir, bool allowGenerate,
-                                         bool allowPlaintext, SeedKeyLoadStatus* status) {
-    SeedKeyLoadStatus localStatus = SeedKeyLoadStatus::OK;
-    if (!status) status = &localStatus;
-    *status = SeedKeyLoadStatus::OK;
-
-    SeedKeyLoadStatus loadStatus = LoadClassified(dataDir);
-
-    if (loadStatus == SeedKeyLoadStatus::OK) {
+    if (Load(dataDir)) {
         // LP-13 CL-1 (MIGRATION, default-on encryption): an existing v1 plaintext
         // key still LOADS so a rolling upgrade never bricks a live seed. But the
         // default is now mandatory encryption-at-rest, so we MIGRATE it in place:
@@ -817,21 +726,18 @@ bool CSeedAttestationKey::LoadOrGenerate(const std::string& dataDir, bool allowG
                                  " (data dir perms / disk) and re-provision to encrypt"
                                  " it at rest." << std::endl;
                 }
-                // *status stays OK either way: the node is running on a usable,
-                // loaded key. A failed migration is non-fatal by design (MEDIUM-1).
+                // The node is running on a usable, loaded key either way. A failed
+                // migration is non-fatal by design (MEDIUM-1).
             } else if (!allowPlaintext) {
                 // Default-on encryption, but no passphrase to encrypt with and no
                 // explicit opt-out: refuse rather than run on a plaintext key the
-                // operator's policy says must be encrypted. This is a PERMANENT
-                // config-policy state (re-running fails identically) => CORRUPT so
-                // an actual seed treats it as fatal.
+                // operator's policy says must be encrypted.
                 std::cerr << "[Attestation] FATAL: on-disk seed key is UNENCRYPTED (v1) and "
                           << SEED_KEY_PASSPHRASE_ENV << " is unset, but encryption-at-rest is"
                              " mandatory by default. Provision the passphrase to migrate it to"
                              " v2 (recommended), or pass --allow-plaintext-seed-key to run on"
                              " the plaintext key." << std::endl;
                 Clear();
-                *status = SeedKeyLoadStatus::CORRUPT;
                 return false;
             }
             // else: allowPlaintext && no passphrase => explicit legacy opt-out;
@@ -840,31 +746,18 @@ bool CSeedAttestationKey::LoadOrGenerate(const std::string& dataDir, bool allowG
         return true;
     }
 
-    // LP-13 (round-2 fold, transient-vs-permanent): a TRANSIENT read error (the
-    // file is PRESENT but momentarily unreadable — EACCES/EBUSY/EIO/…) must NOT
-    // trigger a mint and must NOT be reclassified as a permanent failure. Surface
-    // it as TRANSIENT so the node warns-and-continues (non-attesting) instead of
-    // crash-looping over a disk blip. We do NOT auto-mint over a present-but-
-    // unreadable key (that would risk minting a SECOND key alongside a real one).
-    if (loadStatus == SeedKeyLoadStatus::TRANSIENT) {
-        std::cerr << "[Attestation] WARNING: seed attestation key present but could not be"
-                     " read (transient error) at " << dataDir << "/" << SEED_KEY_FILENAME
-                  << ". NOT minting a replacement; the node will continue NON-ATTESTING."
-                     " Investigate disk/permissions and restart to attest again." << std::endl;
-        *status = SeedKeyLoadStatus::TRANSIENT;
-        return false;
-    }
-
-    // From here loadStatus is MISSING or CORRUPT (a permanent failure). A
-    // missing/corrupt key file must NOT silently mint a fresh consensus signing
-    // key on a production seed. Auto-mint is gated behind the explicit
-    // --generate-seed-key operator flag (allowGenerate), and is only meaningful
-    // for a genuinely MISSING key — a CORRUPT/present file is never overwritten
-    // by an auto-mint (that would destroy a possibly-recoverable key).
-    if (!allowGenerate || loadStatus == SeedKeyLoadStatus::CORRUPT) {
+    // Load() failed. A missing/unreadable key file must NOT silently mint a fresh
+    // consensus signing key on a production seed. CARDINAL no-key-loss guard: we
+    // only auto-mint when the file is genuinely ABSENT. If the file is PRESENT but
+    // could not be loaded (unreadable / corrupt / wrong passphrase), we NEVER
+    // overwrite it with a fresh mint — that would destroy a possibly-recoverable
+    // key. SeedKeyFilePresent() fails CLOSED (reports present on an indeterminate
+    // stat), so an unstattable-but-genuine key is also protected from overwrite.
+    const bool keyFilePresent = SeedKeyFilePresent(dataDir);
+    if (!allowGenerate || keyFilePresent) {
         std::cerr << "[Attestation] FATAL: no usable seed attestation key at "
                   << dataDir << "/" << SEED_KEY_FILENAME
-                  << (loadStatus == SeedKeyLoadStatus::CORRUPT
+                  << (keyFilePresent
                          ? " (file PRESENT but unreadable/corrupt/wrong-passphrase; NOT"
                            " auto-minting over a present key)."
                          : " and --generate-seed-key was NOT given.")
@@ -873,14 +766,12 @@ bool CSeedAttestationKey::LoadOrGenerate(const std::string& dataDir, bool allowG
                      " key was expected to exist, investigate (wrong data dir,"
                      " missing/encrypted file, or unset "
                   << SEED_KEY_PASSPHRASE_ENV << ")." << std::endl;
-        *status = loadStatus;  // MISSING or CORRUPT
         return false;
     }
 
     std::cout << "[Attestation] No existing attestation key found, generating new keypair (--generate-seed-key)..." << std::endl;
     if (!Generate()) {
         std::cerr << "[Attestation] Failed to generate attestation keypair" << std::endl;
-        *status = SeedKeyLoadStatus::CORRUPT;
         return false;
     }
 
@@ -895,7 +786,6 @@ bool CSeedAttestationKey::LoadOrGenerate(const std::string& dataDir, bool allowG
                      " signing key — fix the data dir / perms / passphrase and retry."
                   << std::endl;
         Clear();
-        *status = SeedKeyLoadStatus::CORRUPT;
         return false;
     }
 

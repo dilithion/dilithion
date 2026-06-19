@@ -18,12 +18,8 @@
 //     no passphrase + no opt-out
 //   - CL-2: no plaintext .bak copy survives a save
 //   - MEDIUM-1 (round-2): migration re-save failure is NON-FATAL, v1 byte-intact
-//   - round-2: LoadOrGenerate classifies MISSING / CORRUPT / TRANSIENT (the
-//     classification that drives the node's actual-seed SM-5 scope + warn-vs-fatal)
-//   - round-3: ClassifySeedIntent / IsConfiguredSeed — the EXPLICIT
-//     --attestation-seed seed-intent decision both node binaries route through,
-//     replacing the fragile external_ip-as-seed-intent signal (mutation-checked:
-//     drop the flag-disjunct or the declared-but-unresolved FATAL => a CHECK fails)
+//   - no-key-loss guard: LoadOrGenerate never auto-mints over a present-but-
+//     unloadable key file (a present key is never destroyed by an auto-mint)
 
 #include <attestation/seed_attestation.h>
 #include <dfmp/dfmp.h>
@@ -556,15 +552,13 @@ static void TestMigrationSaveFailIsNonFatal() {
     g_failpointActive = true;
 
     CSeedAttestationKey k2;
-    SeedKeyLoadStatus status = SeedKeyLoadStatus::CORRUPT;
-    bool ok = k2.LoadOrGenerate(dir, /*allowGenerate=*/false, /*allowPlaintext=*/false, &status);
+    bool ok = k2.LoadOrGenerate(dir, /*allowGenerate=*/false, /*allowPlaintext=*/false);
 
     g_failpointActive = false;
     g_seedKeySaveFailpoint = nullptr;
 
     // 3) THE assertions: non-fatal — we keep running on the loaded key.
     CHECK(ok, "LoadOrGenerate returns true (NON-FATAL) when the migration re-save fails");
-    CHECK(status == SeedKeyLoadStatus::OK, "status is OK (running on the loaded key) despite save-fail");
     CHECK(k2.IsValid(), "in-memory key is still valid after failed migration");
     CHECK(k2.GetPubKey() == origPub, "in-memory key is the SAME (loaded v1) keypair");
     CHECK(PrivKeyRoundTrips(k2, origPub), "loaded v1 private key still signs/verifies");
@@ -583,33 +577,28 @@ static void TestMigrationSaveFailIsNonFatal() {
     SetPass(nullptr);
 }
 
-// LP-13 (round-2 fold — transient-vs-permanent classification): the node decides
-// FATAL vs warn-continue from SeedKeyLoadStatus. This pins the classification at
-// the unit level (the node's IP-scope gate then maps actual-seed + MISSING/CORRUPT
-// => fatal, actual-seed + TRANSIENT => warn, non-seed => boot fine). The HIGH-1
-// "community node with no key boots fine" behavior reduces to: a MISSING key with
-// allowGenerate=false yields status==MISSING and the node only aborts when the IP
-// is in the seed set — so the load-bearing unit claim is "MISSING is reported as
-// MISSING (not silently OK), CORRUPT as CORRUPT, and a present-but-unreadable key
-// as TRANSIENT (not MISSING/CORRUPT)". Mutation self-checks noted per assertion.
-static void TestLoadStatusClassification() {
-    std::cout << "[Test] round-2: LoadOrGenerate classifies MISSING / CORRUPT / TRANSIENT" << std::endl;
+// LP-13 (no-key-loss guard, retained after SM-5 removal): LoadOrGenerate must
+// NEVER auto-mint a fresh consensus key OVER a present-but-unloadable key file —
+// that would destroy a possibly-recoverable key. Auto-mint is only permitted when
+// the file is genuinely ABSENT and --generate-seed-key was given. This is the bool
+// behavior the SM-5 status classifier used to drive; it survives the decouple as a
+// plain behavioral test of the CARDINAL "key-loss is impossible" property.
+static void TestNoMintOverPresentKey() {
+    std::cout << "[Test] no-key-loss: never auto-mint over a present key" << std::endl;
 
-    // (a) MISSING: empty dir, no key, no generate flag => status MISSING, false.
+    // (a) MISSING: empty dir, no key, no generate flag => fail loud (false), no mint.
     {
         std::string dir = MakeTempDir();
         SetPass(nullptr);
         CSeedAttestationKey k;
-        SeedKeyLoadStatus st = SeedKeyLoadStatus::OK;
-        bool ok = k.LoadOrGenerate(dir, /*allowGenerate=*/false, /*allowPlaintext=*/false, &st);
-        CHECK(!ok, "MISSING key + no generate => LoadOrGenerate false");
-        CHECK(st == SeedKeyLoadStatus::MISSING,
-              "absent key reports MISSING (mutation: classifying it OK would let a seed boot keyless)");
+        bool ok = k.LoadOrGenerate(dir, /*allowGenerate=*/false, /*allowPlaintext=*/false);
+        CHECK(!ok, "MISSING key + no --generate-seed-key => LoadOrGenerate false (no silent mint)");
+        std::ifstream f(KeyPath(dir), std::ios::binary);
+        CHECK(!f.good(), "no key file was minted when generate was not requested");
     }
 
-    // (b) CORRUPT: a present file with bad magic => status CORRUPT, false. An
-    //     actual seed treats this as fatal; auto-mint must NOT overwrite it even
-    //     with allowGenerate=true (never destroy a present, possibly-recoverable key).
+    // (b) PRESENT-but-CORRUPT: a present file with bad magic must NOT be overwritten
+    //     by an auto-mint even WITH --generate-seed-key. The bytes survive intact.
     {
         std::string dir = MakeTempDir();
         SetPass(nullptr);
@@ -618,51 +607,14 @@ static void TestLoadStatusClassification() {
         std::vector<uint8_t> before = ReadFileBytes(KeyPath(dir));
 
         CSeedAttestationKey k;
-        SeedKeyLoadStatus st = SeedKeyLoadStatus::OK;
-        bool ok = k.LoadOrGenerate(dir, /*allowGenerate=*/true, /*allowPlaintext=*/true, &st);
+        bool ok = k.LoadOrGenerate(dir, /*allowGenerate=*/true, /*allowPlaintext=*/true);
         CHECK(!ok, "CORRUPT present file => LoadOrGenerate false even WITH --generate-seed-key");
-        CHECK(st == SeedKeyLoadStatus::CORRUPT, "present-but-bad file reports CORRUPT");
         std::vector<uint8_t> after = ReadFileBytes(KeyPath(dir));
         CHECK(after == before,
-              "CORRUPT present key is NOT overwritten by auto-mint (no key destroyed)");
+              "present-but-bad key is NOT overwritten by auto-mint (no key destroyed)");
     }
 
-#ifndef _WIN32
-    // (c) TRANSIENT: a present-but-UNREADABLE file (chmod 000, non-root) must
-    //     report TRANSIENT — NOT MISSING and NOT CORRUPT — so an actual seed
-    //     warns-and-continues instead of crash-looping or minting a 2nd key.
-    //     Under root, chmod 000 does not revoke read; honest SKIP (M-4 precedent).
-    {
-        std::string dir = MakeTempDir();
-        SetPass("transient-pass");
-        CSeedAttestationKey k1;
-        CHECK(k1.Generate(), "generate key for transient test");
-        CHECK(k1.Save(dir), "save v2 key");
-
-        if (chmod(KeyPath(dir).c_str(), 0) == 0) {
-            std::ifstream probe(KeyPath(dir), std::ios::binary);
-            if (probe.good()) {
-                std::cout << "  [info] cannot revoke read (running as root?); TRANSIENT leg "
-                             "skipped — run as non-root to exercise it" << std::endl;
-            } else {
-                probe.close();
-                CSeedAttestationKey k2;
-                SeedKeyLoadStatus st = SeedKeyLoadStatus::OK;
-                bool ok = k2.LoadOrGenerate(dir, /*allowGenerate=*/false, /*allowPlaintext=*/false, &st);
-                CHECK(!ok, "present-but-unreadable key => LoadOrGenerate false");
-                CHECK(st == SeedKeyLoadStatus::TRANSIENT,
-                      "present-but-unreadable key reports TRANSIENT (mutation: MISSING/CORRUPT here "
-                      "would crash-loop or mint a 2nd key on a real seed over a disk blip)");
-            }
-            chmod(KeyPath(dir).c_str(), S_IRUSR | S_IWUSR);  // restore for clean teardown
-        } else {
-            std::cout << "  [info] chmod 000 failed; TRANSIENT leg skipped" << std::endl;
-        }
-        SetPass(nullptr);
-    }
-#endif
-
-    // (d) OK: a normal v2 key loads with status OK.
+    // (c) OK: a normal v2 key loads (true).
     {
         std::string dir = MakeTempDir();
         SetPass("ok-pass");
@@ -670,9 +622,7 @@ static void TestLoadStatusClassification() {
         CHECK(k1.Generate(), "generate key");
         CHECK(k1.Save(dir), "save v2");
         CSeedAttestationKey k2;
-        SeedKeyLoadStatus st = SeedKeyLoadStatus::MISSING;
-        bool ok = k2.LoadOrGenerate(dir, false, false, &st);
-        CHECK(ok && st == SeedKeyLoadStatus::OK, "good key loads with status OK");
+        CHECK(k2.LoadOrGenerate(dir, false, false), "good key loads (true)");
         SetPass(nullptr);
     }
 }
@@ -873,51 +823,6 @@ static void TestSeedKeyFilePresentDetectsUnreadable() {
 #endif
 }
 
-// LP-13 round-3: the EXPLICIT --attestation-seed seed-intent classifier. This is
-// the single source of truth both node binaries route through for the fatal-vs-
-// silent startup decision, replacing the fragile bare external_ip-match signal.
-// Mutation-checked: each assertion below KILLS a specific mutation of
-// ClassifySeedIntent (drop the flag-disjunct, drop the declared-but-unresolved
-// FATAL, swap the COMMUNITY fall-through, etc.). seedId >= 0 means external_ip
-// resolved to a configured seat; seedId == -1 means it did not.
-static void TestSeedIntentClassifier() {
-    std::cout << "[Test] round-3: --attestation-seed seed-intent classifier" << std::endl;
-
-    // (1) Flag SET + IP IN set (seedId>=0): CONFIGURED_SEED (must attest; missing
-    //     key => fatal). Explicit + resolved is the canonical seed.
-    CHECK(ClassifySeedIntent(/*flag=*/true, /*seedId=*/0) == SeedIntent::CONFIGURED_SEED,
-          "flag SET + IP-in-set => CONFIGURED_SEED");
-    CHECK(IsConfiguredSeed(true, 3) == true,
-          "flag SET + IP-in-set => IsConfiguredSeed (must attest)");
-
-    // (2) Flag SET + IP NOT in set (seedId==-1): DECLARED_BUT_UNRESOLVED => FATAL.
-    //     THE silent-gap closer. Mutation: if the declared-but-unresolved branch is
-    //     removed, this falls through to COMMUNITY and the assertion fails.
-    CHECK(ClassifySeedIntent(/*flag=*/true, /*seedId=*/-1) == SeedIntent::DECLARED_BUT_UNRESOLVED,
-          "flag SET + IP-NOT-in-set => DECLARED_BUT_UNRESOLVED (declared-but-unresolved FATAL; "
-          "mutation: removing this branch silently demotes a misconfigured seat to COMMUNITY)");
-    CHECK(IsConfiguredSeed(true, -1) == false,
-          "declared-but-unresolved is NOT a (bootable) CONFIGURED_SEED — it is FATAL at the node");
-
-    // (3) NO flag + IP IN set (seedId>=0): CONFIGURED_SEED (backward-compat — live
-    //     seeds keep attesting by IP-match through the rolling deploy). Mutation:
-    //     if the IP-match disjunct is removed, this becomes COMMUNITY and the live
-    //     seeds would silently stop attesting — the assertion fails.
-    CHECK(ClassifySeedIntent(/*flag=*/false, /*seedId=*/2) == SeedIntent::CONFIGURED_SEED,
-          "NO flag + IP-in-set => CONFIGURED_SEED (backward-compat; mutation: dropping the "
-          "IP-match disjunct stops the live seeds attesting)");
-    CHECK(IsConfiguredSeed(false, 2) == true,
-          "NO flag + IP-in-set => IsConfiguredSeed (backward-compat attest)");
-
-    // (4) NO flag + IP NOT in set (seedId==-1): COMMUNITY (boots fine, non-attesting,
-    //     never fatal on key state). Mutation: classifying this CONFIGURED_SEED would
-    //     make every community relay/public-API node fatal-on-missing-key.
-    CHECK(ClassifySeedIntent(/*flag=*/false, /*seedId=*/-1) == SeedIntent::COMMUNITY,
-          "NO flag + IP-NOT-in-set => COMMUNITY (community node; never fatal on keys)");
-    CHECK(IsConfiguredSeed(false, -1) == false,
-          "community node is NOT a configured seed (boots non-attesting)");
-}
-
 int main() {
     std::cout << "=== LP-13 seed_attestation_key_tests ===" << std::endl;
 
@@ -935,8 +840,7 @@ int main() {
     TestDefaultOnEncryptionGate();           // CL-1 (default-on; mutation-kills the gate)
     TestV1ToV2Migration();                   // CL-1 (migration; original key preserved)
     TestMigrationSaveFailIsNonFatal();       // MEDIUM-1 (round-2: migration save-fail non-fatal)
-    TestLoadStatusClassification();          // round-2 (MISSING/CORRUPT/TRANSIENT classification)
-    TestSeedIntentClassifier();              // round-3 (--attestation-seed seed-intent; mutation-checked)
+    TestNoMintOverPresentKey();              // no-key-loss: never auto-mint over a present key
     TestNoPlaintextBak();                    // CL-2 (no plaintext .bak)
     TestSeedKeyFilePresentDetectsUnreadable(); // extreview HIGH (presence vs readability)
 #ifndef _WIN32

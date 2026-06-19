@@ -95,38 +95,6 @@ void CleanseSeedKeyBuffer(std::vector<uint8_t>& buf);
  *  startup. Both node binaries call this to classify a LoadOrGenerate failure. */
 bool SeedKeyFilePresent(const std::string& dataDir);
 
-/** LP-13 round-3: the seed-intent decision, classifying what a node must do at
- *  startup given (a) whether the operator explicitly declared --attestation-seed
- *  and (b) whether external_ip resolves to a configured seat (seedId >= 0). The
- *  fatal-vs-silent startup decision derives from this, NOT from a bare external_ip
- *  match — closing the round-2 silent-non-attest gap where a real seat with a
- *  wrong external_ip silently demoted itself to a "community relay".
- *
- *  Pure + side-effect-free so BOTH node binaries call the SAME classifier (byte
- *  consistency guaranteed by construction) and unit tests can mutation-check it. */
-enum class SeedIntent {
-    /** No --attestation-seed flag AND external_ip not in the seed set. A community
-     *  relay/public-API node: boots fine, NON-attesting, NEVER fatal on key state. */
-    COMMUNITY,
-    /** external_ip resolves to a seat (isConfiguredSeed) — MUST attest; a missing/
-     *  corrupt key is FATAL, a transient key fault is warn+continue. This covers
-     *  both "flag set + IP matches" and the backward-compat "IP matches, no flag". */
-    CONFIGURED_SEED,
-    /** --attestation-seed declared but external_ip does NOT resolve to a seat: a
-     *  misconfigured declared seed. FATAL before key load (the silent-gap closer) —
-     *  a declared seed must resolve or it would silently non-attest. */
-    DECLARED_BUT_UNRESOLVED,
-};
-
-/** Classify seed intent. attestationSeedFlag == --attestation-seed was passed;
- *  seedId >= 0 iff external_ip matched a configured seat. Pure function. */
-SeedIntent ClassifySeedIntent(bool attestationSeedFlag, int seedId);
-
-/** True when the node MUST attest (CONFIGURED_SEED): the explicit flag was set OR
- *  external_ip matched a seat. Equivalent to (attestationSeedFlag || seedId >= 0)
- *  but routed through ClassifySeedIntent so the disjunct lives in ONE place. */
-bool IsConfiguredSeed(bool attestationSeedFlag, int seedId);
-
 /** LP-13 H-2 (atomic-save) TEST SEAM. When set to a non-null function, Save()
  *  invokes it immediately after the temp file has been fully written + fsynced
  *  but BEFORE the atomic rename over the target. If the hook returns true, Save
@@ -144,37 +112,6 @@ extern bool (*g_seedKeySaveFailpoint)();
  *  branch without a real disk fault. nullptr in production (no overhead, no
  *  behavior change). Not for general use. */
 extern bool (*g_seedKeyFsyncFailpoint)();
-
-/**
- * LP-13 (round-2 fold, transient-vs-permanent split): classification of WHY a
- * LoadOrGenerate failed, so the node can decide FATAL vs loud-WARN-and-continue.
- *
- * The cardinal goal of SM-5 ("never SILENTLY non-attest") is satisfied by either
- * a fatal abort OR a loud warning — but a real seed must NOT be bricked into the
- * supervisor's crash-loop by a TRANSIENT disk/permission blip at boot. So:
- *   - OK            : key loaded/generated successfully.
- *   - MISSING       : the key file is genuinely ABSENT (ENOENT). On an actual
- *                     seed this is the intended SM-5 loud FATAL (provision with
- *                     --generate-seed-key) — a permanent, operator-visible state.
- *   - CORRUPT       : the file is PRESENT but unusable for a PERMANENT reason
- *                     (bad magic/version, truncation, decrypt/MAC failure, wrong/
- *                     missing passphrase) OR a config-policy refusal (v1 plaintext
- *                     with no passphrase and no --allow-plaintext-seed-key, or a
- *                     freshly minted key that could not be persisted). Re-running
- *                     will fail identically => FATAL on an actual seed.
- *   - TRANSIENT     : the file is PRESENT but could not be READ for a reason that
- *                     may clear on retry (open() failed with a non-ENOENT errno —
- *                     EACCES/EBUSY/EIO/EMFILE/etc., or an indeterminate stat). A
- *                     reboot/disk-settle may fix it, so this is a loud WARN +
- *                     continue (non-attesting) — NOT fatal — to avoid a 5-second
- *                     crash-loop over a momentary fault.
- */
-enum class SeedKeyLoadStatus {
-    OK = 0,
-    MISSING,
-    CORRUPT,
-    TRANSIENT,
-};
 
 /**
  * Seed node's Dilithium3 keypair for signing attestations.
@@ -286,19 +223,6 @@ public:
                         bool allowPlaintext = false);
 
     /**
-     * LP-13 (round-2 fold): LoadOrGenerate variant that also reports WHY it failed
-     * via SeedKeyLoadStatus, letting the node distinguish a permanent failure
-     * (MISSING / CORRUPT — fatal on an actual seed) from a TRANSIENT read error
-     * (loud warn + continue, NOT fatal). On success *status == OK and the return
-     * is true. The bool return is identical to the 3-arg overload; this overload
-     * just exposes the classification. See SeedKeyLoadStatus.
-     *
-     * @param status [out] failure classification (OK on success).
-     */
-    bool LoadOrGenerate(const std::string& dataDir, bool allowGenerate,
-                        bool allowPlaintext, SeedKeyLoadStatus* status);
-
-    /**
      * Sign an attestation message.
      * @param message The raw message bytes to sign
      * @param[out] signature Output signature (3309 bytes)
@@ -325,12 +249,6 @@ private:
     std::vector<uint8_t> m_pubkey;   // 1952 bytes
     std::vector<uint8_t> m_privkey;  // 4032 bytes (should use SecureAllocator in production)
     bool m_loadedV1Plaintext = false;  // LP-13 H-1: provenance of the in-memory key
-
-    /** LP-13 (round-2 fold): classifying Load — distinguishes a genuinely MISSING
-     *  key (ENOENT) from a present-but-unreadable TRANSIENT error and a present-
-     *  but-bad CORRUPT file. Public Load() forwards to this and keeps the bool
-     *  contract; LoadOrGenerate(..., status) surfaces the classification. */
-    SeedKeyLoadStatus LoadClassified(const std::string& dataDir);
 
     void Clear();
 };
