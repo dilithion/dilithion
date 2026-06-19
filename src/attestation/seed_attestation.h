@@ -114,6 +114,37 @@ extern bool (*g_seedKeySaveFailpoint)();
 extern bool (*g_seedKeyFsyncFailpoint)();
 
 /**
+ * LP-13 (round-2 fold, transient-vs-permanent split): classification of WHY a
+ * LoadOrGenerate failed, so the node can decide FATAL vs loud-WARN-and-continue.
+ *
+ * The cardinal goal of SM-5 ("never SILENTLY non-attest") is satisfied by either
+ * a fatal abort OR a loud warning — but a real seed must NOT be bricked into the
+ * supervisor's crash-loop by a TRANSIENT disk/permission blip at boot. So:
+ *   - OK            : key loaded/generated successfully.
+ *   - MISSING       : the key file is genuinely ABSENT (ENOENT). On an actual
+ *                     seed this is the intended SM-5 loud FATAL (provision with
+ *                     --generate-seed-key) — a permanent, operator-visible state.
+ *   - CORRUPT       : the file is PRESENT but unusable for a PERMANENT reason
+ *                     (bad magic/version, truncation, decrypt/MAC failure, wrong/
+ *                     missing passphrase) OR a config-policy refusal (v1 plaintext
+ *                     with no passphrase and no --allow-plaintext-seed-key, or a
+ *                     freshly minted key that could not be persisted). Re-running
+ *                     will fail identically => FATAL on an actual seed.
+ *   - TRANSIENT     : the file is PRESENT but could not be READ for a reason that
+ *                     may clear on retry (open() failed with a non-ENOENT errno —
+ *                     EACCES/EBUSY/EIO/EMFILE/etc., or an indeterminate stat). A
+ *                     reboot/disk-settle may fix it, so this is a loud WARN +
+ *                     continue (non-attesting) — NOT fatal — to avoid a 5-second
+ *                     crash-loop over a momentary fault.
+ */
+enum class SeedKeyLoadStatus {
+    OK = 0,
+    MISSING,
+    CORRUPT,
+    TRANSIENT,
+};
+
+/**
  * Seed node's Dilithium3 keypair for signing attestations.
  *
  * Generated on first run (if --relay-only seed node), stored in data dir.
@@ -223,6 +254,19 @@ public:
                         bool allowPlaintext = false);
 
     /**
+     * LP-13 (round-2 fold): LoadOrGenerate variant that also reports WHY it failed
+     * via SeedKeyLoadStatus, letting the node distinguish a permanent failure
+     * (MISSING / CORRUPT — fatal on an actual seed) from a TRANSIENT read error
+     * (loud warn + continue, NOT fatal). On success *status == OK and the return
+     * is true. The bool return is identical to the 3-arg overload; this overload
+     * just exposes the classification. See SeedKeyLoadStatus.
+     *
+     * @param status [out] failure classification (OK on success).
+     */
+    bool LoadOrGenerate(const std::string& dataDir, bool allowGenerate,
+                        bool allowPlaintext, SeedKeyLoadStatus* status);
+
+    /**
      * Sign an attestation message.
      * @param message The raw message bytes to sign
      * @param[out] signature Output signature (3309 bytes)
@@ -249,6 +293,12 @@ private:
     std::vector<uint8_t> m_pubkey;   // 1952 bytes
     std::vector<uint8_t> m_privkey;  // 4032 bytes (should use SecureAllocator in production)
     bool m_loadedV1Plaintext = false;  // LP-13 H-1: provenance of the in-memory key
+
+    /** LP-13 (round-2 fold): classifying Load — distinguishes a genuinely MISSING
+     *  key (ENOENT) from a present-but-unreadable TRANSIENT error and a present-
+     *  but-bad CORRUPT file. Public Load() forwards to this and keeps the bool
+     *  contract; LoadOrGenerate(..., status) surfaces the classification. */
+    SeedKeyLoadStatus LoadClassified(const std::string& dataDir);
 
     void Clear();
 };

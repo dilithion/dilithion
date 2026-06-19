@@ -17,6 +17,9 @@
 //     the original keypair is preserved (never lost); refused (fail loud) with
 //     no passphrase + no opt-out
 //   - CL-2: no plaintext .bak copy survives a save
+//   - MEDIUM-1 (round-2): migration re-save failure is NON-FATAL, v1 byte-intact
+//   - round-2: LoadOrGenerate classifies MISSING / CORRUPT / TRANSIENT (the
+//     classification that drives the node's actual-seed SM-5 scope + warn-vs-fatal)
 
 #include <attestation/seed_attestation.h>
 #include <dfmp/dfmp.h>
@@ -516,6 +519,160 @@ static void TestV1ToV2Migration() {
     SetPass(nullptr);
 }
 
+// LP-13 MEDIUM-1 (round-2 fold — THE single most safety-critical migration
+// claim, previously ZERO coverage): when the v1->v2 migration re-Save FAILS, the
+// node must KEEP RUNNING on the loaded (v1) key — NOT fatal — and the original v1
+// file must be byte-intact. A bug that made the migration-save-failure fatal would
+// brick a live seed on a transient disk error during a rolling upgrade.
+//
+// We force the migration Save to fail via the existing g_seedKeySaveFailpoint
+// seam (a simulated crash between temp-write and rename, which the atomic save
+// path turns into a clean false return with the original file untouched).
+// Assertions: LoadOrGenerate returns true (non-fatal); the in-memory key is the
+// SAME (v1) keypair and still signs; the on-disk file is STILL v1 and byte-for-
+// byte identical to before. Mutation self-check: making the migration-save branch
+// fatal (return false / Clear) fails the "non-fatal + key still usable" asserts.
+static void TestMigrationSaveFailIsNonFatal() {
+    std::cout << "[Test] MEDIUM-1: migration re-save failure is NON-FATAL, v1 key preserved" << std::endl;
+    std::string dir = MakeTempDir();
+
+    // 1) Establish a live v1 plaintext key (explicit opt-out to write it).
+    SetPass(nullptr);
+    CSeedAttestationKey k1;
+    CHECK(k1.Generate(), "generate v1 key");
+    std::vector<uint8_t> origPub = k1.GetPubKey();
+    CHECK(k1.Save(dir, /*allowPlaintext=*/true), "save v1 plaintext (legacy live key)");
+    std::vector<uint8_t> v1Before = ReadFileBytes(KeyPath(dir));
+    CHECK(v1Before.size() > 5 && v1Before[4] == 1, "on-disk file is v1 before migration attempt");
+
+    // 2) Provision a passphrase (deploy step) so LoadOrGenerate WILL attempt the
+    //    v1->v2 migration re-save — but arm the failpoint so that re-save FAILS.
+    SetPass("migration-fail-pass");
+    g_seedKeySaveFailpoint = SaveFailpoint;
+    g_failpointActive = true;
+
+    CSeedAttestationKey k2;
+    SeedKeyLoadStatus status = SeedKeyLoadStatus::CORRUPT;
+    bool ok = k2.LoadOrGenerate(dir, /*allowGenerate=*/false, /*allowPlaintext=*/false, &status);
+
+    g_failpointActive = false;
+    g_seedKeySaveFailpoint = nullptr;
+
+    // 3) THE assertions: non-fatal — we keep running on the loaded key.
+    CHECK(ok, "LoadOrGenerate returns true (NON-FATAL) when the migration re-save fails");
+    CHECK(status == SeedKeyLoadStatus::OK, "status is OK (running on the loaded key) despite save-fail");
+    CHECK(k2.IsValid(), "in-memory key is still valid after failed migration");
+    CHECK(k2.GetPubKey() == origPub, "in-memory key is the SAME (loaded v1) keypair");
+    CHECK(PrivKeyRoundTrips(k2, origPub), "loaded v1 private key still signs/verifies");
+    CHECK(k2.LoadedPlaintext(), "in-memory key still flagged plaintext (migration did NOT complete)");
+
+    // 4) On-disk file is STILL the original v1 file, byte-for-byte (atomic save
+    //    left it untouched). The operator can retry the migration later.
+    std::vector<uint8_t> v1After = ReadFileBytes(KeyPath(dir));
+    CHECK(v1After == v1Before, "original v1 key file is BYTE-INTACT after the failed migration");
+    CHECK(v1After.size() > 5 && v1After[4] == 1, "on-disk file is STILL v1 (not partially migrated)");
+
+    // 5) No stray .tmp left occupying the path.
+    std::ifstream tmp(KeyPath(dir) + ".tmp", std::ios::binary);
+    CHECK(!tmp.good(), "no leftover .tmp after the failed migration save");
+
+    SetPass(nullptr);
+}
+
+// LP-13 (round-2 fold — transient-vs-permanent classification): the node decides
+// FATAL vs warn-continue from SeedKeyLoadStatus. This pins the classification at
+// the unit level (the node's IP-scope gate then maps actual-seed + MISSING/CORRUPT
+// => fatal, actual-seed + TRANSIENT => warn, non-seed => boot fine). The HIGH-1
+// "community node with no key boots fine" behavior reduces to: a MISSING key with
+// allowGenerate=false yields status==MISSING and the node only aborts when the IP
+// is in the seed set — so the load-bearing unit claim is "MISSING is reported as
+// MISSING (not silently OK), CORRUPT as CORRUPT, and a present-but-unreadable key
+// as TRANSIENT (not MISSING/CORRUPT)". Mutation self-checks noted per assertion.
+static void TestLoadStatusClassification() {
+    std::cout << "[Test] round-2: LoadOrGenerate classifies MISSING / CORRUPT / TRANSIENT" << std::endl;
+
+    // (a) MISSING: empty dir, no key, no generate flag => status MISSING, false.
+    {
+        std::string dir = MakeTempDir();
+        SetPass(nullptr);
+        CSeedAttestationKey k;
+        SeedKeyLoadStatus st = SeedKeyLoadStatus::OK;
+        bool ok = k.LoadOrGenerate(dir, /*allowGenerate=*/false, /*allowPlaintext=*/false, &st);
+        CHECK(!ok, "MISSING key + no generate => LoadOrGenerate false");
+        CHECK(st == SeedKeyLoadStatus::MISSING,
+              "absent key reports MISSING (mutation: classifying it OK would let a seed boot keyless)");
+    }
+
+    // (b) CORRUPT: a present file with bad magic => status CORRUPT, false. An
+    //     actual seed treats this as fatal; auto-mint must NOT overwrite it even
+    //     with allowGenerate=true (never destroy a present, possibly-recoverable key).
+    {
+        std::string dir = MakeTempDir();
+        SetPass(nullptr);
+        std::vector<uint8_t> garbage(64, 0x77);  // wrong magic, present file
+        WriteFileBytes(KeyPath(dir), garbage);
+        std::vector<uint8_t> before = ReadFileBytes(KeyPath(dir));
+
+        CSeedAttestationKey k;
+        SeedKeyLoadStatus st = SeedKeyLoadStatus::OK;
+        bool ok = k.LoadOrGenerate(dir, /*allowGenerate=*/true, /*allowPlaintext=*/true, &st);
+        CHECK(!ok, "CORRUPT present file => LoadOrGenerate false even WITH --generate-seed-key");
+        CHECK(st == SeedKeyLoadStatus::CORRUPT, "present-but-bad file reports CORRUPT");
+        std::vector<uint8_t> after = ReadFileBytes(KeyPath(dir));
+        CHECK(after == before,
+              "CORRUPT present key is NOT overwritten by auto-mint (no key destroyed)");
+    }
+
+#ifndef _WIN32
+    // (c) TRANSIENT: a present-but-UNREADABLE file (chmod 000, non-root) must
+    //     report TRANSIENT — NOT MISSING and NOT CORRUPT — so an actual seed
+    //     warns-and-continues instead of crash-looping or minting a 2nd key.
+    //     Under root, chmod 000 does not revoke read; honest SKIP (M-4 precedent).
+    {
+        std::string dir = MakeTempDir();
+        SetPass("transient-pass");
+        CSeedAttestationKey k1;
+        CHECK(k1.Generate(), "generate key for transient test");
+        CHECK(k1.Save(dir), "save v2 key");
+
+        if (chmod(KeyPath(dir).c_str(), 0) == 0) {
+            std::ifstream probe(KeyPath(dir), std::ios::binary);
+            if (probe.good()) {
+                std::cout << "  [info] cannot revoke read (running as root?); TRANSIENT leg "
+                             "skipped — run as non-root to exercise it" << std::endl;
+            } else {
+                probe.close();
+                CSeedAttestationKey k2;
+                SeedKeyLoadStatus st = SeedKeyLoadStatus::OK;
+                bool ok = k2.LoadOrGenerate(dir, /*allowGenerate=*/false, /*allowPlaintext=*/false, &st);
+                CHECK(!ok, "present-but-unreadable key => LoadOrGenerate false");
+                CHECK(st == SeedKeyLoadStatus::TRANSIENT,
+                      "present-but-unreadable key reports TRANSIENT (mutation: MISSING/CORRUPT here "
+                      "would crash-loop or mint a 2nd key on a real seed over a disk blip)");
+            }
+            chmod(KeyPath(dir).c_str(), S_IRUSR | S_IWUSR);  // restore for clean teardown
+        } else {
+            std::cout << "  [info] chmod 000 failed; TRANSIENT leg skipped" << std::endl;
+        }
+        SetPass(nullptr);
+    }
+#endif
+
+    // (d) OK: a normal v2 key loads with status OK.
+    {
+        std::string dir = MakeTempDir();
+        SetPass("ok-pass");
+        CSeedAttestationKey k1;
+        CHECK(k1.Generate(), "generate key");
+        CHECK(k1.Save(dir), "save v2");
+        CSeedAttestationKey k2;
+        SeedKeyLoadStatus st = SeedKeyLoadStatus::MISSING;
+        bool ok = k2.LoadOrGenerate(dir, false, false, &st);
+        CHECK(ok && st == SeedKeyLoadStatus::OK, "good key loads with status OK");
+        SetPass(nullptr);
+    }
+}
+
 // LP-13 CL-2: Save leaves NO plaintext .bak behind. The prior implementation
 // staged a copy of the existing (possibly plaintext) key at "<file>.bak" in a
 // crash window; CL-2 removes it. After an UPDATE save (a prior key existed) the
@@ -728,6 +885,8 @@ int main() {
     TestSaveFailMakesLoadOrGenerateFail();   // M-2
     TestDefaultOnEncryptionGate();           // CL-1 (default-on; mutation-kills the gate)
     TestV1ToV2Migration();                   // CL-1 (migration; original key preserved)
+    TestMigrationSaveFailIsNonFatal();       // MEDIUM-1 (round-2: migration save-fail non-fatal)
+    TestLoadStatusClassification();          // round-2 (MISSING/CORRUPT/TRANSIENT classification)
     TestNoPlaintextBak();                    // CL-2 (no plaintext .bak)
     TestSeedKeyFilePresentDetectsUnreadable(); // extreview HIGH (presence vs readability)
 #ifndef _WIN32

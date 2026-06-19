@@ -768,6 +768,12 @@ struct NodeConfig {
                 // LP-13 CL-1: encryption-at-rest is now the DEFAULT, so this flag
                 // is a no-op accepted for backward compatibility with existing
                 // deploy scripts. (It used to be the opt-IN; the default inverted.)
+                // LP-13 (round-2 LOW): emit a one-line DEPRECATION warning so
+                // operators/scripts learn it is now redundant and can drop it.
+                std::cerr << "[WARN] --require-seed-key-encryption is DEPRECATED and now a no-op: "
+                             "seed-key encryption-at-rest is mandatory by DEFAULT. You can remove "
+                             "this flag. (Use --allow-plaintext-seed-key to explicitly opt OUT.)"
+                          << std::endl;
             }
             else if (arg == "--allow-plaintext-seed-key") {
                 // LP-13 CL-1: explicit opt-out of default-on seed-key encryption.
@@ -6928,43 +6934,74 @@ load_genesis_block:  // Bug #29: Label for automatic retry after blockchain wipe
             // v1 plaintext key is migrated to v2 when the passphrase is set, and
             // refused (fatal) with no passphrase + no --allow-plaintext-seed-key.
             //
+            // LP-13 (round-2 fold, HIGH-1 — SCOPE SM-5 TO ACTUAL SEEDS): SM-5's
+            // fatal-on-missing-key must fire ONLY on the configured seeds, NOT on
+            // any third-party community --relay-only/--public-api node (which is
+            // seedCapable but is NOT a configured seed and was never meant to
+            // attest). A node is an ACTUAL SEED iff its resolved external IP
+            // matches one of the configured seed IPs (chainparams
+            // seedAttestationIPs — the SAME set GetMainnetSeedPubkeys() is indexed
+            // by, and the SAME set the seed-ID resolution below already uses; no
+            // parallel resolver). Resolve the seed-ID match ONCE here and reuse it
+            // for both the SM-5 scope gate AND seed-ID assignment.
+            const auto& seedIPs = Dilithion::g_chainParams->seedAttestationIPs;
+            int seedId = -1;
+            if (!config.external_ip.empty()) {
+                for (size_t i = 0; i < seedIPs.size(); i++) {
+                    if (seedIPs[i] == config.external_ip) {
+                        seedId = static_cast<int>(i);
+                        break;
+                    }
+                }
+            }
+            const bool isActualSeed = (seedId >= 0);
+
             // LP-13 (extreview HIGH): PRESENCE test (stat), not ifstream::good()
             // readability — see SeedKeyFilePresent; still drives the diagnostic.
             bool keyFileExists = Attestation::SeedKeyFilePresent(dataDir);
+            Attestation::SeedKeyLoadStatus keyStatus = Attestation::SeedKeyLoadStatus::OK;
             bool attestOk = seedAttestKey.LoadOrGenerate(
-                dataDir, config.generate_seed_key, config.allow_plaintext_seed_key);
+                dataDir, config.generate_seed_key, config.allow_plaintext_seed_key, &keyStatus);
+
             if (!attestOk) {
-                // SM-5: on a seed-capable node, a failed attestation-key init is
-                // ALWAYS fatal (missing, unreadable/corrupt, decrypt/parse failure,
-                // wrong/missing passphrase, plaintext-when-encryption-required, or a
-                // requested mint that could not be persisted). No silent keyless run.
-                std::cerr << "[Attestation] FATAL: seed attestation key initialization FAILED on a "
-                             "seed-capable node (key " << (keyFileExists ? "present but unreadable/"
-                             "corrupt, decrypt/parse failure, wrong/missing " : "MISSING; not minted — ")
-                          << (keyFileExists ? std::string(Attestation::SEED_KEY_PASSPHRASE_ENV) +
-                             ", plaintext key without --allow-plaintext-seed-key, or a mint that could "
-                             "not be persisted" : "pass --generate-seed-key to provision one")
-                          << "). A seed must not run without a usable consensus signing key. "
-                             "Aborting startup." << std::endl;
-                return 1;
-            } else {
-                // Determine seed ID by matching our IP against known seed IPs
-                // For now, use a simple index. In production, compare external IP.
-                int seedId = -1;
-                const auto& seedIPs = Dilithion::g_chainParams->seedAttestationIPs;
-                if (!config.external_ip.empty()) {
-                    for (size_t i = 0; i < seedIPs.size(); i++) {
-                        if (seedIPs[i] == config.external_ip) {
-                            seedId = static_cast<int>(i);
-                            break;
-                        }
-                    }
+                if (!isActualSeed) {
+                    // HIGH-1: a non-seed community relay/public-api node with no (or
+                    // an unusable) key must BOOT FINE — non-attesting, exactly as
+                    // before this hardening. SM-5's fatal-on-missing does NOT apply
+                    // to it (it is not one of the configured seeds and never attests).
+                    std::cout << "  [INFO] No usable seed attestation key; this node is NOT a "
+                                 "configured seed (external IP not in the seed set), so it runs "
+                                 "NON-ATTESTING (normal for a community relay/public-API node)."
+                              << std::endl;
+                } else if (keyStatus == Attestation::SeedKeyLoadStatus::TRANSIENT) {
+                    // Transient-vs-permanent (round-2 fold): on an ACTUAL seed a
+                    // momentary/permission read error is a loud WARN + CONTINUE
+                    // (non-attesting), NOT fatal — a disk blip at boot must not put
+                    // a seed into the wrapper's 5-second crash-loop. SM-5's "never
+                    // SILENTLY non-attest" is still satisfied by the loud warning.
+                    std::cerr << "[Attestation] WARNING: seed attestation key present but could not "
+                                 "be read (TRANSIENT error) on this CONFIGURED SEED. Continuing "
+                                 "NON-ATTESTING; investigate disk/permissions and restart to "
+                                 "resume attesting. (Not aborting over a transient fault.)"
+                              << std::endl;
+                } else {
+                    // ACTUAL seed + a PERMANENT failure (MISSING key, or CORRUPT/
+                    // unreadable/wrong-passphrase/plaintext-policy/mint-not-persisted):
+                    // the intended SM-5 loud FATAL. A seed must not run without a
+                    // usable consensus signing key.
+                    std::cerr << "[Attestation] FATAL: seed attestation key initialization FAILED on a "
+                                 "CONFIGURED SEED (key " << (keyFileExists ? "present but unreadable/"
+                                 "corrupt, decrypt/parse failure, wrong/missing " : "MISSING; not minted — ")
+                              << (keyFileExists ? std::string(Attestation::SEED_KEY_PASSPHRASE_ENV) +
+                                 ", plaintext key without --allow-plaintext-seed-key, or a mint that could "
+                                 "not be persisted" : "pass --generate-seed-key to provision one")
+                              << "). A seed must not run without a usable consensus signing key. "
+                                 "Aborting startup." << std::endl;
+                    return 1;
                 }
-                // Fallback: use --seed-id flag or auto-detect
-                // For testnet, just assign based on order of known IPs
+            } else {
+                // Fallback: default to seed_id=0 if the external IP didn't match.
                 if (seedId < 0) {
-                    // Try to auto-detect from the port number or IP binding
-                    // For now, default to 0 if not specified
                     seedId = 0;
                     std::cerr << "[Attestation] WARNING: Could not determine seed ID. "
                               << "Use --externalip=<IP> to set. Defaulting to seed_id=0" << std::endl;
