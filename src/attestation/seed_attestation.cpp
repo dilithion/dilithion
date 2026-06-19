@@ -480,18 +480,26 @@ void CleanseSeedKeyBuffer(std::vector<uint8_t>& buf) {
     if (!buf.empty()) memory_cleanse(buf.data(), buf.size());
 }
 
-bool CSeedAttestationKey::Save(const std::string& dataDir, bool requireEncryption) const {
+bool CSeedAttestationKey::Save(const std::string& dataDir, bool allowPlaintext) const {
     if (!IsValid()) return false;
 
     std::string path = dataDir + "/" + SEED_KEY_FILENAME;
 
-    // LP-13 H-1: when the operator demands encryption-at-rest, refuse to write a
-    // v1 (plaintext) key. Fail loud so the misconfiguration is impossible to miss
-    // rather than silently persisting an unencrypted consensus signing key.
-    if (requireEncryption && GetSeedKeyPassphrase().empty()) {
-        std::cerr << "[Attestation] FATAL: --require-seed-key-encryption is set but "
-                  << SEED_KEY_PASSPHRASE_ENV << " is unset. Refusing to write an"
-                     " UNENCRYPTED (v1) seed consensus signing key." << std::endl;
+    // LP-13 CL-1 (DEFAULT-ON ENCRYPTION — inverted from the prior default): the
+    // seed consensus signing key is encrypted at rest by default. We refuse to
+    // write a plaintext (v1) key unless the operator EXPLICITLY opts out via
+    // allowPlaintext (--allow-plaintext-seed-key). Without the passphrase we
+    // cannot encrypt, so on the default path (allowPlaintext=false + no
+    // passphrase) we FAIL LOUD rather than silently persist an unencrypted
+    // consensus key. The passphrase is provisioned at deploy via
+    // DILITHION_SEED_KEY_PASSPHRASE.
+    if (GetSeedKeyPassphrase().empty() && !allowPlaintext) {
+        std::cerr << "[Attestation] FATAL: " << SEED_KEY_PASSPHRASE_ENV
+                  << " is unset and seed-key encryption is mandatory by default."
+                     " Refusing to write an UNENCRYPTED (v1) seed consensus signing"
+                     " key. Provision the passphrase (recommended), or pass"
+                     " --allow-plaintext-seed-key to explicitly opt out of"
+                     " encryption-at-rest." << std::endl;
         return false;
     }
 
@@ -607,10 +615,13 @@ bool CSeedAttestationKey::Save(const std::string& dataDir, bool requireEncryptio
     // live "<file>" is left byte-intact and replaced ONLY by an atomic rename of
     // a fully-written, fsync'd temp; if the fsync (POSIX) / FlushFileBuffers
     // (Windows) cannot be confirmed, Save deletes the temp and returns WITHOUT
-    // renaming. A copy of the prior key is first staged at "<file>.bak" so even a
-    // botched rename has a fallback. The guarantee that a crash / partial write /
-    // power loss cannot destroy the only copy rests on fsync-before-rename being
-    // fatal + the atomic rename + the post-rename dir-fsync below.
+    // renaming. LP-13 CL-2: there is NO plaintext "<file>.bak" staging copy — the
+    // atomic rename alone gives the no-key-loss guarantee (the live "<file>" is
+    // untouched until the single rename publishes the fully-flushed temp), so a
+    // second (possibly plaintext) copy of the key on disk was both unnecessary and
+    // a custody hazard. The guarantee that a crash / partial write / power loss
+    // cannot destroy the only copy rests on fsync-before-rename being fatal + the
+    // atomic rename + the post-rename dir-fsync below.
     std::string tmpPath = path + ".tmp";
     std::string bakPath = path + ".bak";
 
@@ -709,54 +720,34 @@ bool CSeedAttestationKey::Save(const std::string& dataDir, bool requireEncryptio
         return finish(false);
     }
 
-    // Stage a .bak of the EXISTING key before we clobber it. Best-effort: if
-    // there is no prior file (first provision) there is nothing to back up.
-    {
-        std::ifstream src(path, std::ios::binary);
-        if (src.is_open()) {
-            std::vector<uint8_t> prior((std::istreambuf_iterator<char>(src)),
-                                        std::istreambuf_iterator<char>());
-            src.close();
-            // LP-13 L-2 (RAII, qwen3 extreview): wipe the prior key bytes (v1 plaintext
-            // private key for a v1 file) on EVERY scope exit incl. a throw, matching
-            // M-3/Save's exception-safe pattern (consistency over the manual cleanse).
-            struct PriorWipe { std::vector<uint8_t>& v; ~PriorWipe(){ if (!v.empty()) memory_cleanse(v.data(), v.size()); } } priorWipe{prior};
-            // LP-13 symlink-hardening (nemotron extreview): O_NOFOLLOW on the .bak too.
-            int bfd = ::open(bakPath.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW, S_IRUSR | S_IWUSR);
-            if (bfd >= 0) {
-                size_t bw = 0; bool bok = true;
-                while (bw < prior.size()) {
-                    ssize_t n = ::write(bfd, prior.data() + bw, prior.size() - bw);
-                    if (n <= 0) { bok = false; break; }
-                    bw += static_cast<size_t>(n);
-                }
-                // LP-13 B-1: surface a .bak fsync failure honestly rather than
-                // swallow it. NOT fatal — with fsync(tmp) now fatal above and the
-                // dir-fsync below, the NEW key is durable before Save returns; the
-                // .bak is belt-and-braces. But on an UPDATE save (a prior key
-                // existed) a non-durable fallback copy is worth logging clearly.
-                bool bsync = bok && (::fsync(bfd) == 0);
-                ::close(bfd);
-                if (!bok) {
-                    std::cerr << "[Attestation] WARNING: failed to write key .bak" << std::endl;
-                } else if (!bsync) {
-                    std::cerr << "[Attestation] WARNING: fsync of key .bak failed (errno "
-                              << errno << "); fallback copy may not be durable across power loss."
-                              << std::endl;
-                }
-            }
-        }
-    }
+    // LP-13 CL-2: NO plaintext .bak. The prior key staging copy was a second
+    // copy of the OLD key at rest — and for a v1 (or legacy plaintext) key that
+    // was a SECOND PLAINTEXT copy of the consensus signing key lingering on disk
+    // inside a crash window. The atomic temp+rename below already gives the
+    // no-key-loss guarantee (a failed/partial write touches only "<file>.tmp";
+    // the live "<file>" is byte-intact until the single atomic rename publishes a
+    // fully-written, fsync'd temp), so the .bak fallback was never load-bearing.
+    // We drop it entirely so no extra (possibly plaintext) seed key ever survives
+    // on disk. Defensive: remove any stale .bak a PRIOR (pre-CL-2) build left.
+    ::unlink(bakPath.c_str());
 
     // Atomic publish: rename(2) over the target is atomic on POSIX.
     if (::rename(tmpPath.c_str(), path.c_str()) != 0) {
         std::cerr << "[Attestation] Key file atomic rename failed (errno " << errno
                   << "); original key left intact at " << path << std::endl;
         ::unlink(tmpPath.c_str());
-        ::unlink(bakPath.c_str());  // LOW-3: don't leave a stale (plaintext-for-v1) .bak copy
         return finish(false);
     }
-    RestrictKeyFilePerms(path);  // perms ride with rename, but re-assert defensively
+    // perms ride with rename, but re-assert defensively. LP-13 (round-2 LOW): if
+    // the post-rename re-assert fails the key was still PUBLISHED (the rename
+    // succeeded — we do NOT fail the save and lose the key over a perms blip), but
+    // the on-disk file may carry wrong/looser perms than 0600. Warn so the operator
+    // can repair it rather than the failure passing silently.
+    if (!RestrictKeyFilePerms(path)) {
+        std::cerr << "[Attestation] WARNING: could not re-assert 0600 on the published key"
+                     " file " << path << " after the atomic rename; the key was SAVED but may"
+                     " carry incorrect permissions. Repair manually (chmod 0600)." << std::endl;
+    }
 
     // fsync the directory so the rename metadata is durable across power loss.
     {
@@ -766,16 +757,10 @@ bool CSeedAttestationKey::Save(const std::string& dataDir, bool requireEncryptio
         int dirfd = ::open(parentDir.c_str(), O_RDONLY);
         if (dirfd >= 0) { ::fsync(dirfd); ::close(dirfd); }
     }
-
-    // LP-13 LOW-3: the .bak was a fallback for a botched rename. The publish
-    // succeeded, so it's now a stale copy of the OLD key — and for a v1
-    // (unencrypted) key it would be a second plaintext copy of the consensus
-    // signing key lingering at rest. Remove it. (rename atomicity already
-    // guarantees the no-key-loss property without a persisted .bak.)
-    ::unlink(bakPath.c_str());
-#else
-    // Windows: write temp with a durable flush, stage .bak, then MoveFileEx
-    // atomic replace.
+#endif
+#ifdef _WIN32
+    // Windows: write temp with a durable flush, then MoveFileEx atomic replace.
+    // LP-13 CL-2: NO plaintext .bak staging (see the POSIX rationale above).
     //
     // LP-13 B-1 (fail-closed durability, Windows): ofstream::flush()/close() only
     // pushes bytes into the OS cache — NOT to stable storage. We must
@@ -836,23 +821,11 @@ bool CSeedAttestationKey::Save(const std::string& dataDir, bool requireEncryptio
         return finish(false);
     }
 
-    // Stage a .bak of the existing key (best-effort).
-    {
-        std::ifstream src(path, std::ios::binary);
-        if (src.is_open()) {
-            std::vector<uint8_t> prior((std::istreambuf_iterator<char>(src)),
-                                        std::istreambuf_iterator<char>());
-            src.close();
-            // LP-13 L-2 (RAII, qwen3 extreview): wipe prior (v1 plaintext for a v1 file) on any exit incl. throw.
-            struct PriorWipe { std::vector<uint8_t>& v; ~PriorWipe(){ if (!v.empty()) memory_cleanse(v.data(), v.size()); } } priorWipe{prior};
-            std::ofstream bf(bakPath, std::ios::binary | std::ios::trunc);
-            if (bf.is_open()) {
-                bf.write(reinterpret_cast<const char*>(prior.data()), prior.size());
-                if (!bf.good()) std::cerr << "[Attestation] WARNING: failed to write key .bak" << std::endl;
-                bf.close();
-            }
-        }
-    }
+    // LP-13 CL-2: NO plaintext .bak. See the POSIX path for the rationale —
+    // MoveFileExW's atomic replace already guarantees no-key-loss without a
+    // second (possibly plaintext) copy on disk. Defensive: remove any stale .bak
+    // a PRIOR (pre-CL-2) build may have left behind.
+    std::remove(bakPath.c_str());
 
     // Atomic publish via MoveFileExW (REPLACE_EXISTING | WRITE_THROUGH): either
     // fully succeeds or fully fails — never a partial/corrupt live key file.
@@ -863,13 +836,14 @@ bool CSeedAttestationKey::Save(const std::string& dataDir, bool requireEncryptio
         std::cerr << "[Attestation] Key file atomic move failed; original key left intact at "
                   << path << std::endl;
         std::remove(tmpPath.c_str());
-        std::remove(bakPath.c_str());  // LOW-3: don't leave a stale (plaintext-for-v1) .bak copy
         return finish(false);
     }
-    RestrictKeyFilePerms(path);  // best-effort no-op on Windows (NTFS ACL governs)
-    // LP-13 LOW-3: publish succeeded — remove the now-stale .bak (a second copy
-    // of the OLD key; plaintext for a v1 key). See the POSIX path for rationale.
-    std::remove(bakPath.c_str());
+    // best-effort no-op on Windows (NTFS ACL governs); symmetric with POSIX warn.
+    if (!RestrictKeyFilePerms(path)) {
+        std::cerr << "[Attestation] WARNING: could not re-assert owner-only perms on the"
+                     " published key file " << path << " after the atomic move; the key was"
+                     " SAVED but may carry incorrect permissions." << std::endl;
+    }
 #endif
 
     std::cout << "[Attestation] Saved seed attestation key to: " << path
@@ -878,32 +852,78 @@ bool CSeedAttestationKey::Save(const std::string& dataDir, bool requireEncryptio
 }
 
 bool CSeedAttestationKey::LoadOrGenerate(const std::string& dataDir, bool allowGenerate,
-                                         bool requireEncryption) {
+                                         bool allowPlaintext) {
     if (Load(dataDir)) {
-        // LP-13 H-1: if encryption-at-rest is required but the key on disk is a
-        // v1 plaintext file, refuse to run on it. The operator must re-provision
-        // with the passphrase set (which re-saves it as v2 encrypted).
-        if (requireEncryption && LoadedPlaintext()) {
-            std::cerr << "[Attestation] FATAL: --require-seed-key-encryption is set but the"
-                         " on-disk key is UNENCRYPTED (v1). Set "
-                      << SEED_KEY_PASSPHRASE_ENV << " and re-provision to encrypt it at rest."
-                      << std::endl;
-            Clear();
-            return false;
+        // LP-13 CL-1 (MIGRATION, default-on encryption): an existing v1 plaintext
+        // key still LOADS so a rolling upgrade never bricks a live seed. But the
+        // default is now mandatory encryption-at-rest, so we MIGRATE it in place:
+        // if a passphrase is available we re-save the already-loaded key as v2
+        // encrypted. The re-save is the audited atomic temp+rename — the original
+        // v1 file stays byte-intact until the encrypted write is confirmed (no
+        // window in which the only copy is lost). The in-memory private key is
+        // unchanged, so a failed migration re-save is non-fatal: we keep running
+        // on the loaded key and warn (the operator can retry). Only when plaintext
+        // is NOT explicitly allowed AND we cannot encrypt (no passphrase) do we
+        // refuse, because that operator demanded encryption-by-default but gave us
+        // no way to provide it.
+        if (LoadedPlaintext()) {
+            std::string passphrase = GetSeedKeyPassphrase();
+            if (!passphrase.empty()) {
+                memory_cleanse(&passphrase[0], passphrase.size());
+                std::cout << "[Attestation] Migrating plaintext (v1) seed key to encrypted"
+                             " (v2) at rest..." << std::endl;
+                if (Save(dataDir, /*allowPlaintext=*/false)) {
+                    m_loadedV1Plaintext = false;  // now persisted as v2
+                    std::cout << "[Attestation] Seed key migrated to v2 encrypted." << std::endl;
+                } else {
+                    // Save left the original v1 file byte-intact (atomic). The
+                    // in-memory key is still valid; keep running and let the
+                    // operator retry the migration. NOT fatal — failing here would
+                    // brick a live seed over a transient disk error.
+                    std::cerr << "[Attestation] WARNING: could not re-save the seed key"
+                                 " encrypted (v2); continuing on the loaded key. The"
+                                 " on-disk key remains UNENCRYPTED (v1) — investigate"
+                                 " (data dir perms / disk) and re-provision to encrypt"
+                                 " it at rest." << std::endl;
+                }
+                // The node is running on a usable, loaded key either way. A failed
+                // migration is non-fatal by design (MEDIUM-1).
+            } else if (!allowPlaintext) {
+                // Default-on encryption, but no passphrase to encrypt with and no
+                // explicit opt-out: refuse rather than run on a plaintext key the
+                // operator's policy says must be encrypted.
+                std::cerr << "[Attestation] FATAL: on-disk seed key is UNENCRYPTED (v1) and "
+                          << SEED_KEY_PASSPHRASE_ENV << " is unset, but encryption-at-rest is"
+                             " mandatory by default. Provision the passphrase to migrate it to"
+                             " v2 (recommended), or pass --allow-plaintext-seed-key to run on"
+                             " the plaintext key." << std::endl;
+                Clear();
+                return false;
+            }
+            // else: allowPlaintext && no passphrase => explicit legacy opt-out;
+            // run on the v1 key unchanged.
         }
         return true;
     }
 
-    // LP-13: a missing/unreadable key file must NOT silently mint a fresh
-    // consensus signing key on a production seed. Auto-mint is gated behind the
-    // explicit --generate-seed-key operator flag (allowGenerate).
-    if (!allowGenerate) {
+    // Load() failed. A missing/unreadable key file must NOT silently mint a fresh
+    // consensus signing key on a production seed. CARDINAL no-key-loss guard: we
+    // only auto-mint when the file is genuinely ABSENT. If the file is PRESENT but
+    // could not be loaded (unreadable / corrupt / wrong passphrase), we NEVER
+    // overwrite it with a fresh mint — that would destroy a possibly-recoverable
+    // key. SeedKeyFilePresent() fails CLOSED (reports present on an indeterminate
+    // stat), so an unstattable-but-genuine key is also protected from overwrite.
+    const bool keyFilePresent = SeedKeyFilePresent(dataDir);
+    if (!allowGenerate || keyFilePresent) {
         std::cerr << "[Attestation] FATAL: no usable seed attestation key at "
                   << dataDir << "/" << SEED_KEY_FILENAME
-                  << " and --generate-seed-key was NOT given. Refusing to mint a"
-                     " new consensus signing key. If this is a first-time"
-                     " provision, restart with --generate-seed-key; if the key"
-                     " was expected to exist, investigate (wrong data dir,"
+                  << (keyFilePresent
+                         ? " (file PRESENT but unreadable/corrupt/wrong-passphrase; NOT"
+                           " auto-minting over a present key)."
+                         : " and --generate-seed-key was NOT given.")
+                  << " Refusing to mint a new consensus signing key. If this is a"
+                     " first-time provision, restart with --generate-seed-key; if the"
+                     " key was expected to exist, investigate (wrong data dir,"
                      " missing/encrypted file, or unset "
                   << SEED_KEY_PASSPHRASE_ENV << ")." << std::endl;
         return false;
@@ -918,7 +938,9 @@ bool CSeedAttestationKey::LoadOrGenerate(const std::string& dataDir, bool allowG
     // LP-13 M-2: a freshly minted key that cannot be PERSISTED is worthless — on
     // the next restart the node would have a different (or no) key that does not
     // match chainparams. Do NOT run on a non-persisted ephemeral key: fail loud.
-    if (!Save(dataDir, requireEncryption)) {
+    // CL-1: a freshly minted key is saved under the default-on encryption policy
+    // (Save refuses plaintext unless allowPlaintext was explicitly passed).
+    if (!Save(dataDir, allowPlaintext)) {
         std::cerr << "[Attestation] FATAL: generated a new seed key but failed to save it"
                      " to disk. Refusing to run on a non-persisted (ephemeral) consensus"
                      " signing key — fix the data dir / perms / passphrase and retry."
