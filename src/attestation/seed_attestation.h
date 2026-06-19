@@ -95,6 +95,132 @@ void CleanseSeedKeyBuffer(std::vector<uint8_t>& buf);
  *  startup. Both node binaries call this to classify a LoadOrGenerate failure. */
 bool SeedKeyFilePresent(const std::string& dataDir);
 
+// ============================================================================
+// LP-13 M-1/M-2 SEED-IDENTITY RESOLUTION (fail-loud, pure helper)
+// ============================================================================
+
+/**
+ * Disposition of the startup seed-identity check. The node glue (both
+ * dilithion-node and dilv-node) factors its resolve+validate decision into
+ * ResolveSeedIdentity() so the load-bearing FATAL/SKIP/REGISTER glue is unit
+ * testable independently of process startup (the prior test exercised only the
+ * pubkey-equality PRIMITIVE, not this decision).
+ */
+enum class SeedIdentityDecision {
+    // Proceed: register as an attestation seed under .seedId.
+    //  - mainnet: externalip resolved to a configured seed AND the loaded key's
+    //    pubkey matches seedAttestationPubkeys[seedId].
+    //  - testnet (empty pubkey set): no consensus pubkey to enforce; seedId is
+    //    the resolved index, or the lenient default 0 when unresolved
+    //    (.usedTestnetDefault is set so the caller can emit the legacy WARN).
+    REGISTER,
+    // HIGH-1 fix: a configured seed set IS present but this node's externalip
+    // matches NO configured seed slot. This is NOT a seed (e.g. a third-party
+    // --public-api explorer/exchange/former-seed that merely carries a key
+    // file). Do NOT abort and do NOT register: a non-seed's attestations are
+    // rejected by consensus anyway, so skipping is the correct, available
+    // behavior (zero security loss). Caller logs a clear WARN and continues.
+    SKIP_NOT_A_SEED,
+    // Genuine misconfiguration: a configured seed set is present AND externalip
+    // resolved to a real seed slot, but the loaded/minted key's pubkey does NOT
+    // match seedAttestationPubkeys[seedId] (or the index is out of range). This
+    // key cannot produce consensus-accepted attestations for this seed_id —
+    // fail loud (caller returns 1).
+    FATAL_MISMATCH,
+    // H-3 (consolidated): this node WOULD register (identity is valid — either a
+    // mainnet seed whose key matches its slot, or a testnet seed), but the ASN
+    // database failed to load, so RegisterSeedAttestation cannot run and the seed
+    // has ZERO attestation capacity. This is NEITHER fatal NOR a silent skip:
+    //  - NOT fatal (the rejected H-3 over-correction): an ASN failure only
+    //    disables ATTESTATION; aborting would also take relay/P2P/--public-api
+    //    offline. On the known ASN-file-lost-on-rotation incident, with a
+    //    3-of-4 zero-spare quorum, that bricks a live seed for an attestation-only
+    //    fault. So the node stays ONLINE.
+    //  - NOT a silent skip (the original H-3 target bug): the seed would start
+    //    "healthy" with a loaded key yet serve zero attestation capacity, and
+    //    getmikattestation would return only the generic "only available on seed
+    //    nodes". So the caller logs a LOUD persistent ERROR and registers a
+    //    DEGRADED marker that makes getmikattestation return a DISTINCT,
+    //    diagnosable "ASN database not loaded" error.
+    // Net: relay stays up, attestation stays UNregistered, the degraded state is
+    // loud at startup AND queryable at the RPC.
+    DEGRADED_NO_ASN,
+    // Datacenter-over-attestation gate (extreview PR#121 Fix 1): on a chain whose
+    // consensus BANS datacenter miners (DilV: attestationDatacenterBan==true), the
+    // datacenter-IP refusal is enforced by IsDatacenterIP(), which consults the
+    // datacenter-ASN set. If that set is EMPTY (DatacenterASNCount()==0) — e.g. a
+    // missing/unparseable datacenter-asns.txt after a data-dir rotation —
+    // IsDatacenterIP() fails OPEN (always false), so the seed would REGISTER and
+    // then sign attestations for datacenter miners it is required to reject. That
+    // silently defeats the datacenter Sybil ban while the seed looks healthy.
+    // Like DEGRADED_NO_ASN, this is NEITHER fatal NOR a silent skip: the node
+    // stays ONLINE for relay/P2P but does NOT register attestation (so it never
+    // hands out an under-defended attestation), and the state is loud at startup
+    // and queryable at getmikattestation. Folded LAST, exactly where asnLoaded is:
+    // it can only soften a would-be REGISTER, never override FATAL_MISMATCH (trust
+    // failure stays fatal) or SKIP_NOT_A_SEED (a non-seed has nothing to register).
+    // INERT on a non-ban chain (DIL: attestationDatacenterBan==false) — there the
+    // datacenter list is not a consensus input, so a missing list never demotes a
+    // would-be REGISTER.
+    DEGRADED_NO_DATACENTER_LIST,
+};
+
+struct SeedIdentityResult {
+    SeedIdentityDecision decision;
+    int seedId = -1;            // resolved index (REGISTER), or -1 (SKIP)
+    bool usedTestnetDefault = false;  // testnet, unresolved -> defaulted to 0
+};
+
+/**
+ * Normalize a user-supplied --externalip value for comparison against the bare
+ * dotted-quad strings in chainparams (HIGH-2 fix). Strips surrounding
+ * whitespace and a trailing ":port" suffix for IPv4 / hostnames. IPv6 literals
+ * (which legitimately contain colons) are left intact: a bracketed "[..]:port"
+ * form keeps the address inside the brackets, and a bare "::"-containing value
+ * is returned trimmed-only (port stripping on raw IPv6 is ambiguous and the
+ * configured seed set is IPv4-only, so an IPv6 externalip simply won't match —
+ * which correctly routes to SKIP_NOT_A_SEED, never a false FATAL).
+ */
+std::string NormalizeExternalIpForSeedMatch(const std::string& externalIp);
+
+/**
+ * Pure resolve+validate decision for the seed-attestation startup glue.
+ *
+ * The decision is the FINAL 4-way disposition the node-startup glue dispatches
+ * on (REGISTER / SKIP_NOT_A_SEED / FATAL_MISMATCH / DEGRADED_NO_ASN), so the
+ * whole decision — including the ASN-DB-failure degradation — is unit-testable
+ * in one place. asnLoaded folds in last: it can only turn a would-be REGISTER
+ * into DEGRADED_NO_ASN; it never overrides FATAL_MISMATCH (a trust failure
+ * stays fatal regardless of ASN state) or SKIP_NOT_A_SEED (a non-seed has
+ * nothing to register, ASN-loaded or not).
+ *
+ * @param seedIPs       chainparams seedAttestationIPs (index-aligned w/ pubkeys)
+ * @param seedPubkeys   chainparams seedAttestationPubkeys (empty => testnet)
+ * @param externalIp    raw --externalip value (normalized internally)
+ * @param loadedPubkey  the loaded/minted key's GetPubKey()
+ * @param asnLoaded     whether the ASN database loaded (asnDatabase.IsLoaded())
+ * @param datacenterBanChain   this chain bans datacenter miners
+ *        (g_chainParams->attestationDatacenterBan; DilV true, DIL false)
+ * @param datacenterListLoaded the datacenter-ASN set is non-empty
+ *        (asnDatabase.DatacenterASNCount() > 0)
+ * @return decision + resolved seedId; see SeedIdentityDecision.
+ *
+ * Fold order for a would-be REGISTER (each can only SOFTEN, never override a
+ * FATAL_MISMATCH or SKIP_NOT_A_SEED): asnLoaded first (DEGRADED_NO_ASN), then
+ * datacenterBanChain && !datacenterListLoaded (DEGRADED_NO_DATACENTER_LIST). A
+ * down ASN DB is reported before a missing datacenter list because the ASN DB is
+ * the harder dependency (no attestation at all without it), but either alone is
+ * enough to withhold registration on a ban chain.
+ */
+SeedIdentityResult ResolveSeedIdentity(
+    const std::vector<std::string>& seedIPs,
+    const std::vector<std::vector<uint8_t>>& seedPubkeys,
+    const std::string& externalIp,
+    const std::vector<uint8_t>& loadedPubkey,
+    bool asnLoaded,
+    bool datacenterBanChain,
+    bool datacenterListLoaded);
+
 /** LP-13 H-2 (atomic-save) TEST SEAM. When set to a non-null function, Save()
  *  invokes it immediately after the temp file has been fully written + fsynced
  *  but BEFORE the atomic rename over the target. If the hook returns true, Save
