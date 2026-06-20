@@ -3163,6 +3163,18 @@ load_genesis_block:  // Bug #29: Label for automatic retry after blockchain wipe
         // Phase 2: Initialize async block validation queue for IBD performance
         std::cout << "Initializing async block validation queue..." << std::endl;
         g_node_context.validation_queue = std::make_unique<CBlockValidationQueue>(g_chainstate, blockchain);
+        // PR #129 MEDIUM-2: register the queue's pending-block-hash provider so
+        // cap eviction pins queued/in-flight blocks AND their ancestors (prevents
+        // a cascade from freeing a queued block's parent and stalling fork
+        // adoption). Registered BEFORE Start() so the provider is live for the
+        // first eviction. The captured raw pointer is valid for the queue's
+        // lifetime; on shutdown the queue is reset before g_chainstate is torn
+        // down. (If the queue is ever reset earlier, clear the provider first.)
+        {
+            CBlockValidationQueue* vq = g_node_context.validation_queue.get();
+            g_chainstate.RegisterPendingBlockHashProvider(
+                [vq]() -> std::set<uint256> { return vq->GetPendingBlockHashes(); });
+        }
         if (g_node_context.validation_queue->Start()) {
             std::cout << "  [OK] Async block validation queue started" << std::endl;
         } else {

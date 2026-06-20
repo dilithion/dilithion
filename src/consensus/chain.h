@@ -252,6 +252,24 @@ private:
     std::vector<BlockConnectCallback> m_blockConnectCallbacks;
     std::vector<BlockDisconnectCallback> m_blockDisconnectCallbacks;
 
+    // PR #129 MEDIUM-2 (cascade-eviction liveness): pending-block-hash provider.
+    // The async validation queue (CBlockValidationQueue) registers a provider
+    // here that returns the set of block hashes it is currently responsible for
+    // — every queued block AND the one in-flight in its worker (popped from the
+    // queue but mid-ProcessBlock, with cs_main released between ops). Eviction
+    // (EvictLowestWorkLeafNotPinned) consults this provider while holding cs_main
+    // and pins each such block AND its pprev-ancestor chain, so a cascade cannot
+    // free a queued block's parent out from under the worker's create path. The
+    // provider returns HASHES only (a pure read of queue state under the queue's
+    // own mutex); eviction does the mapBlockIndex lookup and pprev walk under the
+    // cs_main it already holds. This keeps the lock order cs_main -> queue mutex
+    // (never the reverse) and never re-enters a queue method that calls back into
+    // CChainState. This is ADDITIVE liveness defense — it does NOT supersede the
+    // queue worker's by-hash re-resolve, which remains the authoritative
+    // eviction-/merge-safe correctness path for BLOCKER-1.
+    using PendingBlockHashProvider = std::function<std::set<uint256>()>;
+    PendingBlockHashProvider m_pendingBlockHashProvider;
+
 public:
     // VDF Distribution: Track when the first VDF block at the current tip height was accepted.
     // Used to enforce the grace period — replacements only allowed within this window.
@@ -579,17 +597,19 @@ public:
      * @param target_max stop once mapBlockIndex.size() <= target_max (the
      *        caller passes cap-1 to make room for exactly one new header).
      *        target_max == 0 means "drain EVERY eligible leaf" — TEST/DIAGNOSTIC
-     *        USE ONLY. This is also the default-argument value, so a production
-     *        caller that omits the argument would silently drain the index
-     *        (LOW-1, PR #129 re-red-team). Always pass an explicit cap-1 in
-     *        production code; only tests rely on the 0 default.
+     *        USE ONLY. LOW-c (PR #129 re-red-team): the prior signature gave this
+     *        a DEFAULT ARGUMENT of 0, so a production caller that omitted the
+     *        argument would silently drain the whole index. The default arg has
+     *        been REMOVED — every caller must now pass an explicit target_max, so
+     *        the destructive "drain all" path can only be reached by explicitly
+     *        writing 0 (self-documenting). Production code always passes cap-1.
      *
      * Returns true if at least one entry was evicted; false if no eligible
      * unpinned leaf exists while still over target (caller falls back to
      * fail-closed reject). The false case is unreachable at production cap
      * sizes.
      */
-    bool EvictLowestWorkLeafNotPinned(size_t target_max = 0);
+    bool EvictLowestWorkLeafNotPinned(size_t target_max);
 
     /**
      * Find the last common ancestor between two chains
@@ -729,6 +749,19 @@ public:
      * @param callback Function to call with block data and height
      */
     void RegisterBlockDisconnectCallback(BlockDisconnectCallback callback);
+
+    /**
+     * PR #129 MEDIUM-2: register the async validation queue's pending-block-hash
+     * provider (see PendingBlockHashProvider above). At most one provider is
+     * expected (the single CBlockValidationQueue); a second registration
+     * replaces the first. Eviction calls it under cs_main to pin queued/in-flight
+     * blocks and their ancestors. Pass an empty std::function to clear.
+     *
+     * @param provider returns the set of hashes the queue currently owns
+     *        (queued + in-flight). Returning hashes (not raw pointers) keeps the
+     *        lock order cs_main -> queue mutex clean.
+     */
+    void RegisterPendingBlockHashProvider(PendingBlockHashProvider provider);
 
     // ============================================================
     // Phase 5: chain-selection helpers (PR5.1 declarations only)

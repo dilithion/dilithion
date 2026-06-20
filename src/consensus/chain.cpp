@@ -272,6 +272,43 @@ bool CChainState::EvictLowestWorkLeafNotPinned(size_t target_max) {
             pinned.insert(p);  // in-flight / queued — never evict
         }
     }
+    // ---- (d) PR #129 MEDIUM-2: pin the async queue's pending blocks AND their
+    //     pprev-ancestor chains. A queued block is HAVE_DATA + VALID_TRANSACTIONS
+    //     (MarkBlockReceived couples both flags), so clause (c) above does NOT
+    //     match it, and it is not yet a candidate (clause (b)) during the
+    //     cs_main-released async wait — it is an evictable leaf, and so are its
+    //     non-active ancestors. Multi-pass eviction can therefore cascade up a
+    //     queued block's parent fork and free the parent out from under the
+    //     worker's create path (block_validation_queue.cpp ProcessBlock parent
+    //     lookup), stalling a valid competing fork's adoption under adversarial
+    //     cap pressure. To prevent that LIVENESS hole we pin every hash the queue
+    //     reports as pending (queued + the single in-flight block mid-ProcessBlock)
+    //     plus each one's pprev ancestors.
+    //
+    //     This is ADDITIVE liveness defense. It does NOT replace the worker's
+    //     by-hash re-resolve, which remains the authoritative correctness path:
+    //     pinning guards against EVICTION, not against the AddBlockIndex
+    //     flag-merge that can still destroy a specific unique_ptr and re-home the
+    //     canonical pointer for a hash. The cached QueuedBlock::pindex must stay
+    //     unread regardless of this pin (see the landmine ledger below).
+    //
+    //     Lock order: we already hold cs_main; the provider returns HASHES only
+    //     (a pure read of queue state under the queue's own mutex), establishing
+    //     cs_main -> queue-mutex and never the reverse. The mapBlockIndex lookup
+    //     and pprev walk below run under the cs_main we hold.
+    if (m_pendingBlockHashProvider) {
+        const std::set<uint256> pending = m_pendingBlockHashProvider();
+        for (const uint256& h : pending) {
+            auto it = mapBlockIndex.find(h);
+            if (it == mapBlockIndex.end()) continue;  // already gone / never indexed
+            // Pin the pending block AND walk its pprev chain (the cascade target),
+            // using the same cycle-guarded idiom as clause (b). Stop as soon as we
+            // reach an already-pinned ancestor (active chain / candidate) or null.
+            for (CBlockIndex* p = it->second.get(); p != nullptr; p = p->pprev) {
+                if (!pinned.insert(p).second) break;  // already pinned (or cycle guard)
+            }
+        }
+    }
     // ---- (2.1) RAW-POINTER-HOLDER LANDMINE LEDGER (re-red-team HIGH-1/HIGH-2)-
     // The pinned set above is the COMPLETE protection for every raw CBlockIndex*
     // held outside mapBlockIndex that could be dereferenced after a cs_main
@@ -286,9 +323,16 @@ bool CChainState::EvictLowestWorkLeafNotPinned(size_t target_max) {
     //       bug. NOT covered by clause (c) here (a queued block is
     //       HAVE_DATA + VALID_TRANSACTIONS via MarkBlockReceived, so it is
     //       `fully_validated` and the clause-(c) predicate skips it — see clause
-    //       (c) above). It is covered SOLELY by the queue's by-hash re-resolve
-    //       in block_validation_queue.cpp (GetBlockIndex under the lock, null
-    //       case handled); the cached raw pointer is never re-read.
+    //       (c) above). CORRECTNESS is closed SOLELY by the queue's by-hash
+    //       re-resolve in block_validation_queue.cpp (GetBlockIndex under the
+    //       lock, null case handled); the cached raw pointer is never re-read.
+    //       LIVENESS (PR #129 MEDIUM-2): clause (d) above ADDITIONALLY pins the
+    //       queue's pending/in-flight blocks and their pprev ancestors so a
+    //       cascade does not free a queued block's parent and stall fork
+    //       adoption. Clause (d) is defense-in-depth for liveness — it does NOT
+    //       license re-reading the cached pindex (the flag-merge in AddBlockIndex
+    //       can still re-home the canonical pointer even for a pinned hash), so
+    //       the by-hash re-resolve remains mandatory.
     //   * block_index.h:17  CBlockIndex::pskip — INERT (never assigned; no
     //       BuildSkip exists). pskip is NOT counted in the in-degree map, so a
     //       node referenced only via some other node's pskip would be a freeable
@@ -2386,6 +2430,14 @@ void CChainState::RegisterBlockConnectCallback(BlockConnectCallback callback) {
 void CChainState::RegisterBlockDisconnectCallback(BlockDisconnectCallback callback) {
     std::lock_guard<std::recursive_mutex> lock(cs_main);
     m_blockDisconnectCallbacks.push_back(callback);
+}
+
+void CChainState::RegisterPendingBlockHashProvider(PendingBlockHashProvider provider) {
+    // PR #129 MEDIUM-2: single provider (the async validation queue). Holding
+    // cs_main while assigning keeps it consistent with eviction's read under the
+    // same lock.
+    std::lock_guard<std::recursive_mutex> lock(cs_main);
+    m_pendingBlockHashProvider = std::move(provider);
 }
 
 // ============================================================================

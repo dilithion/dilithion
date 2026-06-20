@@ -30,6 +30,7 @@
 #include <cstring>
 #include <iostream>
 #include <memory>
+#include <set>      // PR #129 MEDIUM-2: PendingBlockHashProvider returns std::set<uint256>
 #include <vector>
 
 namespace {
@@ -444,6 +445,17 @@ void test_evict_never_frees_referenced_parent()
 // by-hash RE-RESOLVE is the SOLE mechanism that closes the BLOCKER-1 UAF for a
 // queued block. This test drives the leg that ACTUALLY holds.
 //
+// LOW-d (PR #129 re-red-team): RENAMED from test_evict_never_frees_inflight_block.
+// The old name was the OPPOSITE of what this test proves — with no
+// PendingBlockHashProvider registered (as here), the in-flight leaf IS evicted;
+// the property under test is that the worker's by-hash re-resolve then returns
+// null SAFELY (never a dangling pointer), i.e. the re-resolve is UAF-safe. The
+// MEDIUM-2 pin that makes a real running queue NOT evict its in-flight block is a
+// SEPARATE layer, covered by Test 9 below (which registers a provider). Keeping
+// the two concerns in separate tests is deliberate: this one proves correctness
+// survives even if the pin is absent/bypassed; Test 9 proves the pin prevents the
+// liveness stall in the first place.
+//
 // The live BLOCKER-1 instance was CBlockValidationQueue::QueuedBlock::pindex —
 // a raw CBlockIndex* cached at QueueBlock() time, then dereferenced in the
 // worker's ProcessBlock AFTER cs_main was released for async validation. The
@@ -471,9 +483,9 @@ void test_evict_never_frees_referenced_parent()
 //     traps a use-after-free if a regression dereferenced the cached pindex
 //     instead of the re-resolved one.
 // ============================================================================
-void test_evict_never_frees_inflight_block()
+void test_queue_byhash_reresolve_is_uaf_safe_when_leaf_evicted()
 {
-    std::cout << "  test_evict_never_frees_inflight_block..." << std::flush;
+    std::cout << "  test_queue_byhash_reresolve_is_uaf_safe_when_leaf_evicted..." << std::flush;
 
     CChainState chainstate;
     ::dilithion::consensus::port::ChainSelectorAdapter adapter(chainstate);
@@ -727,12 +739,267 @@ void test_evict_multipass_cascade_to_zero()
 }
 
 // ============================================================================
+// Test 9 — MEDIUM-2 (PR #129 re-red-team), OPTION (A): the PendingBlockHashProvider
+// pin. A real running queue registers a provider that reports the hashes it owns
+// (queued + in-flight). Eviction (clause (d)) must pin every reported block AND
+// its pprev ancestors, so a cascade cannot free a queued block's parent out from
+// under the worker's create path. This test registers a provider directly on the
+// chainstate (no real queue needed — the provider IS the integration point) and
+// proves the pin holds under aggressive cap pressure.
+//
+// Topology:
+//   active chain (pinned via tip): A -> M1 -> M2   (tip = M2)
+//   off-chain fork:                A -> F  -> Q     (Q = the "queued" block)
+// Without the provider, Test 8 showed eviction(3) cascades F-chain to nothing.
+// WITH a provider reporting Q's hash, eviction(3) must instead keep Q AND its
+// ancestor F alive (F is pinned because it is Q's pprev), so the index cannot
+// drop below {A,M1,M2,F,Q}=5 — the pin floors it above the requested target.
+// ============================================================================
+void test_medium2_provider_pins_queued_block_and_ancestors()
+{
+    std::cout << "  test_medium2_provider_pins_queued_block_and_ancestors..." << std::flush;
+
+    CChainState chainstate;
+    ::dilithion::consensus::port::ChainSelectorAdapter adapter(chainstate);
+
+    uint256 null_hash;
+    std::memset(null_hash.data, 0, 32);
+    auto A = MakeHeader(null_hash, 0x1d00ffff, 1700000000, 0);
+    assert(adapter.ProcessNewHeader(A));
+    const uint256 hashA = A.GetHash();
+
+    // Active chain A -> M1 -> M2 (pinned via tip).
+    uint256 prev = hashA;
+    uint256 hashM2;
+    for (int i = 1; i <= 2; ++i) {
+        auto M = MakeHeader(prev, 0x1d00ffff, 1700000000 + i,
+                            static_cast<uint8_t>(0x10 + i));
+        assert(adapter.ProcessNewHeader(M));
+        prev = M.GetHash();
+        if (i == 2) hashM2 = prev;
+    }
+    CBlockIndex* idxM2 = chainstate.GetBlockIndex(hashM2);
+    assert(idxM2 != nullptr);
+    chainstate.SetTip(idxM2);
+
+    // Off-chain fork A -> F -> Q. Q models a block the queue currently owns;
+    // F is Q's parent (the cascade target MEDIUM-2 is about).
+    auto F = MakeHeader(hashA, 0x1d00ffff, 1700000500, 0xF0);
+    assert(adapter.ProcessNewHeader(F));
+    const uint256 hashF = F.GetHash();
+    auto Q = MakeHeader(hashF, 0x1d00ffff, 1700000501, 0xF1);
+    assert(adapter.ProcessNewHeader(Q));
+    const uint256 hashQ = Q.GetHash();
+
+    CBlockIndex* idxF = chainstate.GetBlockIndex(hashF);
+    CBlockIndex* idxQ = chainstate.GetBlockIndex(hashQ);
+    assert(idxF && idxQ);
+    assert(idxQ->pprev == idxF);
+
+    // Bring Q to the real production queued-block state (HAVE_DATA +
+    // VALID_TRANSACTIONS), so clause (c) does NOT pin it — only the MEDIUM-2
+    // provider (clause d) can. This is the exact state Test 7 evicts WITHOUT a
+    // provider; here the provider must keep it alive.
+    idxQ->MarkBlockReceived();
+    assert((idxQ->nStatus & CBlockIndex::BLOCK_HAVE_DATA) != 0);
+    assert((idxQ->nStatus & CBlockIndex::BLOCK_VALID_MASK)
+               >= CBlockIndex::BLOCK_VALID_TRANSACTIONS);
+
+    // Register the provider: the "queue" reports it owns Q.
+    chainstate.RegisterPendingBlockHashProvider(
+        [hashQ]() -> std::set<uint256> { return std::set<uint256>{hashQ}; });
+
+    // Total = 5 (A,M1,M2,F,Q). Active chain (A,M1,M2)=3 pinned. Ask to drain to
+    // 3. WITHOUT the provider this would cascade-free Q then F (like Test 8).
+    // WITH the provider, Q is pinned (clause d) and F is pinned (Q's pprev), so
+    // nothing on the F-fork can be freed: the index stays at 5.
+    assert(chainstate.GetBlockIndexSize() == 5);
+    bool evicted = chainstate.EvictLowestWorkLeafNotPinned(3);
+    // No eligible unpinned leaf exists (Q pinned by provider, F pinned as Q's
+    // ancestor, active chain pinned), so eviction frees nothing.
+    assert(!evicted);
+    assert(chainstate.GetBlockIndexSize() == 5);  // pin floored above target
+
+    // Q and F both survived (the load-bearing MEDIUM-2 property).
+    assert(chainstate.GetBlockIndex(hashQ) == idxQ);
+    assert(chainstate.GetBlockIndex(hashF) == idxF);
+
+    // ASAN walk: Q -> F -> A is intact and pprev-walkable.
+    int hops = 0;
+    for (CBlockIndex* p = idxQ; p != nullptr; p = p->pprev) {
+        (void)p->nHeight;
+        if (++hops > 1000) { assert(false && "pprev cycle"); break; }
+    }
+    assert(hops == 3);  // Q -> F -> A
+
+    // Clear the provider so a later test on a fresh chainstate is unaffected
+    // (defensive; each test builds its own chainstate anyway).
+    chainstate.RegisterPendingBlockHashProvider(nullptr);
+
+    std::cout << " OK (provider pins queued block Q AND ancestor F; "
+              << "cascade cannot free the queued block's parent)\n";
+}
+
+// ============================================================================
+// Test 10 — MEDIUM-2 NEGATIVE control: with the SAME topology but the provider
+// reporting a DIFFERENT (unrelated) hash, the F-fork is NOT protected and the
+// cascade proceeds exactly as in Test 8. This proves the pin in Test 9 is caused
+// by the provider reporting Q specifically — not by some unrelated change to the
+// eviction policy. A regression where clause (d) over-pins (e.g. pins all leaves)
+// would turn this test RED.
+// ============================================================================
+void test_medium2_provider_unrelated_hash_does_not_overpin()
+{
+    std::cout << "  test_medium2_provider_unrelated_hash_does_not_overpin..." << std::flush;
+
+    CChainState chainstate;
+    ::dilithion::consensus::port::ChainSelectorAdapter adapter(chainstate);
+
+    uint256 null_hash;
+    std::memset(null_hash.data, 0, 32);
+    auto A = MakeHeader(null_hash, 0x1d00ffff, 1700000000, 0);
+    assert(adapter.ProcessNewHeader(A));
+    const uint256 hashA = A.GetHash();
+
+    uint256 prev = hashA;
+    uint256 hashM2;
+    for (int i = 1; i <= 2; ++i) {
+        auto M = MakeHeader(prev, 0x1d00ffff, 1700000000 + i,
+                            static_cast<uint8_t>(0x10 + i));
+        assert(adapter.ProcessNewHeader(M));
+        prev = M.GetHash();
+        if (i == 2) hashM2 = prev;
+    }
+    CBlockIndex* idxM2 = chainstate.GetBlockIndex(hashM2);
+    assert(idxM2 != nullptr);
+    chainstate.SetTip(idxM2);
+
+    auto F = MakeHeader(hashA, 0x1d00ffff, 1700000500, 0xF0);
+    assert(adapter.ProcessNewHeader(F));
+    const uint256 hashF = F.GetHash();
+    auto Q = MakeHeader(hashF, 0x1d00ffff, 1700000501, 0xF1);
+    assert(adapter.ProcessNewHeader(Q));
+    const uint256 hashQ = Q.GetHash();
+    CBlockIndex* idxQ = chainstate.GetBlockIndex(hashQ);
+    assert(idxQ);
+    idxQ->MarkBlockReceived();  // production queued-block state
+
+    // Provider reports a hash NOT in the index — must pin nothing.
+    uint256 bogus;
+    std::memset(bogus.data, 0xEE, 32);
+    chainstate.RegisterPendingBlockHashProvider(
+        [bogus]() -> std::set<uint256> { return std::set<uint256>{bogus}; });
+
+    assert(chainstate.GetBlockIndexSize() == 5);
+    bool evicted = chainstate.EvictLowestWorkLeafNotPinned(3);
+    assert(evicted);                                  // cascade proceeds
+    assert(chainstate.GetBlockIndexSize() == 3);      // only active chain remains
+    assert(chainstate.GetBlockIndex(hashQ) == nullptr);
+    assert(chainstate.GetBlockIndex(hashF) == nullptr);
+
+    chainstate.RegisterPendingBlockHashProvider(nullptr);
+
+    std::cout << " OK (unrelated pending hash pins nothing; "
+              << "clause (d) does not over-pin — cascade proceeds)\n";
+}
+
+// ============================================================================
+// Test 11 — MEDIUM-1 (PR #129 re-red-team): the cap is a HARD CEILING reachable
+// via the queue create-path, not only via ProcessNewHeader. The queue path now
+// runs the SAME ceiling logic ProcessNewHeader uses: at/over cap, call
+// EvictLowestWorkLeafNotPinned(cap-1); if that cannot get under cap, fail closed.
+//
+// HONEST SCOPE NOTE: CBlockValidationQueue::ProcessBlock is private and requires
+// a fully-wired CBlockchainDB + ActivateBestChain to drive end-to-end, which is
+// disproportionate test infra for a branch that mirrors an already-tested
+// primitive. This test drives the DECISION PRIMITIVE the queue path relies on at
+// the same granularity Test 5 covers ProcessNewHeader: (a) when an evictable leaf
+// exists, EvictLowestWorkLeafNotPinned(cap-1) makes room so a subsequent add
+// stays AT the cap (ceiling holds); (b) when every entry is pinned, eviction
+// cannot get under cap and size stays >= cap — exactly the condition on which the
+// queue create-path fails closed.
+// ============================================================================
+void test_medium1_queue_path_cap_is_hard_ceiling()
+{
+    std::cout << "  test_medium1_queue_path_cap_is_hard_ceiling..." << std::flush;
+
+    // Use a tiny explicit cap for clarity (Regtest cap=1000 is large; we model
+    // the decision with a hand-built index and a local cap value).
+    CChainState chainstate;
+    ::dilithion::consensus::port::ChainSelectorAdapter adapter(chainstate);
+
+    uint256 null_hash;
+    std::memset(null_hash.data, 0, 32);
+    auto A = MakeHeader(null_hash, 0x1d00ffff, 1700000000, 0);
+    assert(adapter.ProcessNewHeader(A));
+    const uint256 hashA = A.GetHash();
+
+    // Active chain A -> M1 -> M2 (pinned via tip) plus disposable fork leaves.
+    uint256 prev = hashA;
+    uint256 hashM2;
+    for (int i = 1; i <= 2; ++i) {
+        auto M = MakeHeader(prev, 0x1d00ffff, 1700000000 + i,
+                            static_cast<uint8_t>(0x10 + i));
+        assert(adapter.ProcessNewHeader(M));
+        prev = M.GetHash();
+        if (i == 2) hashM2 = prev;
+    }
+    CBlockIndex* idxM2 = chainstate.GetBlockIndex(hashM2);
+    assert(idxM2 != nullptr);
+    chainstate.SetTip(idxM2);
+
+    // Two disposable side-fork leaves off A (evictable).
+    auto L1 = MakeHeader(hashA, 0x1d00ffff, 1700000500, 0xC1);
+    auto L2 = MakeHeader(hashA, 0x1d00ffff, 1700000501, 0xC2);
+    assert(adapter.ProcessNewHeader(L1));
+    assert(adapter.ProcessNewHeader(L2));
+    // Index now = {A,M1,M2,L1,L2} = 5.
+    const size_t cap = 5;                 // model: we are AT cap.
+    assert(chainstate.GetBlockIndexSize() == cap);
+
+    // ---- (a) Ceiling-holds branch: an evictable leaf exists. The queue path
+    //      calls EvictLowestWorkLeafNotPinned(cap-1) before adding one. After it,
+    //      size must be <= cap-1 so the subsequent add lands AT cap (never over).
+    bool evicted = chainstate.EvictLowestWorkLeafNotPinned(cap - 1);
+    assert(evicted);
+    assert(chainstate.GetBlockIndexSize() <= cap - 1);  // room made for exactly one
+    // Simulate the queue create-path's add of one new block index off the tip.
+    {
+        auto N = MakeHeader(hashM2, 0x1d00ffff, 1700000600, 0xD0);
+        assert(adapter.ProcessNewHeader(N));  // create-path-equivalent insert
+    }
+    assert(chainstate.GetBlockIndexSize() <= cap);       // CEILING held
+
+    // ---- (b) Fail-closed branch: drive the index to a state where ONLY pinned
+    //      entries remain at/over cap, so eviction cannot get under cap. Drain
+    //      every non-pinned leaf first, then the remaining set is the pinned
+    //      active chain. Re-derive a small cap equal to the pinned size and show
+    //      EvictLowestWorkLeafNotPinned(pinnedCap-1) leaves size >= pinnedCap
+    //      (the condition on which the queue create-path returns false).
+    // Drain all eligible leaves (explicit 0 = drain-all; the LOW-c-documented
+    // test/diagnostic use).
+    chainstate.EvictLowestWorkLeafNotPinned(0);
+    const size_t pinnedOnly = chainstate.GetBlockIndexSize();  // == active chain
+    // Every survivor is on the active chain (pinned). Asking to go below that is
+    // impossible — mirrors the queue path's "at cap, nothing evictable" case.
+    bool evicted_b = chainstate.EvictLowestWorkLeafNotPinned(pinnedOnly - 1);
+    assert(!evicted_b);                                   // nothing evictable
+    assert(chainstate.GetBlockIndexSize() == pinnedOnly); // floor == pinned set
+    // => if pinnedOnly were the cap, the queue create-path would observe
+    //    GetBlockIndexSize() >= cap after eviction and FAIL CLOSED. Verified.
+
+    std::cout << " OK (queue-path cap ceiling: evict-to-cap-1 makes room (a); "
+              << "all-pinned leaves => eviction floors at pinned set, "
+              << "create-path fails closed (b))\n";
+}
+
+// ============================================================================
 int main()
 {
     std::cout << "Phase 6 PR6.1 — HeadersManager → chain_selector wiring tests\n";
-    std::cout << "  (9-test suite per v1.5 plan §4 PR6.1 + leaf-eviction regression\n";
-    std::cout << "   + BLOCKER-1 re-resolve + clause (c) belt + MEDIUM-2 cascade,\n";
-    std::cout << "   PR #129)\n\n";
+    std::cout << "  (12-test suite per v1.5 plan §4 PR6.1 + leaf-eviction regression\n";
+    std::cout << "   + BLOCKER-1 re-resolve + clause (c) belt + MEDIUM-2 cascade\n";
+    std::cout << "   + MEDIUM-2 provider-pin + MEDIUM-1 cap-ceiling, PR #129)\n\n";
 
     try {
         test_pr61_happy_path_n_headers_populate_mapBlockIndex();
@@ -741,14 +1008,17 @@ int main()
         test_pr61_rejected_parent_flood_does_not_grow_mapBlockIndex();
         test_pr61_cap_saturation_safe_leaf_eviction();
         test_evict_never_frees_referenced_parent();
-        test_evict_never_frees_inflight_block();
+        test_queue_byhash_reresolve_is_uaf_safe_when_leaf_evicted();
         test_clause_c_belt_pins_havedata_without_validity();
         test_evict_multipass_cascade_to_zero();
+        test_medium2_provider_pins_queued_block_and_ancestors();
+        test_medium2_provider_unrelated_hash_does_not_overpin();
+        test_medium1_queue_path_cap_is_hard_ceiling();
     } catch (const std::exception& e) {
         std::cerr << "\nFAILED: " << e.what() << "\n";
         return 1;
     }
 
-    std::cout << "\nAll 9 PR6.1 wiring tests passed.\n";
+    std::cout << "\nAll 12 PR6.1 wiring tests passed.\n";
     return 0;
 }
