@@ -564,9 +564,17 @@ public:
      * leaf remains. nChainWork comparisons use ChainWorkGreaterThan (chainWork
      * is NOT memcmp-comparable). Holds cs_main throughout.
      *
-     * NOT consensus-affecting: an evicted leaf is a non-active-chain tip whose
-     * header is re-obtainable (mapHeaders is unbounded), so eviction never
-     * changes which chain a node accepts — it only bounds memory.
+     * NOT consensus-affecting: an evicted leaf is a non-active-chain tip — never
+     * the active chain, a reorg candidate, an ancestor of either, or an in-flight
+     * (HAVE_DATA-not-VALID_TRANSACTIONS) block (all pinned). Recovery-safety does
+     * NOT rest on "mapHeaders is unbounded" (it is not — mapHeaders is itself
+     * capped and PruneOrphanedHeaders erases non-best-chain headers more than
+     * ORPHAN_HEADER_EXPIRY_BLOCKS behind tip). The real basis: an evicted fork
+     * tip's header is re-obtainable via PEER RE-ANNOUNCEMENT — if that fork ever
+     * becomes the most-work chain, peers re-feed its headers and blocks and the
+     * node re-derives the index. This matches Bitcoin Core's behaviour (a bounded
+     * index converges on peer re-feed; it is not a hard split). Eviction therefore
+     * never changes which chain a node ultimately accepts — it only bounds memory.
      *
      * @param target_max stop once mapBlockIndex.size() <= target_max (the
      *        caller passes cap-1 to make room for exactly one new header).

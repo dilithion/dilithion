@@ -345,11 +345,22 @@ bool CBlockValidationQueue::ProcessBlock(const QueuedBlock& queued_block) {
             }
         }
 
-    // Get or create block index
-    CBlockIndex* pindex = queued_block.pindex;
-    if (!pindex) {
-        pindex = m_chainstate.GetBlockIndex(blockHash);
-    }
+    // Get or create block index.
+    //
+    // BLOCKER-1 (PR #129 re-red-team): do NOT trust queued_block.pindex. The
+    // cached raw pointer was captured at QueueBlock() time, then cs_main was
+    // released for the duration of async validation. While the entry waited,
+    // EvictLowestWorkLeafNotPinned (now firing at the lowered 500K cap) could
+    // have freed that index if it was an unpinned leaf — making the cached
+    // pointer dangle, which then flowed into ActivateBestChain → use-after-free.
+    // ALWAYS re-resolve by hash under the lock taken in this function; the
+    // by-hash lookup is the authoritative, eviction-safe path. (Eviction now
+    // also pins in-flight HAVE_DATA-not-VALID_TRANSACTIONS blocks in
+    // chain.cpp, so the index should still be present — but we never deref the
+    // stale cached pointer; defense in depth, and we handle the null case.)
+    // The cached field is left in QueuedBlock for callers that still set it,
+    // but it is intentionally NOT read here.
+    CBlockIndex* pindex = m_chainstate.GetBlockIndex(blockHash);
 
     if (!pindex) {
         // Create block index

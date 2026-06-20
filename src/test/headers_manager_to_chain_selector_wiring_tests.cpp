@@ -440,10 +440,215 @@ void test_evict_never_frees_referenced_parent()
 }
 
 // ============================================================================
+// Test 7 — BLOCKER-1 REGRESSION (PR #129 re-red-team): eviction must never free
+// an IN-FLIGHT block (HAVE_DATA set, not yet VALID_TRANSACTIONS).
+//
+// The leaf-only fix (Test 6) closes the interior-node pprev UAF but NOT the
+// general class: a raw CBlockIndex* cached OUTSIDE the pin set. The live
+// instance was CBlockValidationQueue::QueuedBlock::pindex — a block received
+// during IBD, added to mapBlockIndex with BLOCK_HAVE_DATA but NOT yet
+// BLOCK_VALID_TRANSACTIONS (async validation pending), with cs_main released
+// while it waits. Such a block is NOT a candidate (candidate predicate needs
+// VALID_TRANSACTIONS) and, as the newest block in a flood with no children, is
+// an in-degree-0 unpinned leaf — so under the plain leaf-only policy the
+// lowered 500K cap could free it out from under the queue's cached pointer →
+// UAF in ActivateBestChain.
+//
+// Fix under test: EvictLowestWorkLeafNotPinned pins every entry that HAS data
+// but is NOT fully validated (clause (c)). This test builds exactly that entry
+// — a HAVE_DATA-not-VALID_TRANSACTIONS leaf simulating a queued in-flight block
+// — drives eviction hard enough to remove other leaves, and asserts the
+// in-flight leaf SURVIVES and its index is still dereferenceable afterward
+// (ASAN traps a freed-then-read regression on the saved raw pointer, mirroring
+// the queue dequeuing its cached pindex).
+// ============================================================================
+void test_evict_never_frees_inflight_block()
+{
+    std::cout << "  test_evict_never_frees_inflight_block..." << std::flush;
+
+    CChainState chainstate;
+    ::dilithion::consensus::port::ChainSelectorAdapter adapter(chainstate);
+
+    uint256 null_hash;
+    std::memset(null_hash.data, 0, 32);
+    auto A = MakeHeader(null_hash, 0x1d00ffff, 1700000000, 0);
+    assert(adapter.ProcessNewHeader(A));
+    const uint256 hashA = A.GetHash();
+
+    // Active chain A -> M1 -> M2 -> M3 (heaviest, pinned via tip).
+    uint256 prev = hashA;
+    uint256 hashM3;
+    for (int i = 1; i <= 3; ++i) {
+        auto M = MakeHeader(prev, 0x1d00ffff, 1700000000 + i,
+                            static_cast<uint8_t>(0x10 + i));
+        assert(adapter.ProcessNewHeader(M));
+        prev = M.GetHash();
+        if (i == 3) hashM3 = prev;
+    }
+    CBlockIndex* idxM3 = chainstate.GetBlockIndex(hashM3);
+    assert(idxM3 != nullptr);
+    chainstate.SetTip(idxM3);
+
+    // Two off-chain leaves descending from A:
+    //   L_plain : a header-only leaf (BLOCK_VALID_HEADER) — eligible for eviction.
+    //   L_flight: an IN-FLIGHT leaf — header accepted, then we mark it
+    //             HAVE_DATA but DO NOT raise validity to VALID_TRANSACTIONS,
+    //             exactly as a block sitting in the async validation queue.
+    auto L_plain = MakeHeader(hashA, 0x1d00ffff, 1700000500, 0xA0);
+    assert(adapter.ProcessNewHeader(L_plain));
+    const uint256 hashLplain = L_plain.GetHash();
+
+    auto L_flight = MakeHeader(hashA, 0x1d00ffff, 1700000501, 0xA1);
+    assert(adapter.ProcessNewHeader(L_flight));
+    const uint256 hashLflight = L_flight.GetHash();
+
+    CBlockIndex* idxFlight = chainstate.GetBlockIndex(hashLflight);
+    assert(idxFlight != nullptr);
+    // Simulate the queued-block state: HAVE_DATA set, validity still HEADER
+    // (NOT raised to VALID_TRANSACTIONS). This is the exact nStatus a block has
+    // while it waits in CBlockValidationQueue.
+    idxFlight->nStatus |= CBlockIndex::BLOCK_HAVE_DATA;
+    assert((idxFlight->nStatus & CBlockIndex::BLOCK_HAVE_DATA) != 0);
+    assert((idxFlight->nStatus & CBlockIndex::BLOCK_VALID_MASK)
+               < CBlockIndex::BLOCK_VALID_TRANSACTIONS);
+    // Save the raw pointer — this is what the queue caches and later derefs.
+    CBlockIndex* const cached_inflight_ptr = idxFlight;
+
+    // Drive eviction hard: target_max small enough to remove BOTH off-chain
+    // leaves if the policy allowed it. The active chain (A,M1,M2,M3 = 4) is
+    // pinned; total = 6 (A,M1,M2,M3,L_plain,L_flight). Ask to get to 4. A
+    // BROKEN policy (no in-flight pin) would evict BOTH L_plain and L_flight
+    // (both in-degree-0 leaves) → freeing the cached in-flight pointer.
+    const size_t size_before = chainstate.GetBlockIndexSize();
+    assert(size_before == 6);
+    bool evicted = chainstate.EvictLowestWorkLeafNotPinned(4);
+    assert(evicted);
+
+    // L_flight MUST survive (pinned by clause (c)); only L_plain is evictable.
+    CBlockIndex* idxFlight_after = chainstate.GetBlockIndex(hashLflight);
+    assert(idxFlight_after != nullptr);
+    assert(idxFlight_after == cached_inflight_ptr);  // same object, not freed
+    assert(chainstate.GetBlockIndex(hashLplain) == nullptr);  // plain leaf gone
+
+    // Final size: active chain (4) + surviving in-flight leaf (1) = 5. The
+    // in-flight pin floors eviction above target_max=4 — correct: a queued
+    // block is never sacrificed to the cap (it fails closed instead, exactly
+    // as the production path falls back to reject on a full index).
+    assert(chainstate.GetBlockIndexSize() == 5);
+
+    // The load-bearing UAF probe: dereference the cached pointer the way the
+    // validation queue would after dequeue. ASAN traps if it was freed.
+    (void)cached_inflight_ptr->nHeight;
+    (void)cached_inflight_ptr->GetBlockHash();
+    for (CBlockIndex* p = cached_inflight_ptr; p != nullptr; p = p->pprev) {
+        (void)p->nHeight;  // ASAN read probe across the ancestry
+    }
+
+    std::cout << " OK (in-flight HAVE_DATA-not-VALID_TRANSACTIONS leaf pinned; "
+              << "cached pointer still valid post-eviction)\n";
+}
+
+// ============================================================================
+// Test 8 — MEDIUM-2 (PR #129 re-red-team): drive the multi-pass
+// decrement-in-degree-to-0 CASCADE in a single EvictLowestWorkLeafNotPinned
+// call. Test 6 only removes one leaf, so the cascade (after erasing a leaf,
+// its parent's in-degree drops, and the parent becomes an eligible leaf on the
+// NEXT pass) is never exercised end-to-end — the most off-by-one-prone path.
+//
+// Topology:
+//   active chain (pinned via tip): A -> M1 -> M2   (tip = M2)
+//   off-chain linear fork:         A -> F -> F2 -> F3
+// Only F3 is a leaf initially (in-degree 0). F2 has in-degree 1 (F3), F has
+// in-degree 1 (F2). A single eviction call with target_max forcing removal of
+// all three must cascade: evict F3 → F2 becomes leaf → evict F2 → F becomes
+// leaf → evict F. Each parent must become eligible ONLY after its child is
+// gone, and the final pprev walk over survivors must be clean (ASAN).
+// ============================================================================
+void test_evict_multipass_cascade_to_zero()
+{
+    std::cout << "  test_evict_multipass_cascade_to_zero..." << std::flush;
+
+    CChainState chainstate;
+    ::dilithion::consensus::port::ChainSelectorAdapter adapter(chainstate);
+
+    uint256 null_hash;
+    std::memset(null_hash.data, 0, 32);
+    auto A = MakeHeader(null_hash, 0x1d00ffff, 1700000000, 0);
+    assert(adapter.ProcessNewHeader(A));
+    const uint256 hashA = A.GetHash();
+
+    // Active chain A -> M1 -> M2 (heaviest, pinned).
+    uint256 prev = hashA;
+    uint256 hashM2;
+    for (int i = 1; i <= 2; ++i) {
+        auto M = MakeHeader(prev, 0x1d00ffff, 1700000000 + i,
+                            static_cast<uint8_t>(0x10 + i));
+        assert(adapter.ProcessNewHeader(M));
+        prev = M.GetHash();
+        if (i == 2) hashM2 = prev;
+    }
+    CBlockIndex* idxM2 = chainstate.GetBlockIndex(hashM2);
+    assert(idxM2 != nullptr);
+    chainstate.SetTip(idxM2);
+
+    // Off-chain linear fork A -> F -> F2 -> F3.
+    auto F = MakeHeader(hashA, 0x1d00ffff, 1700000500, 0xF0);
+    assert(adapter.ProcessNewHeader(F));
+    const uint256 hashF = F.GetHash();
+    auto F2 = MakeHeader(hashF, 0x1d00ffff, 1700000501, 0xF2);
+    assert(adapter.ProcessNewHeader(F2));
+    const uint256 hashF2 = F2.GetHash();
+    auto F3 = MakeHeader(hashF2, 0x1d00ffff, 1700000502, 0xF3);
+    assert(adapter.ProcessNewHeader(F3));
+    const uint256 hashF3 = F3.GetHash();
+
+    CBlockIndex* idxF  = chainstate.GetBlockIndex(hashF);
+    CBlockIndex* idxF2 = chainstate.GetBlockIndex(hashF2);
+    CBlockIndex* idxF3 = chainstate.GetBlockIndex(hashF3);
+    assert(idxF && idxF2 && idxF3);
+    assert(idxF2->pprev == idxF);
+    assert(idxF3->pprev == idxF2);
+
+    // Total = 6 (A,M1,M2,F,F2,F3). Active chain (A,M1,M2) pinned. Ask to drain
+    // to 3 → forces evicting F3 THEN F2 THEN F in a single call (the cascade).
+    const size_t size_before = chainstate.GetBlockIndexSize();
+    assert(size_before == 6);
+    bool evicted = chainstate.EvictLowestWorkLeafNotPinned(3);
+    assert(evicted);
+    assert(chainstate.GetBlockIndexSize() == 3);  // only active chain remains
+
+    // All three fork nodes gone; none could be freed before its child (a
+    // premature parent-free would have dangled the child's pprev — the cascade
+    // ordering is what this asserts).
+    assert(chainstate.GetBlockIndex(hashF)  == nullptr);
+    assert(chainstate.GetBlockIndex(hashF2) == nullptr);
+    assert(chainstate.GetBlockIndex(hashF3) == nullptr);
+
+    // Active chain intact and pprev-walkable (ASAN probe).
+    assert(chainstate.GetBlockIndex(hashA)  != nullptr);
+    CBlockIndex* tip = chainstate.GetBlockIndex(hashM2);
+    assert(tip != nullptr);
+    int hops = 0;
+    for (CBlockIndex* p = tip; p != nullptr; p = p->pprev) {
+        (void)p->nHeight;
+        if (++hops > 1000) { assert(false && "pprev cycle"); break; }
+    }
+    assert(hops == 3);  // M2 -> M1 -> A
+    CBlockIndex* most_work = chainstate.FindMostWorkChainImpl();
+    (void)most_work;
+    auto tips = chainstate.GetChainTips();
+    (void)tips;
+
+    std::cout << " OK (3-deep cascade F3->F2->F in one call; "
+              << "each parent freed only after its child; walk clean)\n";
+}
+
+// ============================================================================
 int main()
 {
     std::cout << "Phase 6 PR6.1 — HeadersManager → chain_selector wiring tests\n";
-    std::cout << "  (6-test suite per v1.5 plan §4 PR6.1 + leaf-eviction regression)\n\n";
+    std::cout << "  (8-test suite per v1.5 plan §4 PR6.1 + leaf-eviction regression\n";
+    std::cout << "   + BLOCKER-1 in-flight pin + MEDIUM-2 cascade, PR #129)\n\n";
 
     try {
         test_pr61_happy_path_n_headers_populate_mapBlockIndex();
@@ -452,6 +657,8 @@ int main()
         test_pr61_rejected_parent_flood_does_not_grow_mapBlockIndex();
         test_pr61_cap_saturation_safe_leaf_eviction();
         test_evict_never_frees_referenced_parent();
+        test_evict_never_frees_inflight_block();
+        test_evict_multipass_cascade_to_zero();
     } catch (const std::exception& e) {
         std::cerr << "\nFAILED: " << e.what() << "\n";
         return 1;

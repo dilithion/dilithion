@@ -232,6 +232,60 @@ bool CChainState::EvictLowestWorkLeafNotPinned(size_t target_max) {
             if (!pinned.insert(p).second) break;  // ancestor already pinned
         }
     }
+    // (c) BLOCKER-1 (PR #129 re-red-team): every entry that HAS block data but
+    //     is NOT yet fully validated (BLOCK_HAVE_DATA set, validity level below
+    //     BLOCK_VALID_TRANSACTIONS). Such a block is an IN-FLIGHT validation
+    //     candidate: it sits in CBlockValidationQueue, which caches a raw
+    //     CBlockIndex* per queued entry (block_validation_queue.h:56), captured
+    //     while cs_main is released for async validation. Such a block is, by
+    //     construction, NOT yet a candidate (IsBlockACandidateForActivation
+    //     requires BLOCK_VALID_TRANSACTIONS) and — if it is the newest block in
+    //     an IBD flood with no children yet — an in-degree-0 unpinned leaf. The
+    //     prior leaf-only invariant left it evictable, so the now-lowered 500K
+    //     cap could free it out from under the queued raw pointer → UAF passed
+    //     into ActivateBestChain. Pinning it closes the window: the index cannot
+    //     be freed while a block has data but isn't fully validated. Defense in
+    //     depth pairs with the queue dropping its cached-pointer fast-path
+    //     (block_validation_queue.cpp) — either alone closes BLOCKER-1; both
+    //     held so no single regression re-opens it.
+    for (auto& kv : mapBlockIndex) {
+        CBlockIndex* p = kv.second.get();
+        if (!p) continue;
+        const bool have_data = (p->nStatus & CBlockIndex::BLOCK_HAVE_DATA) != 0;
+        const bool fully_validated =
+            (p->nStatus & CBlockIndex::BLOCK_VALID_MASK) >= CBlockIndex::BLOCK_VALID_TRANSACTIONS;
+        if (have_data && !fully_validated) {
+            pinned.insert(p);  // in-flight / queued — never evict
+        }
+    }
+    // ---- (2.1) RAW-POINTER-HOLDER LANDMINE LEDGER (re-red-team HIGH-1/HIGH-2)-
+    // The pinned set above is the COMPLETE protection for every raw CBlockIndex*
+    // held outside mapBlockIndex that could be dereferenced after a cs_main
+    // release. The eviction invariant ("freeing a leaf cannot dangle anyone")
+    // is built over the pprev graph PLUS clause (c); it does NOT automatically
+    // cover any other subsystem that caches a raw index pointer. Every known
+    // external holder, with its current status — anyone WIRING one of the dead
+    // holders MUST either add its target to this pin set or switch the consumer
+    // to a by-hash re-lookup (CChainState::GetBlockIndex), or it re-arms
+    // BLOCKER-1's class:
+    //   * block_validation_queue.h:56  QueuedBlock::pindex  — LIVE; covered by
+    //       clause (c) here AND the queue's by-hash re-resolve. (the fixed bug)
+    //   * block_index.h:17  CBlockIndex::pskip — INERT (never assigned; no
+    //       BuildSkip exists). pskip is NOT counted in the in-degree map, so a
+    //       node referenced only via some other node's pskip would be a freeable
+    //       leaf. If anyone adds BuildSkip(), pskip targets must be pinned or
+    //       counted in in-degree before eviction is safe.
+    //   * peers.h:104/105  pindexBestKnownBlock / pindexLastCommonBlock —
+    //       DECLARED-ONLY (block tracking moved to CBlockTracker). In upstream
+    //       Bitcoin Core these point at arbitrary per-peer fork tips — exactly
+    //       evictable leaves. A future peer-manager port that wires them must
+    //       pin or hash-re-lookup.
+    //   * node_state.h:23  QueuedBlock::pindex (via peers.h vBlocksInFlight) —
+    //       DEAD (sole writer MarkBlockAsInFlight has zero callers). Same
+    //       landmine if re-wired.
+    //   * pnext (block_index.h:16) — SAFE: only ever set on active-chain nodes
+    //       (all fully pinned by clause (a)), so it is intentionally NOT a
+    //       landmine.
 
     // ---- (3) Multi-pass leaf eviction ------------------------------------
     // Each pass: pick the lowest-nChainWork entry that is (in-degree 0) AND
