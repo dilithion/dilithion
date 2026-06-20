@@ -232,22 +232,36 @@ bool CChainState::EvictLowestWorkLeafNotPinned(size_t target_max) {
             if (!pinned.insert(p).second) break;  // ancestor already pinned
         }
     }
-    // (c) BLOCKER-1 (PR #129 re-red-team): every entry that HAS block data but
-    //     is NOT yet fully validated (BLOCK_HAVE_DATA set, validity level below
-    //     BLOCK_VALID_TRANSACTIONS). Such a block is an IN-FLIGHT validation
-    //     candidate: it sits in CBlockValidationQueue, which caches a raw
-    //     CBlockIndex* per queued entry (block_validation_queue.h:56), captured
-    //     while cs_main is released for async validation. Such a block is, by
-    //     construction, NOT yet a candidate (IsBlockACandidateForActivation
-    //     requires BLOCK_VALID_TRANSACTIONS) and — if it is the newest block in
-    //     an IBD flood with no children yet — an in-degree-0 unpinned leaf. The
-    //     prior leaf-only invariant left it evictable, so the now-lowered 500K
-    //     cap could free it out from under the queued raw pointer → UAF passed
-    //     into ActivateBestChain. Pinning it closes the window: the index cannot
-    //     be freed while a block has data but isn't fully validated. Defense in
-    //     depth pairs with the queue dropping its cached-pointer fast-path
-    //     (block_validation_queue.cpp) — either alone closes BLOCKER-1; both
-    //     held so no single regression re-opens it.
+    // (c) BELT for any future HAVE_DATA-before-validity ingress path: every
+    //     entry that HAS block data but is NOT yet fully validated
+    //     (BLOCK_HAVE_DATA set, validity level below BLOCK_VALID_TRANSACTIONS).
+    //
+    //     IMPORTANT — what clause (c) does NOT cover (PR #129 re-red-team HIGH-1):
+    //     it does NOT cover the real BLOCKER-1 target, i.e. a block sitting in
+    //     CBlockValidationQueue. Every production data-ingress path stamps a
+    //     block via MarkBlockReceived() (block_index.h:182-184), which sets
+    //     BLOCK_HAVE_DATA *and* RaiseValidity(BLOCK_VALID_TRANSACTIONS) in ONE
+    //     op. So a queued block is HAVE_DATA + VALID_TRANSACTIONS — it is
+    //     `fully_validated` and therefore is NOT matched by the
+    //     `have_data && !fully_validated` predicate below. It is also not yet a
+    //     m_setBlockIndexCandidates member during the cs_main-released queue
+    //     wait (it only joins the candidate set inside ActivateBestChain, in the
+    //     worker), so clause (b) does not pin it either: during the BLOCKER-1
+    //     window it is still an evictable leaf.
+    //
+    //     The SOLE mechanism that closes BLOCKER-1 for queued blocks is the
+    //     by-hash re-resolve in block_validation_queue.cpp ProcessBlock:
+    //     `pindex = m_chainstate.GetBlockIndex(blockHash)` re-looked-up under the
+    //     lock after the cs_main release, with the null case handled. The cached
+    //     raw QueuedBlock::pindex MUST NOT be re-read across a cs_main release.
+    //
+    //     Clause (c) is kept as a belt: it pins any index that ever holds
+    //     BLOCK_HAVE_DATA WITHOUT having reached VALID_TRANSACTIONS — a state
+    //     no current peer-reachable path produces (the two flags are coupled in
+    //     MarkBlockReceived), but one a future split ingress path (data first,
+    //     validity later) could introduce. If such a path is ever added, clause
+    //     (c) already protects its raw-pointer holders; it is defense-in-depth
+    //     for that hypothetical, NOT coverage of today's queued block.
     for (auto& kv : mapBlockIndex) {
         CBlockIndex* p = kv.second.get();
         if (!p) continue;
@@ -268,8 +282,13 @@ bool CChainState::EvictLowestWorkLeafNotPinned(size_t target_max) {
     // holders MUST either add its target to this pin set or switch the consumer
     // to a by-hash re-lookup (CChainState::GetBlockIndex), or it re-arms
     // BLOCKER-1's class:
-    //   * block_validation_queue.h:56  QueuedBlock::pindex  — LIVE; covered by
-    //       clause (c) here AND the queue's by-hash re-resolve. (the fixed bug)
+    //   * block_validation_queue.h:56  QueuedBlock::pindex  — LIVE; the fixed
+    //       bug. NOT covered by clause (c) here (a queued block is
+    //       HAVE_DATA + VALID_TRANSACTIONS via MarkBlockReceived, so it is
+    //       `fully_validated` and the clause-(c) predicate skips it — see clause
+    //       (c) above). It is covered SOLELY by the queue's by-hash re-resolve
+    //       in block_validation_queue.cpp (GetBlockIndex under the lock, null
+    //       case handled); the cached raw pointer is never re-read.
     //   * block_index.h:17  CBlockIndex::pskip — INERT (never assigned; no
     //       BuildSkip exists). pskip is NOT counted in the in-degree map, so a
     //       node referenced only via some other node's pskip would be a freeable

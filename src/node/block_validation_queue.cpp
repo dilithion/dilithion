@@ -354,10 +354,19 @@ bool CBlockValidationQueue::ProcessBlock(const QueuedBlock& queued_block) {
     // have freed that index if it was an unpinned leaf — making the cached
     // pointer dangle, which then flowed into ActivateBestChain → use-after-free.
     // ALWAYS re-resolve by hash under the lock taken in this function; the
-    // by-hash lookup is the authoritative, eviction-safe path. (Eviction now
-    // also pins in-flight HAVE_DATA-not-VALID_TRANSACTIONS blocks in
-    // chain.cpp, so the index should still be present — but we never deref the
-    // stale cached pointer; defense in depth, and we handle the null case.)
+    // by-hash lookup is the authoritative, eviction-safe path. THIS re-resolve
+    // is the SOLE mechanism that closes BLOCKER-1 for queued blocks.
+    //
+    // NOTE — the eviction pin (clause (c) in chain.cpp) does NOT cover a queued
+    // block: by the time a block is queued it has been stamped by
+    // MarkBlockReceived (block_index.h:182-184), so its validity is already
+    // BLOCK_VALID_TRANSACTIONS. Clause (c) only pins HAVE_DATA-WITHOUT-validity
+    // entries, which a queued block is not — so it is an evictable leaf during
+    // the cs_main-released wait. Do NOT rely on the pin to keep the index alive,
+    // and do NOT re-introduce a cached-pointer fast-path: the cached raw
+    // QueuedBlock::pindex MUST NOT be re-read across a cs_main release. If the
+    // block was evicted while queued, GetBlockIndex returns null below and the
+    // create-or-fail-closed path handles it.
     // The cached field is left in QueuedBlock for callers that still set it,
     // but it is intentionally NOT read here.
     CBlockIndex* pindex = m_chainstate.GetBlockIndex(blockHash);

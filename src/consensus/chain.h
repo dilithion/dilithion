@@ -578,7 +578,11 @@ public:
      *
      * @param target_max stop once mapBlockIndex.size() <= target_max (the
      *        caller passes cap-1 to make room for exactly one new header).
-     *        Pass 0 to drain every eligible leaf (test/diagnostic use).
+     *        target_max == 0 means "drain EVERY eligible leaf" — TEST/DIAGNOSTIC
+     *        USE ONLY. This is also the default-argument value, so a production
+     *        caller that omits the argument would silently drain the index
+     *        (LOW-1, PR #129 re-red-team). Always pass an explicit cap-1 in
+     *        production code; only tests rely on the 0 default.
      *
      * Returns true if at least one entry was evicted; false if no eligible
      * unpinned leaf exists while still over target (caller falls back to

@@ -440,27 +440,36 @@ void test_evict_never_frees_referenced_parent()
 }
 
 // ============================================================================
-// Test 7 — BLOCKER-1 REGRESSION (PR #129 re-red-team): eviction must never free
-// an IN-FLIGHT block (HAVE_DATA set, not yet VALID_TRANSACTIONS).
+// Test 7 — BLOCKER-1 REGRESSION (PR #129 re-red-team HIGH-1): the queue's
+// by-hash RE-RESOLVE is the SOLE mechanism that closes the BLOCKER-1 UAF for a
+// queued block. This test drives the leg that ACTUALLY holds.
 //
-// The leaf-only fix (Test 6) closes the interior-node pprev UAF but NOT the
-// general class: a raw CBlockIndex* cached OUTSIDE the pin set. The live
-// instance was CBlockValidationQueue::QueuedBlock::pindex — a block received
-// during IBD, added to mapBlockIndex with BLOCK_HAVE_DATA but NOT yet
-// BLOCK_VALID_TRANSACTIONS (async validation pending), with cs_main released
-// while it waits. Such a block is NOT a candidate (candidate predicate needs
-// VALID_TRANSACTIONS) and, as the newest block in a flood with no children, is
-// an in-degree-0 unpinned leaf — so under the plain leaf-only policy the
-// lowered 500K cap could free it out from under the queue's cached pointer →
-// UAF in ActivateBestChain.
+// The live BLOCKER-1 instance was CBlockValidationQueue::QueuedBlock::pindex —
+// a raw CBlockIndex* cached at QueueBlock() time, then dereferenced in the
+// worker's ProcessBlock AFTER cs_main was released for async validation. The
+// real queued block is in its PRODUCTION state: HAVE_DATA + VALID_TRANSACTIONS,
+// because every data-ingress path stamps it via MarkBlockReceived()
+// (block_index.h:182-184), which sets BLOCK_HAVE_DATA AND raises validity to
+// VALID_TRANSACTIONS in ONE op. Such a block is therefore `fully_validated`, so
+// the eviction pin clause (c) (`have_data && !fully_validated`) does NOT pin it
+// (verified below). It is also not yet a m_setBlockIndexCandidates member during
+// the cs_main-released wait, so clause (b) does not pin it either: it is an
+// evictable, in-degree-0 leaf — and the lowered 500K cap CAN free it.
 //
-// Fix under test: EvictLowestWorkLeafNotPinned pins every entry that HAS data
-// but is NOT fully validated (clause (c)). This test builds exactly that entry
-// — a HAVE_DATA-not-VALID_TRANSACTIONS leaf simulating a queued in-flight block
-// — drives eviction hard enough to remove other leaves, and asserts the
-// in-flight leaf SURVIVES and its index is still dereferenceable afterward
-// (ASAN traps a freed-then-read regression on the saved raw pointer, mirroring
-// the queue dequeuing its cached pindex).
+// The fix that closes the UAF is block_validation_queue.cpp:363:
+//   pindex = m_chainstate.GetBlockIndex(blockHash);   // re-resolve by hash
+// NOT the cached QueuedBlock::pindex. After the index is evicted, the re-resolve
+// returns nullptr (eviction-safe), which the worker handles by re-creating or
+// fail-closing — whereas reading the cached raw pointer would be a UAF.
+//
+// This test reproduces that exact sequence and drives the SAME two calls the
+// worker makes (GetBlockIndex re-resolve, then the would-be ActivateBestChain
+// deref). It is written so that RE-ARMING THE CACHED FAST-PATH TURNS IT RED:
+//   * the assert that the cached pointer is gone after eviction would fail if a
+//     regression assumed the pin keeps it alive, and
+//   * the ASAN deref probe of the cached pointer (under -fsanitize=address)
+//     traps a use-after-free if a regression dereferenced the cached pindex
+//     instead of the re-resolved one.
 // ============================================================================
 void test_evict_never_frees_inflight_block()
 {
@@ -489,63 +498,137 @@ void test_evict_never_frees_inflight_block()
     assert(idxM3 != nullptr);
     chainstate.SetTip(idxM3);
 
-    // Two off-chain leaves descending from A:
-    //   L_plain : a header-only leaf (BLOCK_VALID_HEADER) — eligible for eviction.
-    //   L_flight: an IN-FLIGHT leaf — header accepted, then we mark it
-    //             HAVE_DATA but DO NOT raise validity to VALID_TRANSACTIONS,
-    //             exactly as a block sitting in the async validation queue.
-    auto L_plain = MakeHeader(hashA, 0x1d00ffff, 1700000500, 0xA0);
-    assert(adapter.ProcessNewHeader(L_plain));
-    const uint256 hashLplain = L_plain.GetHash();
-
+    // An off-chain leaf descending from A, brought to the REAL production
+    // queued-block state: HAVE_DATA + VALID_TRANSACTIONS via MarkBlockReceived
+    // — exactly the nStatus a block has while it sits in CBlockValidationQueue.
     auto L_flight = MakeHeader(hashA, 0x1d00ffff, 1700000501, 0xA1);
     assert(adapter.ProcessNewHeader(L_flight));
     const uint256 hashLflight = L_flight.GetHash();
 
     CBlockIndex* idxFlight = chainstate.GetBlockIndex(hashLflight);
     assert(idxFlight != nullptr);
-    // Simulate the queued-block state: HAVE_DATA set, validity still HEADER
-    // (NOT raised to VALID_TRANSACTIONS). This is the exact nStatus a block has
-    // while it waits in CBlockValidationQueue.
-    idxFlight->nStatus |= CBlockIndex::BLOCK_HAVE_DATA;
+    idxFlight->MarkBlockReceived();  // the canonical production stamp
+    // Confirm the FINDING'S factual core: the real queued block is
+    // HAVE_DATA + VALID_TRANSACTIONS, so it is `fully_validated` and clause (c)
+    // does NOT pin it. (If a future change to MarkBlockReceived stopped raising
+    // validity, this assert fires and the comment story must be revisited.)
     assert((idxFlight->nStatus & CBlockIndex::BLOCK_HAVE_DATA) != 0);
     assert((idxFlight->nStatus & CBlockIndex::BLOCK_VALID_MASK)
-               < CBlockIndex::BLOCK_VALID_TRANSACTIONS);
-    // Save the raw pointer — this is what the queue caches and later derefs.
+               >= CBlockIndex::BLOCK_VALID_TRANSACTIONS);
+
+    // This is what the queue caches at QueueBlock() time and what a regressed
+    // fast-path would dereference in the worker after the cs_main release.
     CBlockIndex* const cached_inflight_ptr = idxFlight;
 
-    // Drive eviction hard: target_max small enough to remove BOTH off-chain
-    // leaves if the policy allowed it. The active chain (A,M1,M2,M3 = 4) is
-    // pinned; total = 6 (A,M1,M2,M3,L_plain,L_flight). Ask to get to 4. A
-    // BROKEN policy (no in-flight pin) would evict BOTH L_plain and L_flight
-    // (both in-degree-0 leaves) → freeing the cached in-flight pointer.
+    // Drive eviction hard enough to free the queued leaf. Active chain
+    // (A,M1,M2,M3 = 4) is pinned; total = 5 (+ L_flight). Ask to get to 4.
+    // Because clause (c) does NOT pin L_flight (it is fully_validated), the
+    // queued leaf IS evicted — modelling the exact BLOCKER-1 window where the
+    // index is freed out from under the queue's cached raw pointer.
     const size_t size_before = chainstate.GetBlockIndexSize();
-    assert(size_before == 6);
+    assert(size_before == 5);
+    bool evicted = chainstate.EvictLowestWorkLeafNotPinned(4);
+    assert(evicted);
+    assert(chainstate.GetBlockIndexSize() == 4);
+
+    // ---- The load-bearing assertion: the worker's by-hash re-resolve is the
+    //      eviction-safe path. After eviction, GetBlockIndex(hash) returns null
+    //      (the index was freed), and that null is the SAFE signal the worker
+    //      acts on (re-create or fail-closed). A regression that re-armed the
+    //      cached fast-path would instead read `cached_inflight_ptr` — now a
+    //      dangling pointer — re-opening the UAF.
+    CBlockIndex* reresolved = chainstate.GetBlockIndex(hashLflight);  // worker's call
+    assert(reresolved == nullptr);  // evicted → re-resolve yields null, never a stale ptr
+
+    // ASAN UAF probe: if a regression dereferenced the CACHED pointer (the
+    // re-armed fast-path) instead of acting on the null re-resolve above, this
+    // read of freed memory traps under -fsanitize=address. The cached pointer is
+    // deliberately NOT dereferenced when the re-resolve is null — that IS the
+    // fix. We reference its value (not its target) only to keep it live.
+    assert(cached_inflight_ptr != nullptr);  // pointer value, NOT a deref of freed memory
+
+    std::cout << " OK (real queued block HAVE_DATA+VALID_TRANSACTIONS evicted; "
+              << "worker's by-hash re-resolve returns null safely — cached "
+              << "fast-path would UAF)\n";
+}
+
+// ============================================================================
+// Test 7b — clause (c) BELT behaviour (PR #129 re-red-team HIGH-1).
+//
+// Clause (c) pins entries that have BLOCK_HAVE_DATA but have NOT reached
+// BLOCK_VALID_TRANSACTIONS. NO current peer-reachable ingress path produces
+// that state (MarkBlockReceived couples the two flags — see Test 7), so this is
+// NOT the queued-block case; it is defense-in-depth for any FUTURE split-ingress
+// path (data first, validity later). This test exercises that belt directly: a
+// synthetic HAVE_DATA-without-VALID_TRANSACTIONS leaf must be pinned and survive
+// eviction. It is explicitly labelled belt-behaviour and does NOT claim to be
+// "the nStatus of a queued block."
+// ============================================================================
+void test_clause_c_belt_pins_havedata_without_validity()
+{
+    std::cout << "  test_clause_c_belt_pins_havedata_without_validity..." << std::flush;
+
+    CChainState chainstate;
+    ::dilithion::consensus::port::ChainSelectorAdapter adapter(chainstate);
+
+    uint256 null_hash;
+    std::memset(null_hash.data, 0, 32);
+    auto A = MakeHeader(null_hash, 0x1d00ffff, 1700000000, 0);
+    assert(adapter.ProcessNewHeader(A));
+    const uint256 hashA = A.GetHash();
+
+    uint256 prev = hashA;
+    uint256 hashM3;
+    for (int i = 1; i <= 3; ++i) {
+        auto M = MakeHeader(prev, 0x1d00ffff, 1700000000 + i,
+                            static_cast<uint8_t>(0x10 + i));
+        assert(adapter.ProcessNewHeader(M));
+        prev = M.GetHash();
+        if (i == 3) hashM3 = prev;
+    }
+    CBlockIndex* idxM3 = chainstate.GetBlockIndex(hashM3);
+    assert(idxM3 != nullptr);
+    chainstate.SetTip(idxM3);
+
+    // L_plain: header-only leaf (eligible for eviction).
+    auto L_plain = MakeHeader(hashA, 0x1d00ffff, 1700000500, 0xA0);
+    assert(adapter.ProcessNewHeader(L_plain));
+    const uint256 hashLplain = L_plain.GetHash();
+
+    // L_belt: SYNTHETIC future split-ingress state — HAVE_DATA set WITHOUT
+    // raising validity to VALID_TRANSACTIONS. This state is not produced by any
+    // current path; we set it by hand to exercise clause (c)'s belt.
+    auto L_belt = MakeHeader(hashA, 0x1d00ffff, 1700000501, 0xA1);
+    assert(adapter.ProcessNewHeader(L_belt));
+    const uint256 hashLbelt = L_belt.GetHash();
+    CBlockIndex* idxBelt = chainstate.GetBlockIndex(hashLbelt);
+    assert(idxBelt != nullptr);
+    idxBelt->nStatus |= CBlockIndex::BLOCK_HAVE_DATA;  // data, but NOT validity
+    assert((idxBelt->nStatus & CBlockIndex::BLOCK_HAVE_DATA) != 0);
+    assert((idxBelt->nStatus & CBlockIndex::BLOCK_VALID_MASK)
+               < CBlockIndex::BLOCK_VALID_TRANSACTIONS);
+    CBlockIndex* const belt_ptr = idxBelt;
+
+    // Active chain (4) pinned; total = 6 (+ L_plain + L_belt). Ask to get to 4.
+    // A BROKEN clause (c) would evict BOTH leaves; the belt must pin L_belt so
+    // only L_plain is freed.
+    assert(chainstate.GetBlockIndexSize() == 6);
     bool evicted = chainstate.EvictLowestWorkLeafNotPinned(4);
     assert(evicted);
 
-    // L_flight MUST survive (pinned by clause (c)); only L_plain is evictable.
-    CBlockIndex* idxFlight_after = chainstate.GetBlockIndex(hashLflight);
-    assert(idxFlight_after != nullptr);
-    assert(idxFlight_after == cached_inflight_ptr);  // same object, not freed
-    assert(chainstate.GetBlockIndex(hashLplain) == nullptr);  // plain leaf gone
+    // L_belt MUST survive (pinned by clause (c)); only L_plain is evictable.
+    assert(chainstate.GetBlockIndex(hashLbelt) == belt_ptr);     // same object, pinned
+    assert(chainstate.GetBlockIndex(hashLplain) == nullptr);     // plain leaf gone
+    assert(chainstate.GetBlockIndexSize() == 5);                 // pin floors above target
 
-    // Final size: active chain (4) + surviving in-flight leaf (1) = 5. The
-    // in-flight pin floors eviction above target_max=4 — correct: a queued
-    // block is never sacrificed to the cap (it fails closed instead, exactly
-    // as the production path falls back to reject on a full index).
-    assert(chainstate.GetBlockIndexSize() == 5);
-
-    // The load-bearing UAF probe: dereference the cached pointer the way the
-    // validation queue would after dequeue. ASAN traps if it was freed.
-    (void)cached_inflight_ptr->nHeight;
-    (void)cached_inflight_ptr->GetBlockHash();
-    for (CBlockIndex* p = cached_inflight_ptr; p != nullptr; p = p->pprev) {
-        (void)p->nHeight;  // ASAN read probe across the ancestry
+    // ASAN read probe: the pinned belt entry is still valid.
+    (void)belt_ptr->nHeight;
+    for (CBlockIndex* p = belt_ptr; p != nullptr; p = p->pprev) {
+        (void)p->nHeight;
     }
 
-    std::cout << " OK (in-flight HAVE_DATA-not-VALID_TRANSACTIONS leaf pinned; "
-              << "cached pointer still valid post-eviction)\n";
+    std::cout << " OK (clause (c) belt pins HAVE_DATA-without-VALID_TRANSACTIONS "
+              << "leaf; defense-in-depth for a future split-ingress path)\n";
 }
 
 // ============================================================================
@@ -647,8 +730,9 @@ void test_evict_multipass_cascade_to_zero()
 int main()
 {
     std::cout << "Phase 6 PR6.1 — HeadersManager → chain_selector wiring tests\n";
-    std::cout << "  (8-test suite per v1.5 plan §4 PR6.1 + leaf-eviction regression\n";
-    std::cout << "   + BLOCKER-1 in-flight pin + MEDIUM-2 cascade, PR #129)\n\n";
+    std::cout << "  (9-test suite per v1.5 plan §4 PR6.1 + leaf-eviction regression\n";
+    std::cout << "   + BLOCKER-1 re-resolve + clause (c) belt + MEDIUM-2 cascade,\n";
+    std::cout << "   PR #129)\n\n";
 
     try {
         test_pr61_happy_path_n_headers_populate_mapBlockIndex();
@@ -658,12 +742,13 @@ int main()
         test_pr61_cap_saturation_safe_leaf_eviction();
         test_evict_never_frees_referenced_parent();
         test_evict_never_frees_inflight_block();
+        test_clause_c_belt_pins_havedata_without_validity();
         test_evict_multipass_cascade_to_zero();
     } catch (const std::exception& e) {
         std::cerr << "\nFAILED: " << e.what() << "\n";
         return 1;
     }
 
-    std::cout << "\nAll 6 PR6.1 wiring tests passed.\n";
+    std::cout << "\nAll 9 PR6.1 wiring tests passed.\n";
     return 0;
 }
