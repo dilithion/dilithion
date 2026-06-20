@@ -3141,6 +3141,102 @@ static void Test_F1R4_DeferredExportGatedByValidate() {
     std::remove(path.c_str());
 }
 
+// ---------------------------------------------------------------------------
+// Test — REGRESSION (LP-7 follow-up, ecosystem-sweep C-1): per-address keys
+// MINTED AFTER encryption must carry a v7 MAC. The three at-rest store sites —
+// GetNewHDAddress (DeriveAndCacheHDAddress), GetNewAddress (encrypted new-keypair
+// path), and ImportKey — stored the encrypted per-address key with an EMPTY
+// vchMAC. SaveUnlocked then wrote a macLen=0 v7 record, and the LP-7 loader
+// (Load: version>=v7 && encKey.vchMAC.empty() -> return false) refused the WHOLE
+// wallet on the next start, bricking it (total funds-access loss). This pins all
+// three paths: encrypt -> mint/import an address -> save -> a FRESH load must
+// SUCCEED and the key must be spendable from the on-disk v7 record. On the
+// unfixed binary every "wallet reloads" assertion below FAILS (Load returns
+// false). The fix mirrors EncryptWallet's per-address ComputeRecordMAC.
+// ---------------------------------------------------------------------------
+static void Test_V7PerAddressKeyMACRoundTrip() {
+    std::cout << COLOR_BLUE "\n[Regression C-1] Per-address keys minted post-encryption carry a v7 MAC (no brick)\n" COLOR_RESET;
+
+    const std::string pass = "P3r@ddr!MAC#R0undtr1p2026";
+
+    // --- (A) GetNewHDAddress -> DeriveAndCacheHDAddress store site ---
+    {
+        const std::string path = "lp7_reg_hdaddr_wallet.dat";
+        std::remove(path.c_str());
+        CDilithiumAddress newAddr;
+        {
+            CWallet w;
+            w.SetWalletFile(path);
+            std::string mnemonic;
+            CHECK(w.GenerateHDWallet(mnemonic), "(HD) generated HD wallet");
+            CHECK(w.EncryptWallet(pass), "(HD) encrypted wallet (stays unlocked)");
+            newAddr = w.GetNewHDAddress();   // buggy store site
+            CHECK(!newAddr.GetData().empty(), "(HD) minted a new HD address post-encryption");
+        }
+        CWallet w2;
+        w2.SetWalletFile(path);
+        bool loaded = w2.Load(path);
+        CHECK(loaded, "(HD) LOAD-BEARING: wallet reloads after minting an HD address (NOT bricked)");
+        CHECK(loaded && FileVersion(path) == WALLET_FILE_VERSION_7, "(HD) on-disk file is v7");
+        CKey rec;
+        bool spendable = loaded && w2.Unlock(pass) && w2.GetKey(newAddr, rec);
+        CHECK(spendable, "(HD) minted address is spendable from the on-disk v7 record");
+        std::remove(path.c_str());
+    }
+
+    // --- (B) GetNewAddress -> encrypted new-keypair store site (3rd site) ---
+    {
+        const std::string path = "lp7_reg_newaddr_wallet.dat";
+        std::remove(path.c_str());
+        CDilithiumAddress newAddr;
+        {
+            CWallet w;
+            w.SetWalletFile(path);
+            std::string mnemonic;
+            CHECK(w.GenerateHDWallet(mnemonic), "(NewAddr) generated HD wallet");
+            CHECK(w.EncryptWallet(pass), "(NewAddr) encrypted wallet");
+            newAddr = w.GetNewAddress();   // buggy store site
+            CHECK(!newAddr.GetData().empty(), "(NewAddr) minted a new address post-encryption");
+        }
+        CWallet w2;
+        w2.SetWalletFile(path);
+        bool loaded = w2.Load(path);
+        CHECK(loaded, "(NewAddr) LOAD-BEARING: wallet reloads after GetNewAddress (NOT bricked)");
+        CKey rec;
+        bool spendable = loaded && w2.Unlock(pass) && w2.GetKey(newAddr, rec);
+        CHECK(spendable, "(NewAddr) minted address is spendable from the on-disk v7 record");
+        std::remove(path.c_str());
+    }
+
+    // --- (C) ImportKey -> importprivkey store site ---
+    {
+        const std::string path = "lp7_reg_import_wallet.dat";
+        std::remove(path.c_str());
+        CKey imported;
+        CHECK(WalletCrypto::GenerateKeyPair(imported), "(Import) generated a keypair to import");
+        CDilithiumAddress impAddr(imported.vchPubKey);
+        {
+            CWallet w;
+            w.SetWalletFile(path);
+            std::string mnemonic;
+            CHECK(w.GenerateHDWallet(mnemonic), "(Import) generated HD wallet");
+            CHECK(w.EncryptWallet(pass), "(Import) encrypted wallet");
+            CHECK(w.ImportKey(imported, impAddr), "(Import) imported a key into the encrypted wallet");
+        }
+        CWallet w2;
+        w2.SetWalletFile(path);
+        bool loaded = w2.Load(path);
+        CHECK(loaded, "(Import) LOAD-BEARING: wallet reloads after importprivkey (NOT bricked)");
+        CKey rec;
+        bool spendable = loaded && w2.Unlock(pass) && w2.GetKey(impAddr, rec);
+        CHECK(spendable &&
+              std::vector<uint8_t>(rec.vchPrivKey.begin(), rec.vchPrivKey.end()) ==
+              std::vector<uint8_t>(imported.vchPrivKey.begin(), imported.vchPrivKey.end()),
+              "(Import) imported private key round-trips from the on-disk v7 record");
+        std::remove(path.c_str());
+    }
+}
+
 int main() {
     std::cout << COLOR_BLUE "==== LP-7 wallet encryption-at-rest tests ====" COLOR_RESET "\n";
 
@@ -3158,6 +3254,7 @@ int main() {
     Test_PerRecordMACIsolation();
     Test_AtomicRenameCrashWindow();
     Test_LegacyPerAddressKey();
+    Test_V7PerAddressKeyMACRoundTrip();   // ecosystem-sweep C-1 regression
     Test_ChangePassphraseLegacyNonHD();
     Test_ChangePassphraseLegacyV6WithMIK();
     Test_EncryptWalletRollback();

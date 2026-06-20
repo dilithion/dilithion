@@ -235,6 +235,15 @@ bool CWallet::GenerateNewKey() {
             return false;
         }
 
+        // LP-7: a per-address at-rest key MUST carry a v7 MAC, or Load() (which
+        // rejects any v7 record with an empty vchMAC) refuses the WHOLE wallet on
+        // the next start — silent funds-access loss. Mirror EncryptWallet's per-
+        // address MAC compute; GetKeyUnlocked already verifies it symmetrically.
+        if (!ComputeRecordMAC(crypter, encKey.vchCryptedKey, encKey.vchMAC)) {
+            memory_cleanse(masterKeyVec.data(), masterKeyVec.size());
+            return false;
+        }
+
         mapCryptedKeys[address] = encKey;
         memory_cleanse(masterKeyVec.data(), masterKeyVec.size());
     } else {
@@ -479,6 +488,15 @@ bool CWallet::ImportKey(const CKey& key, const CDilithiumAddress& address) {
         }
 
         if (!crypter.Encrypt(key.vchPrivKey, encKey.vchCryptedKey)) {
+            memory_cleanse(masterKeyVec.data(), masterKeyVec.size());
+            return false;
+        }
+
+        // LP-7: a per-address at-rest key MUST carry a v7 MAC, or Load() (which
+        // rejects any v7 record with an empty vchMAC) refuses the WHOLE wallet on
+        // the next start — silent funds-access loss. Mirror EncryptWallet's per-
+        // address MAC compute; GetKeyUnlocked already verifies it symmetrically.
+        if (!ComputeRecordMAC(crypter, encKey.vchCryptedKey, encKey.vchMAC)) {
             memory_cleanse(masterKeyVec.data(), masterKeyVec.size());
             return false;
         }
@@ -5690,6 +5708,18 @@ bool CWallet::DeriveAndCacheHDAddress(const CHDKeyPath& path) {
         }
 
         if (!crypter.Encrypt(key.vchPrivKey, encKey.vchCryptedKey)) {
+            memory_cleanse(masterKeyVec.data(), masterKeyVec.size());
+            key.Clear();
+            derived.Wipe();
+            master_copy.Wipe();
+            return false;
+        }
+
+        // LP-7: a per-address at-rest key MUST carry a v7 MAC, or Load() (which
+        // rejects any v7 record with an empty vchMAC) refuses the WHOLE wallet on
+        // the next start — silent funds-access loss. Mirror EncryptWallet's per-
+        // address MAC compute; GetKeyUnlocked already verifies it symmetrically.
+        if (!ComputeRecordMAC(crypter, encKey.vchCryptedKey, encKey.vchMAC)) {
             memory_cleanse(masterKeyVec.data(), masterKeyVec.size());
             key.Clear();
             derived.Wipe();
