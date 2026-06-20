@@ -3193,10 +3193,11 @@ static void Test_V7PerAddressKeyMACRoundTrip() {
             CWallet w;
             w.SetWalletFile(path);
             std::string mnemonic;
-            CHECK(w.GenerateHDWallet(mnemonic), "(NewAddr) generated HD wallet");
-            CHECK(w.EncryptWallet(pass), "(NewAddr) encrypted wallet");
-            newAddr = w.GetNewAddress();   // buggy store site
-            CHECK(!newAddr.GetData().empty(), "(NewAddr) minted a new address post-encryption");
+            CHECK(w.GenerateHDWallet(mnemonic), "(NewKey) generated HD wallet");
+            CHECK(w.EncryptWallet(pass), "(NewKey) encrypted wallet");
+            CHECK(w.GenerateNewKey(), "(NewKey) minted a non-HD key post-encryption (GenerateNewKey)");
+            newAddr = w.GetAddresses().back();   // GenerateNewKey appends → hits the line-242 store
+            CHECK(!newAddr.GetData().empty(), "(NewKey) captured the minted address");
         }
         CWallet w2;
         w2.SetWalletFile(path);
@@ -3233,6 +3234,44 @@ static void Test_V7PerAddressKeyMACRoundTrip() {
               std::vector<uint8_t>(rec.vchPrivKey.begin(), rec.vchPrivKey.end()) ==
               std::vector<uint8_t>(imported.vchPrivKey.begin(), imported.vchPrivKey.end()),
               "(Import) imported private key round-trips from the on-disk v7 record");
+        std::remove(path.c_str());
+    }
+
+    // --- (D) KEYING-MATCH on a LOADED LEGACY v6 wallet (red-team CRITICAL-1):
+    //         a non-HD v6 wallet NEVER migrates, so minting must write a LEGACY-
+    //         keyed MAC (matching VerifyRecordMAC's legacy keying for v<7), not a
+    //         v7-keyed MAC. With the v7-only keying, the minted key loads but is
+    //         silently UNSPENDABLE after reload (MAC verify mismatch). ---
+    {
+        const std::string path = "lp7_reg_v6mint_wallet.dat";
+        std::remove(path.c_str());
+        LegacyV6NonHDResult v6;
+        bool built = BuildLegacyV6NonHDWalletWithKey(path, pass, v6);
+        CHECK(built, "(v6-mint) built legacy v6 non-HD wallet");
+        if (built) {
+            CDilithiumAddress mintedAddr;
+            {
+                CWallet w;
+                w.SetWalletFile(path);            // autosave on
+                CHECK(w.Load(path), "(v6-mint) loaded legacy v6 wallet");
+                CHECK(w.Unlock(pass), "(v6-mint) unlocked (non-HD v6 -> NO migration)");
+                CHECK(FileVersion(path) == WALLET_FILE_VERSION_6,
+                      "(v6-mint) wallet stays v6 after unlock (no migration)");
+                CHECK(w.GenerateNewKey(), "(v6-mint) minted a non-HD key on the v6 wallet (GenerateNewKey)");
+                mintedAddr = w.GetAddresses().back();   // hits the line-242 store at v6
+                CHECK(!mintedAddr.GetData().empty(), "(v6-mint) captured the minted address");
+                CHECK(FileVersion(path) == WALLET_FILE_VERSION_6,
+                      "(v6-mint) file STILL v6 after minting (no v7 promotion)");
+            }
+            CWallet w2;
+            w2.SetWalletFile(path);
+            bool loaded = w2.Load(path);
+            CHECK(loaded, "(v6-mint) wallet reloads after minting on a v6 wallet");
+            CKey rec;
+            bool spendable = loaded && w2.Unlock(pass) && w2.GetKey(mintedAddr, rec);
+            CHECK(spendable,
+                  "(v6-mint) LOAD-BEARING (CRITICAL-1): key minted on a v6 wallet is SPENDABLE after reload (keying matches verify side)");
+        }
         std::remove(path.c_str());
     }
 }
