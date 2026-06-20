@@ -500,9 +500,10 @@ ChainParams ChainParams::DilV() {
     // references via pprev. Pinned set = active-chain ancestors +
     // m_setBlockIndexCandidates and all their pprev ancestors. This is NOT a
     // consensus rule and does not cause divergence: an evicted leaf header is
-    // re-obtainable — mapHeaders (CHeadersManager) is unbounded, so the header
-    // re-arrives via the block/header path if a reorg later needs it. The cap
-    // bounds memory; it never changes which chain is valid.
+    // re-obtainable via PEER RE-ANNOUNCEMENT — if that fork ever becomes the
+    // most-work chain, peers re-feed its headers/blocks and the node re-derives
+    // the index (matching chain.h EvictLowestWorkLeafNotPinned). The cap bounds
+    // memory; it never changes which chain is valid.
     params.nMapBlockIndexCap = 500000;
 
     // VDF: active from genesis — DilV is a VDF-only chain
