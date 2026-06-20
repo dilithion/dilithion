@@ -3274,6 +3274,88 @@ static void Test_V7PerAddressKeyMACRoundTrip() {
         }
         std::remove(path.c_str());
     }
+
+    // --- (E) IMPORTKEY on a LOADED LEGACY v6 wallet (LOW-1 fold):
+    //         same property as (D) for the ImportKey store site. A non-HD v6
+    //         wallet never migrates, so ImportKey must write a LEGACY-keyed MAC
+    //         (matching VerifyRecordMAC for v<7). With v7-only keying the imported
+    //         key loads but is silently UNSPENDABLE after reload (MAC mismatch). ---
+    {
+        const std::string path = "lp7_reg_v6import_wallet.dat";
+        std::remove(path.c_str());
+        LegacyV6NonHDResult v6;
+        bool built = BuildLegacyV6NonHDWalletWithKey(path, pass, v6);
+        CHECK(built, "(v6-import) built legacy v6 non-HD wallet");
+        if (built) {
+            CKey imported;
+            CHECK(WalletCrypto::GenerateKeyPair(imported), "(v6-import) generated a keypair to import");
+            CDilithiumAddress impAddr(imported.vchPubKey);
+            {
+                CWallet w;
+                w.SetWalletFile(path);            // autosave on
+                CHECK(w.Load(path), "(v6-import) loaded legacy v6 wallet");
+                CHECK(w.Unlock(pass), "(v6-import) unlocked (non-HD v6 -> NO migration)");
+                CHECK(FileVersion(path) == WALLET_FILE_VERSION_6,
+                      "(v6-import) wallet stays v6 after unlock (no migration)");
+                CHECK(w.ImportKey(imported, impAddr), "(v6-import) imported a key into the v6 wallet");
+                CHECK(FileVersion(path) == WALLET_FILE_VERSION_6,
+                      "(v6-import) file STILL v6 after import (no v7 promotion)");
+            }
+            CWallet w2;
+            w2.SetWalletFile(path);
+            bool loaded = w2.Load(path);
+            CHECK(loaded, "(v6-import) wallet reloads after importing on a v6 wallet");
+            CKey rec;
+            bool spendable = loaded && w2.Unlock(pass) && w2.GetKey(impAddr, rec);
+            CHECK(spendable &&
+                  std::vector<uint8_t>(rec.vchPrivKey.begin(), rec.vchPrivKey.end()) ==
+                  std::vector<uint8_t>(imported.vchPrivKey.begin(), imported.vchPrivKey.end()),
+                  "(v6-import) LOAD-BEARING (LOW-1): imported private key round-trips/SPENDABLE after reload (keying matches verify side)");
+        }
+        std::remove(path.c_str());
+    }
+
+    // --- (F) GetNewHDAddress / DeriveAndCacheHDAddress on a LOADED LEGACY v6
+    //         NON-HD wallet (LOW-1 fold): HD derivation genuinely CANNOT run on a
+    //         non-HD wallet — GetNewHDAddress() is guarded by `if (!fIsHDWallet)
+    //         return CDilithiumAddress();` (wallet.cpp ~L5372), so it never reaches
+    //         the DeriveAndCacheHDAddress store site and never writes a v7 MAC. We
+    //         therefore assert the GUARDED no-brick outcome rather than forcing an
+    //         invalid HD path: GetNewHDAddress returns EMPTY, the file stays v6 and
+    //         un-promoted, the wallet reloads, and the original v6 key stays
+    //         SPENDABLE. (Were the guard removed and the v7 store site reached on a
+    //         v6 wallet, the minted key would silently unspend — the same property
+    //         (D) pins — but the guard makes that path unreachable here.) ---
+    {
+        const std::string path = "lp7_reg_v6hd_wallet.dat";
+        std::remove(path.c_str());
+        LegacyV6NonHDResult v6;
+        bool built = BuildLegacyV6NonHDWalletWithKey(path, pass, v6);
+        CHECK(built, "(v6-hd) built legacy v6 non-HD wallet");
+        if (built) {
+            {
+                CWallet w;
+                w.SetWalletFile(path);            // autosave on
+                CHECK(w.Load(path), "(v6-hd) loaded legacy v6 wallet");
+                CHECK(w.Unlock(pass), "(v6-hd) unlocked (non-HD v6 -> NO migration)");
+                CHECK(!w.IsHDWallet(), "(v6-hd) loaded wallet is correctly NON-HD");
+                CDilithiumAddress hdAddr = w.GetNewHDAddress();   // guarded: returns empty on non-HD
+                CHECK(hdAddr.GetData().empty(),
+                      "(v6-hd) LOAD-BEARING: GetNewHDAddress is GUARDED on a non-HD v6 wallet (returns empty, no v7 store site reached)");
+                CHECK(FileVersion(path) == WALLET_FILE_VERSION_6,
+                      "(v6-hd) file STILL v6 after guarded GetNewHDAddress (no v7 promotion)");
+            }
+            CWallet w2;
+            w2.SetWalletFile(path);
+            bool loaded = w2.Load(path);
+            CHECK(loaded, "(v6-hd) wallet reloads after the guarded HD-derivation attempt (NOT bricked)");
+            CKey rec;
+            bool spendable = loaded && w2.Unlock(pass) && w2.GetKey(v6.perAddr, rec);
+            CHECK(spendable,
+                  "(v6-hd) original v6 key STILL SPENDABLE after the guarded HD attempt (no brick, no keying drift)");
+        }
+        std::remove(path.c_str());
+    }
 }
 
 int main() {
