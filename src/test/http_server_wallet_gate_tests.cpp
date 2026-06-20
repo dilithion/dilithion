@@ -648,6 +648,16 @@ static Classification ClassifyHttp(const std::string& method,
 static void TestRpcHttpClassificationParity() {
     std::cout << "LP-12 follow-on: CRPCServer <-> CHttpServer path-norm parity..." << std::endl;
 
+    // SCOPE (honest): this verifies PATH-NORMALIZATION parity — that both servers, given
+    // the SAME (method, path) tuple, classify the canonical path identically. It does NOT
+    // verify request-LINE-parser parity: the two servers split the raw request line
+    // differently (CRPCServer: raw find(' '); CHttpServer: istringstream >> tokens), so a
+    // MALFORMED request line (e.g. tab-separated, or missing the HTTP-version token) can
+    // still produce different (method,path) tuples and thus diverge — a KNOWN residual.
+    // That residual is defense-in-depth only (the unconditional Host gate is the live
+    // backstop; the wallet UI is loopback-only), tracked as the parser-unification
+    // follow-up. Do NOT read this test as asserting byte-for-byte request-line parity.
+    //
     // The three vectors named in the contract. POST-FIX, the normalized RPC
     // classification MATCHES CHttpServer for every one (the parity goal). At least
     // two of the three ALSO change verdict vs the pre-fix raw logic, proving the
