@@ -243,25 +243,30 @@ bool ChainSelectorAdapter::ProcessNewHeader(const CBlockHeader& header)
     }
 
     // Phase 6 PR6.1 (v1.5 §3.2 + Cursor v1.5+ A1): mapBlockIndex cap with
-    // eviction-by-lowest-work-not-on-best-chain. Per v1.5 contract:
-    // when cap is reached, evict the lowest-work entry that is NOT an
-    // ancestor of the active chain. This makes room for the new header
-    // without rejecting it.
+    // LEAF-ONLY safe eviction. When the cap is reached, evict the lowest-work
+    // UNPINNED LEAF (in-degree 0 in the pprev graph) to make room for the new
+    // header without rejecting it.
     //
-    // Eviction safety: CChainState::EvictLowestWorkNotOnBestChain holds
-    // cs_main and removes the evicted entry from m_setBlockIndexCandidates
-    // before erasing it from mapBlockIndex (no UAF on chain_selector
-    // pointers).
+    // Eviction safety (the v4.5.0-pull fix): CChainState::
+    // EvictLowestWorkLeafNotPinned holds cs_main and frees ONLY a leaf — an
+    // entry that no surviving entry references via a raw pprev pointer — and
+    // never an entry in the pinned set (active chain + reorg candidates and
+    // their ancestors). The prior "lowest-work-not-on-best-chain" policy could
+    // free an interior fork node whose higher-work child still pointed at it
+    // via pprev → use-after-free on the next chain walk. The leaf invariant
+    // makes that structurally impossible. It also drops the evicted node from
+    // m_setBlockIndexCandidates before the unique_ptr destroys it.
     //
-    // Fail-closed fallback: at extreme cap saturation where ALL entries
-    // are on the active chain (cap < active chain height — unreachable
-    // at production sizes: DIL=500K cap vs ~24K chain height), eviction
-    // returns false and we reject the new header. This is a safety net
+    // Fail-closed fallback: if no eligible unpinned leaf exists (pathological,
+    // unreachable at production cap sizes: DIL/DilV=500K cap vs ~24K chain
+    // height), eviction returns false and we reject the new header. Safety net
     // for misconfigured caps, not the primary path.
     if (Dilithion::g_chainParams) {
         const int cap = Dilithion::g_chainParams->nMapBlockIndexCap;
         if (cap > 0 && m_chainstate.GetBlockIndexSize() >= static_cast<size_t>(cap)) {
-            if (!m_chainstate.EvictLowestWorkNotOnBestChain()) {
+            // Make room for exactly one new header: evict down to cap-1.
+            const size_t target_max = static_cast<size_t>(cap) - 1;
+            if (!m_chainstate.EvictLowestWorkLeafNotPinned(target_max)) {
                 return false;
             }
         }

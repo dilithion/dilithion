@@ -531,23 +531,53 @@ public:
     size_t GetBlockIndexSize() const { return mapBlockIndex.size(); }
 
     /**
-     * Phase 6 PR6.1 (v1.5 §3.2 + Cursor v1.5+ A1): evict lowest-work
-     * entry NOT on the active chain. Called by ChainSelectorAdapter when
-     * mapBlockIndex hits chainparams.nMapBlockIndexCap to make room for
-     * a new pre-validation header.
+     * Phase 6 PR6.1 (v1.5 §3.2 + Cursor v1.5+ A1): evict the lowest-work
+     * UNPINNED LEAF to make room for a new pre-validation header. Called by
+     * ChainSelectorAdapter when mapBlockIndex hits nMapBlockIndexCap.
      *
-     * Eviction policy: walk mapBlockIndex, find the entry with minimum
-     * nChainWork that is NOT an ancestor of pindexTip; remove from
-     * m_setBlockIndexCandidates if present, then erase from
-     * mapBlockIndex. Holds cs_main for the duration to avoid use-after-
-     * free against chain_selector pointers in m_setBlockIndexCandidates.
+     * LEAF-ONLY INVARIANT (the v4.5.0-pull fix). mapBlockIndex owns its
+     * CBlockIndex via unique_ptr, but surviving entries reference their
+     * parent by a RAW pprev pointer (dereferenced in ~50 places across
+     * chain.cpp: FindMostWorkChain, MarkBlockAsFailed, GetChainTips, FindFork,
+     * etc.). The prior implementation evicted the lowest-work entry not on the
+     * active chain — which can be an INTERIOR fork node whose higher-work
+     * child still points at it via pprev. Freeing it dangled the child's pprev
+     * → use-after-free on the next chain walk. This version frees ONLY a leaf:
+     * an entry with in-degree 0 in the pprev graph (no surviving entry names
+     * it as pprev) that is also not in the pinned set.
      *
-     * Returns true on successful eviction. Returns false if the only
-     * remaining entries are on the active chain (caller should fall back
-     * to fail-closed, but this case is essentially unreachable at
-     * production cap sizes — DIL=500K cap vs ~24K active chain height).
+     * PINNED SET (never evicted, even if it is a leaf):
+     *   - every ancestor of pindexTip (the active chain);
+     *   - every entry in m_setBlockIndexCandidates AND all their pprev
+     *     ancestors (the chain selector's reorg-candidate reachable set —
+     *     this also covers the best-header tip whenever it has a block-index
+     *     entry, since such a tip is a candidate). Note: pindexBestHeader does
+     *     NOT exist on CChainState; best-header tracking lives in the separate
+     *     CHeadersManager, so it is pinned transitively via the candidate set
+     *     rather than by direct reference.
+     *
+     * ALGORITHM: build an in-degree map over mapBlockIndex (how many entries
+     * name each node as pprev), build the pinned set, then evict eligible
+     * leaves (in-degree 0, unpinned) lowest-nChainWork first. After erasing a
+     * leaf, decrement its parent's in-degree so the parent may become an
+     * eligible leaf in a later pass. Multi-pass until under cap or no eligible
+     * leaf remains. nChainWork comparisons use ChainWorkGreaterThan (chainWork
+     * is NOT memcmp-comparable). Holds cs_main throughout.
+     *
+     * NOT consensus-affecting: an evicted leaf is a non-active-chain tip whose
+     * header is re-obtainable (mapHeaders is unbounded), so eviction never
+     * changes which chain a node accepts — it only bounds memory.
+     *
+     * @param target_max stop once mapBlockIndex.size() <= target_max (the
+     *        caller passes cap-1 to make room for exactly one new header).
+     *        Pass 0 to drain every eligible leaf (test/diagnostic use).
+     *
+     * Returns true if at least one entry was evicted; false if no eligible
+     * unpinned leaf exists while still over target (caller falls back to
+     * fail-closed reject). The false case is unreachable at production cap
+     * sizes.
      */
-    bool EvictLowestWorkNotOnBestChain();
+    bool EvictLowestWorkLeafNotPinned(size_t target_max = 0);
 
     /**
      * Find the last common ancestor between two chains

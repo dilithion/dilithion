@@ -487,9 +487,23 @@ ChainParams ChainParams::DilV() {
     params.nOutboundFullRelayTarget = 8;
     params.nOutboundBlockRelayTarget = 4;
 
-    // Phase 6 PR6.1: mapBlockIndex cap — DilV is 5M (10× DIL) because
-    // its 60s blocks produce headers ~4× faster than DIL's 240s.
-    params.nMapBlockIndexCap = 5000000;
+    // Phase 6 PR6.1: mapBlockIndex cap. Lowered 5M -> 500K (matches DIL).
+    // 5M permitted ~2 GB of attacker-controlled CBlockIndex memory before
+    // eviction engaged; 500K caps that surface at ~210 MB. DilV's 60s blocks
+    // hit saturation faster than DIL's 240s blocks (~8.7 months of honest
+    // headers vs ~3.8 years), after which a bounded eviction scan runs per
+    // over-cap header insert.
+    //
+    // Eviction safety (see EvictLowestWorkLeafNotPinned, consensus/chain.cpp):
+    // eviction frees ONLY unpinned leaf entries (in-degree 0 in the pprev
+    // graph) — never an interior node that a surviving fork descendant still
+    // references via pprev. Pinned set = active-chain ancestors +
+    // m_setBlockIndexCandidates and all their pprev ancestors. This is NOT a
+    // consensus rule and does not cause divergence: an evicted leaf header is
+    // re-obtainable — mapHeaders (CHeadersManager) is unbounded, so the header
+    // re-arrives via the block/header path if a reorg later needs it. The cap
+    // bounds memory; it never changes which chain is valid.
+    params.nMapBlockIndexCap = 500000;
 
     // VDF: active from genesis — DilV is a VDF-only chain
     params.vdfActivationHeight = 0;

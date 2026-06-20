@@ -187,57 +187,110 @@ bool CChainState::HasBlockIndex(const uint256& hash) const {
 }
 
 // Phase 6 PR6.1 (v1.5 §3.2 + Cursor v1.5+ A1): cap-eviction policy.
-// Evicts lowest-work entry NOT on the active chain.
-bool CChainState::EvictLowestWorkNotOnBestChain() {
+// LEAF-ONLY safe eviction — see the contract in chain.h. Re-does the
+// v4.5.0-pulled cap fix without the use-after-free: the prior version could
+// free an INTERIOR fork node whose higher-work child still referenced it via
+// pprev, dangling that child's pprev. This version frees ONLY unpinned leaves
+// (in-degree 0 in the pprev graph), lowest nChainWork first, multi-pass.
+bool CChainState::EvictLowestWorkLeafNotPinned(size_t target_max) {
     std::lock_guard<std::recursive_mutex> lock(cs_main);
 
     if (mapBlockIndex.empty()) return false;
 
-    // Build a set of active-chain hashes by walking pindexTip → genesis.
-    // O(active_chain_height); cheap relative to map walk below.
-    std::set<uint256> active_chain_hashes;
-    for (CBlockIndex* p = pindexTip; p != nullptr; p = p->pprev) {
-        active_chain_hashes.insert(p->GetBlockHash());
+    // ---- (1) Build the in-degree map over the pprev graph -----------------
+    // in_degree[node] = number of surviving entries that name `node` as pprev.
+    // A node with in_degree 0 is a leaf: no surviving entry references it via
+    // a raw pprev pointer, so freeing it cannot dangle anyone.
+    std::map<CBlockIndex*, size_t> in_degree;
+    for (auto& kv : mapBlockIndex) {
+        in_degree.emplace(kv.second.get(), 0);  // ensure every node is present
     }
-
-    // Find the entry with minimum nChainWork that is NOT on the active
-    // chain. Use ChainWorkGreaterThan (from consensus/pow.h) — chainWork
-    // stored in uint256 doesn't have a memcmp-compatible byte ordering;
-    // raw memcmp gives wrong magnitude comparison.
-    CBlockIndex* worst = nullptr;
-    uint256      worst_work;
-    bool         worst_set = false;
     for (auto& kv : mapBlockIndex) {
         CBlockIndex* p = kv.second.get();
-        if (!p) continue;
-        if (active_chain_hashes.count(kv.first) > 0) continue;  // skip active
-        // We want minimum: p < worst means p has LESS work than current worst.
-        // ChainWorkGreaterThan(a, b) = a > b. So p has less work iff
-        // ChainWorkGreaterThan(worst_work, p->nChainWork) is true
-        // (worst_work > p means p < worst_work, so p is lower-work).
-        if (!worst_set || ChainWorkGreaterThan(worst_work, p->nChainWork)) {
-            worst = p;
-            worst_work = p->nChainWork;
-            worst_set = true;
+        if (p && p->pprev) {
+            auto it = in_degree.find(p->pprev);
+            if (it != in_degree.end()) it->second += 1;
+            // (pprev not in the map would be a topology bug; AddBlockIndex
+            //  enforces parent-presence, so this branch is effectively dead.)
         }
     }
 
-    if (!worst_set) {
-        // All entries are on the active chain. At production cap sizes
-        // (DIL=500K vs ~24K chain height) this is unreachable; if it
-        // happens, caller falls back to fail-closed.
-        return false;
+    // ---- (2) Build the pinned set (never evicted) ------------------------
+    // (a) every ancestor of the active tip.
+    std::set<CBlockIndex*> pinned;
+    for (CBlockIndex* p = pindexTip; p != nullptr; p = p->pprev) {
+        if (!pinned.insert(p).second) break;  // cycle guard (shouldn't happen)
+    }
+    // (b) every reorg candidate AND all of its pprev ancestors. This is the
+    //     chain selector's reachable set; it transitively pins the
+    //     best-header tip whenever that tip has a block-index entry (such a
+    //     tip is, by construction, a candidate). pindexBestHeader does not
+    //     exist on CChainState — best-header state lives in CHeadersManager —
+    //     so the candidate set is the in-scope handle on it.
+    for (CBlockIndex* cand : m_setBlockIndexCandidates) {
+        for (CBlockIndex* p = cand; p != nullptr; p = p->pprev) {
+            if (!pinned.insert(p).second) break;  // ancestor already pinned
+        }
     }
 
-    // Remove from m_setBlockIndexCandidates if present (avoid dangling
-    // pointer in the candidate set).
-    m_setBlockIndexCandidates.erase(worst);
+    // ---- (3) Multi-pass leaf eviction ------------------------------------
+    // Each pass: pick the lowest-nChainWork entry that is (in-degree 0) AND
+    // (unpinned), erase it, decrement its parent's in-degree (the parent may
+    // become an eligible leaf next pass). Stop as soon as we are at/under
+    // target_max (room made) OR no eligible leaf remains. The caller passes
+    // cap-1 so a single call makes room for exactly one new header without
+    // over-draining the index (multi-pass only kicks in when removing one
+    // leaf is not enough to get under target — e.g. a run of stale sibling
+    // leaves). ChainWorkGreaterThan is the ONLY valid chainWork compare —
+    // uint256 chainWork is not memcmp-ordered.
+    bool evicted_any = false;
+    for (;;) {
+        // Stop once we have made room (target_max==0 means "drain all eligible
+        // leaves" — test/diagnostic use only; production always passes cap-1).
+        if (target_max > 0 && mapBlockIndex.size() <= target_max) break;
 
-    // Erase from mapBlockIndex. unique_ptr cleanup destroys CBlockIndex.
-    uint256 worst_hash = worst->GetBlockHash();
-    mapBlockIndex.erase(worst_hash);
+        CBlockIndex* worst = nullptr;
+        uint256      worst_work;
+        bool         worst_set = false;
+        for (auto& kv : mapBlockIndex) {
+            CBlockIndex* p = kv.second.get();
+            if (!p) continue;
+            auto deg_it = in_degree.find(p);
+            if (deg_it == in_degree.end() || deg_it->second != 0) continue;  // not a leaf
+            if (pinned.count(p) > 0) continue;                                // pinned
+            // minimum nChainWork: p is lower-work than current worst iff
+            // worst_work > p->nChainWork.
+            if (!worst_set || ChainWorkGreaterThan(worst_work, p->nChainWork)) {
+                worst = p;
+                worst_work = p->nChainWork;
+                worst_set = true;
+            }
+        }
 
-    return true;
+        if (!worst_set) {
+            // No eligible unpinned leaf remains. Either we are under cap with
+            // only pinned/interior entries, or (pathological, unreachable at
+            // production cap sizes) everything is pinned — caller fail-closes.
+            break;
+        }
+
+        // Decrement the parent's in-degree so it can become eligible later.
+        if (worst->pprev) {
+            auto pit = in_degree.find(worst->pprev);
+            if (pit != in_degree.end() && pit->second > 0) pit->second -= 1;
+        }
+
+        // Drop our bookkeeping references BEFORE the unique_ptr destroys it.
+        in_degree.erase(worst);
+        m_setBlockIndexCandidates.erase(worst);  // a leaf is normally a
+                                                 // candidate; erase keeps the
+                                                 // non-owning set clean.
+        const uint256 worst_hash = worst->GetBlockHash();
+        mapBlockIndex.erase(worst_hash);         // unique_ptr frees CBlockIndex
+        evicted_any = true;
+    }
+
+    return evicted_any;
 }
 
 CBlockIndex* CChainState::FindFork(CBlockIndex* pindex1, CBlockIndex* pindex2) {
