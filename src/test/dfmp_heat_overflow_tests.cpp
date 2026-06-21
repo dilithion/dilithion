@@ -222,6 +222,38 @@ TEST(s4_below_gate_byte_identical_v33) {
     }
     std::cout << "    V33 saturate=false == legacy formula for heat 0..70 (consensus-frozen)"
               << std::endl;
+
+    // Cursor MED-2: broaden below-gate identity to ALL versions. saturate is a NO-OP below
+    // each version's overflow point — i.e. saturate=true == saturate=false for every
+    // sub-overflow heat. This proves per-version byte-identity without a per-version replica.
+    // At the FIRST true/false divergence (the cap point) the saturated path must be exactly MAX
+    // (it caps + breaks); below it the two are bit-identical.
+    for (const auto& v : kVersions) {
+        int boundary = -1;
+        for (int heat = 0; heat <= OBSERVATION_WINDOW; heat++) {
+            int64_t sat = v.fn(heat, /*saturate=*/true);
+            int64_t leg = v.fn(heat, /*saturate=*/false);
+            if (sat == leg) continue;  // identical below the cap
+            boundary = heat;
+            ASSERT(sat == FP_HEAT_MULTIPLIER_MAX,
+                std::string(v.name) + ": first saturate true/false divergence at heat=" +
+                std::to_string(heat) + " but saturated != MAX (got " + std::to_string(sat) + ")");
+            break;
+        }
+        std::cout << "    " << v.name << ": saturate is a no-op below heat="
+                  << (boundary < 0 ? OBSERVATION_WINDOW : boundary) << " (byte-identical)" << std::endl;
+    }
+
+    // Combinator below-gate identity (Cursor MED-2): the saturate flag must not change any
+    // sub-overflow combinator value either.
+    for (int heat = 0; heat <= 50; heat++) {
+        int64_t s = CalculateTotalMultiplierFP_V33(0, -1, heat, /*saturate=*/true);
+        int64_t l = CalculateTotalMultiplierFP_V33(0, -1, heat, /*saturate=*/false);
+        ASSERT(s == l,
+            "V33 combinator saturate flag changed a sub-overflow value at heat=" +
+            std::to_string(heat) + " (s=" + std::to_string(s) + ", l=" + std::to_string(l) + ")");
+    }
+    std::cout << "    V33 combinator saturate=true == false for sub-overflow heat 0..50" << std::endl;
 }
 
 // =======================================================================
@@ -232,15 +264,23 @@ TEST(combinator_v33_near_cap_bounded) {
     // firstSeenHeight=-1 → maturity 2.5x (FP_PENDING_START_V32). heat=90 → heatFP saturates.
     int64_t total = CalculateTotalMultiplierFP_V33(/*currentHeight=*/0, /*firstSeenHeight=*/-1,
                                                    /*heat=*/90, /*saturate=*/true);
-    // maturity=2.5x, heatFP saturates to MAX (5.83e16). The raw int64 product
-    // (2.5e6 * 5.83e16 = 1.46e23) overflows int64, so the combinator computes it in 128-bit
-    // and clamps to FP_HEAT_MULTIPLIER_MAX. Result MUST be exactly MAX (positive, bounded).
+    // maturity stacks ON TOP of the capped heat: product = maturityFP * heatCap / FP_SCALE.
+    // The 128-bit math computes it exactly; it must clamp at the TRUE int64 boundary, NOT at
+    // FP_HEAT_MULTIPLIER_MAX (Cursor MED-1) — else the maturity multiplier is discarded and the
+    // target is ~2.5x easier than it should be. The real product (~1.46e17) fits int64.
+    int64_t maturityFP = CalculatePendingPenaltyFP_V33(0, -1);  // the maturity at this height
+    int64_t heatCap    = heatV33(90, /*saturate=*/true);        // = FP_HEAT_MULTIPLIER_MAX
+    int64_t expected   = static_cast<int64_t>(
+        (static_cast<__uint128_t>(maturityFP) * static_cast<__uint128_t>(heatCap)) / FP_SCALE);
     ASSERT(total > 0, "V33 combinator total must be positive (no overflow), got " +
         std::to_string(total));
-    ASSERT(total == FP_HEAT_MULTIPLIER_MAX,
-        "V33 combinator at heat=90 must clamp to FP_HEAT_MULTIPLIER_MAX, got " +
-        std::to_string(total));
-    // It must NOT have collapsed to <= 1.0x (the wrapped-overflow defect).
+    ASSERT(total == expected,
+        "V33 combinator must return the exact maturity x heat product " + std::to_string(expected) +
+        ", got " + std::to_string(total));
+    // LOAD-BEARING for MED-1: the stacked product MUST exceed the heat cap alone — if the code
+    // still ceilinged at FP_HEAT_MULTIPLIER_MAX this fails (maturity stacking lost).
+    ASSERT(total > FP_HEAT_MULTIPLIER_MAX,
+        "V33 combinator must stack maturity above the heat cap (MED-1), got " + std::to_string(total));
     ASSERT(total > FP_SCALE,
         "V33 combinator at heat=90 collapsed to <= 1.0x: " + std::to_string(total));
     std::cout << "    V33 combinator (heat=90, maturity 2.5x, saturate): total=" << total

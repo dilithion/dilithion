@@ -372,8 +372,13 @@ int64_t CalculateTotalMultiplierFP(int currentHeight, int firstSeenHeight, int h
     // saturate=false keeps the exact legacy int64 expression (byte-identical below gate).
     if (saturate) {
         __uint128_t prod = (static_cast<__uint128_t>(pendingFP) * static_cast<__uint128_t>(heatFP)) / FP_SCALE;
-        return prod > static_cast<__uint128_t>(FP_HEAT_MULTIPLIER_MAX)
-            ? FP_HEAT_MULTIPLIER_MAX : static_cast<int64_t>(prod);
+        // Clamp at the TRUE int64 overflow boundary, NOT the heat-fn cap: the maturity×heat
+        // PRODUCT legitimately exceeds FP_HEAT_MULTIPLIER_MAX (maturity up to ~5x stacks on the
+        // capped heat) and still fits int64 (max ~2.9e17 < INT64_MAX). Ceiling at the heat cap
+        // would flatten the stack ~2.5-5x EASIER at heat cap (Cursor MED-1). This clamp is
+        // defensive — with capped heatFP the product never actually reaches INT64_MAX.
+        return prod > static_cast<__uint128_t>(INT64_MAX)
+            ? INT64_MAX : static_cast<int64_t>(prod);
     }
     return (pendingFP * heatFP) / FP_SCALE;
 }
@@ -383,8 +388,13 @@ int64_t CombineMaturityHeatFP(int64_t maturityFP, int64_t heatFP, bool saturate)
     // to the legacy inline `(maturityFP * heatFP) / FP_SCALE`.
     if (saturate) {
         __uint128_t prod = (static_cast<__uint128_t>(maturityFP) * static_cast<__uint128_t>(heatFP)) / FP_SCALE;
-        return prod > static_cast<__uint128_t>(FP_HEAT_MULTIPLIER_MAX)
-            ? FP_HEAT_MULTIPLIER_MAX : static_cast<int64_t>(prod);
+        // Clamp at the TRUE int64 overflow boundary, NOT the heat-fn cap: the maturity×heat
+        // PRODUCT legitimately exceeds FP_HEAT_MULTIPLIER_MAX (maturity up to ~5x stacks on the
+        // capped heat) and still fits int64 (max ~2.9e17 < INT64_MAX). Ceiling at the heat cap
+        // would flatten the stack ~2.5-5x EASIER at heat cap (Cursor MED-1). This clamp is
+        // defensive — with capped heatFP the product never actually reaches INT64_MAX.
+        return prod > static_cast<__uint128_t>(INT64_MAX)
+            ? INT64_MAX : static_cast<int64_t>(prod);
     }
     return (maturityFP * heatFP) / FP_SCALE;
 }
@@ -565,8 +575,13 @@ int64_t CalculateTotalMultiplierFP_V31(int currentHeight, int firstSeenHeight, i
     // total = maturity × heat (C-3: 128-bit + clamp under saturate; see base combinator)
     if (saturate) {
         __uint128_t prod = (static_cast<__uint128_t>(pendingFP) * static_cast<__uint128_t>(heatFP)) / FP_SCALE;
-        return prod > static_cast<__uint128_t>(FP_HEAT_MULTIPLIER_MAX)
-            ? FP_HEAT_MULTIPLIER_MAX : static_cast<int64_t>(prod);
+        // Clamp at the TRUE int64 overflow boundary, NOT the heat-fn cap: the maturity×heat
+        // PRODUCT legitimately exceeds FP_HEAT_MULTIPLIER_MAX (maturity up to ~5x stacks on the
+        // capped heat) and still fits int64 (max ~2.9e17 < INT64_MAX). Ceiling at the heat cap
+        // would flatten the stack ~2.5-5x EASIER at heat cap (Cursor MED-1). This clamp is
+        // defensive — with capped heatFP the product never actually reaches INT64_MAX.
+        return prod > static_cast<__uint128_t>(INT64_MAX)
+            ? INT64_MAX : static_cast<int64_t>(prod);
     }
     return (pendingFP * heatFP) / FP_SCALE;
 }
@@ -631,8 +646,13 @@ int64_t CalculateTotalMultiplierFP_V32(int currentHeight, int firstSeenHeight, i
     // total = maturity × heat (C-3: 128-bit + clamp under saturate; see base combinator)
     if (saturate) {
         __uint128_t prod = (static_cast<__uint128_t>(pendingFP) * static_cast<__uint128_t>(heatFP)) / FP_SCALE;
-        return prod > static_cast<__uint128_t>(FP_HEAT_MULTIPLIER_MAX)
-            ? FP_HEAT_MULTIPLIER_MAX : static_cast<int64_t>(prod);
+        // Clamp at the TRUE int64 overflow boundary, NOT the heat-fn cap: the maturity×heat
+        // PRODUCT legitimately exceeds FP_HEAT_MULTIPLIER_MAX (maturity up to ~5x stacks on the
+        // capped heat) and still fits int64 (max ~2.9e17 < INT64_MAX). Ceiling at the heat cap
+        // would flatten the stack ~2.5-5x EASIER at heat cap (Cursor MED-1). This clamp is
+        // defensive — with capped heatFP the product never actually reaches INT64_MAX.
+        return prod > static_cast<__uint128_t>(INT64_MAX)
+            ? INT64_MAX : static_cast<int64_t>(prod);
     }
     return (pendingFP * heatFP) / FP_SCALE;
 }
@@ -686,8 +706,13 @@ int64_t CalculateTotalMultiplierFP_V33(int currentHeight, int firstSeenHeight, i
     // total = maturity × heat (C-3: 128-bit + clamp under saturate; see base combinator)
     if (saturate) {
         __uint128_t prod = (static_cast<__uint128_t>(pendingFP) * static_cast<__uint128_t>(heatFP)) / FP_SCALE;
-        return prod > static_cast<__uint128_t>(FP_HEAT_MULTIPLIER_MAX)
-            ? FP_HEAT_MULTIPLIER_MAX : static_cast<int64_t>(prod);
+        // Clamp at the TRUE int64 overflow boundary, NOT the heat-fn cap: the maturity×heat
+        // PRODUCT legitimately exceeds FP_HEAT_MULTIPLIER_MAX (maturity up to ~5x stacks on the
+        // capped heat) and still fits int64 (max ~2.9e17 < INT64_MAX). Ceiling at the heat cap
+        // would flatten the stack ~2.5-5x EASIER at heat cap (Cursor MED-1). This clamp is
+        // defensive — with capped heatFP the product never actually reaches INT64_MAX.
+        return prod > static_cast<__uint128_t>(INT64_MAX)
+            ? INT64_MAX : static_cast<int64_t>(prod);
     }
     return (pendingFP * heatFP) / FP_SCALE;
 }
@@ -751,8 +776,13 @@ int64_t CalculateTotalMultiplierFP_V34(int currentHeight, int firstSeenHeight, i
     // total = maturity × heat (C-3: 128-bit + clamp under saturate; see base combinator)
     if (saturate) {
         __uint128_t prod = (static_cast<__uint128_t>(pendingFP) * static_cast<__uint128_t>(heatFP)) / FP_SCALE;
-        return prod > static_cast<__uint128_t>(FP_HEAT_MULTIPLIER_MAX)
-            ? FP_HEAT_MULTIPLIER_MAX : static_cast<int64_t>(prod);
+        // Clamp at the TRUE int64 overflow boundary, NOT the heat-fn cap: the maturity×heat
+        // PRODUCT legitimately exceeds FP_HEAT_MULTIPLIER_MAX (maturity up to ~5x stacks on the
+        // capped heat) and still fits int64 (max ~2.9e17 < INT64_MAX). Ceiling at the heat cap
+        // would flatten the stack ~2.5-5x EASIER at heat cap (Cursor MED-1). This clamp is
+        // defensive — with capped heatFP the product never actually reaches INT64_MAX.
+        return prod > static_cast<__uint128_t>(INT64_MAX)
+            ? INT64_MAX : static_cast<int64_t>(prod);
     }
     return (pendingFP * heatFP) / FP_SCALE;
 }
