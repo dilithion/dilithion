@@ -240,6 +240,18 @@ TEST(s4_below_gate_byte_identical_v33) {
                 std::to_string(heat) + " but saturated != MAX (got " + std::to_string(sat) + ")");
             break;
         }
+        // Guard against vacuity (red-team LOW-1): if NO true/false divergence was seen in range,
+        // saturate genuinely never fired — which is only legitimate if the version is properly
+        // bounded at max heat (its whole curve fits below the cap). If it instead reached the cap
+        // (or wrapped) without the loop catching a split, the saturate branch is broken or the
+        // test range is too short. Assert genuine boundedness in that case.
+        if (boundary == -1) {
+            int64_t mx = v.fn(OBSERVATION_WINDOW, /*saturate=*/true);
+            ASSERT(mx >= FP_SCALE && mx < FP_HEAT_MULTIPLIER_MAX,
+                std::string(v.name) + ": no saturate divergence in heat 0.." +
+                std::to_string(OBSERVATION_WINDOW) + " but max-heat value " + std::to_string(mx) +
+                " is not bounded below the cap (range too short, or saturate cap not firing)");
+        }
         std::cout << "    " << v.name << ": saturate is a no-op below heat="
                   << (boundary < 0 ? OBSERVATION_WINDOW : boundary) << " (byte-identical)" << std::endl;
     }
