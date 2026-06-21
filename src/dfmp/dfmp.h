@@ -68,6 +68,12 @@ constexpr int64_t FP_PENDING_END = 1000000;     // 1.0 × 1,000,000
 constexpr int64_t FP_HEAT_CLIFF = 2000000;      // 2.0 × 1,000,000 (cliff at free tier + 1)
 constexpr int64_t FP_HEAT_GROWTH = 158;          // 1.58x per block (multiply by 158, divide by 100)
 
+// C-3: saturating cap for the heat-penalty exponential. = INT64_MAX / FP_HEAT_GROWTH
+// (the largest growth factor, 158) so the next (penalty*FP_HEAT_GROWTH) can never overflow
+// int64. Minimal-behavior-change: only inputs that WOULD overflow are flattened — they
+// saturate to the HARDEST target instead of wrapping to the easiest 1.0x. Activation-gated.
+constexpr int64_t FP_HEAT_MULTIPLIER_MAX = INT64_MAX / FP_HEAT_GROWTH;  // ≈ 5.83e16
+
 // DFMP v3.0: Dormancy decay constants
 constexpr int DORMANCY_THRESHOLD = 720;           // Blocks of inactivity before maturity resets
 constexpr int DORMANCY_DECAY_BLOCKS = 400;         // Decay duration after dormancy reset
@@ -358,7 +364,7 @@ int64_t CalculatePendingPenaltyFP(int currentHeight, int firstSeenHeight);
  * @param uniqueMiners Number of unique miners in window (0 = use static threshold)
  * @return Heat multiplier × FP_SCALE (e.g., 1000000 for 1.0×)
  */
-int64_t CalculateHeatMultiplierFP(int heat, int uniqueMiners = 0);
+int64_t CalculateHeatMultiplierFP(int heat, int uniqueMiners = 0, bool saturate = false);
 
 /**
  * Calculate total DFMP multiplier (fixed-point)
@@ -371,7 +377,7 @@ int64_t CalculateHeatMultiplierFP(int heat, int uniqueMiners = 0);
  * @param uniqueMiners Number of unique miners in window (0 = use static threshold)
  * @return Total multiplier × FP_SCALE
  */
-int64_t CalculateTotalMultiplierFP(int currentHeight, int firstSeenHeight, int heat, int uniqueMiners = 0);
+int64_t CalculateTotalMultiplierFP(int currentHeight, int firstSeenHeight, int heat, int uniqueMiners = 0, bool saturate = false);
 
 /**
  * Calculate effective target (256-bit integer division)
@@ -384,6 +390,21 @@ int64_t CalculateTotalMultiplierFP(int currentHeight, int firstSeenHeight, int h
  */
 uint256 CalculateEffectiveTarget(const uint256& baseTarget, int64_t multiplierFP);
 
+/**
+ * C-3: combine maturity × heat into a total multiplier (fixed-point), overflow-safe.
+ *
+ * Computes (maturityFP × heatFP) / FP_SCALE. When `saturate` is true (at/above the
+ * overflow-fix activation height), the product is evaluated in 128-bit and clamped to
+ * FP_HEAT_MULTIPLIER_MAX so a capped heat penalty (≤ ~5.83e16) times maturity (≤ 5e6)
+ * cannot overflow int64. When `saturate` is false the result is byte-identical to the
+ * legacy inline `(maturityFP * heatFP) / FP_SCALE` int64 expression (consensus-frozen).
+ *
+ * Used by the consensus validator (pow.cpp) and the mining-state mirror (dilithion-node.cpp),
+ * which combine the maturity and effective-heat penalties inline rather than via the
+ * CalculateTotalMultiplierFP* combinators.
+ */
+int64_t CombineMaturityHeatFP(int64_t maturityFP, int64_t heatFP, bool saturate = false);
+
 // ============================================================================
 // DFMP v3.1 MULTIPLIER CALCULATION (Fixed-Point)
 // ============================================================================
@@ -392,10 +413,10 @@ uint256 CalculateEffectiveTarget(const uint256& baseTarget, int64_t multiplierFP
 int64_t CalculatePendingPenaltyFP_V31(int currentHeight, int firstSeenHeight);
 
 /** v3.1 heat multiplier: 36-block free tier, 1.5x cliff, 1.08x growth */
-int64_t CalculateHeatMultiplierFP_V31(int heat, int uniqueMiners = 0);
+int64_t CalculateHeatMultiplierFP_V31(int heat, int uniqueMiners = 0, bool saturate = false);
 
 /** v3.1 total multiplier: maturity × heat */
-int64_t CalculateTotalMultiplierFP_V31(int currentHeight, int firstSeenHeight, int heat, int uniqueMiners = 0);
+int64_t CalculateTotalMultiplierFP_V31(int currentHeight, int firstSeenHeight, int heat, int uniqueMiners = 0, bool saturate = false);
 
 // ============================================================================
 // CONVENIENCE FUNCTIONS
@@ -428,10 +449,10 @@ double GetHeatMultiplier_V31(int heat, int uniqueMiners = 0);
 int64_t CalculatePendingPenaltyFP_V32(int currentHeight, int firstSeenHeight);
 
 /** v3.2 heat multiplier: 12-block free tier, 2.0x cliff, 1.58x growth */
-int64_t CalculateHeatMultiplierFP_V32(int heat, int uniqueMiners = 0);
+int64_t CalculateHeatMultiplierFP_V32(int heat, int uniqueMiners = 0, bool saturate = false);
 
 /** v3.2 total multiplier: maturity × heat */
-int64_t CalculateTotalMultiplierFP_V32(int currentHeight, int firstSeenHeight, int heat, int uniqueMiners = 0);
+int64_t CalculateTotalMultiplierFP_V32(int currentHeight, int firstSeenHeight, int heat, int uniqueMiners = 0, bool saturate = false);
 
 /** v3.2 convenience functions for logging */
 double GetPendingPenalty_V32(int currentHeight, int firstSeenHeight);
@@ -445,10 +466,10 @@ double GetHeatMultiplier_V32(int heat, int uniqueMiners = 0);
 int64_t CalculatePendingPenaltyFP_V33(int currentHeight, int firstSeenHeight);
 
 /** v3.3 heat multiplier: 12-block free, linear to 4.0x at 24, then exponential (NO dynamic scaling) */
-int64_t CalculateHeatMultiplierFP_V33(int heat);
+int64_t CalculateHeatMultiplierFP_V33(int heat, bool saturate = false);
 
 /** v3.3 total multiplier: maturity × heat */
-int64_t CalculateTotalMultiplierFP_V33(int currentHeight, int firstSeenHeight, int heat);
+int64_t CalculateTotalMultiplierFP_V33(int currentHeight, int firstSeenHeight, int heat, bool saturate = false);
 
 /** v3.3 convenience functions for logging */
 double GetPendingPenalty_V33(int currentHeight, int firstSeenHeight);
@@ -462,10 +483,10 @@ double GetHeatMultiplier_V33(int heat);
 int64_t CalculatePendingPenaltyFP_V34(int currentHeight, int firstSeenHeight);
 
 /** v3.4 heat multiplier: free tier depends on verification status */
-int64_t CalculateHeatMultiplierFP_V34(int heat, bool isVerified);
+int64_t CalculateHeatMultiplierFP_V34(int heat, bool isVerified, bool saturate = false);
 
 /** v3.4 total multiplier: maturity × heat */
-int64_t CalculateTotalMultiplierFP_V34(int currentHeight, int firstSeenHeight, int heat, bool isVerified);
+int64_t CalculateTotalMultiplierFP_V34(int currentHeight, int firstSeenHeight, int heat, bool isVerified, bool saturate = false);
 
 /** v3.4 convenience functions for logging */
 double GetPendingPenalty_V34(int currentHeight, int firstSeenHeight);

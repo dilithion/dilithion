@@ -15,6 +15,13 @@
 
 namespace DFMP {
 
+// C-3: the saturating maturity×heat combiner uses __uint128_t (a GCC/Clang extension) —
+// the SAME 128-bit integer support already required by CalculateEffectiveTarget below.
+// Fail the build LOUDLY on any toolchain lacking it rather than silently miscompiling
+// consensus math. (Dilithion ships via MSYS2 GCC/Clang; this asserts the invariant.)
+static_assert(sizeof(__uint128_t) == 16,
+              "C-3 / DFMP requires 128-bit integer support (__uint128_t; GCC/Clang)");
+
 // ============================================================================
 // GLOBAL STATE
 // ============================================================================
@@ -321,7 +328,7 @@ int64_t CalculatePendingPenaltyFP(int currentHeight, int firstSeenHeight) {
     return FP_PENDING_END;           // 1.0x (mature)
 }
 
-int64_t CalculateHeatMultiplierFP(int heat, int uniqueMiners) {
+int64_t CalculateHeatMultiplierFP(int heat, int uniqueMiners, bool saturate) {
     // DFMP v3.0 Heat Penalty with Dynamic Scaling:
     // Free tier scales by active miner count:
     //   effectiveFreeThreshold = max(FREE_TIER_THRESHOLD, OBSERVATION_WINDOW / uniqueMiners)
@@ -345,19 +352,51 @@ int64_t CalculateHeatMultiplierFP(int heat, int uniqueMiners) {
     int exponent = heat - effectiveFreeThreshold - 1;
 
     for (int i = 0; i < exponent; i++) {
+        if (saturate && penalty > FP_HEAT_MULTIPLIER_MAX) { penalty = FP_HEAT_MULTIPLIER_MAX; break; }
         penalty = (penalty * FP_HEAT_GROWTH) / 100;  // × 1.58
     }
 
+    if (saturate && penalty > FP_HEAT_MULTIPLIER_MAX) penalty = FP_HEAT_MULTIPLIER_MAX;
     return penalty;
 }
 
-int64_t CalculateTotalMultiplierFP(int currentHeight, int firstSeenHeight, int heat, int uniqueMiners) {
+int64_t CalculateTotalMultiplierFP(int currentHeight, int firstSeenHeight, int heat, int uniqueMiners, bool saturate) {
     int64_t pendingFP = CalculatePendingPenaltyFP(currentHeight, firstSeenHeight);
-    int64_t heatFP = CalculateHeatMultiplierFP(heat, uniqueMiners);
+    int64_t heatFP = CalculateHeatMultiplierFP(heat, uniqueMiners, saturate);
 
     // total = maturity × heat
     // In fixed-point: total_fp = (maturity_fp × heat_fp) / FP_SCALE
+    // C-3: when saturating, a capped heatFP (≤ FP_HEAT_MULTIPLIER_MAX ≈ 5.83e16) times
+    // maturity (≤ 5e6) would still overflow int64 in the raw multiply, so compute the
+    // product in 128-bit and clamp to FP_HEAT_MULTIPLIER_MAX (already the hardest target).
+    // saturate=false keeps the exact legacy int64 expression (byte-identical below gate).
+    if (saturate) {
+        __uint128_t prod = (static_cast<__uint128_t>(pendingFP) * static_cast<__uint128_t>(heatFP)) / FP_SCALE;
+        // Clamp at the TRUE int64 overflow boundary, NOT the heat-fn cap: the maturity×heat
+        // PRODUCT legitimately exceeds FP_HEAT_MULTIPLIER_MAX (maturity up to ~5x stacks on the
+        // capped heat) and still fits int64 (max ~2.9e17 < INT64_MAX). Ceiling at the heat cap
+        // would flatten the stack ~2.5-5x EASIER at heat cap (Cursor MED-1). This clamp is
+        // defensive — with capped heatFP the product never actually reaches INT64_MAX.
+        return prod > static_cast<__uint128_t>(INT64_MAX)
+            ? INT64_MAX : static_cast<int64_t>(prod);
+    }
     return (pendingFP * heatFP) / FP_SCALE;
+}
+
+int64_t CombineMaturityHeatFP(int64_t maturityFP, int64_t heatFP, bool saturate) {
+    // C-3: overflow-safe maturity × heat. See header. saturate=false is byte-identical
+    // to the legacy inline `(maturityFP * heatFP) / FP_SCALE`.
+    if (saturate) {
+        __uint128_t prod = (static_cast<__uint128_t>(maturityFP) * static_cast<__uint128_t>(heatFP)) / FP_SCALE;
+        // Clamp at the TRUE int64 overflow boundary, NOT the heat-fn cap: the maturity×heat
+        // PRODUCT legitimately exceeds FP_HEAT_MULTIPLIER_MAX (maturity up to ~5x stacks on the
+        // capped heat) and still fits int64 (max ~2.9e17 < INT64_MAX). Ceiling at the heat cap
+        // would flatten the stack ~2.5-5x EASIER at heat cap (Cursor MED-1). This clamp is
+        // defensive — with capped heatFP the product never actually reaches INT64_MAX.
+        return prod > static_cast<__uint128_t>(INT64_MAX)
+            ? INT64_MAX : static_cast<int64_t>(prod);
+    }
+    return (maturityFP * heatFP) / FP_SCALE;
 }
 
 uint256 CalculateEffectiveTarget(const uint256& baseTarget, int64_t multiplierFP) {
@@ -365,6 +404,9 @@ uint256 CalculateEffectiveTarget(const uint256& baseTarget, int64_t multiplierFP
     // In fixed-point: effective_target = baseTarget × FP_SCALE / multiplierFP
 
     // Ensure multiplier is at least 1× (shouldn't happen but be safe)
+    // C-3: with the saturating cap upstream (saturate=true at/above the gate), every
+    // multiplierFP reaching here is in [FP_SCALE, FP_HEAT_MULTIPLIER_MAX] and never
+    // negative/wrapped, so this floor is now a true safety floor rather than a wrap-catcher.
     if (multiplierFP < FP_SCALE) {
         multiplierFP = FP_SCALE;
     }
@@ -495,7 +537,7 @@ int64_t CalculatePendingPenaltyFP_V31(int currentHeight, int firstSeenHeight) {
     return FP_PENDING_END;           // 1.0x (mature)
 }
 
-int64_t CalculateHeatMultiplierFP_V31(int heat, int uniqueMiners) {
+int64_t CalculateHeatMultiplierFP_V31(int heat, int uniqueMiners, bool saturate) {
     // DFMP v3.1: Softened heat penalty
     // Free tier: 36 blocks (or dynamic if higher)
     // Above free tier: 1.5x cliff, then 1.08x per block
@@ -518,17 +560,29 @@ int64_t CalculateHeatMultiplierFP_V31(int heat, int uniqueMiners) {
     int exponent = heat - effectiveFreeThreshold - 1;
 
     for (int i = 0; i < exponent; i++) {
+        if (saturate && penalty > FP_HEAT_MULTIPLIER_MAX) { penalty = FP_HEAT_MULTIPLIER_MAX; break; }
         penalty = (penalty * FP_HEAT_GROWTH_V31) / 100;  // × 1.08
     }
 
+    if (saturate && penalty > FP_HEAT_MULTIPLIER_MAX) penalty = FP_HEAT_MULTIPLIER_MAX;
     return penalty;
 }
 
-int64_t CalculateTotalMultiplierFP_V31(int currentHeight, int firstSeenHeight, int heat, int uniqueMiners) {
+int64_t CalculateTotalMultiplierFP_V31(int currentHeight, int firstSeenHeight, int heat, int uniqueMiners, bool saturate) {
     int64_t pendingFP = CalculatePendingPenaltyFP_V31(currentHeight, firstSeenHeight);
-    int64_t heatFP = CalculateHeatMultiplierFP_V31(heat, uniqueMiners);
+    int64_t heatFP = CalculateHeatMultiplierFP_V31(heat, uniqueMiners, saturate);
 
-    // total = maturity × heat
+    // total = maturity × heat (C-3: 128-bit + clamp under saturate; see base combinator)
+    if (saturate) {
+        __uint128_t prod = (static_cast<__uint128_t>(pendingFP) * static_cast<__uint128_t>(heatFP)) / FP_SCALE;
+        // Clamp at the TRUE int64 overflow boundary, NOT the heat-fn cap: the maturity×heat
+        // PRODUCT legitimately exceeds FP_HEAT_MULTIPLIER_MAX (maturity up to ~5x stacks on the
+        // capped heat) and still fits int64 (max ~2.9e17 < INT64_MAX). Ceiling at the heat cap
+        // would flatten the stack ~2.5-5x EASIER at heat cap (Cursor MED-1). This clamp is
+        // defensive — with capped heatFP the product never actually reaches INT64_MAX.
+        return prod > static_cast<__uint128_t>(INT64_MAX)
+            ? INT64_MAX : static_cast<int64_t>(prod);
+    }
     return (pendingFP * heatFP) / FP_SCALE;
 }
 
@@ -554,7 +608,7 @@ int64_t CalculatePendingPenaltyFP_V32(int currentHeight, int firstSeenHeight) {
     return FP_PENDING_END;           // 1.0x (mature)
 }
 
-int64_t CalculateHeatMultiplierFP_V32(int heat, int uniqueMiners) {
+int64_t CalculateHeatMultiplierFP_V32(int heat, int uniqueMiners, bool saturate) {
     // DFMP v3.2: Aggressive heat penalty (same formula as v3.0)
     // Free tier: 12 blocks (or dynamic if higher)
     // Above free tier: 2.0x cliff, then 1.58x per block
@@ -577,17 +631,29 @@ int64_t CalculateHeatMultiplierFP_V32(int heat, int uniqueMiners) {
     int exponent = heat - effectiveFreeThreshold - 1;
 
     for (int i = 0; i < exponent; i++) {
+        if (saturate && penalty > FP_HEAT_MULTIPLIER_MAX) { penalty = FP_HEAT_MULTIPLIER_MAX; break; }
         penalty = (penalty * FP_HEAT_GROWTH_V32) / 100;  // × 1.58
     }
 
+    if (saturate && penalty > FP_HEAT_MULTIPLIER_MAX) penalty = FP_HEAT_MULTIPLIER_MAX;
     return penalty;
 }
 
-int64_t CalculateTotalMultiplierFP_V32(int currentHeight, int firstSeenHeight, int heat, int uniqueMiners) {
+int64_t CalculateTotalMultiplierFP_V32(int currentHeight, int firstSeenHeight, int heat, int uniqueMiners, bool saturate) {
     int64_t pendingFP = CalculatePendingPenaltyFP_V32(currentHeight, firstSeenHeight);
-    int64_t heatFP = CalculateHeatMultiplierFP_V32(heat, uniqueMiners);
+    int64_t heatFP = CalculateHeatMultiplierFP_V32(heat, uniqueMiners, saturate);
 
-    // total = maturity × heat
+    // total = maturity × heat (C-3: 128-bit + clamp under saturate; see base combinator)
+    if (saturate) {
+        __uint128_t prod = (static_cast<__uint128_t>(pendingFP) * static_cast<__uint128_t>(heatFP)) / FP_SCALE;
+        // Clamp at the TRUE int64 overflow boundary, NOT the heat-fn cap: the maturity×heat
+        // PRODUCT legitimately exceeds FP_HEAT_MULTIPLIER_MAX (maturity up to ~5x stacks on the
+        // capped heat) and still fits int64 (max ~2.9e17 < INT64_MAX). Ceiling at the heat cap
+        // would flatten the stack ~2.5-5x EASIER at heat cap (Cursor MED-1). This clamp is
+        // defensive — with capped heatFP the product never actually reaches INT64_MAX.
+        return prod > static_cast<__uint128_t>(INT64_MAX)
+            ? INT64_MAX : static_cast<int64_t>(prod);
+    }
     return (pendingFP * heatFP) / FP_SCALE;
 }
 
@@ -600,7 +666,7 @@ int64_t CalculatePendingPenaltyFP_V33(int currentHeight, int firstSeenHeight) {
     return CalculatePendingPenaltyFP_V32(currentHeight, firstSeenHeight);
 }
 
-int64_t CalculateHeatMultiplierFP_V33(int heat) {
+int64_t CalculateHeatMultiplierFP_V33(int heat, bool saturate) {
     // DFMP v3.3: Three-zone penalty, NO dynamic scaling
     //   Zone 1 (Free):        0-12 blocks  → 1.0x
     //   Zone 2 (Linear):     13-24 blocks  → 1.0 + (heat-12) × 0.25  (ramps to 4.0x)
@@ -625,17 +691,29 @@ int64_t CalculateHeatMultiplierFP_V33(int heat) {
     int exponent = heat - LINEAR_ZONE_END_V33;
 
     for (int i = 0; i < exponent; i++) {
+        if (saturate && penalty > FP_HEAT_MULTIPLIER_MAX) { penalty = FP_HEAT_MULTIPLIER_MAX; break; }
         penalty = (penalty * FP_HEAT_GROWTH_V33) / 100;  // × 1.58
     }
 
+    if (saturate && penalty > FP_HEAT_MULTIPLIER_MAX) penalty = FP_HEAT_MULTIPLIER_MAX;
     return penalty;
 }
 
-int64_t CalculateTotalMultiplierFP_V33(int currentHeight, int firstSeenHeight, int heat) {
+int64_t CalculateTotalMultiplierFP_V33(int currentHeight, int firstSeenHeight, int heat, bool saturate) {
     int64_t pendingFP = CalculatePendingPenaltyFP_V33(currentHeight, firstSeenHeight);
-    int64_t heatFP = CalculateHeatMultiplierFP_V33(heat);
+    int64_t heatFP = CalculateHeatMultiplierFP_V33(heat, saturate);
 
-    // total = maturity × heat
+    // total = maturity × heat (C-3: 128-bit + clamp under saturate; see base combinator)
+    if (saturate) {
+        __uint128_t prod = (static_cast<__uint128_t>(pendingFP) * static_cast<__uint128_t>(heatFP)) / FP_SCALE;
+        // Clamp at the TRUE int64 overflow boundary, NOT the heat-fn cap: the maturity×heat
+        // PRODUCT legitimately exceeds FP_HEAT_MULTIPLIER_MAX (maturity up to ~5x stacks on the
+        // capped heat) and still fits int64 (max ~2.9e17 < INT64_MAX). Ceiling at the heat cap
+        // would flatten the stack ~2.5-5x EASIER at heat cap (Cursor MED-1). This clamp is
+        // defensive — with capped heatFP the product never actually reaches INT64_MAX.
+        return prod > static_cast<__uint128_t>(INT64_MAX)
+            ? INT64_MAX : static_cast<int64_t>(prod);
+    }
     return (pendingFP * heatFP) / FP_SCALE;
 }
 
@@ -648,7 +726,7 @@ int64_t CalculatePendingPenaltyFP_V34(int currentHeight, int firstSeenHeight) {
     return CalculatePendingPenaltyFP_V32(currentHeight, firstSeenHeight);
 }
 
-int64_t CalculateHeatMultiplierFP_V34(int heat, bool isVerified) {
+int64_t CalculateHeatMultiplierFP_V34(int heat, bool isVerified, bool saturate) {
     // DFMP v3.4: Same three-zone curve as v3.3, but free tier depends on
     // DNA verification status:
     //   Verified:   12 free blocks
@@ -667,6 +745,11 @@ int64_t CalculateHeatMultiplierFP_V34(int heat, bool isVerified) {
     if (heat <= LINEAR_ZONE_END_V34) {
         int excess = heat - freeTier;
         int linearSpan = LINEAR_ZONE_END_V34 - freeTier;
+        // Defensive: unreachable with current constants (freeTier 3|12 < LINEAR_ZONE_END 24,
+        // so linearSpan is always > 0). If a future constant change made the linear zone
+        // degenerate, fail SAFE to the HARDER zone-3 base (4.0x), NEVER the easiest 1.0x —
+        // a concentration defense must never hand a degenerate case the easiest target.
+        if (linearSpan <= 0) return FP_LINEAR_END_PENALTY_V34;
         // Ramp from 1.0x to 4.0x over linearSpan blocks
         // penalty = 1.0 + excess × 3.0 / linearSpan
         int64_t ramp = (static_cast<int64_t>(excess) * 3 * FP_SCALE) / linearSpan;
@@ -678,17 +761,29 @@ int64_t CalculateHeatMultiplierFP_V34(int heat, bool isVerified) {
     int exponent = heat - LINEAR_ZONE_END_V34;
 
     for (int i = 0; i < exponent; i++) {
+        if (saturate && penalty > FP_HEAT_MULTIPLIER_MAX) { penalty = FP_HEAT_MULTIPLIER_MAX; break; }
         penalty = (penalty * FP_HEAT_GROWTH_V34) / 100;  // × 1.58
     }
 
+    if (saturate && penalty > FP_HEAT_MULTIPLIER_MAX) penalty = FP_HEAT_MULTIPLIER_MAX;
     return penalty;
 }
 
-int64_t CalculateTotalMultiplierFP_V34(int currentHeight, int firstSeenHeight, int heat, bool isVerified) {
+int64_t CalculateTotalMultiplierFP_V34(int currentHeight, int firstSeenHeight, int heat, bool isVerified, bool saturate) {
     int64_t pendingFP = CalculatePendingPenaltyFP_V34(currentHeight, firstSeenHeight);
-    int64_t heatFP = CalculateHeatMultiplierFP_V34(heat, isVerified);
+    int64_t heatFP = CalculateHeatMultiplierFP_V34(heat, isVerified, saturate);
 
-    // total = maturity × heat
+    // total = maturity × heat (C-3: 128-bit + clamp under saturate; see base combinator)
+    if (saturate) {
+        __uint128_t prod = (static_cast<__uint128_t>(pendingFP) * static_cast<__uint128_t>(heatFP)) / FP_SCALE;
+        // Clamp at the TRUE int64 overflow boundary, NOT the heat-fn cap: the maturity×heat
+        // PRODUCT legitimately exceeds FP_HEAT_MULTIPLIER_MAX (maturity up to ~5x stacks on the
+        // capped heat) and still fits int64 (max ~2.9e17 < INT64_MAX). Ceiling at the heat cap
+        // would flatten the stack ~2.5-5x EASIER at heat cap (Cursor MED-1). This clamp is
+        // defensive — with capped heatFP the product never actually reaches INT64_MAX.
+        return prod > static_cast<__uint128_t>(INT64_MAX)
+            ? INT64_MAX : static_cast<int64_t>(prod);
+    }
     return (pendingFP * heatFP) / FP_SCALE;
 }
 

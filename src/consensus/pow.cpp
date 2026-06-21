@@ -409,6 +409,11 @@ bool CheckProofOfWorkDFMP(
     int dfmpV34ActivationHeight = Dilithion::g_chainParams ?
         Dilithion::g_chainParams->dfmpV34ActivationHeight : 999999999;
 
+    // C-3: saturating heat math gate. At/above the activation height, heat-penalty fns
+    // saturate at FP_HEAT_MULTIPLIER_MAX instead of overflowing int64 (which wrapped the
+    // heaviest miner to the easiest 1.0x target). Below the gate: byte-identical legacy math.
+    bool dfmpSat = Dilithion::g_chainParams && height >= Dilithion::g_chainParams->dfmpOverflowFixActivationHeight;
+
     int64_t multiplierFP;
 
     if (height >= dfmpV34ActivationHeight) {
@@ -427,7 +432,7 @@ bool CheckProofOfWorkDFMP(
         }
 
         // MIK identity heat penalty (v3.4 - verification-aware)
-        int64_t mikHeatPenalty = DFMP::CalculateHeatMultiplierFP_V34(blocksInWindow, isVerified);
+        int64_t mikHeatPenalty = DFMP::CalculateHeatMultiplierFP_V34(blocksInWindow, isVerified, dfmpSat);
 
         // Payout address heat penalty (uses same verification status as the MIK)
         int64_t payoutHeatPenalty = DFMP::FP_SCALE;  // 1.0x default
@@ -435,7 +440,7 @@ bool CheckProofOfWorkDFMP(
             DFMP::Identity payoutIdentity = DFMP::DeriveIdentityFromScript(
                 coinbaseTx.vout[0].scriptPubKey);
             int payoutHeat = DFMP::g_payoutHeatTracker->GetHeat(payoutIdentity);
-            payoutHeatPenalty = DFMP::CalculateHeatMultiplierFP_V34(payoutHeat, isVerified);
+            payoutHeatPenalty = DFMP::CalculateHeatMultiplierFP_V34(payoutHeat, isVerified, dfmpSat);
         }
 
         // Effective heat = max(MIK heat, payout heat)
@@ -445,7 +450,7 @@ bool CheckProofOfWorkDFMP(
         int64_t maturityPenalty = DFMP::CalculatePendingPenaltyFP_V34(height, effectiveFirstSeen);
 
         // Total = maturity x heat
-        multiplierFP = (maturityPenalty * effectiveHeatPenalty) / DFMP::FP_SCALE;
+        multiplierFP = DFMP::CombineMaturityHeatFP(maturityPenalty, effectiveHeatPenalty, dfmpSat);
 
     } else if (height >= dfmpV33ActivationHeight) {
         // ====================================================================
@@ -454,7 +459,7 @@ bool CheckProofOfWorkDFMP(
         // ====================================================================
 
         // MIK identity heat penalty (v3.3 - no dynamic scaling, no uniqueMiners param)
-        int64_t mikHeatPenalty = DFMP::CalculateHeatMultiplierFP_V33(blocksInWindow);
+        int64_t mikHeatPenalty = DFMP::CalculateHeatMultiplierFP_V33(blocksInWindow, dfmpSat);
 
         // Payout address heat penalty (v3.3 - same formula, no dynamic scaling)
         int64_t payoutHeatPenalty = DFMP::FP_SCALE;  // 1.0x default
@@ -462,7 +467,7 @@ bool CheckProofOfWorkDFMP(
             DFMP::Identity payoutIdentity = DFMP::DeriveIdentityFromScript(
                 coinbaseTx.vout[0].scriptPubKey);
             int payoutHeat = DFMP::g_payoutHeatTracker->GetHeat(payoutIdentity);
-            payoutHeatPenalty = DFMP::CalculateHeatMultiplierFP_V33(payoutHeat);
+            payoutHeatPenalty = DFMP::CalculateHeatMultiplierFP_V33(payoutHeat, dfmpSat);
         }
 
         // Effective heat = max(MIK heat, payout heat)
@@ -472,7 +477,7 @@ bool CheckProofOfWorkDFMP(
         int64_t maturityPenalty = DFMP::CalculatePendingPenaltyFP_V33(height, effectiveFirstSeen);
 
         // Total = maturity x heat
-        multiplierFP = (maturityPenalty * effectiveHeatPenalty) / DFMP::FP_SCALE;
+        multiplierFP = DFMP::CombineMaturityHeatFP(maturityPenalty, effectiveHeatPenalty, dfmpSat);
 
     } else if (height >= dfmpV32ActivationHeight) {
         // ====================================================================
@@ -481,7 +486,7 @@ bool CheckProofOfWorkDFMP(
         // ====================================================================
 
         // MIK identity heat penalty (v3.2 aggressive)
-        int64_t mikHeatPenalty = DFMP::CalculateHeatMultiplierFP_V32(blocksInWindow, uniqueMiners);
+        int64_t mikHeatPenalty = DFMP::CalculateHeatMultiplierFP_V32(blocksInWindow, uniqueMiners, dfmpSat);
 
         // Payout address heat penalty (v3.2 aggressive)
         int64_t payoutHeatPenalty = DFMP::FP_SCALE;  // 1.0x default
@@ -493,7 +498,7 @@ bool CheckProofOfWorkDFMP(
             if (height >= dfmpDynamicScalingHeight) {
                 payoutUniqueMiners = DFMP::g_payoutHeatTracker->GetUniqueMinerCount();
             }
-            payoutHeatPenalty = DFMP::CalculateHeatMultiplierFP_V32(payoutHeat, payoutUniqueMiners);
+            payoutHeatPenalty = DFMP::CalculateHeatMultiplierFP_V32(payoutHeat, payoutUniqueMiners, dfmpSat);
         }
 
         // Effective heat = max(MIK heat, payout heat)
@@ -503,7 +508,7 @@ bool CheckProofOfWorkDFMP(
         int64_t maturityPenalty = DFMP::CalculatePendingPenaltyFP_V32(height, effectiveFirstSeen);
 
         // Total = maturity x heat
-        multiplierFP = (maturityPenalty * effectiveHeatPenalty) / DFMP::FP_SCALE;
+        multiplierFP = DFMP::CombineMaturityHeatFP(maturityPenalty, effectiveHeatPenalty, dfmpSat);
 
     } else if (height >= dfmpV31ActivationHeight) {
         // ====================================================================
@@ -512,7 +517,7 @@ bool CheckProofOfWorkDFMP(
         // ====================================================================
 
         // MIK identity heat penalty (v3.1 softened)
-        int64_t mikHeatPenalty = DFMP::CalculateHeatMultiplierFP_V31(blocksInWindow, uniqueMiners);
+        int64_t mikHeatPenalty = DFMP::CalculateHeatMultiplierFP_V31(blocksInWindow, uniqueMiners, dfmpSat);
 
         // Payout address heat penalty (v3.1 softened)
         int64_t payoutHeatPenalty = DFMP::FP_SCALE;  // 1.0x default
@@ -524,7 +529,7 @@ bool CheckProofOfWorkDFMP(
             if (height >= dfmpDynamicScalingHeight) {
                 payoutUniqueMiners = DFMP::g_payoutHeatTracker->GetUniqueMinerCount();
             }
-            payoutHeatPenalty = DFMP::CalculateHeatMultiplierFP_V31(payoutHeat, payoutUniqueMiners);
+            payoutHeatPenalty = DFMP::CalculateHeatMultiplierFP_V31(payoutHeat, payoutUniqueMiners, dfmpSat);
         }
 
         // Effective heat = max(MIK heat, payout heat)
@@ -534,7 +539,7 @@ bool CheckProofOfWorkDFMP(
         int64_t maturityPenalty = DFMP::CalculatePendingPenaltyFP_V31(height, effectiveFirstSeen);
 
         // Total = maturity x heat
-        multiplierFP = (maturityPenalty * effectiveHeatPenalty) / DFMP::FP_SCALE;
+        multiplierFP = DFMP::CombineMaturityHeatFP(maturityPenalty, effectiveHeatPenalty, dfmpSat);
 
     } else if (height >= dfmpV3ActivationHeight) {
         // ====================================================================
@@ -542,7 +547,7 @@ bool CheckProofOfWorkDFMP(
         // ====================================================================
 
         // MIK identity heat penalty (with dynamic scaling)
-        int64_t mikHeatPenalty = DFMP::CalculateHeatMultiplierFP(blocksInWindow, uniqueMiners);
+        int64_t mikHeatPenalty = DFMP::CalculateHeatMultiplierFP(blocksInWindow, uniqueMiners, dfmpSat);
 
         // Payout address heat penalty (closes primary exploit)
         int64_t payoutHeatPenalty = DFMP::FP_SCALE;  // 1.0x default
@@ -554,7 +559,7 @@ bool CheckProofOfWorkDFMP(
             if (height >= dfmpDynamicScalingHeight) {
                 payoutUniqueMiners = DFMP::g_payoutHeatTracker->GetUniqueMinerCount();
             }
-            payoutHeatPenalty = DFMP::CalculateHeatMultiplierFP(payoutHeat, payoutUniqueMiners);
+            payoutHeatPenalty = DFMP::CalculateHeatMultiplierFP(payoutHeat, payoutUniqueMiners, dfmpSat);
         }
 
         // Effective heat = max(MIK heat, payout heat)
@@ -564,7 +569,7 @@ bool CheckProofOfWorkDFMP(
         int64_t maturityPenalty = DFMP::CalculatePendingPenaltyFP(height, effectiveFirstSeen);
 
         // Total = maturity x heat
-        multiplierFP = (maturityPenalty * effectiveHeatPenalty) / DFMP::FP_SCALE;
+        multiplierFP = DFMP::CombineMaturityHeatFP(maturityPenalty, effectiveHeatPenalty, dfmpSat);
     } else {
         // ====================================================================
         // DFMP v2.0: Standard penalty (MIK heat only, original thresholds)
