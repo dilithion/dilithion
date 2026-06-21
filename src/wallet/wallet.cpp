@@ -244,8 +244,7 @@ bool CWallet::GenerateNewKey() {
         // non-HD v6 wallet never migrates — so a v7-keyed MAC written here would
         // make the freshly-minted key UNSPENDABLE on the next load. Select keying
         // by the loaded file version, exactly as EncryptWallet/ChangePassphrase do.
-        const bool legacyKeying =
-            (m_loadedFileVersion != 0 && m_loadedFileVersion < WALLET_FILE_VERSION_7);
+        const bool legacyKeying = LegacyRecordKeying();
         if (!ComputeRecordMAC(crypter, encKey.vchCryptedKey, encKey.vchMAC, legacyKeying)) {
             memory_cleanse(masterKeyVec.data(), masterKeyVec.size());
             key.Clear();   // defense-in-depth: wipe the plaintext key on the failure
@@ -378,8 +377,7 @@ bool CWallet::VerifyRecordMAC(CCrypter& crypter,
     // matches the on-disk version: legacy AES-keyed HMAC for v3-v6, separated
     // MAC key for v7. (m_loadedFileVersion == 0 means a freshly-created in-memory
     // wallet whose records this build wrote with the default separated keying.)
-    const bool legacyKeying =
-        (m_loadedFileVersion != 0 && m_loadedFileVersion < WALLET_FILE_VERSION_7);
+    const bool legacyKeying = LegacyRecordKeying();
     return crypter.VerifyMAC(ciphertext, mac, legacyKeying);
 }
 
@@ -511,8 +509,7 @@ bool CWallet::ImportKey(const CKey& key, const CDilithiumAddress& address) {
         // non-HD v6 wallet never migrates — so a v7-keyed MAC written here would
         // make the freshly-minted key UNSPENDABLE on the next load. Select keying
         // by the loaded file version, exactly as EncryptWallet/ChangePassphrase do.
-        const bool legacyKeying =
-            (m_loadedFileVersion != 0 && m_loadedFileVersion < WALLET_FILE_VERSION_7);
+        const bool legacyKeying = LegacyRecordKeying();
         if (!ComputeRecordMAC(crypter, encKey.vchCryptedKey, encKey.vchMAC, legacyKeying)) {
             memory_cleanse(masterKeyVec.data(), masterKeyVec.size());
             return false;
@@ -1917,8 +1914,7 @@ bool CWallet::ChangePassphrase(const std::string& passphraseOld,
     //   - loaded v7 / 0 -> separated v7 keying (file is/stays v7)
     // (The single v6->v7 migration — which DOES recompute every MAC to separated
     // keying — still happens exactly once, on the next Unlock, never here.)
-    const bool legacyMasterKeying =
-        (m_loadedFileVersion != 0 && m_loadedFileVersion < WALLET_FILE_VERSION_7);
+    const bool legacyMasterKeying = LegacyRecordKeying();
     std::vector<uint8_t> newMAC;
     if (!ComputeRecordMAC(crypterNew, newCryptedKey, newMAC, legacyMasterKeying)) {
         memory_cleanse(derivedKeyOld.data(), derivedKeyOld.size());
@@ -3062,8 +3058,7 @@ bool CWallet::SaveUnlocked(const std::string& filename) const {
     // m_loadedFileVersion to v7, so this writer then emits v7 from then on. A freshly
     // created in-memory wallet (m_loadedFileVersion == 0) and an already-v7 wallet
     // both write v7.
-    const bool writeLegacyV6 =
-        (m_loadedFileVersion != 0 && m_loadedFileVersion < WALLET_FILE_VERSION_7);
+    const bool writeLegacyV6 = LegacyRecordKeying();
 
     if (writeLegacyV6) {
         file.write(WALLET_FILE_MAGIC_V6, 8);  // "DILWLT06" — keep the loaded version
@@ -5741,8 +5736,7 @@ bool CWallet::DeriveAndCacheHDAddress(const CHDKeyPath& path) {
         // non-HD v6 wallet never migrates — so a v7-keyed MAC written here would
         // make the freshly-minted key UNSPENDABLE on the next load. Select keying
         // by the loaded file version, exactly as EncryptWallet/ChangePassphrase do.
-        const bool legacyKeying =
-            (m_loadedFileVersion != 0 && m_loadedFileVersion < WALLET_FILE_VERSION_7);
+        const bool legacyKeying = LegacyRecordKeying();
         if (!ComputeRecordMAC(crypter, encKey.vchCryptedKey, encKey.vchMAC, legacyKeying)) {
             memory_cleanse(masterKeyVec.data(), masterKeyVec.size());
             key.Clear();
