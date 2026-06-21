@@ -139,6 +139,9 @@ public:
     // After this height: verified MIKs get 12, unverified get 3 free blocks
     int dfmpV34ActivationHeight;
 
+    // C-3 overflow fix: below = legacy heat math (frozen); at/above = saturating. OFF until set at deploy.
+    int dfmpOverflowFixActivationHeight;
+
     // Phase 3 port: minimum chain-work threshold for HeadersSync PRESYNC
     // gating. A peer's claimed header chain must accumulate at least this
     // much work in PRESYNC before transitioning to REDOWNLOAD. Mainnet:

@@ -94,6 +94,7 @@ ChainParams ChainParams::Mainnet() {
 
     // DFMP v3.4: verification-aware free tier (verified=12, unverified=3)
     params.dfmpV34ActivationHeight = 999999999;  // Disabled until DNA verification matures
+    params.dfmpOverflowFixActivationHeight = 999999999;  // C-3 saturating heat math OFF until deploy
 
     // Compact encoding fix: fixes BigToCompact sign bit bug that caused
     // difficulty to be ~5x harder than intended due to EDA + sign bit compounding.
@@ -313,6 +314,7 @@ ChainParams ChainParams::Testnet() {
 
     // DFMP v3.4 - disabled on testnet until DNA verification matures
     params.dfmpV34ActivationHeight = 999999999;
+    params.dfmpOverflowFixActivationHeight = 999999999;  // C-3 saturating heat math OFF until deploy
 
     // Compact encoding fix: always active on testnet (no legacy blocks to worry about)
     params.compactEncodingFixHeight = 0;
@@ -466,6 +468,7 @@ ChainParams ChainParams::DilV() {
     params.dfmpV32ActivationHeight = 0;
     params.dfmpV33ActivationHeight = 0;
     params.dfmpV34ActivationHeight = 999999999;  // Disabled until DNA verification matures
+    params.dfmpOverflowFixActivationHeight = 999999999;  // C-3 saturating heat math OFF until deploy
 
     // Compact encoding fix: active from genesis
     params.compactEncodingFixHeight = 0;

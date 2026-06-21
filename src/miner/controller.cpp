@@ -1191,15 +1191,18 @@ std::optional<CBlockTemplate> CMiningController::CreateBlockTemplate(
                 Dilithion::g_chainParams->dfmpV32ActivationHeight : 999999999;
             int dfmpV33Height = Dilithion::g_chainParams ?
                 Dilithion::g_chainParams->dfmpV33ActivationHeight : 999999999;
+            // C-3: saturating heat math gate (must match validator pow.cpp exactly).
+            bool dfmpSat = Dilithion::g_chainParams &&
+                static_cast<int>(nHeight) >= Dilithion::g_chainParams->dfmpOverflowFixActivationHeight;
             int64_t multiplierFP;
             if (static_cast<int>(nHeight) >= dfmpV33Height) {
-                multiplierFP = DFMP::CalculateTotalMultiplierFP_V33(nHeight, firstSeen, heat);
+                multiplierFP = DFMP::CalculateTotalMultiplierFP_V33(nHeight, firstSeen, heat, dfmpSat);
             } else if (static_cast<int>(nHeight) >= dfmpV32Height) {
-                multiplierFP = DFMP::CalculateTotalMultiplierFP_V32(nHeight, firstSeen, heat);
+                multiplierFP = DFMP::CalculateTotalMultiplierFP_V32(nHeight, firstSeen, heat, 0, dfmpSat);
             } else if (static_cast<int>(nHeight) >= dfmpV31Height) {
-                multiplierFP = DFMP::CalculateTotalMultiplierFP_V31(nHeight, firstSeen, heat);
+                multiplierFP = DFMP::CalculateTotalMultiplierFP_V31(nHeight, firstSeen, heat, 0, dfmpSat);
             } else {
-                multiplierFP = DFMP::CalculateTotalMultiplierFP(nHeight, firstSeen, heat);
+                multiplierFP = DFMP::CalculateTotalMultiplierFP(nHeight, firstSeen, heat, 0, dfmpSat);
             }
 
             // Apply multiplier to get effective target

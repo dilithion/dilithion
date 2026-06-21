@@ -1766,6 +1766,10 @@ std::optional<CBlockTemplate> BuildMiningTemplate(CBlockchainDB& blockchain, CWa
         int dfmpV34ActivationHeight = Dilithion::g_chainParams ?
             Dilithion::g_chainParams->dfmpV34ActivationHeight : 999999999;
 
+        // C-3: saturating heat math gate (must match validator pow.cpp exactly).
+        bool dfmpSat = Dilithion::g_chainParams &&
+            static_cast<int>(nHeight) >= Dilithion::g_chainParams->dfmpOverflowFixActivationHeight;
+
         int64_t multiplierFP;
         double payoutHeatMult = 1.0;
 
@@ -1783,7 +1787,7 @@ std::optional<CBlockTemplate> BuildMiningTemplate(CBlockchainDB& blockchain, CWa
             }
 
             // MIK identity heat penalty (v3.4 - verification-aware)
-            int64_t mikHeatPenalty = DFMP::CalculateHeatMultiplierFP_V34(heat, isVerified);
+            int64_t mikHeatPenalty = DFMP::CalculateHeatMultiplierFP_V34(heat, isVerified, dfmpSat);
 
             // Payout address heat penalty (uses same verification status as the MIK)
             int64_t payoutHeatPenalty = DFMP::FP_SCALE;  // 1.0x default
@@ -1791,7 +1795,7 @@ std::optional<CBlockTemplate> BuildMiningTemplate(CBlockchainDB& blockchain, CWa
                 DFMP::Identity payoutIdentity = DFMP::DeriveIdentityFromScript(
                     coinbaseTx.vout[0].scriptPubKey);
                 int payoutHeat = DFMP::g_payoutHeatTracker->GetHeat(payoutIdentity);
-                payoutHeatPenalty = DFMP::CalculateHeatMultiplierFP_V34(payoutHeat, isVerified);
+                payoutHeatPenalty = DFMP::CalculateHeatMultiplierFP_V34(payoutHeat, isVerified, dfmpSat);
                 payoutHeatMult = static_cast<double>(payoutHeatPenalty) / DFMP::FP_SCALE;
             }
 
@@ -1802,11 +1806,11 @@ std::optional<CBlockTemplate> BuildMiningTemplate(CBlockchainDB& blockchain, CWa
             int64_t maturityPenalty = DFMP::CalculatePendingPenaltyFP_V34(nHeight, firstSeen);
 
             // Total = maturity x heat
-            multiplierFP = (maturityPenalty * effectiveHeatPenalty) / DFMP::FP_SCALE;
+            multiplierFP = DFMP::CombineMaturityHeatFP(maturityPenalty, effectiveHeatPenalty, dfmpSat);
 
         } else if (static_cast<int>(nHeight) >= dfmpV33ActivationHeight) {
             // DFMP v3.3: No dynamic scaling, linear+exponential penalty (must match validator exactly)
-            int64_t mikHeatPenalty = DFMP::CalculateHeatMultiplierFP_V33(heat);
+            int64_t mikHeatPenalty = DFMP::CalculateHeatMultiplierFP_V33(heat, dfmpSat);
 
             // Payout address heat penalty (v3.3, no dynamic scaling)
             int64_t payoutHeatPenalty = DFMP::FP_SCALE;  // 1.0x default
@@ -1814,7 +1818,7 @@ std::optional<CBlockTemplate> BuildMiningTemplate(CBlockchainDB& blockchain, CWa
                 DFMP::Identity payoutIdentity = DFMP::DeriveIdentityFromScript(
                     coinbaseTx.vout[0].scriptPubKey);
                 int payoutHeat = DFMP::g_payoutHeatTracker->GetHeat(payoutIdentity);
-                payoutHeatPenalty = DFMP::CalculateHeatMultiplierFP_V33(payoutHeat);
+                payoutHeatPenalty = DFMP::CalculateHeatMultiplierFP_V33(payoutHeat, dfmpSat);
                 payoutHeatMult = static_cast<double>(payoutHeatPenalty) / DFMP::FP_SCALE;
             }
 
@@ -1825,11 +1829,11 @@ std::optional<CBlockTemplate> BuildMiningTemplate(CBlockchainDB& blockchain, CWa
             int64_t maturityPenalty = DFMP::CalculatePendingPenaltyFP_V33(nHeight, firstSeen);
 
             // Total = maturity × effective heat
-            multiplierFP = (maturityPenalty * effectiveHeatPenalty) / DFMP::FP_SCALE;
+            multiplierFP = DFMP::CombineMaturityHeatFP(maturityPenalty, effectiveHeatPenalty, dfmpSat);
 
         } else if (static_cast<int>(nHeight) >= dfmpV32ActivationHeight) {
             // DFMP v3.2: Tightened anti-whale (must match validator exactly)
-            int64_t mikHeatPenalty = DFMP::CalculateHeatMultiplierFP_V32(heat, uniqueMiners);
+            int64_t mikHeatPenalty = DFMP::CalculateHeatMultiplierFP_V32(heat, uniqueMiners, dfmpSat);
 
             // Payout address heat penalty (v3.2 aggressive)
             int64_t payoutHeatPenalty = DFMP::FP_SCALE;  // 1.0x default
@@ -1841,7 +1845,7 @@ std::optional<CBlockTemplate> BuildMiningTemplate(CBlockchainDB& blockchain, CWa
                 if (static_cast<int>(nHeight) >= dfmpDynamicScalingHeight) {
                     payoutUniqueMiners = DFMP::g_payoutHeatTracker->GetUniqueMinerCount();
                 }
-                payoutHeatPenalty = DFMP::CalculateHeatMultiplierFP_V32(payoutHeat, payoutUniqueMiners);
+                payoutHeatPenalty = DFMP::CalculateHeatMultiplierFP_V32(payoutHeat, payoutUniqueMiners, dfmpSat);
                 payoutHeatMult = static_cast<double>(payoutHeatPenalty) / DFMP::FP_SCALE;
             }
 
@@ -1852,11 +1856,11 @@ std::optional<CBlockTemplate> BuildMiningTemplate(CBlockchainDB& blockchain, CWa
             int64_t maturityPenalty = DFMP::CalculatePendingPenaltyFP_V32(nHeight, firstSeen);
 
             // Total = maturity × effective heat
-            multiplierFP = (maturityPenalty * effectiveHeatPenalty) / DFMP::FP_SCALE;
+            multiplierFP = DFMP::CombineMaturityHeatFP(maturityPenalty, effectiveHeatPenalty, dfmpSat);
 
         } else if (static_cast<int>(nHeight) >= dfmpV31ActivationHeight) {
             // DFMP v3.1: Softened parameters (must match validator exactly)
-            int64_t mikHeatPenalty = DFMP::CalculateHeatMultiplierFP_V31(heat, uniqueMiners);
+            int64_t mikHeatPenalty = DFMP::CalculateHeatMultiplierFP_V31(heat, uniqueMiners, dfmpSat);
 
             // Payout address heat penalty (v3.1 softened)
             int64_t payoutHeatPenalty = DFMP::FP_SCALE;  // 1.0x default
@@ -1868,7 +1872,7 @@ std::optional<CBlockTemplate> BuildMiningTemplate(CBlockchainDB& blockchain, CWa
                 if (static_cast<int>(nHeight) >= dfmpDynamicScalingHeight) {
                     payoutUniqueMiners = DFMP::g_payoutHeatTracker->GetUniqueMinerCount();
                 }
-                payoutHeatPenalty = DFMP::CalculateHeatMultiplierFP_V31(payoutHeat, payoutUniqueMiners);
+                payoutHeatPenalty = DFMP::CalculateHeatMultiplierFP_V31(payoutHeat, payoutUniqueMiners, dfmpSat);
                 payoutHeatMult = static_cast<double>(payoutHeatPenalty) / DFMP::FP_SCALE;
             }
 
@@ -1879,11 +1883,11 @@ std::optional<CBlockTemplate> BuildMiningTemplate(CBlockchainDB& blockchain, CWa
             int64_t maturityPenalty = DFMP::CalculatePendingPenaltyFP_V31(nHeight, firstSeen);
 
             // Total = maturity × effective heat
-            multiplierFP = (maturityPenalty * effectiveHeatPenalty) / DFMP::FP_SCALE;
+            multiplierFP = DFMP::CombineMaturityHeatFP(maturityPenalty, effectiveHeatPenalty, dfmpSat);
 
         } else if (static_cast<int>(nHeight) >= dfmpV3ActivationHeight) {
             // DFMP v3.0: Multi-layer penalty (must match validator exactly)
-            int64_t mikHeatPenalty = DFMP::CalculateHeatMultiplierFP(heat, uniqueMiners);
+            int64_t mikHeatPenalty = DFMP::CalculateHeatMultiplierFP(heat, uniqueMiners, dfmpSat);
 
             // Payout address heat penalty
             int64_t payoutHeatPenalty = DFMP::FP_SCALE;  // 1.0x default
@@ -1895,7 +1899,7 @@ std::optional<CBlockTemplate> BuildMiningTemplate(CBlockchainDB& blockchain, CWa
                 if (static_cast<int>(nHeight) >= dfmpDynamicScalingHeight) {
                     payoutUniqueMiners = DFMP::g_payoutHeatTracker->GetUniqueMinerCount();
                 }
-                payoutHeatPenalty = DFMP::CalculateHeatMultiplierFP(payoutHeat, payoutUniqueMiners);
+                payoutHeatPenalty = DFMP::CalculateHeatMultiplierFP(payoutHeat, payoutUniqueMiners, dfmpSat);
                 payoutHeatMult = static_cast<double>(payoutHeatPenalty) / DFMP::FP_SCALE;
             }
 
@@ -1906,7 +1910,7 @@ std::optional<CBlockTemplate> BuildMiningTemplate(CBlockchainDB& blockchain, CWa
             int64_t maturityPenalty = DFMP::CalculatePendingPenaltyFP(nHeight, firstSeen);
 
             // Total = maturity × effective heat
-            multiplierFP = (maturityPenalty * effectiveHeatPenalty) / DFMP::FP_SCALE;
+            multiplierFP = DFMP::CombineMaturityHeatFP(maturityPenalty, effectiveHeatPenalty, dfmpSat);
         } else {
             // DFMP v2.0: Standard penalty
             multiplierFP = DFMP::CalculateTotalMultiplierFP(nHeight, firstSeen, heat, uniqueMiners);
