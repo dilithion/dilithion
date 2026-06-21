@@ -3196,16 +3196,16 @@ static void Test_V7PerAddressKeyMACRoundTrip() {
             CHECK(w.GenerateHDWallet(mnemonic), "(NewKey) generated HD wallet");
             CHECK(w.EncryptWallet(pass), "(NewKey) encrypted wallet");
             CHECK(w.GenerateNewKey(), "(NewKey) minted a non-HD key post-encryption (GenerateNewKey)");
-            newAddr = w.GetAddresses().back();   // GenerateNewKey appends → hits the line 254 store
+            newAddr = w.GetAddresses().back();   // GenerateNewKey appends → hits the line 257 store
             CHECK(!newAddr.GetData().empty(), "(NewKey) captured the minted address");
         }
         CWallet w2;
         w2.SetWalletFile(path);
         bool loaded = w2.Load(path);
-        CHECK(loaded, "(NewAddr) LOAD-BEARING: wallet reloads after GetNewAddress (NOT bricked)");
+        CHECK(loaded, "(NewKey) LOAD-BEARING: wallet reloads after GenerateNewKey (NOT bricked)");
         CKey rec;
         bool spendable = loaded && w2.Unlock(pass) && w2.GetKey(newAddr, rec);
-        CHECK(spendable, "(NewAddr) minted address is spendable from the on-disk v7 record");
+        CHECK(spendable, "(NewKey) minted address is spendable from the on-disk v7 record");
         std::remove(path.c_str());
     }
 
@@ -3258,7 +3258,7 @@ static void Test_V7PerAddressKeyMACRoundTrip() {
                 CHECK(FileVersion(path) == WALLET_FILE_VERSION_6,
                       "(v6-mint) wallet stays v6 after unlock (no migration)");
                 CHECK(w.GenerateNewKey(), "(v6-mint) minted a non-HD key on the v6 wallet (GenerateNewKey)");
-                mintedAddr = w.GetAddresses().back();   // hits the line 254 store at v6
+                mintedAddr = w.GetAddresses().back();   // hits the line 257 store at v6
                 CHECK(!mintedAddr.GetData().empty(), "(v6-mint) captured the minted address");
                 CHECK(FileVersion(path) == WALLET_FILE_VERSION_6,
                       "(v6-mint) file STILL v6 after minting (no v7 promotion)");
