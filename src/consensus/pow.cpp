@@ -422,14 +422,20 @@ bool CheckProofOfWorkDFMP(
         // Verified MIKs: 12 free blocks, Unverified: 3 free blocks
         // ====================================================================
 
-        // Determine verification status of this MIK
-        bool isVerified = true;  // Default: verified (safe fallback during IBD)
-        if (g_node_context.dna_registry) {
-            std::array<uint8_t, 20> mikArr;
-            std::memcpy(mikArr.data(), identity.data, 20);
-            auto status = g_node_context.dna_registry->get_verification_status(mikArr);
-            isVerified = (status == digital_dna::verification::VerificationStatus::VERIFIED);
-        }
+        // Simplified Option C (D-7): blind verification status — isVerified is forced false
+        // so Q1=STRICT (everyone gets the unverified free-tier=3). The get_verification_status
+        // read is dropped entirely.
+        //
+        // Safety premise: isVerified has ZERO live consensus effect outside this V34 gate.
+        // Every CONSENSUS reader of isVerified / get_verification_status is enumerated here
+        // (pow.cpp, dilithion-node.cpp, dilv-node.cpp — all inside `height >= dfmpV34ActivationHeight`
+        // guards). The only other reader is NON-consensus: an RPC reporter at src/rpc/server.cpp:5623
+        // (getdfmpstatus display) — it still reads real status, so if v3.4 is ever activated its
+        // reported penalty must also be blinded to match consensus (tracked pre-activation item).
+        // dfmpV34ActivationHeight=999999999 on all chains (src/core/chainparams.cpp:96 DIL,
+        // :315 testnet, :468 DilV) — this branch is dead code today. Blinding in place is not a live
+        // consensus change; it is safe-by-construction if v3.4 ever activates.
+        bool isVerified = false;
 
         // MIK identity heat penalty (v3.4 - verification-aware)
         int64_t mikHeatPenalty = DFMP::CalculateHeatMultiplierFP_V34(blocksInWindow, isVerified, dfmpSat);
@@ -584,14 +590,9 @@ bool CheckProofOfWorkDFMP(
     double multiplier = static_cast<double>(multiplierFP) / DFMP::FP_SCALE;
     if (multiplier > 1.01) {
         if (height >= dfmpV34ActivationHeight) {
-            // Determine verification status for logging
-            bool logIsVerified = true;
-            if (g_node_context.dna_registry) {
-                std::array<uint8_t, 20> mikArr;
-                std::memcpy(mikArr.data(), identity.data, 20);
-                auto status = g_node_context.dna_registry->get_verification_status(mikArr);
-                logIsVerified = (status == digital_dna::verification::VerificationStatus::VERIFIED);
-            }
+            // Simplified Option C (D-7): log-path mirrors dispatch — logIsVerified forced false
+            // (see dispatch-site comment above for full safety premise).
+            bool logIsVerified = false;
             double maturityMult = DFMP::GetPendingPenalty_V34(height, effectiveFirstSeen);
             double heatMult = DFMP::GetHeatMultiplier_V34(blocksInWindow, logIsVerified);
 
