@@ -248,6 +248,9 @@ bool CWallet::GenerateNewKey() {
             (m_loadedFileVersion != 0 && m_loadedFileVersion < WALLET_FILE_VERSION_7);
         if (!ComputeRecordMAC(crypter, encKey.vchCryptedKey, encKey.vchMAC, legacyKeying)) {
             memory_cleanse(masterKeyVec.data(), masterKeyVec.size());
+            key.Clear();   // defense-in-depth: wipe the plaintext key on the failure
+                           // path (mirrors DeriveAndCacheHDAddress's fail branch); CKey
+                           // RAII already wipes on return, this makes the intent explicit.
             return false;
         }
 
