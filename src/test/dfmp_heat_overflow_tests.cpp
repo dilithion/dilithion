@@ -166,10 +166,12 @@ TEST(s3_overflow_input_hardest_and_load_bearing) {
     // gate genuinely changes behavior. If the gate were a no-op this assertion would fail.)
     ASSERT(legacyV33 != satV33,
         "V33 heat=90: legacy path must differ from saturated path (load-bearing check)");
-    // And it must match the independent legacy replica (same wrapped bit pattern),
-    // confirming saturate=false faithfully reproduces the pre-fix binary.
-    ASSERT(legacyV33 == legacyHeatV33(kOverflowHeat),
-        "V33 heat=90 saturate=false must match the hand-replicated legacy formula");
+    // NOTE: we deliberately do NOT assert legacyV33 equals a hand-replicated OVERFLOWED
+    // value — the legacy int64 multiply is UB on overflow, so the exact wrapped bits are not
+    // a portable contract (asserting it would rest the test on UB matching across compilers).
+    // Below-gate byte-identity is proven instead by S4 over the WELL-DEFINED sub-overflow
+    // range (heat 0..70) — which is what consensus actually relies on — plus the collapse
+    // proof below (legacy drops below FP_SCALE; saturated returns MAX).
 
     // The exact C-3 defect (easiest-target collapse): somewhere in the heat sweep the legacy
     // int64 wrap drops the heaviest miner BELOW FP_SCALE (1.0x) — which CalculateEffectiveTarget

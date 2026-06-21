@@ -15,6 +15,13 @@
 
 namespace DFMP {
 
+// C-3: the saturating maturity×heat combiner uses __uint128_t (a GCC/Clang extension) —
+// the SAME 128-bit integer support already required by CalculateEffectiveTarget below.
+// Fail the build LOUDLY on any toolchain lacking it rather than silently miscompiling
+// consensus math. (Dilithion ships via MSYS2 GCC/Clang; this asserts the invariant.)
+static_assert(sizeof(__uint128_t) == 16,
+              "C-3 / DFMP requires 128-bit integer support (__uint128_t; GCC/Clang)");
+
 // ============================================================================
 // GLOBAL STATE
 // ============================================================================
@@ -713,7 +720,11 @@ int64_t CalculateHeatMultiplierFP_V34(int heat, bool isVerified, bool saturate) 
     if (heat <= LINEAR_ZONE_END_V34) {
         int excess = heat - freeTier;
         int linearSpan = LINEAR_ZONE_END_V34 - freeTier;
-        if (linearSpan <= 0) return FP_SCALE;  // defensive: unreachable with current constants
+        // Defensive: unreachable with current constants (freeTier 3|12 < LINEAR_ZONE_END 24,
+        // so linearSpan is always > 0). If a future constant change made the linear zone
+        // degenerate, fail SAFE to the HARDER zone-3 base (4.0x), NEVER the easiest 1.0x —
+        // a concentration defense must never hand a degenerate case the easiest target.
+        if (linearSpan <= 0) return FP_LINEAR_END_PENALTY_V34;
         // Ramp from 1.0x to 4.0x over linearSpan blocks
         // penalty = 1.0 + excess × 3.0 / linearSpan
         int64_t ramp = (static_cast<int64_t>(excess) * 3 * FP_SCALE) / linearSpan;
