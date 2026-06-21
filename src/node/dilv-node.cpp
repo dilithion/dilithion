@@ -1723,11 +1723,14 @@ std::optional<CBlockTemplate> BuildMiningTemplate(CBlockchainDB& blockchain, CWa
             // read is dropped entirely.
             //
             // Safety premise: isVerified has ZERO live consensus effect outside this V34 gate.
-            // Every consensus reader of isVerified / get_verification_status is enumerated here
+            // Every CONSENSUS reader of isVerified / get_verification_status is enumerated here
             // (pow.cpp, dilithion-node.cpp, dilv-node.cpp — all inside `height >= dfmpV34ActivationHeight`
-            // guards). dfmpV34ActivationHeight=999999999 on both mainnets (chainparams.cpp:96 DIL,
-            // :468 DilV) — this branch is dead code today. Blinding in place is not a live consensus
-            // change; it is safe-by-construction if v3.4 ever activates.
+            // guards). The only other reader is NON-consensus: an RPC reporter at src/rpc/server.cpp:5623
+            // (getdfmpstatus display) — it still reads real status, so if v3.4 is ever activated its
+            // reported penalty must also be blinded to match consensus (tracked pre-activation item).
+            // dfmpV34ActivationHeight=999999999 on all chains (src/core/chainparams.cpp:96 DIL,
+            // :315 testnet, :468 DilV) — this branch is dead code today. Blinding in place is not a live
+            // consensus change; it is safe-by-construction if v3.4 ever activates.
             bool isVerified = false;
 
             // MIK identity heat penalty (v3.4 - verification-aware)
