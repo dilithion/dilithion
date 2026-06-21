@@ -235,6 +235,25 @@ bool CWallet::GenerateNewKey() {
             return false;
         }
 
+        // LP-7: a per-address at-rest key MUST carry a v7 MAC, or Load() (which
+        // rejects any v7 record with an empty vchMAC) refuses the WHOLE wallet on
+        // the next start — silent funds-access loss. Mirror EncryptWallet's per-
+        // address MAC compute; GetKeyUnlocked already verifies it symmetrically.
+        // The MAC keying MUST match the verify side (VerifyRecordMAC in
+        // GetKeyUnlocked): a loaded v3-v6 wallet uses legacy AES-keyed HMAC, and a
+        // non-HD v6 wallet never migrates — so a v7-keyed MAC written here would
+        // make the freshly-minted key UNSPENDABLE on the next load. Select keying
+        // by the loaded file version, exactly as EncryptWallet/ChangePassphrase do.
+        const bool legacyKeying =
+            (m_loadedFileVersion != 0 && m_loadedFileVersion < WALLET_FILE_VERSION_7);
+        if (!ComputeRecordMAC(crypter, encKey.vchCryptedKey, encKey.vchMAC, legacyKeying)) {
+            memory_cleanse(masterKeyVec.data(), masterKeyVec.size());
+            key.Clear();   // defense-in-depth: wipe the plaintext key on the failure
+                           // path (mirrors DeriveAndCacheHDAddress's fail branch); CKey
+                           // RAII already wipes on return, this makes the intent explicit.
+            return false;
+        }
+
         mapCryptedKeys[address] = encKey;
         memory_cleanse(masterKeyVec.data(), masterKeyVec.size());
     } else {
@@ -479,6 +498,22 @@ bool CWallet::ImportKey(const CKey& key, const CDilithiumAddress& address) {
         }
 
         if (!crypter.Encrypt(key.vchPrivKey, encKey.vchCryptedKey)) {
+            memory_cleanse(masterKeyVec.data(), masterKeyVec.size());
+            return false;
+        }
+
+        // LP-7: a per-address at-rest key MUST carry a v7 MAC, or Load() (which
+        // rejects any v7 record with an empty vchMAC) refuses the WHOLE wallet on
+        // the next start — silent funds-access loss. Mirror EncryptWallet's per-
+        // address MAC compute; GetKeyUnlocked already verifies it symmetrically.
+        // The MAC keying MUST match the verify side (VerifyRecordMAC in
+        // GetKeyUnlocked): a loaded v3-v6 wallet uses legacy AES-keyed HMAC, and a
+        // non-HD v6 wallet never migrates — so a v7-keyed MAC written here would
+        // make the freshly-minted key UNSPENDABLE on the next load. Select keying
+        // by the loaded file version, exactly as EncryptWallet/ChangePassphrase do.
+        const bool legacyKeying =
+            (m_loadedFileVersion != 0 && m_loadedFileVersion < WALLET_FILE_VERSION_7);
+        if (!ComputeRecordMAC(crypter, encKey.vchCryptedKey, encKey.vchMAC, legacyKeying)) {
             memory_cleanse(masterKeyVec.data(), masterKeyVec.size());
             return false;
         }
@@ -5690,6 +5725,25 @@ bool CWallet::DeriveAndCacheHDAddress(const CHDKeyPath& path) {
         }
 
         if (!crypter.Encrypt(key.vchPrivKey, encKey.vchCryptedKey)) {
+            memory_cleanse(masterKeyVec.data(), masterKeyVec.size());
+            key.Clear();
+            derived.Wipe();
+            master_copy.Wipe();
+            return false;
+        }
+
+        // LP-7: a per-address at-rest key MUST carry a v7 MAC, or Load() (which
+        // rejects any v7 record with an empty vchMAC) refuses the WHOLE wallet on
+        // the next start — silent funds-access loss. Mirror EncryptWallet's per-
+        // address MAC compute; GetKeyUnlocked already verifies it symmetrically.
+        // The MAC keying MUST match the verify side (VerifyRecordMAC in
+        // GetKeyUnlocked): a loaded v3-v6 wallet uses legacy AES-keyed HMAC, and a
+        // non-HD v6 wallet never migrates — so a v7-keyed MAC written here would
+        // make the freshly-minted key UNSPENDABLE on the next load. Select keying
+        // by the loaded file version, exactly as EncryptWallet/ChangePassphrase do.
+        const bool legacyKeying =
+            (m_loadedFileVersion != 0 && m_loadedFileVersion < WALLET_FILE_VERSION_7);
+        if (!ComputeRecordMAC(crypter, encKey.vchCryptedKey, encKey.vchMAC, legacyKeying)) {
             memory_cleanse(masterKeyVec.data(), masterKeyVec.size());
             key.Clear();
             derived.Wipe();
