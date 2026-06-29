@@ -2654,13 +2654,19 @@ load_genesis_block:  // Bug #29: Label for automatic retry after blockchain wipe
         }
 
         std::cout << "  Network: " << Dilithion::g_chainParams->GetNetworkName() << std::endl;
-        std::cout << "  Genesis hash: " << genesis.GetHash().GetHex() << std::endl;
+        std::cout << "  Genesis hash: " << Genesis::GetGenesisHash().GetHex() << std::endl;
         std::cout << "  Genesis time: " << genesis.nTime << std::endl;
         std::cout << " ✓" << std::endl;
         std::cout << "  [OK] Genesis block verified" << std::endl;
 
-        // Initialize blockchain with genesis block if needed
-        uint256 genesisHash = genesis.GetHash();
+        // Initialize blockchain with genesis block if needed.
+        // Use the single-source, integrity-validated accessor (Genesis::GetGenesisHash)
+        // instead of recomputing genesis.GetHash() here: it self-corrects a transient
+        // genesis miscompute to the chainparams-pinned value, so the DB key can never
+        // be a wrong genesis (which would strand the node on a private chain peers
+        // ban for `invalid_genesis`). See node/genesis.cpp GetGenesisHash().
+        uint256 genesisHash = Genesis::GetGenesisHash();
+
         if (!blockchain.BlockExists(genesisHash)) {
             std::cout << "Initializing blockchain with genesis block..." << std::endl;
 
