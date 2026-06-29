@@ -9,6 +9,7 @@
 #include <core/chainparams.h>
 #include <vdf/coinbase_vdf.h>
 #include <util/base58.h>
+#include <util/logging.h>
 
 #include <cstring>
 #include <iostream>
@@ -258,10 +259,11 @@ uint256 GetGenesisHash() {
         if (Dilithion::g_chainParams && !Dilithion::g_chainParams->genesisHash.empty()) {
             const uint256 pinned = uint256S(Dilithion::g_chainParams->genesisHash);
             if (!(computed == pinned)) {
-                std::cerr << "[GENESIS] ERROR: recomputed genesis hash " << computed.GetHex()
-                          << " does not match the value pinned in chainparams " << pinned.GetHex()
-                          << " — using the pinned value (transient compute fault; see ops board "
-                             "randomx-genesis-init-corruption)." << std::endl;
+                LogPrintf(ALL, ERROR,
+                    "[GENESIS] recomputed genesis hash %s does not match the value pinned in "
+                    "chainparams %s — using the pinned value (transient compute fault; see ops "
+                    "board randomx-genesis-init-corruption)",
+                    computed.GetHex().c_str(), pinned.GetHex().c_str());
                 computed = pinned;
             }
         }
