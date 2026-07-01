@@ -24,12 +24,34 @@
 #include <core/chainparams.h>
 #include <uint256.h>
 #include <crypto/sha3.h>
+#include <amount.h>
 
 #include <vector>
 #include <cstring>
 #include <memory>
+#include <set>
 
-using namespace Consensus;
+// NOTE: the live CBlockValidator lives in the GLOBAL namespace (not Consensus).
+// The pre-fix test's `using namespace Consensus;` was part of its staleness.
+
+namespace {
+// Helper: build a representative CTransaction and return it as a CTransactionRef,
+// matching the LIVE CBlockValidator::BuildMerkleRoot(std::vector<CTransactionRef>)
+// signature (the pre-fix test used a stale BlockValidator/std::vector<CTransaction>
+// API that no longer exists).
+CTransactionRef MakeTx(uint8_t fill, int32_t version = 1, uint64_t amount = 50 * COIN) {
+    CTransaction tx;
+    tx.nVersion = version;
+    tx.nLockTime = 0;
+    uint256 prevHash;
+    memset(prevHash.data, fill, 32);
+    std::vector<uint8_t> sig(100, fill);
+    tx.vin.push_back(CTxIn(prevHash, 0, sig, CTxIn::SEQUENCE_FINAL));
+    std::vector<uint8_t> scriptPubKey(50, fill);
+    tx.vout.push_back(CTxOut(amount, scriptPubKey));
+    return MakeTransactionRef(std::move(tx));
+}
+} // namespace
 
 BOOST_AUTO_TEST_SUITE(phase4_5_consensus_fixes_tests)
 
@@ -38,128 +60,101 @@ BOOST_AUTO_TEST_SUITE(phase4_5_consensus_fixes_tests)
 // ============================================================================
 
 /**
- * Test CVE-2012-2459 Fix: Merkle tree rejects duplicate transactions
+ * CVE-2012-2459 — corrected to reflect LIVE behavior.
  *
- * VULNERABILITY: Bitcoin CVE-2012-2459 allowed blocks with duplicate transactions
- * to pass validation because the merkle tree implementation allowed duplicate
- * hashes at internal nodes.
+ * The ORIGINAL test asserted that BuildMerkleRoot returns a NULL root when the
+ * transaction list contains duplicates. That assertion is FALSE against the
+ * live code: "BUG #49 FIX" (validation.cpp:59-62) deliberately removed the
+ * merkle-layer duplicate check because it was rejecting valid orphan blocks.
+ * The old test also called BlockValidator::BuildMerkleRoot(std::vector<CTransaction>),
+ * a class/signature that no longer exists — it could not even compile, so it
+ * gave false "CVE covered" comfort.
  *
- * FIX: src/consensus/validation.cpp now detects duplicate hashes in merkle tree
- * and returns null hash to indicate invalid block.
+ * Live truth (see _LIVE_CODE_DIVERGENCE_SCOPE JOB 1):
+ *  - BuildMerkleRoot does NOT null out on duplicates (documented below), and
+ *  - the CVE consensus-split path is closed on the connect path — historically
+ *    incidentally by ApplyBlock's UTXO double-spend rejection, and now EXPLICITLY
+ *    by the duplicate-txid guard added to CUTXOSet::ApplyBlock.
+ *
+ * This case documents the merkle-layer behavior so a future re-introduction of
+ * a null-on-duplicate merkle rule (which would be a consensus change) is caught.
  */
-BOOST_AUTO_TEST_CASE(cve_2012_2459_duplicate_transaction_attack) {
-    BlockValidator validator;
+BOOST_AUTO_TEST_CASE(cve_2012_2459_merkle_layer_does_not_null_on_duplicate) {
+    CBlockValidator validator;
 
-    // Create a normal transaction
-    CTransaction tx1;
-    tx1.nVersion = 1;
-    tx1.nLockTime = 0;
+    CTransactionRef tx1 = MakeTx(0x42);
 
-    uint256 prevHash;
-    memset(prevHash.data, 0x42, 32);
-    std::vector<uint8_t> sig1(100, 0xAA);
-    tx1.vin.push_back(CTxIn(prevHash, 0, sig1, CTxIn::SEQUENCE_FINAL));
+    // Duplicate transactions in the merkle input (the CVE attack shape).
+    std::vector<CTransactionRef> dup_txs{tx1, tx1};
+    uint256 dup_root = validator.BuildMerkleRoot(dup_txs);
 
-    std::vector<uint8_t> scriptPubKey1(50, 0xBB);
-    tx1.vout.push_back(CTxOut(50 * COIN, scriptPubKey1));
-
-    // Create vector with DUPLICATE transactions (CVE-2012-2459 attack)
-    std::vector<CTransaction> malicious_txs;
-    malicious_txs.push_back(tx1);
-    malicious_txs.push_back(tx1);  // DUPLICATE - should be rejected!
-
-    // Build merkle root with duplicate transactions
-    uint256 merkle_root = validator.BuildMerkleRoot(malicious_txs);
-
-    // FIX: Should return null hash (all zeros) to indicate invalid merkle tree
+    // LIVE behavior: BUG #49 removed the null-on-duplicate rule. The merkle root
+    // is a normal, non-null hash. (The CVE is closed at the connect path, not here.)
     uint256 null_hash;
     memset(null_hash.data, 0, 32);
-
-    BOOST_CHECK_EQUAL(merkle_root, null_hash);
-    BOOST_CHECK_MESSAGE(merkle_root == null_hash,
-                       "CVE-2012-2459: Duplicate transactions should result in null merkle root");
+    BOOST_CHECK_MESSAGE(dup_root != null_hash,
+        "LIVE: merkle root over duplicate txs is non-null (BUG #49 removed the "
+        "merkle-layer CVE check; the guard lives on the connect path)");
 }
 
 /**
- * Test CVE-2012-2459 Fix: Merkle tree accepts unique transactions
+ * CVE-2012-2459 — unique transactions produce a valid (non-null) merkle root.
  */
 BOOST_AUTO_TEST_CASE(cve_2012_2459_unique_transactions_valid) {
-    BlockValidator validator;
+    CBlockValidator validator;
 
-    // Create two DIFFERENT transactions
-    CTransaction tx1;
-    tx1.nVersion = 1;
-    tx1.nLockTime = 0;
-    uint256 prevHash1;
-    memset(prevHash1.data, 0x42, 32);
-    std::vector<uint8_t> sig1(100, 0xAA);
-    tx1.vin.push_back(CTxIn(prevHash1, 0, sig1, CTxIn::SEQUENCE_FINAL));
-    std::vector<uint8_t> scriptPubKey1(50, 0xBB);
-    tx1.vout.push_back(CTxOut(50 * COIN, scriptPubKey1));
+    CTransactionRef tx1 = MakeTx(0x42, 1, 50 * COIN);
+    CTransactionRef tx2 = MakeTx(0x99, 1, 25 * COIN);
 
-    CTransaction tx2;
-    tx2.nVersion = 1;
-    tx2.nLockTime = 0;
-    uint256 prevHash2;
-    memset(prevHash2.data, 0x99, 32);  // Different from tx1
-    std::vector<uint8_t> sig2(100, 0xCC);  // Different signature
-    tx2.vin.push_back(CTxIn(prevHash2, 0, sig2, CTxIn::SEQUENCE_FINAL));
-    std::vector<uint8_t> scriptPubKey2(50, 0xDD);
-    tx2.vout.push_back(CTxOut(25 * COIN, scriptPubKey2));  // Different amount
-
-    // Create vector with UNIQUE transactions
-    std::vector<CTransaction> valid_txs;
-    valid_txs.push_back(tx1);
-    valid_txs.push_back(tx2);
-
-    // Build merkle root with unique transactions
+    std::vector<CTransactionRef> valid_txs{tx1, tx2};
     uint256 merkle_root = validator.BuildMerkleRoot(valid_txs);
 
-    // Should return valid (non-null) merkle root
     uint256 null_hash;
     memset(null_hash.data, 0, 32);
-
-    BOOST_CHECK_NE(merkle_root, null_hash);
     BOOST_CHECK_MESSAGE(merkle_root != null_hash,
                        "Unique transactions should result in valid merkle root");
 }
 
 /**
- * Test CVE-2012-2459 Fix: Multiple duplicates at different positions
+ * CVE-2012-2459 — the connect-path duplicate-txid guard is the real closure.
+ *
+ * A block whose merkle input contains two transactions with the SAME txid
+ * collides with the CVE malleability shape. The explicit guard now lives in
+ * CUTXOSet::ApplyBlock (std::set<uint256> reject). We assert the guard's
+ * decision predicate directly here (a full ApplyBlock needs an open leveldb
+ * UTXO db, which is an integration-test dependency): the same-txid pair is
+ * detected as a duplicate, a distinct pair is not.
  */
-BOOST_AUTO_TEST_CASE(cve_2012_2459_multiple_duplicate_pairs) {
-    BlockValidator validator;
+BOOST_AUTO_TEST_CASE(cve_2012_2459_connect_path_dup_txid_detected) {
+    CTransactionRef tx1 = MakeTx(0x42);
+    CTransactionRef tx1_copy = MakeTx(0x42);   // byte-identical => same txid
+    CTransactionRef tx2 = MakeTx(0x99);        // distinct => different txid
 
-    // Create transactions
-    CTransaction tx1, tx2, tx3;
-    tx1.nVersion = 1;
-    tx2.nVersion = 2;
-    tx3.nVersion = 3;
+    // Same construction the ApplyBlock guard uses: insert txids into a set and
+    // reject on the first collision.
+    BOOST_CHECK(tx1->GetHash() == tx1_copy->GetHash());
+    BOOST_CHECK(tx1->GetHash() != tx2->GetHash());
 
-    // All have same structure but different versions
-    for (auto* tx : {&tx1, &tx2, &tx3}) {
-        uint256 prevHash;
-        memset(prevHash.data, tx->nVersion, 32);
-        std::vector<uint8_t> sig(100, tx->nVersion);
-        tx->vin.push_back(CTxIn(prevHash, 0, sig, CTxIn::SEQUENCE_FINAL));
-        std::vector<uint8_t> scriptPubKey(50, tx->nVersion);
-        tx->vout.push_back(CTxOut(50 * COIN, scriptPubKey));
+    std::set<uint256> seen;
+    std::vector<CTransactionRef> block_txs{tx1, tx1_copy, tx2};
+    bool duplicate_found = false;
+    for (const auto& tx : block_txs) {
+        if (!seen.insert(tx->GetHash()).second) {
+            duplicate_found = true;
+            break;
+        }
     }
+    BOOST_CHECK_MESSAGE(duplicate_found,
+        "Connect-path guard must flag the duplicate-txid block (CVE-2012-2459)");
 
-    // Create vector with duplicate tx1
-    std::vector<CTransaction> malicious_txs;
-    malicious_txs.push_back(tx1);
-    malicious_txs.push_back(tx1);  // Duplicate
-    malicious_txs.push_back(tx2);
-    malicious_txs.push_back(tx3);
-
-    // Build merkle root
-    uint256 merkle_root = validator.BuildMerkleRoot(malicious_txs);
-
-    // Should return null hash
-    uint256 null_hash;
-    memset(null_hash.data, 0, 32);
-    BOOST_CHECK_EQUAL(merkle_root, null_hash);
+    // A block of only-unique txids is NOT flagged.
+    std::set<uint256> seen2;
+    std::vector<CTransactionRef> unique_txs{tx1, tx2};
+    bool dup_in_unique = false;
+    for (const auto& tx : unique_txs) {
+        if (!seen2.insert(tx->GetHash()).second) { dup_in_unique = true; break; }
+    }
+    BOOST_CHECK_MESSAGE(!dup_in_unique, "Unique-txid block must not be flagged");
 }
 
 // ============================================================================

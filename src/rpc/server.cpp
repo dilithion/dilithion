@@ -29,6 +29,7 @@
 #include <consensus/tx_validation.h>
 #include <consensus/pow.h>
 #include <consensus/validation.h>  // For DeserializeBlockTransactions
+#include <consensus/sighash_preimage.h>  // Single-source ML-DSA sighash preimage builder
 #include <index/tx_index.h>  // PR-5: txindex fast-path for getrawtransaction/gettransaction
 #include <index/coinstatsindex.h>  // PR-BA-2: coinstatsindex registration in getindexinfo
 #include <node/mempool_persist.h>  // PR-MP-3: savemempool RPC handler
@@ -8507,29 +8508,14 @@ std::string CRPCServer::RPC_ClaimHTLC(const std::string& params) {
     claim_tx.vout.push_back(std::move(claim_output_tx));
 
     // Sign: compute signature message (same algorithm as wallet SignTransaction)
+    // via the single-source builder — byte-identical to the prior open-coded
+    // 44-byte form. Input index = 0 for the HTLC claim's single input.
     uint256 signing_hash = claim_tx.GetSigningHash();
     uint32_t chain_id = Dilithion::g_chainParams->chainID;
     uint32_t version = claim_tx.nVersion;
 
-    std::vector<uint8_t> sig_message;
-    sig_message.reserve(44);
-    sig_message.insert(sig_message.end(), signing_hash.begin(), signing_hash.end());
-    // Input index = 0 (4 bytes LE)
-    sig_message.push_back(0); sig_message.push_back(0); sig_message.push_back(0); sig_message.push_back(0);
-    // Version (4 bytes LE)
-    sig_message.push_back(static_cast<uint8_t>(version & 0xFF));
-    sig_message.push_back(static_cast<uint8_t>((version >> 8) & 0xFF));
-    sig_message.push_back(static_cast<uint8_t>((version >> 16) & 0xFF));
-    sig_message.push_back(static_cast<uint8_t>((version >> 24) & 0xFF));
-    // Chain ID (4 bytes LE)
-    sig_message.push_back(static_cast<uint8_t>(chain_id & 0xFF));
-    sig_message.push_back(static_cast<uint8_t>((chain_id >> 8) & 0xFF));
-    sig_message.push_back(static_cast<uint8_t>((chain_id >> 16) & 0xFF));
-    sig_message.push_back(static_cast<uint8_t>((chain_id >> 24) & 0xFF));
-
-    // SHA3-256 the message
     uint8_t sig_hash[32];
-    SHA3_256(sig_message.data(), sig_message.size(), sig_hash);
+    Consensus::ComputeSighash(signing_hash, /*input_idx=*/0, version, chain_id, sig_hash);
 
     // Sign with Dilithium3
     std::vector<uint8_t> signature;
@@ -8685,26 +8671,14 @@ std::string CRPCServer::RPC_RefundHTLC(const std::string& params) {
     CTxOut refund_output_tx(refund_output, std::move(output_script));
     refund_tx.vout.push_back(std::move(refund_output_tx));
 
-    // Sign
+    // Sign via the single-source builder — byte-identical to the prior
+    // open-coded 44-byte form. Input index = 0 for the refund's single input.
     uint256 signing_hash = refund_tx.GetSigningHash();
     uint32_t chain_id = Dilithion::g_chainParams->chainID;
     uint32_t version = refund_tx.nVersion;
 
-    std::vector<uint8_t> sig_message;
-    sig_message.reserve(44);
-    sig_message.insert(sig_message.end(), signing_hash.begin(), signing_hash.end());
-    sig_message.push_back(0); sig_message.push_back(0); sig_message.push_back(0); sig_message.push_back(0);
-    sig_message.push_back(static_cast<uint8_t>(version & 0xFF));
-    sig_message.push_back(static_cast<uint8_t>((version >> 8) & 0xFF));
-    sig_message.push_back(static_cast<uint8_t>((version >> 16) & 0xFF));
-    sig_message.push_back(static_cast<uint8_t>((version >> 24) & 0xFF));
-    sig_message.push_back(static_cast<uint8_t>(chain_id & 0xFF));
-    sig_message.push_back(static_cast<uint8_t>((chain_id >> 8) & 0xFF));
-    sig_message.push_back(static_cast<uint8_t>((chain_id >> 16) & 0xFF));
-    sig_message.push_back(static_cast<uint8_t>((chain_id >> 24) & 0xFF));
-
     uint8_t sig_hash[32];
-    SHA3_256(sig_message.data(), sig_message.size(), sig_hash);
+    Consensus::ComputeSighash(signing_hash, /*input_idx=*/0, version, chain_id, sig_hash);
 
     std::vector<uint8_t> signature;
     if (!WalletCrypto::Sign(refund_key, sig_hash, 32, signature)) {
