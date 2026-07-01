@@ -1473,6 +1473,7 @@ FUZZ_CONSENSUS_OBJECTS := $(OBJ_DIR)/consensus/pow.o \
                           $(OBJ_DIR)/consensus/fees.o \
                           $(OBJ_DIR)/consensus/tx_validation.o \
                           $(OBJ_DIR)/consensus/validation.o \
+                          $(OBJ_DIR)/consensus/sighash_preimage.o \
                           $(OBJ_DIR)/consensus/signature_batch_verifier.o
 
 FUZZ_DFMP_OBJECTS := $(OBJ_DIR)/dfmp/dfmp.o \
