@@ -21,6 +21,7 @@
 #include <primitives/transaction.h>
 #include <primitives/block.h>
 #include <node/block_index.h>
+#include <node/utxo_set.h>
 #include <core/chainparams.h>
 #include <uint256.h>
 #include <crypto/sha3.h>
@@ -30,6 +31,9 @@
 #include <cstring>
 #include <memory>
 #include <set>
+#include <filesystem>
+#include <random>
+#include <sstream>
 
 // NOTE: the live CBlockValidator lives in the GLOBAL namespace (not Consensus).
 // The pre-fix test's `using namespace Consensus;` was part of its staleness.
@@ -50,6 +54,103 @@ CTransactionRef MakeTx(uint8_t fill, int32_t version = 1, uint64_t amount = 50 *
     std::vector<uint8_t> scriptPubKey(50, fill);
     tx.vout.push_back(CTxOut(amount, scriptPubKey));
     return MakeTransactionRef(std::move(tx));
+}
+
+// ---------------------------------------------------------------------------
+// Connect-path guard fixtures (INFO-1 fold): drive the REAL guard inside
+// CUTXOSet::ApplyBlock rather than re-implementing its set-insert logic.
+// ---------------------------------------------------------------------------
+
+// RAII temp directory for a per-test leveldb UTXO db, mirroring the pattern in
+// chainstate_integrity_tests.cpp / tx_index_integration_tests.cpp.
+struct UtxoTempDir {
+    std::filesystem::path path;
+    explicit UtxoTempDir(const std::string& tag) {
+        std::random_device rd;
+        std::ostringstream oss;
+        oss << "dilithion-phase45-cve-" << tag << "-" << rd();
+        path = std::filesystem::temp_directory_path() / oss.str();
+        std::error_code ec;
+        std::filesystem::create_directories(path, ec);
+    }
+    ~UtxoTempDir() {
+        std::error_code ec;
+        std::filesystem::remove_all(path, ec);
+    }
+    std::string str() const { return path.string(); }
+};
+
+// A minimal non-coinbase tx with an EMPTY input vector. ApplyBlock's per-tx
+// loop skips input-spending when vin is empty (the `for (txin : tx->vin)` body
+// never runs), so this tx neither requires a pre-populated UTXO set nor can
+// fail the "input not found" check. That is deliberate: it isolates the
+// duplicate-txid guard as the SOLE reason a dup-txid block is rejected — with
+// the guard removed, ApplyBlock processes both copies without error.
+CTransactionRef MakeInputlessTx(uint8_t fill, uint64_t amount = 10 * COIN) {
+    CTransaction tx;
+    tx.nVersion = 1;
+    tx.nLockTime = 0;
+    // vin intentionally empty.
+    std::vector<uint8_t> scriptPubKey(20, fill);
+    tx.vout.push_back(CTxOut(amount, scriptPubKey));
+    return MakeTransactionRef(std::move(tx));
+}
+
+// A coinbase-shaped tx (null prevout) for slot 0. ApplyBlock treats tx_idx==0
+// as coinbase and skips its inputs regardless, but a null prevout keeps the
+// shape honest.
+CTransactionRef MakeCoinbaseLikeTx(uint8_t fill) {
+    CTransaction tx;
+    tx.nVersion = 1;
+    tx.nLockTime = 0;
+    uint256 nullPrev;  // all-zero => null prevout
+    std::vector<uint8_t> sig{0xCB, fill};
+    tx.vin.push_back(CTxIn(nullPrev, 0xFFFFFFFFu, sig, CTxIn::SEQUENCE_FINAL));
+    std::vector<uint8_t> scriptPubKey(20, fill);
+    tx.vout.push_back(CTxOut(50 * COIN, scriptPubKey));
+    return MakeTransactionRef(std::move(tx));
+}
+
+void WriteCompactSizeInline(std::vector<uint8_t>& data, uint64_t size) {
+    if (size < 253) {
+        data.push_back(static_cast<uint8_t>(size));
+    } else if (size <= 0xFFFF) {
+        data.push_back(253);
+        data.push_back(static_cast<uint8_t>(size & 0xFF));
+        data.push_back(static_cast<uint8_t>((size >> 8) & 0xFF));
+    } else {
+        data.push_back(254);
+        for (int i = 0; i < 4; ++i)
+            data.push_back(static_cast<uint8_t>((size >> (i * 8)) & 0xFF));
+    }
+}
+
+// Assemble a CBlock whose vtx byte-blob is exactly what
+// CBlockValidator::DeserializeBlockTransactions (called by ApplyBlock) parses:
+// compactsize(txCount) followed by each tx->Serialize().
+CBlock MakeBlockFromTxs(const std::vector<CTransactionRef>& txs) {
+    CBlock block;
+    block.nVersion = 1;
+    block.nTime = 1700000000;
+    block.nBits = 0x1d00ffff;
+    block.nNonce = 0;
+
+    std::vector<uint8_t> vtx_data;
+    WriteCompactSizeInline(vtx_data, txs.size());
+    for (const auto& tx : txs) {
+        auto data = tx->Serialize();
+        vtx_data.insert(vtx_data.end(), data.begin(), data.end());
+    }
+    block.vtx = std::move(vtx_data);
+    return block;
+}
+
+uint256 MakeDistinctBlockHash(uint8_t tag) {
+    uint256 h;
+    std::memset(h.data, 0, 32);
+    h.data[0] = tag;
+    h.data[31] = 0x42;  // sentinel — never all-zero
+    return h;
 }
 } // namespace
 
@@ -118,43 +219,68 @@ BOOST_AUTO_TEST_CASE(cve_2012_2459_unique_transactions_valid) {
 /**
  * CVE-2012-2459 — the connect-path duplicate-txid guard is the real closure.
  *
- * A block whose merkle input contains two transactions with the SAME txid
- * collides with the CVE malleability shape. The explicit guard now lives in
- * CUTXOSet::ApplyBlock (std::set<uint256> reject). We assert the guard's
- * decision predicate directly here (a full ApplyBlock needs an open leveldb
- * UTXO db, which is an integration-test dependency): the same-txid pair is
- * detected as a duplicate, a distinct pair is not.
+ * LOAD-BEARING (INFO-1 fold): this test exercises the ACTUAL guard inside
+ * CUTXOSet::ApplyBlock (utxo_set.cpp: the `std::set<uint256> seen_txids` reject),
+ * NOT a re-implementation of it. The earlier version of this case re-built the
+ * set-insert logic inline and asserted on its own reconstruction — it would have
+ * passed even with the real guard deleted (false coverage). This version builds
+ * a real CBlock, calls ApplyBlock on a live (temp) UTXO db, and asserts the
+ * return value.
+ *
+ * MUTATION-KILL PROPERTY (verified manually — see PR notes): the duplicate txs
+ * are INPUT-LESS non-coinbase transactions, so ApplyBlock's input-spending path
+ * is a no-op for them. The ONLY thing that rejects the dup-txid block is the
+ * guard. With the guard removed, ApplyBlock processes both identical txs without
+ * error and returns TRUE — so this assertion flips to a hard failure. The
+ * unique-txid positive control proves the fixture itself lets ApplyBlock succeed,
+ * i.e. a `false` on the dup block is attributable to the guard and not to some
+ * incidental setup failure.
  */
 BOOST_AUTO_TEST_CASE(cve_2012_2459_connect_path_dup_txid_detected) {
-    CTransactionRef tx1 = MakeTx(0x42);
-    CTransactionRef tx1_copy = MakeTx(0x42);   // byte-identical => same txid
-    CTransactionRef tx2 = MakeTx(0x99);        // distinct => different txid
+    // Sanity: byte-identical txs collide on txid; distinct fills do not.
+    CTransactionRef probe_a = MakeInputlessTx(0x42);
+    CTransactionRef probe_a_copy = MakeInputlessTx(0x42);
+    CTransactionRef probe_b = MakeInputlessTx(0x99);
+    BOOST_REQUIRE(probe_a->GetHash() == probe_a_copy->GetHash());
+    BOOST_REQUIRE(probe_a->GetHash() != probe_b->GetHash());
 
-    // Same construction the ApplyBlock guard uses: insert txids into a set and
-    // reject on the first collision.
-    BOOST_CHECK(tx1->GetHash() == tx1_copy->GetHash());
-    BOOST_CHECK(tx1->GetHash() != tx2->GetHash());
+    UtxoTempDir td("dup-txid");
+    CUTXOSet utxo;
+    BOOST_REQUIRE_MESSAGE(utxo.Open(td.str(), true),
+        "must open a temp UTXO db to drive the real ApplyBlock guard");
 
-    std::set<uint256> seen;
-    std::vector<CTransactionRef> block_txs{tx1, tx1_copy, tx2};
-    bool duplicate_found = false;
-    for (const auto& tx : block_txs) {
-        if (!seen.insert(tx->GetHash()).second) {
-            duplicate_found = true;
-            break;
-        }
+    // --- Positive control: a unique-txid block is ACCEPTED. -----------------
+    // coinbase-shaped tx at slot 0 + one distinct input-less tx. Proves the
+    // fixture lets ApplyBlock reach success, so the dup-block rejection below is
+    // the guard's doing, not a broken setup.
+    {
+        std::vector<CTransactionRef> unique_txs{
+            MakeCoinbaseLikeTx(0x11), MakeInputlessTx(0x22)};
+        CBlock unique_block = MakeBlockFromTxs(unique_txs);
+        uint256 hashU = MakeDistinctBlockHash(0x01);
+        BOOST_CHECK_MESSAGE(utxo.ApplyBlock(unique_block, /*height=*/1, hashU),
+            "unique-txid block must be ACCEPTED by ApplyBlock (positive control)");
     }
-    BOOST_CHECK_MESSAGE(duplicate_found,
-        "Connect-path guard must flag the duplicate-txid block (CVE-2012-2459)");
 
-    // A block of only-unique txids is NOT flagged.
-    std::set<uint256> seen2;
-    std::vector<CTransactionRef> unique_txs{tx1, tx2};
-    bool dup_in_unique = false;
-    for (const auto& tx : unique_txs) {
-        if (!seen2.insert(tx->GetHash()).second) { dup_in_unique = true; break; }
+    // --- The CVE shape: a block with two SAME-txid txs is REJECTED. ---------
+    // [coinbase, txX, txX] — txX byte-identical twice => same txid. The guard
+    // fires on the second copy. Because txX is input-less, removing the guard
+    // would make ApplyBlock succeed (mutation-kill isolation).
+    {
+        CTransactionRef dupTx = MakeInputlessTx(0x55);
+        CTransactionRef dupTx_copy = MakeInputlessTx(0x55);  // same bytes => same txid
+        BOOST_REQUIRE(dupTx->GetHash() == dupTx_copy->GetHash());
+
+        std::vector<CTransactionRef> dup_txs{
+            MakeCoinbaseLikeTx(0x33), dupTx, dupTx_copy};
+        CBlock dup_block = MakeBlockFromTxs(dup_txs);
+        uint256 hashD = MakeDistinctBlockHash(0x02);
+        BOOST_CHECK_MESSAGE(!utxo.ApplyBlock(dup_block, /*height=*/2, hashD),
+            "duplicate-txid block must be REJECTED by the ApplyBlock guard "
+            "(CVE-2012-2459); if this passes with the guard present but the "
+            "test still succeeds after the guard is deleted, the test is not "
+            "load-bearing");
     }
-    BOOST_CHECK_MESSAGE(!dup_in_unique, "Unique-txid block must not be flagged");
 }
 
 // ============================================================================
