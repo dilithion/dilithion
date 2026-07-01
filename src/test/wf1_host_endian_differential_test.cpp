@@ -16,10 +16,16 @@
 //   2. calls the NEW production serializer, and
 //   3. asserts new_bytes == old_bytes across several representative inputs.
 //
-// It ALSO asserts the DIL mainnet genesis block hash is byte-identical to the
-// frozen genesis-hash constant in chainparams.cpp, both at the 80-byte header
-// preimage level (airtight: RandomX is a pure function of these bytes) and at
-// the full RandomX-hash level (end-to-end).
+// It ALSO asserts BOTH frozen genesis hashes are byte-identical to their
+// constants in chainparams.cpp:
+//   - DIL mainnet (legacy/RandomX, 80-byte header): 80-byte preimage byte-
+//     equality (airtight: RandomX is a pure function of these bytes) + the full
+//     RandomX-hash end-to-end.
+//   - DilV (VDF/SHA3, 144-byte header): 144-byte preimage byte-equality (incl.
+//     the 64-byte VDF extension) + the full SHA3-256 hash end-to-end. The DilV
+//     block is fully constructible in-process (hardcoded VDF proof, checked-in
+//     prefund, pure SHA3 with no key init), so the full-hash assertion is
+//     feasible without a nonce search.
 //
 // This is a STANDALONE program (its own main, returns non-zero on any failure),
 // deliberately NOT wired into the Boost suite so it can run in isolation with a
@@ -466,6 +472,68 @@ int main() {
         } else {
             g_failures++;
             printf("  [FAIL] %-28s CHAIN-SPLIT: genesis hash CHANGED\n", "GENESIS hash");
+            printf("         computed: %s\n", computed.c_str());
+            printf("         frozen:   %s\n", frozen.c_str());
+        }
+
+        delete g_chainParams; g_chainParams = nullptr;
+    }
+
+    // ---- GENESIS HASH UNCHANGED (DilV / VDF genesis) ----
+    // Belt-and-suspenders for the WF-1 endian fix on the OTHER genesis-critical
+    // surface: the DilV chain's genesis is a v4 VDF block, so its header carries
+    // the 64-byte VDF extension on top of the 80-byte legacy portion, and its
+    // hash is SHA3-256 of the full 144-byte header (NOT RandomX). We assert both
+    // the header preimage bytes AND the full hash are unchanged after the fix.
+    //
+    // The full-hash assertion IS feasible here (unlike a mined RandomX genesis
+    // that would need a nonce search) because the DilV VDF proof/output are
+    // hardcoded in CreateDilVGenesisBlock(), the prefund set is a checked-in
+    // .inc, and SHA3-256 is a pure function with no key/VM init — so the block
+    // is fully constructible in-process and the hash is deterministic.
+    printf("\nGENESIS-HASH-UNCHANGED proof (DilV / VDF genesis)\n");
+    {
+        g_chainParams = new ChainParams(ChainParams::DilV());
+        const std::string frozen = g_chainParams->genesisHash;  // chainparams.cpp:428
+
+        CBlock genesis = Genesis::CreateDilVGenesisBlock();
+
+        // Sanity: this must actually be a VDF (v4) block, else the VDF-extension
+        // bytes below would be silently skipped and the check would be vacuous.
+        g_checks++;
+        if (genesis.nVersion == CBlockHeader::VDF_VERSION && genesis.IsVDFBlock()) {
+            printf("  [PASS] %-28s is a VDF (v4) block\n", "DILV genesis");
+        } else {
+            g_failures++;
+            printf("  [FAIL] %-28s NOT a VDF block (nVersion=%d) — check vacuous\n",
+                   "DILV genesis", genesis.nVersion);
+        }
+
+        // (a) Airtight: the full 144-byte header preimage the hash consumes
+        //     (80-byte legacy portion incl. the WF-1 endian sites + 64-byte VDF
+        //     extension) must be byte-identical to the old host-endian
+        //     construction. SHA3 is a pure function of these bytes, so identical
+        //     bytes => identical hash. old_block_serialize_header() reproduces
+        //     the pre-WF-1 emission including the VDF extension for v>=4.
+        std::vector<uint8_t> newPre = genesis.SerializeHeader();
+        std::vector<uint8_t> oldPre = old_block_serialize_header(genesis);
+        expect_eq_bytes("DILV GENESIS preimage", "144-byte VDF header", newPre, oldPre);
+        g_checks++;
+        if (newPre.size() == 144) {
+            printf("  [PASS] %-28s preimage is 144 bytes (VDF/SHA3)\n", "DILV GENESIS preimage");
+        } else { g_failures++; printf("  [FAIL] DILV GENESIS preimage size=%zu (expected 144)\n", newPre.size()); }
+
+        // (b) End-to-end: compute the actual SHA3-256 genesis hash and compare
+        //     to the frozen constant. No RandomX key/VM init needed for VDF blocks.
+        genesis.InvalidateCache();
+        std::string computed = genesis.GetHash().GetHex();
+
+        g_checks++;
+        if (computed == frozen) {
+            printf("  [PASS] %-28s %s == frozen constant\n", "DILV GENESIS hash", computed.c_str());
+        } else {
+            g_failures++;
+            printf("  [FAIL] %-28s CHAIN-SPLIT: DilV genesis hash CHANGED\n", "DILV GENESIS hash");
             printf("         computed: %s\n", computed.c_str());
             printf("         frozen:   %s\n", frozen.c_str());
         }
