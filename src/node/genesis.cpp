@@ -272,16 +272,16 @@ static void SerializeBlockHeader(const CBlock& block, uint32_t nonce, std::vecto
     data.reserve(80);
 
     // version (4) + prevBlock (32) + merkleRoot (32) + time (4) + bits (4) + nonce (4) = 80
-    const uint8_t* versionBytes = reinterpret_cast<const uint8_t*>(&block.nVersion);
-    data.insert(data.end(), versionBytes, versionBytes + 4);
+    // WF-1: explicit little-endian for the four 32-bit scalars, byte-identical to
+    // CBlockHeader::SerializeHeader() (the canonical serializer) for a legacy
+    // (v1) block. This helper is the offline genesis-mining hasher; it must emit
+    // the same 80 bytes the validator's GetHash() path consumes.
+    AppendLE32(data, static_cast<uint32_t>(block.nVersion));
     data.insert(data.end(), block.hashPrevBlock.begin(), block.hashPrevBlock.end());
     data.insert(data.end(), block.hashMerkleRoot.begin(), block.hashMerkleRoot.end());
-    const uint8_t* timeBytes = reinterpret_cast<const uint8_t*>(&block.nTime);
-    data.insert(data.end(), timeBytes, timeBytes + 4);
-    const uint8_t* bitsBytes = reinterpret_cast<const uint8_t*>(&block.nBits);
-    data.insert(data.end(), bitsBytes, bitsBytes + 4);
-    const uint8_t* nonceBytes = reinterpret_cast<const uint8_t*>(&nonce);
-    data.insert(data.end(), nonceBytes, nonceBytes + 4);
+    AppendLE32(data, block.nTime);
+    AppendLE32(data, block.nBits);
+    AppendLE32(data, nonce);
 }
 
 void MineWorker(int threadId, int numThreads, const CBlock& templateBlock, const uint256& target) {

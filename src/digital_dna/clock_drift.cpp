@@ -1,4 +1,5 @@
 #include "clock_drift.h"
+#include "dna_serialize.h"  // WF-1: explicit-LE consensus serialization helpers
 
 #include <algorithm>
 #include <cmath>
@@ -239,16 +240,18 @@ std::string ClockDriftFingerprint::to_json() const {
 std::vector<uint8_t> ClockDriftFingerprint::serialize() const {
     // Serialize derived metrics only (not raw samples)
     // 3 doubles (24) + 2 uint64 (16) + 2 uint32 (8) = 48 bytes
+    // WF-1: explicit little-endian (byte-identical on LE hosts to the previous
+    // memcpy copies; portable across architectures).
     std::vector<uint8_t> data(48);
     size_t offset = 0;
 
-    std::memcpy(data.data() + offset, &drift_rate_ppm, 8); offset += 8;
-    std::memcpy(data.data() + offset, &drift_stability, 8); offset += 8;
-    std::memcpy(data.data() + offset, &jitter_signature, 8); offset += 8;
-    std::memcpy(data.data() + offset, &observation_start, 8); offset += 8;
-    std::memcpy(data.data() + offset, &observation_end, 8); offset += 8;
-    std::memcpy(data.data() + offset, &num_reference_peers, 4); offset += 4;
-    std::memcpy(data.data() + offset, &num_samples, 4); offset += 4;
+    dna_le::set_double(data.data() + offset, drift_rate_ppm); offset += 8;
+    dna_le::set_double(data.data() + offset, drift_stability); offset += 8;
+    dna_le::set_double(data.data() + offset, jitter_signature); offset += 8;
+    dna_le::set_u64(data.data() + offset, observation_start); offset += 8;
+    dna_le::set_u64(data.data() + offset, observation_end); offset += 8;
+    dna_le::set_u32(data.data() + offset, num_reference_peers); offset += 4;
+    dna_le::set_u32(data.data() + offset, num_samples); offset += 4;
 
     return data;
 }
@@ -257,14 +260,15 @@ ClockDriftFingerprint ClockDriftFingerprint::deserialize(const std::vector<uint8
     ClockDriftFingerprint fp;
     if (data.size() < 48) return fp;
 
+    // WF-1: explicit little-endian reads, matched to serialize() above.
     size_t offset = 0;
-    std::memcpy(&fp.drift_rate_ppm, data.data() + offset, 8); offset += 8;
-    std::memcpy(&fp.drift_stability, data.data() + offset, 8); offset += 8;
-    std::memcpy(&fp.jitter_signature, data.data() + offset, 8); offset += 8;
-    std::memcpy(&fp.observation_start, data.data() + offset, 8); offset += 8;
-    std::memcpy(&fp.observation_end, data.data() + offset, 8); offset += 8;
-    std::memcpy(&fp.num_reference_peers, data.data() + offset, 4); offset += 4;
-    std::memcpy(&fp.num_samples, data.data() + offset, 4); offset += 4;
+    fp.drift_rate_ppm = dna_le::get_double(data.data() + offset); offset += 8;
+    fp.drift_stability = dna_le::get_double(data.data() + offset); offset += 8;
+    fp.jitter_signature = dna_le::get_double(data.data() + offset); offset += 8;
+    fp.observation_start = dna_le::get_u64(data.data() + offset); offset += 8;
+    fp.observation_end = dna_le::get_u64(data.data() + offset); offset += 8;
+    fp.num_reference_peers = dna_le::get_u32(data.data() + offset); offset += 4;
+    fp.num_samples = dna_le::get_u32(data.data() + offset); offset += 4;
 
     return fp;
 }

@@ -423,8 +423,13 @@ void CMiningController::MiningWorker(uint32_t threadId) {
             // Format: version(4) + prevBlock(32) + merkleRoot(32) + time(4) + bits(4) + nonce(4)
             size_t offset = 0;
 
+            // WF-1: explicit little-endian for the four 32-bit scalars so the
+            // miner produces byte-identical PoW input to the validator's
+            // CBlockHeader::SerializeHeader(). Byte-identical to the previous
+            // host-endian memcpy on LE hosts.
+
             // Version (4 bytes)
-            std::memcpy(header + offset, &currentBlock.nVersion, 4);
+            WriteLE32(header + offset, static_cast<uint32_t>(currentBlock.nVersion));
             offset += 4;
 
             // Previous block hash (32 bytes)
@@ -436,11 +441,11 @@ void CMiningController::MiningWorker(uint32_t threadId) {
             offset += 32;
 
             // Time (4 bytes)
-            std::memcpy(header + offset, &currentBlock.nTime, 4);
+            WriteLE32(header + offset, currentBlock.nTime);
             offset += 4;
 
             // Difficulty bits (4 bytes)
-            std::memcpy(header + offset, &currentBlock.nBits, 4);
+            WriteLE32(header + offset, currentBlock.nBits);
             offset += 4;
 
             // Nonce will be updated in hot loop (last 4 bytes at offset 76)
@@ -456,7 +461,7 @@ void CMiningController::MiningWorker(uint32_t threadId) {
         // BUG #24 FIX: Fast nonce update (only 4 bytes, no allocations)
         // Update nonce in place at offset 76 (last 4 bytes of 80-byte header)
         uint32_t nonce32 = static_cast<uint32_t>(nonce64 & 0xFFFFFFFF);
-        std::memcpy(header + 76, &nonce32, 4);
+        WriteLE32(header + 76, nonce32);  // WF-1: explicit LE, byte-equal on LE hosts
 
         // Compute RandomX hash
         try {

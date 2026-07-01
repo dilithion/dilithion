@@ -468,6 +468,16 @@ genesis_gen: $(CORE_OBJECTS) $(OBJ_DIR)/test/genesis_test.o $(DILITHIUM_OBJECTS)
 	@$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS) $(LIBS)
 	@echo "$(COLOR_GREEN)✓ genesis_gen built successfully$(COLOR_RESET)"
 
+# WF-1 host-endian differential / byte-equality test (CONSENSUS SAFETY PROOF).
+# Asserts the 9 explicit-LE serialization sites are byte-identical to the old
+# host-endian bytes on this (LE) machine, and that the DIL genesis hash is
+# unchanged (both at the 80-byte header preimage and the full RandomX hash).
+# Links the full CORE_OBJECTS the same way genesis_gen does.
+wf1_host_endian_differential_test: $(CORE_OBJECTS) $(OBJ_DIR)/test/wf1_host_endian_differential_test.o $(DILITHIUM_OBJECTS) $(CHIAVDF_OBJECTS) | libzmq
+	@echo "$(COLOR_BLUE)[LINK]$(COLOR_RESET) $@"
+	@$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS) $(LIBS)
+	@echo "$(COLOR_GREEN)✓ wf1_host_endian_differential_test built successfully$(COLOR_RESET)"
+
 inspect_db: $(CORE_OBJECTS) $(OBJ_DIR)/tools/inspect_db.o $(DILITHIUM_OBJECTS) $(CHIAVDF_OBJECTS)
 	@echo "$(COLOR_BLUE)[LINK]$(COLOR_RESET) $@"
 	@$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS) $(LIBS)
