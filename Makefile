@@ -495,7 +495,7 @@ dilv-genesis-vdf: $(CORE_OBJECTS) $(OBJ_DIR)/tools/dilv_genesis_vdf.o $(DILITHIU
 # Test Binaries
 # ============================================================================
 
-tests: phase1_test miner_tests wallet_tests rpc_tests rpc_auth_tests rpc_host_header_tests http_server_wallet_gate_tests ratelimiter_tests timestamp_tests crypter_tests seed_attestation_key_tests wallet_encryption_integration_tests wallet_persistence_tests integration_tests net_tests connman_tests tx_validation_tests tx_relay_tests mining_integration_tests bug_003_block_size_tests dfmp_mik_tests dfmp_heat_overflow_tests mik_registration_persistence_tests dna_propagation_tests test_passphrase_validator script_tests addrman_v2_tests peer_scorer_tests peer_scorer_banman_integration_tests header_proof_checker_tests chain_selector_tests getchaintips_equivalence_tests chain_case_2_5_equivalence_tests chain_work_smoke_tests reorg_wal_crash_injection_tests competing_sibling_below_checkpoint_tests headers_manager_to_chain_selector_wiring_tests fast_path_2_boundary_tests v4_1_checkpoint_enforcement_tests v4_1_chain_selector_suppression_tests auto_rebuild_marker_mode_symmetry_tests add_block_index_flag_merge_tests port_chain_selector_invariants_tests legacy_vs_port_differential_tests chainstate_integrity_tests
+tests: phase1_test miner_tests wallet_tests rpc_tests rpc_auth_tests rpc_host_header_tests http_server_wallet_gate_tests ratelimiter_tests timestamp_tests crypter_tests seed_attestation_key_tests wallet_encryption_integration_tests wallet_persistence_tests integration_tests net_tests connman_tests tx_validation_tests tx_relay_tests mining_integration_tests bug_003_block_size_tests dfmp_mik_tests dfmp_heat_overflow_tests mik_registration_persistence_tests dna_propagation_tests test_passphrase_validator script_tests genesis_freeze_kats addrman_v2_tests peer_scorer_tests peer_scorer_banman_integration_tests header_proof_checker_tests chain_selector_tests getchaintips_equivalence_tests chain_case_2_5_equivalence_tests chain_work_smoke_tests reorg_wal_crash_injection_tests competing_sibling_below_checkpoint_tests headers_manager_to_chain_selector_wiring_tests fast_path_2_boundary_tests v4_1_checkpoint_enforcement_tests v4_1_chain_selector_suppression_tests auto_rebuild_marker_mode_symmetry_tests add_block_index_flag_merge_tests port_chain_selector_invariants_tests legacy_vs_port_differential_tests chainstate_integrity_tests
 	@echo "$(COLOR_GREEN)✓ All tests built successfully$(COLOR_RESET)"
 
 phase1_test: $(CORE_OBJECTS) $(OBJ_DIR)/test/phase1_simple_test.o $(DILITHIUM_OBJECTS) $(CHIAVDF_OBJECTS)
@@ -636,6 +636,13 @@ script_tests: $(CORE_OBJECTS) $(OBJ_DIR)/test/script_tests.o $(DILITHIUM_OBJECTS
 	@echo "$(COLOR_BLUE)[LINK]$(COLOR_RESET) $@"
 	@$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS) $(LIBS)
 	@echo "$(COLOR_GREEN)✓ script_tests built successfully$(COLOR_RESET)"
+
+# Genesis-freeze Known-Answer Tests (VDF challenge preimage + opcode semantics).
+# Freeze-drift tripwire — asserts current byte-level behavior, no logic change.
+genesis_freeze_kats: $(CORE_OBJECTS) $(OBJ_DIR)/test/genesis_freeze_kats.o $(DILITHIUM_OBJECTS) $(CHIAVDF_OBJECTS)
+	@echo "$(COLOR_BLUE)[LINK]$(COLOR_RESET) $@"
+	@$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS) $(LIBS)
+	@echo "$(COLOR_GREEN)✓ genesis_freeze_kats built successfully$(COLOR_RESET)"
 
 addrman_v2_tests: $(CORE_OBJECTS) $(OBJ_DIR)/test/addrman_v2_tests.o $(DILITHIUM_OBJECTS) $(CHIAVDF_OBJECTS)
 	@echo "$(COLOR_BLUE)[LINK]$(COLOR_RESET) $@"
@@ -1088,6 +1095,9 @@ test: tests test_dilithion asert_test
 	@echo ""
 	@echo "$(COLOR_YELLOW)Running Phase 6 script system tests...$(COLOR_RESET)"
 	@./script_tests
+	@echo ""
+	@echo "$(COLOR_YELLOW)Running genesis-freeze KATs...$(COLOR_RESET)"
+	@./genesis_freeze_kats
 	@echo ""
 	@echo "$(COLOR_GREEN)✓ All test suites complete$(COLOR_RESET)"
 
