@@ -949,6 +949,7 @@ BOOST_TEST_OBJECTS := $(OBJ_DIR)/test/test_dilithion.o \
 	$(OBJ_DIR)/test/utxo_tests.o \
 	$(OBJ_DIR)/test/tx_validation_tests.o \
 	$(OBJ_DIR)/test/phase4_5_consensus_fixes_tests.o \
+	$(OBJ_DIR)/test/sighash_preimage_tests.o \
 	$(OBJ_DIR)/test/ibd_coordinator_tests.o \
 	$(OBJ_DIR)/test/misbehavior_scoring_tests.o \
 	$(OBJ_DIR)/test/ibd_functional_tests.o \
