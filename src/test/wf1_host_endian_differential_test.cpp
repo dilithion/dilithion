@@ -89,22 +89,6 @@ static std::vector<uint8_t> old_genesis_serialize_header(const CBlock& block, ui
     return data;
 }
 
-// A2 genesis.cpp SerializeBlockHeader (legacy 80-byte mining helper), NEW form.
-// The production helper is file-static in genesis.cpp; this mirrors its exact
-// emission (AppendLE32 for the four scalars). It is NOT relied on alone — it is
-// asserted byte-equal to the canonical A1 SerializeHeader() below, which IS
-// production, so the mirror is anchored to production.
-static std::vector<uint8_t> new_genesis_serialize_header(const CBlock& block, uint32_t nonce) {
-    std::vector<uint8_t> data;
-    AppendLE32(data, static_cast<uint32_t>(block.nVersion));
-    data.insert(data.end(), block.hashPrevBlock.begin(), block.hashPrevBlock.end());
-    data.insert(data.end(), block.hashMerkleRoot.begin(), block.hashMerkleRoot.end());
-    AppendLE32(data, block.nTime);
-    AppendLE32(data, block.nBits);
-    AppendLE32(data, nonce);
-    return data;
-}
-
 // A3-FillShortTxIDSelector: the 88-byte SHA3 preimage, OLD host-endian form.
 static std::vector<uint8_t> old_a3_selector_preimage(const CBlockHeader& header, uint64_t nonce) {
     std::vector<uint8_t> data(88);
@@ -179,6 +163,11 @@ static const std::vector<HV> kHvs = {
     {4, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu},   // VDF, all-ones
     {4, 0x01020304u, 0xdeadbeefu, 0x12345678u},   // VDF, mixed
     {1, 0x80000000u, 0x00ff00ffu, 0x0000abcdu},
+    // Negative int32 nVersion: exercises the two's-complement cast path
+    // (static_cast<uint32_t>(int32) in AppendLE32) rather than only reasoning
+    // about it. -1 => 0xFFFFFFFF; also below VDF_VERSION so stays legacy 80-byte.
+    {-1, 0x0a0b0c0du, 0x11223344u, 0x55667788u},
+    {(int32_t)0x80000000, 0x01020304u, 0x0f0f0f0fu, 0xa5a5a5a5u}, // INT32_MIN
 };
 
 // ===========================================================================
@@ -194,18 +183,23 @@ BOOST_AUTO_TEST_CASE(a1_block_serialize_header) {
     }
 }
 
-// A2: genesis mining helper (legacy 80-byte). new==old AND new==A1 canonical
-// (miner and validator agree byte-for-byte). A2 is anchored to production via A1.
+// A2: PRODUCTION-DRIVING. Genesis::SerializeBlockHeader() is the REAL offline
+// genesis-mining hasher (now exposed, non-static). We drive it directly and
+// assert (i) byte-equal to the old host-endian genesis emission, and (ii)
+// byte-equal to the canonical A1 SerializeHeader() for the same legacy header
+// (miner and validator agree byte-for-byte). A future endian drift in the
+// production genesis hasher now fails CI — no hand-copied mirror is trusted.
 BOOST_AUTO_TEST_CASE(a2_genesis_serialize_header) {
     for (const auto& x : kHvs) {
         CBlockHeader legacy = make_header(x.v, x.t, x.bits, x.nonce, false);
         legacy.nVersion = 1; legacy.nNonce = x.nonce;
         CBlock gb; static_cast<CBlockHeader&>(gb) = legacy;
 
-        std::vector<uint8_t> newA2 = new_genesis_serialize_header(gb, x.nonce);
-        BOOST_CHECK(newA2 == old_genesis_serialize_header(gb, x.nonce));
-        // Anchor to production: A2 helper == canonical A1 legacy serialization.
-        BOOST_CHECK(newA2 == legacy.SerializeHeader());
+        std::vector<uint8_t> prodA2;
+        Genesis::SerializeBlockHeader(gb, x.nonce, prodA2);  // REAL production helper
+        BOOST_CHECK(prodA2 == old_genesis_serialize_header(gb, x.nonce));
+        // Anchor to canonical validator serialization: A2 == A1.
+        BOOST_CHECK(prodA2 == legacy.SerializeHeader());
     }
 }
 
@@ -305,6 +299,12 @@ BOOST_AUTO_TEST_CASE(a4_controller_header_production_driving) {
 // ===========================================================================
 // FAMILY C — VDF challenge preimage.
 // ===========================================================================
+// C1: PRODUCTION-DRIVING. ComputeVDFChallenge() builds the 56-byte preimage
+// internally then SHA3-256's it (the raw preimage is not exposed). We drive the
+// REAL production function and assert its challenge equals SHA3-256 over the OLD
+// host-endian preimage. A future endian drift in the production emitter changes
+// the challenge and fails CI. (The new==old mirror check is retained as a cheap
+// byte-layout document, but the production assertion is what's load-bearing.)
 BOOST_AUTO_TEST_CASE(c1_vdf_preimage) {
     uint256 prev;
     for (int i = 0; i < 32; i++) prev.data[i] = static_cast<uint8_t>(0x33 + i);
@@ -312,7 +312,16 @@ BOOST_AUTO_TEST_CASE(c1_vdf_preimage) {
     for (int i = 0; i < 20; i++) addr[i] = static_cast<uint8_t>(0xA0 + i);
     std::vector<int> heights = {0, 1, 40000, 0x00FF00FF, 0x7FFFFFFF, (int)0xFFFFFFFF};
     for (int hgt : heights) {
-        BOOST_CHECK(new_c1_vdf_preimage(prev, hgt, addr) == old_c1_vdf_preimage(prev, hgt, addr));
+        // Documentary: new host-independent preimage == old host-endian preimage.
+        std::vector<uint8_t> oldPre = old_c1_vdf_preimage(prev, hgt, addr);
+        BOOST_CHECK(new_c1_vdf_preimage(prev, hgt, addr) == oldPre);
+
+        // Load-bearing: the REAL production emitter's challenge equals SHA3-256
+        // over the old host-endian preimage.
+        std::array<uint8_t, 32> expected{};
+        SHA3_256(oldPre.data(), oldPre.size(), expected.data());
+        std::array<uint8_t, 32> prod = ComputeVDFChallenge(prev, hgt, addr);
+        BOOST_CHECK(prod == expected);
     }
 }
 
@@ -431,9 +440,25 @@ BOOST_AUTO_TEST_CASE(b4_bandwidth_proof) {
 // ===========================================================================
 // GENESIS HASH UNCHANGED — DIL mainnet (legacy/RandomX, 80-byte header).
 // ===========================================================================
+
+// RAII scope-guard: installs a fresh g_chainParams and restores + frees the
+// previous one in its destructor, so a BOOST_REQUIRE/BOOST_CHECK throw inside a
+// genesis test cannot skip the restore and poison the rest of the suite.
+struct ChainParamsGuard {
+    ChainParams* saved;
+    explicit ChainParamsGuard(ChainParams* fresh) : saved(g_chainParams) {
+        g_chainParams = fresh;  // takes ownership of `fresh`
+    }
+    ~ChainParamsGuard() {
+        delete g_chainParams;   // free the fresh params installed above
+        g_chainParams = saved;  // restore the previous global
+    }
+    ChainParamsGuard(const ChainParamsGuard&) = delete;
+    ChainParamsGuard& operator=(const ChainParamsGuard&) = delete;
+};
+
 BOOST_AUTO_TEST_CASE(genesis_dil_mainnet_unchanged) {
-    ChainParams* saved = g_chainParams;
-    g_chainParams = new ChainParams(ChainParams::Mainnet());
+    ChainParamsGuard guard(new ChainParams(ChainParams::Mainnet()));
     const std::string frozen = g_chainParams->genesisHash;  // chainparams.cpp constant
 
     CBlock genesis = Genesis::CreateGenesisBlock();
@@ -446,23 +471,22 @@ BOOST_AUTO_TEST_CASE(genesis_dil_mainnet_unchanged) {
     BOOST_CHECK_EQUAL(newPre.size(), 80u);
 
     // (b) End-to-end: compute the actual RandomX genesis hash vs frozen constant.
+    // Arg 3 = light_mode: 1 => light mode (256 MB cache, no 2GB+ dataset). The
+    // RandomX hash is a pure function of the key + input; light vs full mode
+    // produce the identical hash, so this must match the frozen constant.
     const char* rx_key = "Dilithion-RandomX-v1";
-    randomx_init_for_hashing(rx_key, strlen(rx_key), 0);  // light init
+    randomx_init_for_hashing(rx_key, strlen(rx_key), 1);  // light init (arg3=1)
     genesis.InvalidateCache();
     std::string computed = genesis.GetHash().GetHex();
     BOOST_CHECK_MESSAGE(computed == frozen,
         "DIL genesis hash CHANGED (chain split): computed=" << computed << " frozen=" << frozen);
-
-    delete g_chainParams;
-    g_chainParams = saved;
 }
 
 // ===========================================================================
 // GENESIS HASH UNCHANGED — DilV (VDF/SHA3, 144-byte header).
 // ===========================================================================
 BOOST_AUTO_TEST_CASE(genesis_dilv_unchanged) {
-    ChainParams* saved = g_chainParams;
-    g_chainParams = new ChainParams(ChainParams::DilV());
+    ChainParamsGuard guard(new ChainParams(ChainParams::DilV()));
     const std::string frozen = g_chainParams->genesisHash;
 
     CBlock genesis = Genesis::CreateDilVGenesisBlock();
@@ -484,9 +508,6 @@ BOOST_AUTO_TEST_CASE(genesis_dilv_unchanged) {
     std::string computed = genesis.GetHash().GetHex();
     BOOST_CHECK_MESSAGE(computed == frozen,
         "DilV genesis hash CHANGED (chain split): computed=" << computed << " frozen=" << frozen);
-
-    delete g_chainParams;
-    g_chainParams = saved;
 }
 
 BOOST_AUTO_TEST_SUITE_END()

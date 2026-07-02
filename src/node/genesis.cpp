@@ -266,8 +266,10 @@ static std::mutex g_resultMutex;
 static uint32_t g_winningNonce = 0;
 static uint256 g_winningHash;
 
-// Serialize block header to 80 bytes (for thread-safe hashing)
-static void SerializeBlockHeader(const CBlock& block, uint32_t nonce, std::vector<uint8_t>& data) {
+// Serialize block header to 80 bytes (for thread-safe hashing).
+// Exposed (non-static, declared in genesis.h) so the WF-1 byte-equality test can
+// drive the REAL production emitter instead of a hand-copied mirror.
+void SerializeBlockHeader(const CBlock& block, uint32_t nonce, std::vector<uint8_t>& data) {
     data.clear();
     data.reserve(80);
 

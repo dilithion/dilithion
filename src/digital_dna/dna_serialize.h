@@ -20,10 +20,19 @@
 
 #include <cstdint>
 #include <cstring>
+#include <limits>
 #include <vector>
 
 namespace digital_dna {
 namespace dna_le {
+
+// Consensus double serialization reinterprets the double's bit pattern as a
+// uint64 and writes it little-endian. That is only a stable, cross-host
+// consensus encoding if double is IEEE-754 binary64. On an exotic FP host this
+// would silently produce a different dna_hash and split the chain — turn it into
+// a compile error instead.
+static_assert(std::numeric_limits<double>::is_iec559 && sizeof(double) == 8,
+              "consensus double serialization requires IEEE-754 binary64");
 
 // ---- Appending writers (little-endian) ----
 
