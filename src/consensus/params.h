@@ -257,9 +257,16 @@ static const int MEDIAN_TIME_SPAN = 11;
  * F-08 safety invariant: a reorg must never be able to un-mature (and thus
  * un-spend) a matured coinbase. The rolling reorg cap must therefore be no
  * deeper than coinbase maturity, i.e. MAX_REORG_DEPTH <= COINBASE_MATURITY.
- * Machine-checked at compile time so any future retune of either constant that
- * would violate the invariant fails the build instead of shipping silently.
- * (See ION_DECISION_REGISTER F-08 / K-08.)
+ *
+ * SCOPE (do NOT over-read this): the static_assert below guards only the
+ * COMPILE-TIME constant (DIL: COINBASE_MATURITY = 100). The check that actually
+ * enforces maturity at runtime reads the PER-CHAIN value
+ * g_chainParams->coinbaseMaturity (e.g. DilV = 6, utxo_set.cpp), which this
+ * assert does NOT cover. On a chain whose runtime maturity is below
+ * MAX_REORG_DEPTH (DilV: 6 < 60), a reorg in the (maturity, cap] window can
+ * still un-spend a matured coinbase — a separate live-chain finding, not caught
+ * here. This assert protects DIL's compile-time invariant only.
+ * (See ION_DECISION_REGISTER F-08 / K-08 + the DilV maturity item.)
  */
 static_assert(MAX_REORG_DEPTH <= COINBASE_MATURITY,
               "F-08 violated: MAX_REORG_DEPTH must be <= COINBASE_MATURITY — "
