@@ -210,6 +210,16 @@ private:
     // is toggled from the const LogOffCanonicalTransition() accessor.
     mutable std::atomic<bool> m_off_canonical_logged{false};
 
+    // Magnet v1a: monotonically counts how many times the edge-trigger in
+    // LogOffCanonicalTransition ACTUALLY emitted (i.e. won the false→true
+    // latch transition). Incremented ONLY on the emit path, so it directly
+    // observes the latch: double-logging within one episode, or a failure to
+    // re-arm, is detectable by the unit test (magnet_canonical_health_tests
+    // M5) that IsOnCanonical() alone cannot see (IsOnCanonical reads the
+    // rebuild flag, not this latch). Observability-only; production never
+    // reads it. mutable: toggled from the const emitter.
+    mutable std::atomic<uint64_t> m_off_canonical_emit_count{0};
+
     // ============================================================
     // Phase 5: TEST-ONLY hooks for Patch B equivalence harness.
     // ============================================================
@@ -400,10 +410,12 @@ public:
 
     /**
      * Magnet v1a: machine-readable reason string, empty when on-canonical.
-     * One of: "" (on-canonical), "depth-rejection" (a better chain exists
-     * beyond MAX_REORG_DEPTH), "work-drift" (a heavier candidate leaf was
-     * not adopted). Mirrors the DepthRejection/ConnectTipFailure/... cause
-     * classes only where they represent an off-best-chain condition.
+     * One of: "" (on-canonical) or "depth-rejection" (a strictly-better chain
+     * exists beyond MAX_REORG_DEPTH that the node cannot auto-switch to — the
+     * node is genuinely stuck behind a better chain). The earlier "work-drift"
+     * reason (a heavier candidate leaf was not adopted) was DROPPED per
+     * red-team MED-1: its unique cases were false-positives (see chain.cpp).
+     * Genuine drift detection is a v2 item (F7 anchored-root).
      */
     std::string OffCanonicalReason() const;
 
@@ -420,6 +432,16 @@ public:
      *                      (< 0 when unknown); local tip height is read here.
      */
     void LogOffCanonicalTransition(const std::string& reason, int64_t best_known_ht) const;
+
+    /**
+     * Magnet v1a TEST OBSERVABILITY: number of times LogOffCanonicalTransition
+     * has actually emitted (won the edge-trigger latch). Lets the unit test
+     * verify exactly-one-emit-per-episode and re-arm — behavior IsOnCanonical()
+     * cannot observe. Not used by production code.
+     */
+    uint64_t OffCanonicalEmitCount() const {
+        return m_off_canonical_emit_count.load(std::memory_order_acquire);
+    }
 
     /**
      * v4.3.3 F10 + F15 (Layer-3 round 3 HIGH-1, 2026-05-04): anchor the
