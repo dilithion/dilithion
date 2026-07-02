@@ -2,6 +2,7 @@
 // Distributed under the MIT software license
 
 #include <consensus/chain.h>
+#include <consensus/params.h>    // Consensus::MAX_REORG_DEPTH (single source of truth)
 #include <consensus/pow.h>
 #include <consensus/reorg_wal.h>  // P1-4: WAL for atomic reorgs
 #include <consensus/validation.h> // BUG #109 FIX: DeserializeBlockTransactions
@@ -840,16 +841,17 @@ bool CChainState::ActivateBestChain(CBlockIndex* pindexNew, const CBlock& block,
     // VULN-008 FIX: Protect against excessively deep reorganizations
     // CID 1675248 FIX: Use int64_t to prevent overflow when computing reorg depth
     // and add validation to ensure reorg_depth is non-negative
-    static const int64_t MAX_REORG_DEPTH = 100;  // Similar to Bitcoin's practical limit
+    // Single source of truth: Consensus::MAX_REORG_DEPTH (consensus/params.h).
+    const int64_t reorg_cap = static_cast<int64_t>(Consensus::MAX_REORG_DEPTH);
     int64_t reorg_depth = static_cast<int64_t>(pindexTip->nHeight) - static_cast<int64_t>(pindexFork->nHeight);
     if (reorg_depth < 0) {
         std::cerr << "[Chain] ERROR: Invalid reorg depth (negative): " << reorg_depth << std::endl;
         std::cerr << "  Tip height: " << pindexTip->nHeight << ", Fork height: " << pindexFork->nHeight << std::endl;
         return false;
     }
-    if (reorg_depth > MAX_REORG_DEPTH) {
+    if (reorg_depth > reorg_cap) {
         std::cerr << "[Chain] ERROR: Reorganization too deep: " << reorg_depth << " blocks" << std::endl;
-        std::cerr << "  Maximum allowed: " << MAX_REORG_DEPTH << " blocks" << std::endl;
+        std::cerr << "  Maximum allowed: " << reorg_cap << " blocks" << std::endl;
         std::cerr << "  This may indicate a long-range attack or network partition" << std::endl;
         return false;
     }
@@ -2764,7 +2766,8 @@ bool CChainState::ActivateBestChainStep(CBlockIndex* pindexMostWork,
     // disconnect list is empty; connect list walks pindexMostWork all the way back.
 
     // 1.5) v4.3.3 F4 (audit modality 1 I2 / modality 2 MEDIUM-6): reorg depth
-    // cap on the port path. Mirrors legacy chain.cpp:780-792 MAX_REORG_DEPTH=100.
+    // cap on the port path. Mirrors the legacy cap using the single-source
+    // Consensus::MAX_REORG_DEPTH (consensus/params.h) — no literal copy here.
     //
     // Pre-fix, the port path's ActivateBestChainStep had no depth check —
     // canary 3 attempted a 441-block reorg unconstrained. The legacy cap
@@ -2794,13 +2797,14 @@ bool CChainState::ActivateBestChainStep(CBlockIndex* pindexMostWork,
     // M1 helper's plumbing is the only path that respects --datadir=PATH
     // (the H1 defect Layer-3 caught on v4.3.2-M1).
     if (pindexTip != nullptr && pindexFork != nullptr) {
-        static const int64_t MAX_REORG_DEPTH = 100;  // matches legacy chain.cpp:780
+        // Single source of truth: Consensus::MAX_REORG_DEPTH (consensus/params.h).
+        const int64_t reorg_cap = static_cast<int64_t>(Consensus::MAX_REORG_DEPTH);
         const int64_t reorg_depth =
             static_cast<int64_t>(pindexTip->nHeight) -
             static_cast<int64_t>(pindexFork->nHeight);
-        if (reorg_depth > MAX_REORG_DEPTH) {
+        if (reorg_depth > reorg_cap) {
             std::cerr << "[Chain] ActivateBestChainStep: reorg depth " << reorg_depth
-                      << " exceeds MAX_REORG_DEPTH=" << MAX_REORG_DEPTH
+                      << " exceeds MAX_REORG_DEPTH=" << reorg_cap
                       << " (tip h=" << pindexTip->nHeight
                       << ", fork h=" << pindexFork->nHeight
                       << "). Dropping candidate (NOT marking failed); flagging "
