@@ -10,6 +10,7 @@
 #include <digital_dna/sample_envelope.h>  // Phase 1.5: SignDNAEnvelope
 #include <rpc/auth.h>  // FIX-011/FIX-012: For SecureCompare
 #include <util/base58.h>
+#include <util/bech32m.h>  // ION: bech32m (BIP350) address encoding (ION-gated)
 #include <node/utxo_set.h>
 #include <node/mempool.h>
 #include <node/blockchain_storage.h>  // BUG #56 FIX: For CBlockchainDB (RescanFromHeight)
@@ -141,14 +142,65 @@ CDilithiumAddress::CDilithiumAddress(const std::vector<uint8_t>& pubkey) {
     // vchData is now 21 bytes (1 + 20)
 }
 
+// ION address encoding is gated on a non-empty per-chain bech32 HRP
+// (ChainParams::bech32Prefix). DIL/DilV/Testnet/Regtest leave it "" and keep
+// Base58Check BYTE-UNCHANGED; only ION ("ion") re-encodes the SAME payload
+// ([version byte, 20-byte hash]) in bech32m (BIP350). This is a pure
+// human-readable re-encoding — the on-chain locking script is untouched.
+namespace {
+// Returns the active chain's bech32 HRP, or "" when the chain uses Base58Check.
+std::string ActiveBech32Prefix() {
+    if (Dilithion::g_chainParams && !Dilithion::g_chainParams->bech32Prefix.empty()) {
+        return Dilithion::g_chainParams->bech32Prefix;
+    }
+    return "";
+}
+} // namespace
+
 std::string CDilithiumAddress::ToString() const {
     if (!IsValid()) {
         return "";
+    }
+    const std::string hrp = ActiveBech32Prefix();
+    if (!hrp.empty()) {
+        // ION path: re-encode the 21-byte payload as bech32m(hrp, 8->5 bits).
+        std::vector<uint8_t> data5;
+        if (!bech32m::ConvertBits(data5, vchData, 8, 5, /*pad=*/true)) {
+            return "";
+        }
+        return bech32m::Encode(hrp, data5);
     }
     return ::EncodeBase58Check(vchData);
 }
 
 bool CDilithiumAddress::SetString(const std::string& str) {
+    const std::string hrp = ActiveBech32Prefix();
+
+    // Auto-detect: on a bech32m chain, a string that starts with "<hrp>1" is
+    // decoded as bech32m; anything else falls through to Base58Check. On a
+    // Base58Check chain (empty hrp) the bech32m branch is never taken, so
+    // DIL/DilV/Testnet parsing is byte-identical to before.
+    if (!hrp.empty() && str.size() > hrp.size() &&
+        str.compare(0, hrp.size(), hrp) == 0 && str[hrp.size()] == '1') {
+        bech32m::DecodeResult dec = bech32m::Decode(str);
+        if (!dec.ok || dec.hrp != hrp) {
+            vchData.clear();
+            return false;
+        }
+        std::vector<uint8_t> payload;
+        if (!bech32m::ConvertBits(payload, dec.data, 5, 8, /*pad=*/false)) {
+            vchData.clear();
+            return false;
+        }
+        // Same payload shape as Base58Check: 1 version byte + 20 hash bytes.
+        if (payload.size() != 21 || payload[0] != 0x1E) {
+            vchData.clear();
+            return false;
+        }
+        vchData = std::move(payload);
+        return true;
+    }
+
     if (!::DecodeBase58Check(str, vchData)) {
         vchData.clear();
         return false;
