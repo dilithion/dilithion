@@ -11,6 +11,7 @@
 #include <cstring>
 #include <iostream>
 #include <atomic>
+#include <set>
 
 // v4.4 (fix/integrity-monitor-self-heal): classify a non-ok leveldb::Status
 // from an undo-record Get() into the (cause, transient) taxonomy the periodic
@@ -587,10 +588,26 @@ bool CUTXOSet::ApplyBlock(const CBlock& block, uint32_t height, const uint256& b
     // Step 3: Process each transaction
     leveldb::WriteBatch batch;
 
+    // CVE-2012-2459 defense-in-depth: explicit duplicate-txid guard on the live
+    // connect path (ApplyBlock runs on every ConnectTip). A block containing two
+    // transactions with the same txid is already rejected incidentally by the
+    // input-not-found check below (the first copy spends+deletes the outpoints,
+    // the second hits GetUTXO -> false), but that closure is incidental. This
+    // makes the rejection explicit and structural. Reject-only: no consensus
+    // rule changes, no accepted-block hash changes.
+    std::set<uint256> seen_txids;
+
     for (size_t tx_idx = 0; tx_idx < transactions.size(); ++tx_idx) {
         const CTransactionRef& tx = transactions[tx_idx];
         bool is_coinbase = (tx_idx == 0);
         uint256 txid = tx->GetHash();
+
+        if (!seen_txids.insert(txid).second) {
+            std::cerr << "[ERROR] CUTXOSet::ApplyBlock: Duplicate transaction in block "
+                      << "(CVE-2012-2459 guard): tx " << tx_idx << " txid "
+                      << txid.GetHex() << std::endl;
+            return false;
+        }
 
         // Step 3a: Spend inputs (skip for coinbase)
         if (!is_coinbase) {

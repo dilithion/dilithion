@@ -4,6 +4,7 @@
 #include <consensus/tx_validation.h>
 #include <consensus/fees.h>
 #include <consensus/signature_batch_verifier.h>  // Phase 3.2: Batch sig verification
+#include <consensus/sighash_preimage.h>
 #include <script/script.h>
 #include <script/interpreter.h>
 #include <crypto/sha3.h>
@@ -748,42 +749,23 @@ bool CTransactionValidator::PrepareSignatureData(const CTransaction& tx, size_t 
         return false;
     }
 
-    // Construct signature message (same as VerifyScript)
-    uint256 tx_hash = tx.GetSigningHash();
-
-    std::vector<uint8_t> sig_message;
-    sig_message.reserve(44);  // hash + index + version + chainID
-
-    sig_message.insert(sig_message.end(), tx_hash.begin(), tx_hash.end());
-
-    // Add input index
-    uint32_t input_idx = static_cast<uint32_t>(inputIdx);
-    sig_message.push_back(static_cast<uint8_t>(input_idx & 0xFF));
-    sig_message.push_back(static_cast<uint8_t>((input_idx >> 8) & 0xFF));
-    sig_message.push_back(static_cast<uint8_t>((input_idx >> 16) & 0xFF));
-    sig_message.push_back(static_cast<uint8_t>((input_idx >> 24) & 0xFF));
-
-    // Add transaction version
-    uint32_t version = tx.nVersion;
-    sig_message.push_back(static_cast<uint8_t>(version & 0xFF));
-    sig_message.push_back(static_cast<uint8_t>((version >> 8) & 0xFF));
-    sig_message.push_back(static_cast<uint8_t>((version >> 16) & 0xFF));
-    sig_message.push_back(static_cast<uint8_t>((version >> 24) & 0xFF));
-
-    // Add chain ID
+    // Construct signature message (same as VerifyScript) via the single-source
+    // builder — byte-identical to the prior open-coded 44-byte form.
     if (Dilithion::g_chainParams == nullptr) {
         error = "Chain parameters not initialized";
         return false;
     }
     uint32_t chain_id = Dilithion::g_chainParams->chainID;
-    sig_message.push_back(static_cast<uint8_t>(chain_id & 0xFF));
-    sig_message.push_back(static_cast<uint8_t>((chain_id >> 8) & 0xFF));
-    sig_message.push_back(static_cast<uint8_t>((chain_id >> 16) & 0xFF));
-    sig_message.push_back(static_cast<uint8_t>((chain_id >> 24) & 0xFF));
+
+    uint256 tx_hash = tx.GetSigningHash();
 
     // Hash the signature message
     message.resize(32);
-    SHA3_256(sig_message.data(), sig_message.size(), message.data());
+    Consensus::ComputeSighash(tx_hash,
+                              static_cast<uint32_t>(inputIdx),
+                              static_cast<uint32_t>(tx.nVersion),
+                              chain_id,
+                              message.data());
 
     return true;
 }

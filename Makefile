@@ -180,6 +180,7 @@ CONSENSUS_SOURCES := src/consensus/fees.cpp \
                      src/consensus/chain_verifier.cpp \
                      src/consensus/tx_validation.cpp \
                      src/consensus/signature_batch_verifier.cpp \
+                     src/consensus/sighash_preimage.cpp \
                      src/consensus/validation.cpp \
                      src/consensus/vdf_validation.cpp \
                      src/consensus/port/chain_selector_impl.cpp
@@ -947,6 +948,8 @@ BOOST_TEST_OBJECTS := $(OBJ_DIR)/test/test_dilithion.o \
 	$(OBJ_DIR)/test/consensus_validation_tests.o \
 	$(OBJ_DIR)/test/utxo_tests.o \
 	$(OBJ_DIR)/test/tx_validation_tests.o \
+	$(OBJ_DIR)/test/phase4_5_consensus_fixes_tests.o \
+	$(OBJ_DIR)/test/sighash_preimage_tests.o \
 	$(OBJ_DIR)/test/ibd_coordinator_tests.o \
 	$(OBJ_DIR)/test/misbehavior_scoring_tests.o \
 	$(OBJ_DIR)/test/ibd_functional_tests.o \
@@ -981,6 +984,14 @@ difficulty_determinism_test: $(OBJ_DIR)/test/difficulty_determinism_test.o $(OBJ
 	@echo "$(COLOR_BLUE)[LINK]$(COLOR_RESET) $@"
 	@$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS) $(LIBS)
 	@echo "$(COLOR_GREEN)✓ Difficulty determinism test built successfully$(COLOR_RESET)"
+
+# Differential byte-equality proof for the single-source sighash preimage.
+# Links only the helper + sha3 + block (uint256) — no full-node dependency.
+# Exit 0 = the refactored builder is byte-equal to the legacy open-coded form.
+sighash_differential_tests: $(OBJ_DIR)/test/sighash_differential_tests.o $(OBJ_DIR)/consensus/sighash_preimage.o $(OBJ_DIR)/crypto/sha3.o $(OBJ_DIR)/crypto/randomx_hash.o $(OBJ_DIR)/primitives/block.o $(DILITHIUM_OBJECTS)
+	@echo "$(COLOR_BLUE)[LINK]$(COLOR_RESET) $@"
+	@$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS) $(LIBS)
+	@echo "$(COLOR_GREEN)✓ Sighash differential test built successfully$(COLOR_RESET)"
 
 eda_test:
 	@echo "$(COLOR_BLUE)[CXX+LINK]$(COLOR_RESET) src/test/eda_test.cpp (standalone)"
@@ -1463,6 +1474,7 @@ FUZZ_CONSENSUS_OBJECTS := $(OBJ_DIR)/consensus/pow.o \
                           $(OBJ_DIR)/consensus/fees.o \
                           $(OBJ_DIR)/consensus/tx_validation.o \
                           $(OBJ_DIR)/consensus/validation.o \
+                          $(OBJ_DIR)/consensus/sighash_preimage.o \
                           $(OBJ_DIR)/consensus/signature_batch_verifier.o
 
 FUZZ_DFMP_OBJECTS := $(OBJ_DIR)/dfmp/dfmp.o \

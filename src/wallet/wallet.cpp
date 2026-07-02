@@ -19,6 +19,7 @@
 #include <consensus/tx_validation.h>
 #include <consensus/fees.h>
 #include <consensus/sighash.h>  // WALLET-015 FIX: SIGHASH types
+#include <consensus/sighash_preimage.h>  // Single-source ML-DSA sighash preimage builder
 #include <consensus/validation.h>  // BUG #112 FIX: For CBlockValidator::DeserializeBlockTransactions
 #include <core/chainparams.h>  // CHAIN-ID FIX: For replay protection
 
@@ -5081,34 +5082,16 @@ bool CWallet::SignTransaction(CTransaction& tx, CUTXOSet& utxo_set, std::string&
 
             // VULN-003 FIX: Create signature message with version
             // CHAIN-ID FIX: Include chain ID to prevent cross-chain replay attacks (EIP-155 style)
-            std::vector<uint8_t> sig_message;
-            sig_message.reserve(32 + 4 + 4 + 4);  // hash + index + version + chainID
-            sig_message.insert(sig_message.end(), tx_hash.begin(), tx_hash.end());
-
-            // Add input index (4 bytes, little-endian)
-            uint32_t input_idx = static_cast<uint32_t>(i);
-            sig_message.push_back(static_cast<uint8_t>(input_idx & 0xFF));
-            sig_message.push_back(static_cast<uint8_t>((input_idx >> 8) & 0xFF));
-            sig_message.push_back(static_cast<uint8_t>((input_idx >> 16) & 0xFF));
-            sig_message.push_back(static_cast<uint8_t>((input_idx >> 24) & 0xFF));
-
-            // Add transaction version
-            sig_message.push_back(static_cast<uint8_t>(version & 0xFF));
-            sig_message.push_back(static_cast<uint8_t>((version >> 8) & 0xFF));
-            sig_message.push_back(static_cast<uint8_t>((version >> 16) & 0xFF));
-            sig_message.push_back(static_cast<uint8_t>((version >> 24) & 0xFF));
-
-            // Add chain ID
-            sig_message.push_back(static_cast<uint8_t>(chain_id & 0xFF));
-            sig_message.push_back(static_cast<uint8_t>((chain_id >> 8) & 0xFF));
-            sig_message.push_back(static_cast<uint8_t>((chain_id >> 16) & 0xFF));
-            sig_message.push_back(static_cast<uint8_t>((chain_id >> 24) & 0xFF));
-
-            // Hash the signature message
+            // Routed through the single-source builder — byte-identical to the
+            // prior open-coded 44-byte form (hash + index + version + chainID).
             SigningData data;
             data.input_index = i;
             data.sig_hash.resize(32);
-            SHA3_256(sig_message.data(), sig_message.size(), data.sig_hash.data());
+            Consensus::ComputeSighash(tx_hash,
+                                      static_cast<uint32_t>(i),
+                                      static_cast<uint32_t>(version),
+                                      chain_id,
+                                      data.sig_hash.data());
             data.scriptPubKey = utxo_entry.out.scriptPubKey;
 
             // Find the key for this address
