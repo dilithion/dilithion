@@ -421,29 +421,14 @@ void CMiningController::MiningWorker(uint32_t threadId) {
         if (needNewTemplate) {
             // Template changed - re-serialize the static parts of header
             // Format: version(4) + prevBlock(32) + merkleRoot(32) + time(4) + bits(4) + nonce(4)
-            size_t offset = 0;
-
-            // Version (4 bytes)
-            std::memcpy(header + offset, &currentBlock.nVersion, 4);
-            offset += 4;
-
-            // Previous block hash (32 bytes)
-            std::memcpy(header + offset, currentBlock.hashPrevBlock.begin(), 32);
-            offset += 32;
-
-            // Merkle root (32 bytes)
-            std::memcpy(header + offset, currentBlock.hashMerkleRoot.begin(), 32);
-            offset += 32;
-
-            // Time (4 bytes)
-            std::memcpy(header + offset, &currentBlock.nTime, 4);
-            offset += 4;
-
-            // Difficulty bits (4 bytes)
-            std::memcpy(header + offset, &currentBlock.nBits, 4);
-            offset += 4;
-
-            // Nonce will be updated in hot loop (last 4 bytes at offset 76)
+            //
+            // WF-1: assemble the 80-byte legacy PoW preimage through the single
+            // canonical helper (WriteMiningHeaderLE), which routes the four 32-bit
+            // scalars through WriteLE32 so the miner's PoW input is byte-identical
+            // to the validator's CBlockHeader::SerializeHeader() on any host. The
+            // nonce field (offset 76) is (re)written per iteration in the hot loop
+            // below; the value passed here is a placeholder that gets overwritten.
+            WriteMiningHeaderLE(header, currentBlock, currentBlock.nNonce);
 
             cachedBlock = currentBlock;
             lastHashTarget = currentHashTarget;
@@ -456,7 +441,7 @@ void CMiningController::MiningWorker(uint32_t threadId) {
         // BUG #24 FIX: Fast nonce update (only 4 bytes, no allocations)
         // Update nonce in place at offset 76 (last 4 bytes of 80-byte header)
         uint32_t nonce32 = static_cast<uint32_t>(nonce64 & 0xFFFFFFFF);
-        std::memcpy(header + 76, &nonce32, 4);
+        WriteLE32(header + 76, nonce32);  // WF-1: explicit LE, byte-equal on LE hosts
 
         // Compute RandomX hash
         try {

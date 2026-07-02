@@ -967,6 +967,7 @@ BOOST_TEST_OBJECTS := $(OBJ_DIR)/test/test_dilithion.o \
 	$(OBJ_DIR)/test/fee_wiring_tests.o \
 	$(OBJ_DIR)/test/zmq_tests.o \
 	$(OBJ_DIR)/test/seed_attestation_glue_tests.o \
+	$(OBJ_DIR)/test/wf1_host_endian_differential_test.o \
 	$(CRYPTO_PROPERTY_OBJECTS)
 
 # Link test objects + full library (CORE_OBJECTS) to avoid hand-picked object drift

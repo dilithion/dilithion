@@ -90,6 +90,20 @@ CBlock CreateDilVGenesisBlock();
 bool MineGenesisBlock(CBlock& block, const uint256& target, int numThreads);
 bool MineGenesisBlock(CBlock& block, const uint256& target);  // Single-threaded overload
 
+/**
+ * Serialize a legacy (80-byte) block header for the offline genesis-mining
+ * hasher, with an externally-supplied nonce.
+ *
+ * WF-1: emits the four 32-bit scalars in explicit little-endian, byte-identical
+ * to CBlockHeader::SerializeHeader() for a legacy (v1) block. Exposed (rather
+ * than file-static) so the WF-1 differential test can drive this real emitter.
+ *
+ * @param block  Block whose header fields are serialized
+ * @param nonce  Nonce to write (overrides block.nNonce in the output)
+ * @param data   Output buffer (cleared, then filled with 80 bytes)
+ */
+void SerializeBlockHeader(const CBlock& block, uint32_t nonce, std::vector<uint8_t>& data);
+
 } // namespace Genesis
 
 #endif // DILITHION_NODE_GENESIS_H

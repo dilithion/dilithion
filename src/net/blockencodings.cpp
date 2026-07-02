@@ -260,13 +260,16 @@ void CBlockHeaderAndShortTxIDs::FillShortTxIDSelector() const
     static_assert(80 + 8 <= HEADER_WITH_NONCE_SIZE, "shortnonce overflow");
 
     // Header serialization (bounds verified at compile time)
-    memcpy(data, &header.nVersion, 4);
+    // WF-1: explicit little-endian for the multi-byte scalars so the SHA3
+    // short-txid selector key is computed identically on every architecture.
+    // Byte-identical to the previous host-endian memcpy on LE hosts.
+    WriteLE32(data, static_cast<uint32_t>(header.nVersion));
     memcpy(data + 4, header.hashPrevBlock.data, 32);
     memcpy(data + 36, header.hashMerkleRoot.data, 32);
-    memcpy(data + 68, &header.nTime, 4);
-    memcpy(data + 72, &header.nBits, 4);
-    memcpy(data + 76, &header.nNonce, 4);
-    memcpy(data + 80, &nonce, 8);
+    WriteLE32(data + 68, header.nTime);
+    WriteLE32(data + 72, header.nBits);
+    WriteLE32(data + 76, header.nNonce);
+    WriteLE64(data + 80, nonce);
 
     // SHA3-256 hash
     uint8_t hash[32];
