@@ -929,8 +929,11 @@ void CWallet::FlushSettledMiningNotificationsUnlocked(int currentHeight) {
             snprintf(rewardStr,  sizeof(rewardStr),  "%.8f", rewardCoins);
             snprintf(balanceStr, sizeof(balanceStr), "%.8f", balanceCoins);
 
+            // ION widen (2026-07): 3-way coin label. DIL/DilV unchanged.
             const char* coinLabel =
-                (Dilithion::g_chainParams && Dilithion::g_chainParams->IsDilV()) ? "DilV" : "DIL";
+                (Dilithion::g_chainParams && Dilithion::g_chainParams->IsDilV()) ? "DilV"
+                : (Dilithion::g_chainParams && Dilithion::g_chainParams->IsIon()) ? "ION"
+                : "DIL";
 
             std::cout << "\n"
                 << "============================================================\n"
@@ -4266,7 +4269,10 @@ bool CWallet::ScanUTXOs(CUTXOSet& global_utxo_set) {
                     utxosFound++;
 
                     {
-                        const char* unitLabel = (Dilithion::g_chainParams && Dilithion::g_chainParams->IsDilV()) ? "volts" : "ions";
+                        // ION widen (2026-07): 3-way subunit label — ION's subunit is "quanta". DIL/DilV unchanged.
+                        const char* unitLabel = (Dilithion::g_chainParams && Dilithion::g_chainParams->IsDilV()) ? "volts"
+                                                : (Dilithion::g_chainParams && Dilithion::g_chainParams->IsIon()) ? "quanta"
+                                                : "ions";
                         std::cout << "[Wallet] Found UTXO: " << outpoint.hash.GetHex().substr(0, 16)
                                   << ":" << outpoint.n << " (" << entry.out.nValue << " " << unitLabel << ")" << std::endl;
                     }

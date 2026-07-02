@@ -1303,7 +1303,9 @@ void CRPCServer::HandleClient(int clientSocket) {
             size_t cp = wallet_html.find(chain_ph);
             if (cp != std::string::npos) {
                 wallet_html.replace(cp, chain_ph.size(),
-                    Dilithion::g_chainParams->IsDilV() ? "dilv" : "dil");
+                    Dilithion::g_chainParams->IsDilV() ? "dilv"
+                    : Dilithion::g_chainParams->IsIon() ? "ion"
+                    : "dil");
             }
         }
 
@@ -8984,7 +8986,12 @@ std::string CRPCServer::RPC_InitiateSwap(const std::string& params) {
     swap.swap_id             = swap_id;
     swap.role                = SwapRole::INITIATOR;
     swap.state               = SwapState::HTLC_FUNDED;
-    swap.our_chain           = (Dilithion::g_chainParams->network == Dilithion::DILV) ? "dilv" : "dil";
+    // ION widen (2026-07): 3-way chain label — ION must self-identify as "ion"
+    // to a swap counterparty, NOT "dil" (wrong-chain settlement risk). DIL/DilV
+    // labels unchanged.
+    swap.our_chain           = (Dilithion::g_chainParams->network == Dilithion::DILV) ? "dilv"
+                              : (Dilithion::g_chainParams->network == Dilithion::ION)  ? "ion"
+                              : "dil";
     swap.their_chain         = their_chain;
     swap.our_amount          = send_amount;
     swap.their_amount        = receive_amount;
@@ -9175,7 +9182,12 @@ std::string CRPCServer::RPC_AcceptSwap(const std::string& params) {
     swap.swap_id             = swap_id;
     swap.role                = SwapRole::RESPONDER;
     swap.state               = SwapState::HTLC_FUNDED;
-    swap.our_chain           = (Dilithion::g_chainParams->network == Dilithion::DILV) ? "dilv" : "dil";
+    // ION widen (2026-07): 3-way chain label — ION must self-identify as "ion"
+    // to a swap counterparty, NOT "dil" (wrong-chain settlement risk). DIL/DilV
+    // labels unchanged.
+    swap.our_chain           = (Dilithion::g_chainParams->network == Dilithion::DILV) ? "dilv"
+                              : (Dilithion::g_chainParams->network == Dilithion::ION)  ? "ion"
+                              : "dil";
     swap.their_chain         = their_chain;
     swap.our_amount          = amount;
     swap.their_amount        = static_cast<CAmount>(receive_amount_dbl * 100000000);

@@ -846,6 +846,14 @@ regtest_chainparams_smoke: $(CORE_OBJECTS) $(OBJ_DIR)/test/regtest_chainparams_s
 	@$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS) $(LIBS)
 	@echo "$(COLOR_GREEN)✓ regtest_chainparams_smoke built successfully$(COLOR_RESET)"
 
+# ION VDF-dispatch functional test (red-team PR #142 follow-up).
+# Proves the CRITICAL/HIGH fixes (VDF proof checker + ION genesis seeding +
+# fixed-nBits no div-by-zero) and the IsVdfChain() byte-neutral truth table.
+ion_vdf_dispatch_tests: $(CORE_OBJECTS) $(OBJ_DIR)/test/ion_vdf_dispatch_tests.o $(DILITHIUM_OBJECTS) $(CHIAVDF_OBJECTS)
+	@echo "$(COLOR_BLUE)[LINK]$(COLOR_RESET) $@"
+	@$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS) $(LIBS)
+	@echo "$(COLOR_GREEN)✓ ion_vdf_dispatch_tests built successfully$(COLOR_RESET)"
+
 dna_serialization_test: $(CORE_OBJECTS) $(OBJ_DIR)/digital_dna/dna_serialization_test.o $(DILITHIUM_OBJECTS) $(CHIAVDF_OBJECTS)
 	@echo "$(COLOR_BLUE)[LINK]$(COLOR_RESET) $@"
 	@$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS) $(LIBS)

@@ -1672,13 +1672,17 @@ std::optional<CBlockTemplate> BuildMiningTemplate(CBlockchainDB& blockchain, CWa
 
     // DFMP v2.0: Apply difficulty penalty based on MIK identity
     // New miners get 3.0x penalty that decays over 360 blocks
-    // DilV: DFMP heat penalty is disabled — VDF distribution + cooldown tracker already
-    // ensure fairness. Heat penalty only penalises the sole miner keeping the chain alive.
+    // VDF chains (DilV, ION): DFMP heat penalty is disabled — VDF distribution +
+    // cooldown tracker already ensure fairness. Heat penalty only penalises the
+    // sole miner keeping the chain alive.
+    // ION widen (2026-07): keyed on IsVdfChain() (was IsDilV()) so ION's early
+    // sole miner is not heat-penalized from genesis (ION has dfmpActivationHeight=0).
+    // Byte-neutral for DIL/DilV.
     int dfmpActivationHeight = Dilithion::g_chainParams ?
         Dilithion::g_chainParams->dfmpActivationHeight : 0;
-    bool isDilV = Dilithion::g_chainParams && Dilithion::g_chainParams->IsDilV();
+    bool isVdfChain = Dilithion::g_chainParams && Dilithion::g_chainParams->IsVdfChain();
 
-    if (!isDilV && nHeight >= static_cast<uint32_t>(dfmpActivationHeight) && !mikIdentity.IsNull()) {
+    if (!isVdfChain && nHeight >= static_cast<uint32_t>(dfmpActivationHeight) && !mikIdentity.IsNull()) {
         // Get first-seen height (-1 for new identity)
         int firstSeen = -1;
         if (DFMP::g_identityDb != nullptr) {
@@ -6900,7 +6904,12 @@ load_genesis_block:  // Bug #29: Label for automatic retry after blockchain wipe
         const bool seedCapable = config.relay_only || config.public_api;
         static Attestation::CSeedAttestationKey seedAttestKey;
         static CASNDatabase asnDatabase;
-        if (Dilithion::g_chainParams && Dilithion::g_chainParams->IsDilV() && seedCapable) {
+        // ION widen (2026-07): keyed on IsVdfChain() (was IsDilV()) so ION also
+        // loads the seed-attestation key / ASN database. ION sets
+        // attestationDatacenterBan=true and intends seed-attested MIK
+        // registration; without this the attestation path is latently dead when
+        // ION later flips seedAttestationActivationHeight. Byte-neutral for DIL/DilV.
+        if (Dilithion::g_chainParams && Dilithion::g_chainParams->IsVdfChain() && seedCapable) {
             std::string dataDir = Dilithion::g_chainParams->dataDir;
 
             // Load ASN database from data directory (or project root)
@@ -7925,10 +7934,14 @@ load_genesis_block:  // Bug #29: Label for automatic retry after blockchain wipe
             // Runs every iteration (cheap hash comparison, heavy work only on tip change).
             // Placed OUTSIDE the VDF miner check block so resume works when paused.
             //
-            // DilV: Disabled. Solo mining is the expected early-stage mode on DilV —
-            // VDF distribution + cooldown tracker handle fairness. Fork detection via solo
-            // mining ratio is a RandomX/PoW concept and produces false positives here.
-            if (Dilithion::g_chainParams && Dilithion::g_chainParams->IsDilV()) {
+            // VDF chains (DilV, ION): Disabled. Solo mining is the expected
+            // early-stage mode — VDF distribution + cooldown tracker handle
+            // fairness. Fork detection via solo mining ratio is a RandomX/PoW
+            // concept and produces false positives here.
+            // ION widen (2026-07): keyed on IsVdfChain() (was IsDilV()) so ION's
+            // healthy early solo mining is not flagged as a fork attack.
+            // Byte-neutral for DIL/DilV.
+            if (Dilithion::g_chainParams && Dilithion::g_chainParams->IsVdfChain()) {
                 // No-op: fork detection not applicable to VDF solo mining
             } else {
                 CBlockIndex* tipIndex = g_chainstate.GetTip();

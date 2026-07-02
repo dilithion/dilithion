@@ -530,6 +530,19 @@ public:
     bool IsIon() const { return network == ION; }
     bool IsRegtest() const { return network == REGTEST; }
 
+    // VDF-chain class predicate. TRUE for the VDF-consensus chains (DilV and
+    // ION), FALSE for the RandomX/PoW chains (DIL mainnet, testnet). Regtest is
+    // configured as a VDF chain but is gated separately at each site (it takes
+    // its own air-gap/fast-path arms), so it is intentionally NOT folded in here.
+    //
+    // BYTE-NEUTRAL sweep property: replacing a chain-*class* `IsDilV()` gate
+    // with `IsVdfChain()` changes truth value ONLY for ION — DIL stays false,
+    // DilV stays true — and only newly-includes ION in the VDF arm. Use this
+    // for VDF-CLASS dispatch (proof checker, fixed nBits, fork-detection no-op,
+    // heat-penalty disable). Do NOT use it for DilV-*identity* special-cases
+    // (genesis block, seed lists, unit labels) — those need an explicit ION arm.
+    bool IsVdfChain() const { return IsDilV() || IsIon(); }
+
     /**
      * MAINNET SECURITY: Get the last checkpoint at or before given height
      *

@@ -92,11 +92,15 @@ CHeadersManager::CHeadersManager()
         ? Dilithion::g_chainParams->nMinimumChainWork
         : uint256();
 
-    // Phase 3: pick the chain-agnostic proof checker. DilV (VDF-only chain)
-    // ships VDFHeaderProofChecker; DIL ships RandomXHeaderProofChecker.
+    // Phase 3: pick the chain-agnostic proof checker. VDF chains (DilV, ION)
+    // ship VDFHeaderProofChecker; DIL ships RandomXHeaderProofChecker.
     // The HeadersSyncState instances we construct below get a non-owning
     // pointer to this; lifetime: owned by manager, outlives all states.
-    if (Dilithion::g_chainParams && Dilithion::g_chainParams->IsDilV()) {
+    // ION widen (2026-07): keyed on IsVdfChain() (was IsDilV()) so ION — a
+    // VDF-only chain — gets the VDF proof checker instead of RandomX; without
+    // this every ION header would be validated by the wrong checker (rejected,
+    // or accepted with the VDF proof unchecked). Byte-neutral for DIL/DilV.
+    if (Dilithion::g_chainParams && Dilithion::g_chainParams->IsVdfChain()) {
         m_proof_checker =
             std::make_unique<::dilithion::net::port::VDFHeaderProofChecker>();
     } else {
@@ -106,8 +110,19 @@ CHeadersManager::CHeadersManager()
 
     // BUG FIX: Add genesis to mapHeaders so block 1 can accumulate chain work properly
     // Without this, block 1's pprev is nullptr and chainWork doesn't include genesis work
-    CBlock genesis = (Dilithion::g_chainParams && Dilithion::g_chainParams->IsDilV()) ?
-        Genesis::CreateDilVGenesisBlock() : Genesis::CreateGenesisBlock();
+    // ION widen (2026-07): genesis is a chain-IDENTITY special-case (not a VDF
+    // class), so ION needs its OWN arm — CreateIonGenesisBlock() — not DilV's.
+    // Seeding the wrong genesis inserts a hash that block 1's pprev lookup can
+    // never match → sync stalls at height 1 (the exact symptom this block was
+    // originally added to prevent for DilV).
+    CBlock genesis;
+    if (Dilithion::g_chainParams && Dilithion::g_chainParams->IsDilV()) {
+        genesis = Genesis::CreateDilVGenesisBlock();
+    } else if (Dilithion::g_chainParams && Dilithion::g_chainParams->IsIon()) {
+        genesis = Genesis::CreateIonGenesisBlock();
+    } else {
+        genesis = Genesis::CreateGenesisBlock();
+    }
     uint256 genesisHash = genesis.GetHash();
     uint256 genesisWork = GetBlockWork(genesis.nBits);
 
@@ -2282,8 +2297,8 @@ void CHeadersManager::AddToHeightIndex(const uint256& hash, int height)
     // Log when multiple headers exist at same height
     if (mapHeightIndex[height].size() > 1 && g_verbose.load(std::memory_order_relaxed)) {
         size_t count = mapHeightIndex[height].size();
-        if (Dilithion::g_chainParams && Dilithion::g_chainParams->IsDilV()) {
-            // DilV: competing VDF blocks at same height is normal — all miners produce one
+        if (Dilithion::g_chainParams && Dilithion::g_chainParams->IsVdfChain()) {
+            // VDF chains (DilV, ION): competing VDF blocks at same height is normal — all miners produce one
             std::cout << "[HeadersManager] VDF competition at height " << height
                       << " - " << count << " competing blocks. Determining lowest hash." << std::endl;
         } else {
