@@ -2189,6 +2189,80 @@ CBlockIndex* CChainState::GetTip() const {
     return pindexTip;
 }
 
+// ============================================================================
+// Magnet v1a (fork-resistance): canonical node-health signal.
+// OBSERVABILITY ONLY — pure read + report. No fork-choice / reorg / validation
+// / mining behavior is touched here. See chain.h IsOnCanonical() doc.
+// ============================================================================
+
+std::string CChainState::OffCanonicalReason() const {
+    // Case (1): a pending chain-rebuild caused by DepthRejection means a
+    // strictly-better chain exists beyond MAX_REORG_DEPTH that the node
+    // cannot auto-switch to. Lock-free acquire-load pair (FlagChainRebuild
+    // stores the reason with release semantics BEFORE the flag).
+    if (m_chain_needs_rebuild.load(std::memory_order_acquire) &&
+        m_chain_rebuild_reason.load(std::memory_order_acquire) ==
+            ChainRebuildReason::DepthRejection) {
+        return "depth-rejection";
+    }
+
+    // Case (2) — drift signal: the heaviest-work candidate leaf has strictly
+    // greater chain-work than the active tip but was not adopted. Pure read
+    // of existing state under cs_main. m_setBlockIndexCandidates is ordered
+    // heaviest-work-first, so the front is the best-known leaf.
+    {
+        std::lock_guard<std::recursive_mutex> lock(cs_main);
+        if (pindexTip != nullptr && !m_setBlockIndexCandidates.empty()) {
+            const CBlockIndex* pBest = *m_setBlockIndexCandidates.begin();
+            if (pBest != nullptr &&
+                ChainWorkGreaterThan(pBest->nChainWork, pindexTip->nChainWork)) {
+                return "work-drift";
+            }
+        }
+    }
+
+    return "";  // on-canonical
+}
+
+bool CChainState::IsOnCanonical() const {
+    return OffCanonicalReason().empty();
+}
+
+void CChainState::LogOffCanonicalTransition(const std::string& reason,
+                                            int64_t best_known_ht) const {
+    // Edge-trigger: only emit on the on→off-canonical transition. The
+    // latch is cleared when the node returns on-canonical (see
+    // ClearChainRebuildFlag), so a later re-entry logs again.
+    bool expected = false;
+    if (!m_off_canonical_logged.compare_exchange_strong(
+            expected, true,
+            std::memory_order_acq_rel, std::memory_order_acquire)) {
+        return;  // already logged this off-canonical episode
+    }
+
+    const int local_tip_height = m_cachedHeight.load(std::memory_order_acquire);
+
+    // ONE greppable structured ERROR line. Includes the reason, local tip
+    // height, and best-known height when available (< 0 → "unknown").
+    // Built with std::string concatenation (no <sstream> needed here).
+    const std::string msg =
+        "[Magnet] OFF-CANONICAL: node is not on the best-known chain (reason=" +
+        (reason.empty() ? std::string("unknown") : reason) +
+        " local_tip_height=" + std::to_string(local_tip_height) +
+        " best_known_height=" +
+        (best_known_ht >= 0 ? std::to_string(best_known_ht)
+                            : std::string("unknown")) +
+        ")";
+
+    // Route through the structured logger at ERROR level. Call the CLogger
+    // method DIRECTLY rather than via the LogPrintConsensus/LogError macros:
+    // those token-paste `LVL_##level`, and on Windows the <windows.h> `ERROR`
+    // macro (=0) pre-expands the `ERROR` argument to `0`, yielding `LVL_0`.
+    // Calling LogPrintFormat with the enum value sidesteps the macro entirely.
+    CLogger::GetInstance().LogPrintFormat(
+        LogCategory::CONSENSUS, LogLevel::LVL_ERROR, "%s", msg.c_str());
+}
+
 void CChainState::SetTip(CBlockIndex* pindex) {
     std::lock_guard<std::recursive_mutex> lock(cs_main);
     
@@ -2320,6 +2394,11 @@ void CChainState::ClearChainRebuildFlag() {
     // reason. No active caller relies on this today; defensive symmetry.
     m_chain_rebuild_reason.store(ChainRebuildReason::UndoFailure,
                                   std::memory_order_release);
+    // Magnet v1a (OBSERVABILITY ONLY): re-arm the off-canonical edge-trigger
+    // so that if the node later re-enters the off-canonical state, the single
+    // structured ERROR line is emitted again. Clearing the rebuild flag is the
+    // node returning on-canonical (recovery initiated), so the latch resets.
+    m_off_canonical_logged.store(false, std::memory_order_release);
     ResetUndoFailureCounter();
 }
 
@@ -2819,6 +2898,19 @@ bool CChainState::ActivateBestChainStep(CBlockIndex* pindexMostWork,
             // any observer of m_chain_needs_rebuild=true via acquire-load
             // also sees DepthRejection as the cause.
             FlagChainRebuild(ChainRebuildReason::DepthRejection);
+            // Magnet v1a (OBSERVABILITY ONLY): the node now knows a strictly-
+            // better chain exists beyond MAX_REORG_DEPTH but cannot auto-switch
+            // — the canonical "I am off the best chain" transition. Emit ONE
+            // greppable structured ERROR line (edge-triggered; latch prevents
+            // per-block spam). best-known height = the heaviest rejected
+            // candidate's height (pindexMostWork). This is a pure log call: it
+            // changes no consensus/reorg/mining behavior and mutates only the
+            // observability latch.
+            LogOffCanonicalTransition(
+                "depth-rejection",
+                pindexMostWork != nullptr
+                    ? static_cast<int64_t>(pindexMostWork->nHeight)
+                    : -1);
             return false;
         }
     }
