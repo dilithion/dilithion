@@ -211,18 +211,48 @@ CBlock CreateDilVGenesisBlock() {
     return genesis;
 }
 
+// ===========================================================================
+// ION genesis block (Dilithion v2 — VDF chain)
+// ===========================================================================
+//
+// ION reuses DilV's VDF genesis construction verbatim. The genesis VDF
+// *challenge* is chain-IDENTITY-independent: it is
+//   SHA3-256( zeros_32 || height_0_le32 || zeros_20 )
+// (see src/tools/dilv_genesis_vdf.cpp) — it contains NO networkMagic, chainID,
+// port, or timestamp. Therefore the precomputed 500,000-iteration Wesolowski
+// proof hardcoded in CreateDilVGenesisBlock() is a REAL, VERIFYING proof for
+// ION's genesis too. Everything that distinguishes ION's genesis block
+// (genesisTime, genesisNBits, genesisCoinbaseMsg, pre-funds) is already read
+// from g_chainParams inside CreateDilVGenesisBlock(), so calling it while
+// g_chainParams points at ION's params yields the correct ION genesis block.
+//
+// TODO(genesis-ceremony): the resulting genesis *hash* depends on ION's
+// genesisTime (currently a placeholder). Before launch, fix ION's genesisTime
+// at the ceremony, run the node once to print the hash, and pin it in
+// ChainParams::Ion().genesisHash. Do NOT fabricate/guess a hash. The VDF proof
+// itself needs no recomputation (chain-independent challenge, verified above).
+CBlock CreateIonGenesisBlock() {
+    return CreateDilVGenesisBlock();
+}
+
 uint256 GetGenesisHash() {
     static uint256 hash;
     static bool initialized = false;
 
     if (!initialized) {
-        // Use VDF genesis for any chain with VDF active from genesis (DilV, or testnet in VDF-only mode)
+        // Use VDF genesis for any chain with VDF active from genesis (DilV, ION,
+        // or testnet in VDF-only mode)
         bool useVdfGenesis = Dilithion::g_chainParams &&
             (Dilithion::g_chainParams->IsDilV() ||
+             Dilithion::g_chainParams->IsIon() ||
              (Dilithion::g_chainParams->vdfActivationHeight == 0 &&
               Dilithion::g_chainParams->vdfExclusiveHeight == 0));
+        // ION delegates to CreateDilVGenesisBlock() (chain-independent VDF proof);
+        // both produce a g_chainParams-driven VDF genesis block.
         CBlock genesis = useVdfGenesis ?
-            CreateDilVGenesisBlock() : CreateGenesisBlock();
+            (Dilithion::g_chainParams->IsIon() ? CreateIonGenesisBlock()
+                                               : CreateDilVGenesisBlock())
+            : CreateGenesisBlock();
         hash = genesis.GetHash();
         initialized = true;
     }
@@ -236,8 +266,9 @@ bool IsGenesisBlock(const CBlock& block) {
         throw std::runtime_error("Chain parameters not initialized");
     }
 
-    // Use VDF genesis for any chain with VDF active from genesis
+    // Use VDF genesis for any chain with VDF active from genesis (DilV, ION, ...)
     bool useVdfGenesis = Dilithion::g_chainParams->IsDilV() ||
+        Dilithion::g_chainParams->IsIon() ||
         (Dilithion::g_chainParams->vdfActivationHeight == 0 &&
          Dilithion::g_chainParams->vdfExclusiveHeight == 0);
 
@@ -253,7 +284,9 @@ bool IsGenesisBlock(const CBlock& block) {
 
     // Check merkle root matches expected
     CBlock genesis = useVdfGenesis ?
-        CreateDilVGenesisBlock() : CreateGenesisBlock();
+        (Dilithion::g_chainParams->IsIon() ? CreateIonGenesisBlock()
+                                           : CreateDilVGenesisBlock())
+        : CreateGenesisBlock();
     if (!(block.hashMerkleRoot == genesis.hashMerkleRoot)) return false;
 
     return true;
