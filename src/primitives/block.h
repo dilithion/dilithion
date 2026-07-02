@@ -176,6 +176,28 @@ public:
     void InvalidateCache() { fHashCached = false; }
 };
 
+// ---------------------------------------------------------------------------
+// Miner hot-loop header assembly (WF-1).
+//
+// The mining controller builds the 80-byte legacy PoW preimage directly into a
+// raw buffer at fixed offsets (it cannot allocate a std::vector per nonce). This
+// helper is the single canonical assembler for that buffer, routing the four
+// 32-bit scalars through WriteLE32 so the miner's PoW input is byte-identical to
+// the validator's CBlockHeader::SerializeHeader() for a legacy (80-byte) header.
+// Both miner/controller.cpp AND the WF-1 differential test call THIS function, so
+// the test drives the real production assembly (no hand-copied mirror).
+//
+// `dst` MUST point to at least 80 writable bytes. `nonce32` is written at offset
+// 76 (the field the hot loop mutates each iteration); h.nNonce is ignored.
+inline void WriteMiningHeaderLE(uint8_t* dst, const CBlockHeader& h, uint32_t nonce32) {
+    WriteLE32(dst + 0, static_cast<uint32_t>(h.nVersion));
+    memcpy(dst + 4,  h.hashPrevBlock.begin(), 32);
+    memcpy(dst + 36, h.hashMerkleRoot.begin(), 32);
+    WriteLE32(dst + 68, h.nTime);
+    WriteLE32(dst + 72, h.nBits);
+    WriteLE32(dst + 76, nonce32);
+}
+
 class CBlock : public CBlockHeader {
 public:
     std::vector<uint8_t> vtx;

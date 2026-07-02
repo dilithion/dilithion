@@ -327,16 +327,16 @@ std::vector<uint8_t> CBlockHeaderAndShortTxIDs::Serialize() const
     result.reserve(88 + shorttxids.size() * 6 + prefilledtxn.size() * 200);
 
     // Serialize header
-    // WF-1: explicit little-endian for all multi-byte scalars (header 32-bit
-    // fields, the 8-byte selector nonce, and the wire framing counts). This is
-    // byte-identical to the previous host-endian copy on LE hosts and keeps the
-    // Deserialize() side (below) a matched little-endian round-trip.
-    AppendLE32(result, static_cast<uint32_t>(header.nVersion));
+    const uint8_t* ptr = reinterpret_cast<const uint8_t*>(&header.nVersion);
+    result.insert(result.end(), ptr, ptr + 4);
     result.insert(result.end(), header.hashPrevBlock.data, header.hashPrevBlock.data + 32);
     result.insert(result.end(), header.hashMerkleRoot.data, header.hashMerkleRoot.data + 32);
-    AppendLE32(result, header.nTime);
-    AppendLE32(result, header.nBits);
-    AppendLE32(result, header.nNonce);
+    ptr = reinterpret_cast<const uint8_t*>(&header.nTime);
+    result.insert(result.end(), ptr, ptr + 4);
+    ptr = reinterpret_cast<const uint8_t*>(&header.nBits);
+    result.insert(result.end(), ptr, ptr + 4);
+    ptr = reinterpret_cast<const uint8_t*>(&header.nNonce);
+    result.insert(result.end(), ptr, ptr + 4);
     // VDF extension fields (version >= 4): 32 bytes vdfOutput + 32 bytes vdfProofHash
     if (header.nVersion >= 4) {
         result.insert(result.end(), header.vdfOutput.data, header.vdfOutput.data + 32);
@@ -344,11 +344,13 @@ std::vector<uint8_t> CBlockHeaderAndShortTxIDs::Serialize() const
     }
 
     // Nonce (8 bytes)
-    AppendLE64(result, nonce);
+    ptr = reinterpret_cast<const uint8_t*>(&nonce);
+    result.insert(result.end(), ptr, ptr + 8);
 
     // Short txids count (4 bytes)
     uint32_t count = static_cast<uint32_t>(shorttxids.size());
-    AppendLE32(result, count);
+    ptr = reinterpret_cast<const uint8_t*>(&count);
+    result.insert(result.end(), ptr, ptr + 4);
 
     // Short txids (6 bytes each)
     for (const auto& shortid : shorttxids) {
@@ -357,17 +359,17 @@ std::vector<uint8_t> CBlockHeaderAndShortTxIDs::Serialize() const
         }
     }
 
-    // Prefilled count (2 bytes, little-endian)
+    // Prefilled count (2 bytes)
     uint16_t prefilled_count = static_cast<uint16_t>(prefilledtxn.size());
-    result.push_back(static_cast<uint8_t>(prefilled_count));
-    result.push_back(static_cast<uint8_t>(prefilled_count >> 8));
+    ptr = reinterpret_cast<const uint8_t*>(&prefilled_count);
+    result.insert(result.end(), ptr, ptr + 2);
 
     // Prefilled transactions (differential index encoding)
     uint16_t last_index = 0;
     for (const auto& prefilled : prefilledtxn) {
         uint16_t diff = prefilled.index - last_index;
-        result.push_back(static_cast<uint8_t>(diff));
-        result.push_back(static_cast<uint8_t>(diff >> 8));
+        ptr = reinterpret_cast<const uint8_t*>(&diff);
+        result.insert(result.end(), ptr, ptr + 2);
 
         std::vector<uint8_t> txData = prefilled.tx.Serialize();
         // CID 1675171 FIX: Use move iterators to avoid unnecessary copy
@@ -390,18 +392,17 @@ bool CBlockHeaderAndShortTxIDs::Deserialize(const uint8_t* data, size_t len)
     size_t offset = 0;
 
     // Header
-    // WF-1: explicit little-endian reads, matched to Serialize() above.
-    header.nVersion = static_cast<int32_t>(ReadLE32(data + offset));
+    memcpy(&header.nVersion, data + offset, 4);
     offset += 4;
     memcpy(header.hashPrevBlock.data, data + offset, 32);
     offset += 32;
     memcpy(header.hashMerkleRoot.data, data + offset, 32);
     offset += 32;
-    header.nTime = ReadLE32(data + offset);
+    memcpy(&header.nTime, data + offset, 4);
     offset += 4;
-    header.nBits = ReadLE32(data + offset);
+    memcpy(&header.nBits, data + offset, 4);
     offset += 4;
-    header.nNonce = ReadLE32(data + offset);
+    memcpy(&header.nNonce, data + offset, 4);
     offset += 4;
     // VDF extension fields (version >= 4): 32 bytes vdfOutput + 32 bytes vdfProofHash
     if (header.nVersion >= 4) {
@@ -413,7 +414,7 @@ bool CBlockHeaderAndShortTxIDs::Deserialize(const uint8_t* data, size_t len)
     }
 
     // Nonce
-    nonce = ReadLE64(data + offset);
+    memcpy(&nonce, data + offset, 8);
     offset += 8;
 
     // Fill SipHash keys
@@ -421,7 +422,8 @@ bool CBlockHeaderAndShortTxIDs::Deserialize(const uint8_t* data, size_t len)
 
     // Short txids count
     if (offset + 4 > len) return false;
-    uint32_t count = ReadLE32(data + offset);
+    uint32_t count = 0;
+    memcpy(&count, data + offset, 4);
     offset += 4;
 
     if (count > 100000) {
@@ -440,10 +442,10 @@ bool CBlockHeaderAndShortTxIDs::Deserialize(const uint8_t* data, size_t len)
         offset += 6;
     }
 
-    // Prefilled count (little-endian)
+    // Prefilled count
     if (offset + 2 > len) return false;
-    uint16_t prefilled_count = static_cast<uint16_t>(data[offset])
-                             | (static_cast<uint16_t>(data[offset + 1]) << 8);
+    uint16_t prefilled_count = 0;
+    memcpy(&prefilled_count, data + offset, 2);
     offset += 2;
 
     // Prefilled transactions
@@ -452,8 +454,8 @@ bool CBlockHeaderAndShortTxIDs::Deserialize(const uint8_t* data, size_t len)
     for (size_t i = 0; i < prefilled_count; i++) {
         if (offset + 2 > len) return false;
 
-        uint16_t diff = static_cast<uint16_t>(data[offset])
-                      | (static_cast<uint16_t>(data[offset + 1]) << 8);
+        uint16_t diff = 0;
+        memcpy(&diff, data + offset, 2);
         offset += 2;
 
         prefilledtxn[i].index = last_index + diff;
