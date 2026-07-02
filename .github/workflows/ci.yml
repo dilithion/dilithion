@@ -84,6 +84,15 @@ jobs:
       run: |
         make dilithion-node -j$(nproc)
 
+    - name: Build DilV and ION Nodes
+      run: |
+        # Compile the VDF-chain binaries so an ION/DilV compile break or a
+        # re-narrowed IsVdfChain() dispatch site fails CI instead of shipping
+        # green (round-2 MEDIUM: machine-enforce the sweep across the release
+        # binaries, not just the tests).
+        make dilv-node -j$(nproc)
+        make ion-node -j$(nproc)
+
     - name: Build Genesis Generator
       run: |
         make genesis_gen -j$(nproc)

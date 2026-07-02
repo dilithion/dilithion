@@ -849,10 +849,9 @@ regtest_chainparams_smoke: $(CORE_OBJECTS) $(OBJ_DIR)/test/regtest_chainparams_s
 # ION VDF-dispatch functional test (red-team PR #142 follow-up).
 # Proves the CRITICAL/HIGH fixes (VDF proof checker + ION genesis seeding +
 # fixed-nBits no div-by-zero) and the IsVdfChain() byte-neutral truth table.
-ion_vdf_dispatch_tests: $(CORE_OBJECTS) $(OBJ_DIR)/test/ion_vdf_dispatch_tests.o $(DILITHIUM_OBJECTS) $(CHIAVDF_OBJECTS)
-	@echo "$(COLOR_BLUE)[LINK]$(COLOR_RESET) $@"
-	@$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS) $(LIBS)
-	@echo "$(COLOR_GREEN)✓ ion_vdf_dispatch_tests built successfully$(COLOR_RESET)"
+# Now a Boost.Test suite compiled INTO test_dilithion (see BOOST_TEST_OBJECTS),
+# so CI machine-enforces the sweep on every ./test_dilithion run — no standalone
+# target (which is why there is no ion_vdf_dispatch_tests rule here anymore).
 
 dna_serialization_test: $(CORE_OBJECTS) $(OBJ_DIR)/digital_dna/dna_serialization_test.o $(DILITHIUM_OBJECTS) $(CHIAVDF_OBJECTS)
 	@echo "$(COLOR_BLUE)[LINK]$(COLOR_RESET) $@"
@@ -985,6 +984,7 @@ BOOST_TEST_OBJECTS := $(OBJ_DIR)/test/test_dilithion.o \
 	$(OBJ_DIR)/test/zmq_tests.o \
 	$(OBJ_DIR)/test/seed_attestation_glue_tests.o \
 	$(OBJ_DIR)/test/wf1_host_endian_differential_test.o \
+	$(OBJ_DIR)/test/ion_vdf_dispatch_tests.o \
 	$(CRYPTO_PROPERTY_OBJECTS)
 
 # Link test objects + full library (CORE_OBJECTS) to avoid hand-picked object drift
