@@ -12,26 +12,9 @@
 
 namespace digital_dna {
 
-// --- TimeSyncMessage ---
-
-std::vector<uint8_t> TimeSyncMessage::serialize() const {
-    std::vector<uint8_t> data(25);
-    std::memcpy(data.data(), &sender_timestamp_us, 8);
-    std::memcpy(data.data() + 8, &sender_wall_ms, 8);
-    std::memcpy(data.data() + 16, &nonce, 8);
-    data[24] = is_response ? 1 : 0;
-    return data;
-}
-
-TimeSyncMessage TimeSyncMessage::deserialize(const std::vector<uint8_t>& data) {
-    TimeSyncMessage msg;
-    if (data.size() < 25) return msg;
-    std::memcpy(&msg.sender_timestamp_us, data.data(), 8);
-    std::memcpy(&msg.sender_wall_ms, data.data() + 8, 8);
-    std::memcpy(&msg.nonce, data.data() + 16, 8);
-    msg.is_response = data[24] != 0;
-    return msg;
-}
+// NOTE: TimeSyncMessage::serialize()/deserialize() (and the struct) were removed
+// as dead code — the live MSG_DNA_TIME_SYNC wire is handled by
+// CreateDNATimeSyncMessage / ProcessDNATimeSyncMessage in net.cpp (CDataStream, LE).
 
 // --- ClockDriftCollector ---
 
