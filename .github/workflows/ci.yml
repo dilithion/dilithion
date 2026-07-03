@@ -89,8 +89,9 @@ jobs:
         # Fable5 merge-gate: fail the build if ion-node.cpp carries any DilV
         # identity token (wire magic, production seed IP, DilV datadir selector,
         # dilv-node REST port, .dilv path) in live code. Makes the "ION binary
-        # secretly says DilV" class of regression a machine gate. Comments are
-        # exempt (see scripts/check-ion-identity.sh).
+        # secretly says DilV" class of regression a machine gate. Only FULL-LINE
+        # comments are exempt — a DilV token in a trailing comment on a code line
+        # still fails (fail-closed; see scripts/check-ion-identity.sh).
         bash scripts/check-ion-identity.sh
 
     - name: Build DilV and ION Nodes

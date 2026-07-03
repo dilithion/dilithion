@@ -868,7 +868,7 @@ struct NodeConfig {
         std::cout << std::endl;
         std::cout << "\033[1;32mQUICK START:\033[0m" << std::endl;
         std::cout << "  " << program << "              No arguments = Auto-start VDF mining!" << std::endl;
-        std::cout << "                            • Auto-connect to seed nodes" << std::endl;
+        std::cout << "                            • ION has no public seeds yet — add peers via --addnode" << std::endl;
         std::cout << "                            • Start VDF mining immediately" << std::endl;
         std::cout << std::endl;
         std::cout << "Options:" << std::endl;

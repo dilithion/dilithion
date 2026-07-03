@@ -38,7 +38,16 @@ TARGET="src/node/ion-node.cpp"
 # Keep this list maintainable — one token (or `|`-alternative) per concern.
 # Only add tokens that CANNOT legitimately appear in correct ION code.
 # ---------------------------------------------------------------------------
-#   DILV_MAGIC                 — DilV wire magic (ION must use ION_MAGIC)
+#   DILV_MAGIC                 — DilV wire magic symbol (ION must use ION_MAGIC)
+#   0xD17FD100                 — DilV wire magic LITERAL. Distinct vector from
+#                                DILV_MAGIC: someone could set
+#                                g_network_magic = 0xD17FD100 without ever
+#                                naming the DILV_MAGIC symbol (Fable5 M-NEW-2).
+#   ChainParams::DilV(         — DilV chainparams factory. An ion-node that
+#                                constructs DilV params directly (…= ChainParams::
+#                                DilV()) would inherit DilV's ENTIRE identity while
+#                                every per-token check above still passed
+#                                (Fable5 M-NEW-2). ION must build ChainParams::Ion().
 #   138.197.68.128             — DilV NYC production seed IP (ION has no seeds)
 #   GetDataDir(Dilithion::DILV — would open DilV's datadir / LevelDB
 #   .dilv                      — DilV data-directory path fragment
@@ -52,7 +61,14 @@ TARGET="src/node/ion-node.cpp"
 #                                H-1). Note: bare "x402" is intentionally NOT a
 #                                token — ion-node legitimately logs an
 #                                "x402 facilitator disabled on ION" message.
-PATTERN='DILV_MAGIC|138\.197\.68\.128|GetDataDir\(Dilithion::DILV|\.dilv|seed-dilv|9444|9332|9334|RegisterX402Facilitator'
+#
+# ACCEPTED LIMITATION (scope). This gate targets ACCIDENTAL regression — a
+# clone-and-forget where a DilV token survives in ion-node — not a malicious
+# author. A determined author can defeat any textual gate by token-splitting
+# (e.g. `0xD17F` "D100", or `"ChainParams::" "DilV()"` assembled across lines/
+# macros). Hardening against that is explicitly OUT OF SCOPE; the defense there
+# is code review, not this grep.
+PATTERN='DILV_MAGIC|0xD17FD100|ChainParams::DilV\(|138\.197\.68\.128|GetDataDir\(Dilithion::DILV|\.dilv|seed-dilv|9444|9332|9334|RegisterX402Facilitator'
 
 if [ ! -f "$TARGET" ]; then
     echo "check-ion-identity: ERROR: $TARGET not found (run from repo root)" >&2
