@@ -161,10 +161,10 @@
 // CRASH HANDLER: Log crash info to file before terminating
 static LONG WINAPI CrashHandler(EXCEPTION_POINTERS* pExceptionInfo) {
     // Get data directory for crash log
-    std::string crashLogPath = "dilv_crash.log";
+    std::string crashLogPath = "ion_crash.log";
     char* appdata = std::getenv("APPDATA");
     if (appdata) {
-        crashLogPath = std::string(appdata) + "\\.dilv\\crash.log";
+        crashLogPath = std::string(appdata) + "\\.ion\\crash.log";
     }
 
     std::ofstream crashLog(crashLogPath, std::ios::app);
@@ -585,7 +585,7 @@ struct NodeConfig {
             std::string arg(argv[i]);
 
             if (arg == "--testnet") {
-                std::cerr << "Error: DilV node does not support --testnet (DilV is its own network)" << std::endl;
+                std::cerr << "Error: ION node does not support --testnet (ION is its own network)" << std::endl;
                 return false;
             }
             else if (arg == "--regtest") {
@@ -919,11 +919,11 @@ struct NodeConfig {
         std::cout << "  --help, -h            Show this help message" << std::endl;
         std::cout << std::endl;
         std::cout << "Configuration:" << std::endl;
-        std::cout << "  Configuration file: dilv.conf (in data directory)" << std::endl;
+        std::cout << "  Configuration file: dilithion.conf (in data directory)" << std::endl;
         std::cout << "  Priority: Command-line > Config file > Default" << std::endl;
         std::cout << std::endl;
         std::cout << "Network Defaults:" << std::endl;
-        std::cout << "  DilV:  datadir=.dilv  port=9444  rpcport=9332" << std::endl;
+        std::cout << "  ION:   datadir=.ion   port=10444  rpcport=10332" << std::endl;
         std::cout << std::endl;
         std::cout << "Examples:" << std::endl;
         std::cout << "  " << program << "                                    (Quick start)" << std::endl;
@@ -1013,9 +1013,9 @@ bool EnsureMIKRegistered(CWallet& wallet, unsigned int nextHeight) {
     if (!s_bannerShown && !DFMP::g_identityDb->HasMIKPubKey(identity)) {
         std::cout << std::endl;
         std::cout << "+----------------------------------------------------------------------+" << std::endl;
-        std::cout << "|  FIRST-TIME MINER SETUP (DilV)                                       |" << std::endl;
+        std::cout << "|  FIRST-TIME MINER SETUP (ION)                                        |" << std::endl;
         std::cout << "|                                                                      |" << std::endl;
-        std::cout << "|  Your miner identity is not yet registered on DilV. Before your      |" << std::endl;
+        std::cout << "|  Your miner identity is not yet registered on ION. Before your       |" << std::endl;
         std::cout << "|  first block, the node runs a ONE-TIME setup sequence:               |" << std::endl;
         std::cout << "|                                                                      |" << std::endl;
         std::cout << "|    1. Digital DNA fingerprint (hardware-bound, passive)              |" << std::endl;
@@ -1594,9 +1594,9 @@ std::optional<CBlockTemplate> BuildMiningTemplate(CBlockchainDB& blockchain, CWa
 
         std::cout << "[Mining] Coinbase outputs: " << coinbaseTx.vout.size()
                   << " (miner=" << minerAmount/100000000.0
-                  << " DilV, devFund=" << devFundAmount/100000000.0
-                  << " DilV -> DJrywx..., devReward=" << devRewardAmount/100000000.0
-                  << " DilV -> DRne9y...)" << std::endl;
+                  << " ION, devFund=" << devFundAmount/100000000.0
+                  << " ION -> DJrywx..., devReward=" << devRewardAmount/100000000.0
+                  << " ION -> DRne9y...)" << std::endl;
     }
 
     // Store coinbase transaction globally for callback access
@@ -1983,15 +1983,15 @@ int main(int argc, char* argv[]) {
     NodeConfig config;
 
     if (quick_start_mode) {
-        // Smart defaults - DilV
+        // Smart defaults - ION
         std::cout << "\033[1;32m" << std::endl;  // Green bold
         std::cout << "======================================" << std::endl;
-        std::cout << "  DILV QUICK START MODE" << std::endl;
+        std::cout << "  ION QUICK START MODE" << std::endl;
         std::cout << "======================================" << std::endl;
         std::cout << "\033[0m" << std::endl;  // Reset color
         std::cout << "No arguments detected - using defaults:" << std::endl;
-        std::cout << "  • Network:    DilV (VDF distribution payment chain)" << std::endl;
-        std::cout << "  • Seed node:  138.197.68.128:9444 (NYC - official)" << std::endl;
+        std::cout << "  • Network:    ION (post-quantum VDF chain)" << std::endl;
+        std::cout << "  • Peers:      none yet — ION has no public seed nodes; use --addnode=<ip:port>" << std::endl;
         std::cout << "  • Mining:     ENABLED (VDF, single-threaded)" << std::endl;
         std::cout << std::endl;
         std::cout << "To customize settings, run: " << argv[0] << " --help" << std::endl;
@@ -2001,20 +2001,21 @@ int main(int argc, char* argv[]) {
         std::this_thread::sleep_for(std::chrono::seconds(3));
         std::cout << std::endl;
 
-        // Apply smart defaults - DilV
+        // Apply smart defaults - ION.
+        // NOTE: ION has no public seed nodes yet, so add_nodes stays empty here.
+        // Peers are supplied via --addnode until the ION seed set is stood up.
         config.start_mining = true;
-        config.add_nodes.push_back("138.197.68.128:9444");  // NYC DilV seed node
     }
     else if (!config.ParseArgs(argc, argv)) {
         config.PrintUsage(argv[0]);
         return 1;
     }
 
-    // Load configuration from dilv.conf
-    // DilV always uses its own data directory (no testnet variant)
+    // Load configuration from the ION config file
+    // ION always uses its own data directory (no testnet variant)
     std::string initial_datadir = config.datadir;
     if (initial_datadir.empty()) {
-        initial_datadir = GetDataDir(Dilithion::DILV);
+        initial_datadir = GetDataDir(Dilithion::ION);
     }
     
     // Load config file from initial datadir
@@ -2028,7 +2029,7 @@ int main(int argc, char* argv[]) {
     // Apply config file and environment variable settings (only if not set via command-line)
     // Priority: Command-line > Environment > Config file > Default
     
-    // DilV: No testnet override — DilV is its own network
+    // ION: No testnet override — ION is its own network
 
     // Data directory (only if not set via command-line)
     if (config.datadir.empty()) {
@@ -2036,7 +2037,7 @@ int main(int argc, char* argv[]) {
         if (!conf_datadir.empty()) {
             config.datadir = conf_datadir;
         } else {
-            config.datadir = GetDataDir(Dilithion::DILV);
+            config.datadir = GetDataDir(Dilithion::ION);
         }
     }
     
@@ -2502,13 +2503,13 @@ int main(int argc, char* argv[]) {
             randomx_init_validation_mode(rx_key, strlen(rx_key));
             std::cout << "  [OK] RandomX validation mode ready" << std::endl;
         } else {
-            std::cout << "  [OK] DilV uses VDF consensus (no RandomX initialization needed)" << std::endl;
+            std::cout << "  [OK] ION uses VDF consensus (no RandomX initialization needed)" << std::endl;
         }
 
         // Load and verify genesis block
 load_genesis_block:  // Bug #29: Label for automatic retry after blockchain wipe
-        std::cout << "[1/6] Loading DilV genesis block..." << std::flush;
-        CBlock genesis = Genesis::CreateDilVGenesisBlock();
+        std::cout << "[1/6] Loading ION genesis block..." << std::flush;
+        CBlock genesis = Genesis::CreateIonGenesisBlock();
 
         if (!Genesis::IsGenesisBlock(genesis)) {
             ErrorMessage error = CErrorFormatter::ValidationError("genesis block", 
@@ -3046,8 +3047,9 @@ load_genesis_block:  // Bug #29: Label for automatic retry after blockchain wipe
             std::cout << "  [OK] Chain integrity validation passed" << std::endl;
         }
 
-        // Set network magic for P2P protocol — DilV uses its own unique magic
-        NetProtocol::g_network_magic = NetProtocol::DILV_MAGIC;
+        // Set network magic for P2P protocol — ION uses its own unique magic
+        // (must equal ChainParams::Ion().networkMagic = 0xD1150200).
+        NetProtocol::g_network_magic = NetProtocol::ION_MAGIC;
 
         // Phase 2: Initialize P2P networking (prepare for later)
         std::cout << "Initializing P2P components..." << std::endl;
@@ -3654,7 +3656,7 @@ load_genesis_block:  // Bug #29: Label for automatic retry after blockchain wipe
 
         // Create and start HTTP API server for dashboard
         // Use port 18334 for testnet, 8334 for mainnet (Bitcoin convention)
-        int api_port = 9334;  // DilV REST API port
+        int api_port = 10334;  // ION REST API port (distinct from dilv-node's 9334; parallels ION rpc 10332)
         // CVE-2026-RPC-CORS: gate all-interfaces bind on --public-api
         CHttpServer http_server(api_port, config.public_api);
         g_node_state.http_server = &http_server;
@@ -3702,7 +3704,7 @@ load_genesis_block:  // Bug #29: Label for automatic retry after blockchain wipe
         });
 
         // Set stats handler that returns cached statistics as JSON (never blocks)
-        std::string network_name = "dilv";
+        std::string network_name = "ion";
         http_server.SetStatsHandler([&cached_stats, network_name]() -> std::string {
             return cached_stats.ToJSON(network_name);
         });
@@ -3768,26 +3770,22 @@ load_genesis_block:  // Bug #29: Label for automatic retry after blockchain wipe
         // a ready, fail-closed gate.
         http_server.ConfigureHostAllowlist(config.rpc_allow_hosts);
 
-        // x402 Payment Facilitator — enables HTTP 402 micropayments on DilV
-        static x402::CFacilitator x402_facilitator;
-        x402_facilitator.RegisterUTXOSet(&utxo_set);
-        x402_facilitator.RegisterMempool(&mempool);
-        x402_facilitator.RegisterChainState(&g_chainstate);
-        x402_facilitator.RegisterNodeContext(&g_node_context);  // Extensions: DNA trust, VDF, SIWX
-
+        // x402 Payment Facilitator — DISABLED on ION (Fable5 H-1).
+        // x402's settlement network id and asset are compile-time DilV constants
+        // (x402_types.h NETWORK_ID_DILV / ASSET_ID "DILV"). x402 is not an ION
+        // feature; registering it on ion-node would advertise DilV as the
+        // settlement network to clients (wrong-chain payment risk). We therefore
+        // do NOT register the facilitator and do NOT route /x402/ requests here.
+        // Re-enable only once x402 carries an ION-specific network id/asset.
         http_server.SetRestApiHandler([](const std::string& method,
                                          const std::string& path,
                                          const std::string& body,
                                          const std::string& clientIP) -> std::string {
-            // Route x402 requests to the facilitator
-            if (x402::CFacilitator::IsX402Request(path)) {
-                return x402_facilitator.HandleRequest(method, path, body, clientIP);
-            }
-            // Route REST API requests to the standard handler
+            // Route REST API requests to the standard handler (no x402 on ION).
             return rest_api.HandleRequest(method, path, body, clientIP);
         });
         std::cout << "[HttpServer] REST API enabled for light wallet support" << std::endl;
-        std::cout << "[HttpServer] x402 facilitator enabled at /x402/" << std::endl;
+        std::cout << "[HttpServer] x402 facilitator disabled on ION (DilV-only settlement identity)" << std::endl;
 
         // BUG #140 FIX: Make HTTP server failure non-fatal
         // The stats endpoint is optional - core P2P functionality should continue
@@ -4865,7 +4863,7 @@ load_genesis_block:  // Bug #29: Label for automatic retry after blockchain wipe
         if (vdf_available) {
             std::cout << "  [OK] VDF library initialized (" << vdf::version() << ")" << std::endl;
         } else {
-            std::cerr << "  [ERROR] VDF library not available -- DilV requires VDF!" << std::endl;
+            std::cerr << "  [ERROR] VDF library not available -- ION requires VDF!" << std::endl;
             delete Dilithion::g_chainParams;
             return 1;
         }
@@ -5250,7 +5248,7 @@ load_genesis_block:  // Bug #29: Label for automatic retry after blockchain wipe
                     unsigned int h = static_cast<unsigned int>(g_chainstate.GetHeight());
                     int64_t mature = wallet.GetAvailableBalance(utxo_set, h);
                     std::cout << "  [OK] Wallet synced - balance: " << std::fixed << std::setprecision(8)
-                              << (static_cast<double>(mature) / 100000000.0) << " DilV" << std::endl;
+                              << (static_cast<double>(mature) / 100000000.0) << " ION" << std::endl;
                 } else {
                     std::cerr << "  WARNING: Failed to load wallet" << std::endl;
                 }
@@ -5734,11 +5732,11 @@ load_genesis_block:  // Bug #29: Label for automatic retry after blockchain wipe
                 int64_t total = mature + immature;
                 std::cout << "  [OK] Full scan complete" << std::endl;
                 std::cout << "       Mature (spendable): " << std::fixed << std::setprecision(8)
-                          << (static_cast<double>(mature) / 100000000.0) << " DilV" << std::endl;
+                          << (static_cast<double>(mature) / 100000000.0) << " ION" << std::endl;
                 std::cout << "       Immature (coinbase): " << std::fixed << std::setprecision(8)
-                          << (static_cast<double>(immature) / 100000000.0) << " DilV" << std::endl;
+                          << (static_cast<double>(immature) / 100000000.0) << " ION" << std::endl;
                 std::cout << "       Total: " << std::fixed << std::setprecision(8)
-                          << (static_cast<double>(total) / 100000000.0) << " DilV" << std::endl;
+                          << (static_cast<double>(total) / 100000000.0) << " ION" << std::endl;
                 std::cout.flush();
             } else {
                 std::cerr << "  WARNING: Rescan failed" << std::endl;
@@ -5756,11 +5754,11 @@ load_genesis_block:  // Bug #29: Label for automatic retry after blockchain wipe
                 int64_t total = mature + immature;
                 std::cout << "  [OK] Incremental scan complete" << std::endl;
                 std::cout << "       Mature (spendable): " << std::fixed << std::setprecision(8)
-                          << (static_cast<double>(mature) / 100000000.0) << " DilV" << std::endl;
+                          << (static_cast<double>(mature) / 100000000.0) << " ION" << std::endl;
                 std::cout << "       Immature (coinbase): " << std::fixed << std::setprecision(8)
-                          << (static_cast<double>(immature) / 100000000.0) << " DilV" << std::endl;
+                          << (static_cast<double>(immature) / 100000000.0) << " ION" << std::endl;
                 std::cout << "       Total: " << std::fixed << std::setprecision(8)
-                          << (static_cast<double>(total) / 100000000.0) << " DilV" << std::endl;
+                          << (static_cast<double>(total) / 100000000.0) << " ION" << std::endl;
                 std::cout.flush();
             } else {
                 std::cerr << "  WARNING: Rescan failed" << std::endl;
@@ -5774,11 +5772,11 @@ load_genesis_block:  // Bug #29: Label for automatic retry after blockchain wipe
             int64_t total = mature + immature;
             std::cout << "  [OK] Wallet already synced to chain tip" << std::endl;
             std::cout << "       Mature (spendable): " << std::fixed << std::setprecision(8)
-                      << (static_cast<double>(mature) / 100000000.0) << " DilV" << std::endl;
+                      << (static_cast<double>(mature) / 100000000.0) << " ION" << std::endl;
             std::cout << "       Immature (coinbase): " << std::fixed << std::setprecision(8)
-                      << (static_cast<double>(immature) / 100000000.0) << " DilV" << std::endl;
+                      << (static_cast<double>(immature) / 100000000.0) << " ION" << std::endl;
             std::cout << "       Total: " << std::fixed << std::setprecision(8)
-                      << (static_cast<double>(total) / 100000000.0) << " DilV" << std::endl;
+                      << (static_cast<double>(total) / 100000000.0) << " ION" << std::endl;
             std::cout.flush();
         }
 
@@ -6864,7 +6862,8 @@ load_genesis_block:  // Bug #29: Label for automatic retry after blockchain wipe
         rpc_server.RegisterChainState(&g_chainstate);
         rpc_server.RegisterMempool(&mempool);
         rpc_server.RegisterUTXOSet(&utxo_set);
-        rpc_server.RegisterX402Facilitator(&x402_facilitator);  // x402 payment protocol
+        // x402 facilitator DISABLED on ION (Fable5 H-1): its network id/asset are
+        // compile-time DilV constants, so it must not be exposed on ion-node.
         rpc_server.SetTestnet(config.testnet);
         rpc_server.SetPublicAPI(config.public_api);  // Light wallet REST API (for seed nodes)
         rpc_server.SetAttestationRateLimit(config.attestation_rate_limit);  // Sybil defense Phase 0
@@ -7758,7 +7757,7 @@ load_genesis_block:  // Bug #29: Label for automatic retry after blockchain wipe
                                 std::cout << "  [WARN] Try these fixes:" << std::endl;
                                 std::cout << "  [WARN]   1. Download bootstrap from https://github.com/dilithion/dilithion/releases" << std::endl;
                                 std::cout << "  [WARN]   2. Run `ion-node --reset-chain` to wipe chain data (preserves wallet.dat + mik_registration.dat)" << std::endl;
-                                std::cout << "  [WARN]   3. Use --addnode=138.197.68.128:9444 to connect directly to seed nodes" << std::endl;
+                                std::cout << "  [WARN]   3. Use --addnode=<ip:port> to connect directly to a known ION peer (ION has no public seed nodes yet)" << std::endl;
                                 std::cout << "  [WARN]   4. If in a country with internet restrictions, use a VPN\n" << std::endl;
                             }
                         }

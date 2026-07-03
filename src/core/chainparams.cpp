@@ -713,7 +713,10 @@ ChainParams ChainParams::Ion() {
 
     // Genesis block parameters (VDF genesis — see CreateIonGenesisBlock).
     // genesisTime/genesisHash are set at the genesis ceremony, NOT now.
-    params.genesisTime = 1774656000;   // ION-distinct placeholder — confirm at launch (genesis ceremony)
+    // TODO(genesis-ceremony): the real ION genesis time is pinned at the ceremony.
+    // Until then use a DISTINCT placeholder (+1 day past DilV's 1774656000) so the
+    // ION and DilV genesis blocks are not near-identical byte-for-byte.
+    params.genesisTime = 1774742400;   // ION-distinct placeholder — confirm at launch (genesis ceremony)
     params.genesisNonce = 0;           // Not used for VDF blocks (nonce is vestigial)
     params.genesisNBits = 0x1d00ffff;  // Fixed — VDF uses lowest-output-wins, not hash-under-target
     // TODO(genesis-ceremony): compute + pin the real ION genesis hash before launch.

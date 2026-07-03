@@ -145,22 +145,28 @@ BOOST_AUTO_TEST_CASE(ion_seeds_own_genesis) {
     CBlock ionGenesis = Genesis::CreateIonGenesisBlock();
     uint256 ionGenesisHash = ionGenesis.GetHash();   // VDF → SHA3, no RandomX
 
-    // GetGenesisHash() is the live authoritative genesis hash. Under ION it must
-    // resolve to the ION genesis (proving the seeded genesis matches the real
-    // one → block 1's pprev lookup finds it → sync past height 1).
+    // Cache-INDEPENDENT determinism check (Fable5 M-3).
     //
-    // NOTE (round-2 LOW): GetGenesisHash() caches into a function-static, and
-    // CreateIonGenesisBlock() currently DELEGATES verbatim to the DilV genesis
-    // (byte-identical), so this hash-equality alone is a weak discriminator —
-    // it would still hold if a stale DilV cache leaked in. It is kept as a
-    // consistency check, but the ION-SPECIFIC guarantees below (exact VDF
-    // nVersion + the ION coinbase message embedded in the genesis coinbase) are
-    // the robust distinguishers that actually prove "ION built its own genesis
-    // from ION params", independent of the cache.
-    uint256 authoritative = Genesis::GetGenesisHash();
-    BOOST_CHECK_MESSAGE(ionGenesisHash == authoritative,
+    // The original assertion compared ionGenesisHash against
+    // Genesis::GetGenesisHash(). That function caches its result in a
+    // function-static that is NOT reset by ChainParamsGuard, which made the check
+    // ORDER-DEPENDENT: if an earlier suite ran under DIL/DilV params it would have
+    // cached that chain's genesis hash, and the equality here would spuriously
+    // FAIL — ION's genesis differs from DilV's by both its coinbase message and
+    // (now) its genesisTime, so the hashes are NOT equal. Calling GetGenesisHash()
+    // here would also POISON the cache for later suites. (The old NOTE that
+    // claimed equality "would still hold on a stale DilV cache" was simply wrong:
+    // the two genesis blocks are not byte-identical.)
+    //
+    // We therefore assert against a freshly, directly recomputed ION genesis hash
+    // (no function-static cache, no cross-suite side effects). This proves the ION
+    // genesis factory is deterministic; the ION-SPECIFIC distinguishers below
+    // (exact VDF nVersion + ION coinbase message) prove it was built from ION's
+    // own params.
+    uint256 ionGenesisHashRecomputed = Genesis::CreateIonGenesisBlock().GetHash();
+    BOOST_CHECK_MESSAGE(ionGenesisHash == ionGenesisHashRecomputed,
         "ION genesis hash (" + ionGenesisHash.GetHex() +
-        ") != GetGenesisHash() (" + authoritative.GetHex() + ")");
+        ") != freshly recomputed ION genesis hash (" + ionGenesisHashRecomputed.GetHex() + ")");
 
     // ROBUST DISTINGUISHER 1 — exact VDF version, not merely ">= VDF_VERSION".
     // The legacy else-branch (CreateGenesisBlock) would seed a v1 block; the ION
