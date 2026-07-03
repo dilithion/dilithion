@@ -159,10 +159,10 @@ static const int DIFFICULTY_ADJUSTMENT_INTERVAL_V2 = 360;
  * (Bitcoin-practical-limit lineage). SINGLE SOURCE OF TRUTH: every reorg-bound
  * check references this constant; there must be no literal copies elsewhere.
  *
- * Value = 60 (ION decision F-02, 2026-07-01: tightened from the inherited 100).
+ * Value = 60 (tightened 2026-07-01 from the inherited 100).
  * On a constant-VDF-work chain nChainWork ~= block-count, so this hard depth
  * cap + attested-identity scarcity are the deep-reorg defense (not PoW
- * cumulative-work cost). See ION_DECISION_REGISTER F-02.
+ * cumulative-work cost).
  */
 static const int MAX_REORG_DEPTH = 60;
 
@@ -266,7 +266,7 @@ static const int MEDIAN_TIME_SPAN = 11;
  * MAX_REORG_DEPTH (DilV: 6 < 60), a reorg in the (maturity, cap] window can
  * still un-spend a matured coinbase — a separate live-chain finding, not caught
  * here. This assert protects DIL's compile-time invariant only.
- * (See ION_DECISION_REGISTER F-08 / K-08 + the DilV maturity item.)
+ * (See the DilV coinbase-maturity item.)
  */
 static_assert(MAX_REORG_DEPTH <= COINBASE_MATURITY,
               "F-08 violated: MAX_REORG_DEPTH must be <= COINBASE_MATURITY — "
