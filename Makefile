@@ -435,11 +435,10 @@ BOOST_RPC_WEBSOCKET_TEST_SOURCE := src/test/rpc_websocket_tests.cpp
 .DEFAULT_GOAL := all
 
 # Default target: build main binaries and utilities
-all: dilithion-node dilv-node ion-node genesis_gen check-wallet-balance
+all: dilithion-node dilv-node genesis_gen check-wallet-balance
 	@echo "$(COLOR_GREEN)✓ Build complete!$(COLOR_RESET)"
 	@echo "  dilithion-node:        $(shell ls -lh dilithion-node 2>/dev/null | awk '{print $$5}')"
 	@echo "  dilv-node:             $(shell ls -lh dilv-node 2>/dev/null | awk '{print $$5}')"
-	@echo "  ion-node:              $(shell ls -lh ion-node 2>/dev/null | awk '{print $$5}')"
 	@echo "  genesis_gen:           $(shell ls -lh genesis_gen 2>/dev/null | awk '{print $$5}')"
 	@echo "  check-wallet-balance:  $(shell ls -lh check-wallet-balance 2>/dev/null | awk '{print $$5}')"
 
@@ -464,14 +463,6 @@ dilv-node: $(CORE_OBJECTS) $(OBJ_DIR)/node/dilv-node.o $(DILITHIUM_OBJECTS) $(CH
 	@echo "$(COLOR_BLUE)[LINK]$(COLOR_RESET) $@"
 	@$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS) $(LIBS)
 	@echo "$(COLOR_GREEN)✓ dilv-node built successfully$(COLOR_RESET)"
-
-# ION (Dilithion v2) node — mirrors the dilv-node target; ion-node.cpp selects
-# ChainParams::Ion() instead of ChainParams::DilV(). Same object dirs
-# ($(OBJ_DIR)/node) and libzmq order-only prerequisite as dilv-node.
-ion-node: $(CORE_OBJECTS) $(OBJ_DIR)/node/ion-node.o $(DILITHIUM_OBJECTS) $(CHIAVDF_OBJECTS) | libzmq
-	@echo "$(COLOR_BLUE)[LINK]$(COLOR_RESET) $@"
-	@$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS) $(LIBS)
-	@echo "$(COLOR_GREEN)✓ ion-node built successfully$(COLOR_RESET)"
 
 genesis_gen: $(CORE_OBJECTS) $(OBJ_DIR)/test/genesis_test.o $(DILITHIUM_OBJECTS) $(CHIAVDF_OBJECTS)
 	@echo "$(COLOR_BLUE)[LINK]$(COLOR_RESET) $@"
@@ -854,13 +845,6 @@ regtest_chainparams_smoke: $(CORE_OBJECTS) $(OBJ_DIR)/test/regtest_chainparams_s
 	@$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS) $(LIBS)
 	@echo "$(COLOR_GREEN)✓ regtest_chainparams_smoke built successfully$(COLOR_RESET)"
 
-# ION VDF-dispatch functional test (red-team PR #142 follow-up).
-# Proves the CRITICAL/HIGH fixes (VDF proof checker + ION genesis seeding +
-# fixed-nBits no div-by-zero) and the IsVdfChain() byte-neutral truth table.
-# Now a Boost.Test suite compiled INTO test_dilithion (see BOOST_TEST_OBJECTS),
-# so CI machine-enforces the sweep on every ./test_dilithion run — no standalone
-# target (which is why there is no ion_vdf_dispatch_tests rule here anymore).
-
 dna_serialization_test: $(CORE_OBJECTS) $(OBJ_DIR)/digital_dna/dna_serialization_test.o $(DILITHIUM_OBJECTS) $(CHIAVDF_OBJECTS)
 	@echo "$(COLOR_BLUE)[LINK]$(COLOR_RESET) $@"
 	@$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS) $(LIBS)
@@ -992,7 +976,6 @@ BOOST_TEST_OBJECTS := $(OBJ_DIR)/test/test_dilithion.o \
 	$(OBJ_DIR)/test/zmq_tests.o \
 	$(OBJ_DIR)/test/seed_attestation_glue_tests.o \
 	$(OBJ_DIR)/test/wf1_host_endian_differential_test.o \
-	$(OBJ_DIR)/test/ion_vdf_dispatch_tests.o \
 	$(CRYPTO_PROPERTY_OBJECTS)
 
 # Link test objects + full library (CORE_OBJECTS) to avoid hand-picked object drift
@@ -1268,7 +1251,7 @@ libzmq-clean:
 clean:
 	@echo "$(COLOR_YELLOW)Cleaning build artifacts...$(COLOR_RESET)"
 	@rm -rf $(BUILD_DIR)
-	@rm -f dilithion-node dilv-node ion-node genesis_gen
+	@rm -f dilithion-node genesis_gen
 	@rm -f phase1_test miner_tests wallet_tests rpc_tests rpc_auth_tests timestamp_tests crypter_tests seed_attestation_key_tests wallet_encryption_integration_tests wallet_persistence_tests integration_tests net_tests tx_validation_tests tx_relay_tests mining_integration_tests dfmp_mik_tests mik_registration_persistence_tests registration_manager_tests dna_propagation_tests
 	@rm -f test_dilithion
 	@rm -f $(DILITHIUM_OBJECTS)

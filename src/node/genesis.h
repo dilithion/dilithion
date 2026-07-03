@@ -75,19 +75,6 @@ bool IsGenesisBlock(const CBlock& block);
 CBlock CreateDilVGenesisBlock();
 
 /**
- * Create the ION (Dilithion v2) genesis block (VDF chain).
- *
- * ION reuses DilV's VDF genesis construction. The genesis VDF challenge is
- * chain-identity-independent, so DilV's precomputed Wesolowski proof is a real,
- * verifying proof for ION too; the block content is otherwise driven entirely
- * by g_chainParams (ION's params). This delegates to CreateDilVGenesisBlock().
- * See genesis.cpp for the full rationale and the genesis-ceremony TODO.
- *
- * @return The ION genesis block
- */
-CBlock CreateIonGenesisBlock();
-
-/**
  * Mine the genesis block
  *
  * This function mines the genesis block by finding a valid nonce.
