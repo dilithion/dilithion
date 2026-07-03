@@ -25,6 +25,7 @@
 #include <core/chainparams.h>  // CHAIN-ID FIX: For replay protection
 
 #include <algorithm>
+#include <cctype>
 #include <random>  // WALLET-007 FIX: For std::shuffle
 #include <cstring>
 #include <fstream>
@@ -180,8 +181,24 @@ bool CDilithiumAddress::SetString(const std::string& str) {
     // decoded as bech32m; anything else falls through to Base58Check. On a
     // Base58Check chain (empty hrp) the bech32m branch is never taken, so
     // DIL/DilV/Testnet parsing is byte-identical to before.
-    if (!hrp.empty() && str.size() > hrp.size() &&
-        str.compare(0, hrp.size(), hrp) == 0 && str[hrp.size()] == '1') {
+    //
+    // The HRP prefix match is CASE-INSENSITIVE: bech32/bech32m are case-
+    // insensitive by spec, so a spec-valid all-uppercase "ION1…" (e.g. from a
+    // QR code) must reach Decode() — which lowercases the HRP and rejects only
+    // MIXED case. A case-sensitive gate here would wrongly fall an uppercase
+    // ION address through to Base58Check (which fails on 'O'/'I'). We only
+    // detect the prefix here; Decode() remains the authoritative validator.
+    auto ci_hrp_match = [](const std::string& s, const std::string& p) {
+        if (s.size() <= p.size() || s[p.size()] != '1') return false;
+        for (size_t i = 0; i < p.size(); ++i) {
+            if (std::tolower(static_cast<unsigned char>(s[i])) !=
+                std::tolower(static_cast<unsigned char>(p[i]))) {
+                return false;
+            }
+        }
+        return true;
+    };
+    if (!hrp.empty() && ci_hrp_match(str, hrp)) {
         bech32m::DecodeResult dec = bech32m::Decode(str);
         if (!dec.ok || dec.hrp != hrp) {
             vchData.clear();

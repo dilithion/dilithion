@@ -23,6 +23,7 @@
 #include <util/bech32m.h>
 #include <wallet/wallet.h>
 #include <core/chainparams.h>
+#include <rpc/rest_api.h>
 
 #include <cstdint>
 #include <string>
@@ -220,6 +221,103 @@ BOOST_AUTO_TEST_CASE(dilv_base58_unchanged) {
     CDilithiumAddress addr = CDilithiumAddress::FromData(FixedPayload());
     // Same base58 payload encoding as DIL (both empty-hrp / Base58Check).
     BOOST_CHECK_EQUAL(addr.ToString(), std::string(BASE58_PIN));
+}
+
+// ---------------------------------------------------------------------------
+// (5) Wiring-completeness regression (red-team WIRING-COMPLETENESS fold).
+//     These pin the ION-reachable address sites that previously bypassed the
+//     gated CDilithiumAddress and hardcoded Base58/'D'-prefix logic.
+// ---------------------------------------------------------------------------
+
+// HIGH-1: the REST address-validation gate (ValidateAddress) must accept an ION
+// bech32m address (previously hard-rejected by the 'D'-prefix + size>40 +
+// Base58-charset pre-filter) and still reject garbage. Exercised through the
+// PUBLIC HandleRequest entry point (ValidateAddress is a private helper): with
+// no UTXO set registered, an address that PASSES validation falls through to a
+// 503 "UTXO set not available", while an address that FAILS validation returns
+// a 400 "Invalid address format" — so the two are cleanly distinguishable.
+BOOST_AUTO_TEST_CASE(rest_validateaddress_ion) {
+    ChainParamsGuard guard(new ChainParams(ChainParams::Ion()));
+    CRestAPI api;  // no components registered
+
+    // Native ION address now passes validation (reaches the 503, not the 400).
+    std::string ok = api.HandleRequest("GET", std::string("/api/v1/balance/") + ION_PIN, "", "127.0.0.1");
+    BOOST_CHECK_MESSAGE(ok.find("Invalid address format") == std::string::npos,
+                        "ION address wrongly rejected by REST ValidateAddress: " + ok);
+    BOOST_CHECK(ok.find("UTXO set not available") != std::string::npos);
+
+    // Uppercase ION address (case-insensitive, LOW-1) also passes the REST gate.
+    std::string upper(ION_PIN);
+    for (char& c : upper) if (c >= 'a' && c <= 'z') c -= ('a' - 'A');
+    std::string okUp = api.HandleRequest("GET", std::string("/api/v1/utxos/") + upper, "", "127.0.0.1");
+    BOOST_CHECK(okUp.find("Invalid address format") == std::string::npos);
+
+    // Garbage is still rejected at the validation gate (400).
+    std::string bad = api.HandleRequest("GET", "/api/v1/balance/not-a-real-address", "", "127.0.0.1");
+    BOOST_CHECK(bad.find("Invalid address format") != std::string::npos);
+
+    // A corrupted bech32m checksum is rejected too.
+    std::string corrupt(ION_PIN);
+    corrupt[corrupt.size() - 1] = (corrupt[corrupt.size() - 1] == 'p') ? 'q' : 'p';
+    std::string badcs = api.HandleRequest("GET", std::string("/api/v1/balance/") + corrupt, "", "127.0.0.1");
+    BOOST_CHECK(badcs.find("Invalid address format") != std::string::npos);
+}
+
+// HIGH-1 (DIL side): the REST gate on a Base58Check chain still accepts a valid
+// DIL address and rejects a bech32m string — DIL behaviour unchanged.
+BOOST_AUTO_TEST_CASE(rest_validateaddress_dil_unchanged) {
+    ChainParamsGuard guard(new ChainParams(ChainParams::Mainnet()));
+    CRestAPI api;
+
+    std::string dil = api.HandleRequest("GET", std::string("/api/v1/balance/") + BASE58_PIN, "", "127.0.0.1");
+    BOOST_CHECK(dil.find("Invalid address format") == std::string::npos);   // DIL accepted
+    BOOST_CHECK(dil.find("UTXO set not available") != std::string::npos);
+
+    std::string ionOnDil = api.HandleRequest("GET", std::string("/api/v1/balance/") + ION_PIN, "", "127.0.0.1");
+    BOOST_CHECK(ionOnDil.find("Invalid address format") != std::string::npos);  // ion1… invalid on DIL
+
+    std::string junk = api.HandleRequest("GET", "/api/v1/balance/garbage", "", "127.0.0.1");
+    BOOST_CHECK(junk.find("Invalid address format") != std::string::npos);
+}
+
+// LOW-1: an all-uppercase ION1… address parses (case-insensitive HRP gate) to
+// the SAME payload as its lowercase form; a MIXED-case address is rejected.
+BOOST_AUTO_TEST_CASE(ion_uppercase_accepted_mixed_rejected) {
+    ChainParamsGuard guard(new ChainParams(ChainParams::Ion()));
+
+    std::string upper(ION_PIN);
+    for (char& c : upper) if (c >= 'a' && c <= 'z') c -= ('a' - 'A');
+    CDilithiumAddress up;
+    BOOST_REQUIRE(up.SetString(upper));
+    BOOST_CHECK(up.GetData() == FixedPayload());
+
+    // Mixed case: uppercase the HRP only (bech32m rejects mixed case in Decode).
+    std::string mixed(ION_PIN);
+    mixed[0] = 'I'; mixed[1] = 'O'; mixed[2] = 'N';  // "ION1…" body stays lowercase
+    CDilithiumAddress mx;
+    BOOST_CHECK(!mx.SetString(mixed));
+}
+
+// MED-1 (DNA emit) / MED-2 (x402 parse): both now delegate to the gated
+// ToString()/SetString(). Prove the parse path an ION user hits yields the same
+// 21-byte payload the facilitator extracts (decoded.data()+1 == 20-byte hash),
+// and that the emit side renders ion1… — the same round-trip the DNA RPC does.
+BOOST_AUTO_TEST_CASE(ion_parse_emit_shared_gate) {
+    ChainParamsGuard guard(new ChainParams(ChainParams::Ion()));
+    // Emit side (DNA pubkeyhash_to_address delegates here): ion1… form.
+    CDilithiumAddress emitted = CDilithiumAddress::FromData(FixedPayload());
+    std::string s = emitted.ToString();
+    BOOST_CHECK(s.rfind("ion1", 0) == 0);
+    // Parse side (facilitator SetString delegates here): recovers payload,
+    // version 0x1E, and a 20-byte hash tail exactly as decoded.data()+1 expects.
+    CDilithiumAddress parsed;
+    BOOST_REQUIRE(parsed.SetString(s));
+    const std::vector<uint8_t>& d = parsed.GetData();
+    BOOST_REQUIRE_EQUAL(d.size(), 21u);
+    BOOST_CHECK_EQUAL(d[0], 0x1E);
+    const std::vector<uint8_t> fp = FixedPayload();
+    BOOST_CHECK(std::vector<uint8_t>(d.begin() + 1, d.end()) ==
+                std::vector<uint8_t>(fp.begin() + 1, fp.end()));
 }
 
 BOOST_AUTO_TEST_SUITE_END()
