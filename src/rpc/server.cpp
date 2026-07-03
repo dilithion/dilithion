@@ -3740,7 +3740,17 @@ std::string CRPCServer::RPC_GetBlockchainInfo(const std::string& params) {
     oss << "\"integrity_health\":\""
         << (Dilithion::ChainstateIntegrityMonitor::IsIntegrityHealthDegraded()
                 ? "degraded" : "ok")
-        << "\"";
+        << "\",";
+    // Magnet v1a (fork-resistance, OBSERVABILITY ONLY): operator/monitoring-
+    // pollable "am I on the best-known chain?" signal. on_canonical=false when
+    // the node is stuck behind a strictly-better chain beyond MAX_REORG_DEPTH
+    // (a DepthRejection rebuild is pending) — off_canonical_reason is then
+    // "depth-rejection". off_canonical_reason is the machine-readable cause
+    // ("" when on-canonical). Pure read + report — no consensus/mining
+    // behavior is affected.
+    const std::string off_reason = m_chainstate->OffCanonicalReason();
+    oss << "\"on_canonical\":" << (off_reason.empty() ? "true" : "false") << ",";
+    oss << "\"off_canonical_reason\":\"" << off_reason << "\"";
     oss << "}";
     return oss.str();
 }
