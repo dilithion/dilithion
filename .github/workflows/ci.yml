@@ -84,6 +84,25 @@ jobs:
       run: |
         make dilithion-node -j$(nproc)
 
+    - name: Check ION identity hygiene
+      run: |
+        # Fable5 merge-gate: fail the build if ion-node.cpp carries any DilV
+        # identity token (wire magic, production seed IP, DilV datadir selector,
+        # dilv-node REST port, .dilv path) in live code. Makes the "ION binary
+        # secretly says DilV" class of regression a machine gate. Only FULL-LINE
+        # comments are exempt — a DilV token in a trailing comment on a code line
+        # still fails (fail-closed; see scripts/check-ion-identity.sh).
+        bash scripts/check-ion-identity.sh
+
+    - name: Build DilV and ION Nodes
+      run: |
+        # Compile the VDF-chain binaries so an ION/DilV compile break or a
+        # re-narrowed IsVdfChain() dispatch site fails CI instead of shipping
+        # green (round-2 MEDIUM: machine-enforce the sweep across the release
+        # binaries, not just the tests).
+        make dilv-node -j$(nproc)
+        make ion-node -j$(nproc)
+
     - name: Build Genesis Generator
       run: |
         make genesis_gen -j$(nproc)

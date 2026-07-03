@@ -663,8 +663,11 @@ bool CNetMessageProcessor::ProcessVersionMessage(int peer_id, CDataStream& strea
 
         // Protocol version negotiation (Bitcoin Core pattern)
         // Reject peers with incompatible protocol versions
-        // DilV requires v3.8.3+ (70007) due to fork defense consensus changes
-        int minProtoVersion = (NetProtocol::g_network_magic == NetProtocol::DILV_MAGIC)
+        // DilV requires v3.8.3+ (70007) due to fork defense consensus changes.
+        // ION is a VDF chain like DilV (fresh genesis) — it takes the same VDF
+        // min-proto floor, not the generic DIL fallback.
+        int minProtoVersion = (NetProtocol::g_network_magic == NetProtocol::DILV_MAGIC ||
+                               NetProtocol::g_network_magic == NetProtocol::ION_MAGIC)
             ? NetProtocol::DILV_MIN_PEER_PROTO_VERSION
             : NetProtocol::MIN_PEER_PROTO_VERSION;
         if (msg.version < minProtoVersion) {

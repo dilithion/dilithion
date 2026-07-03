@@ -12,6 +12,7 @@ enum Network {
     MAINNET,
     TESTNET,
     DILV,       // DilV: VDF distribution payment chain
+    ION,        // ION (Dilithion v2): post-quantum VDF chain — additive scaffold
     REGTEST     // Phase 5: regression-test mode for byte-equivalence integration tests
 };
 
@@ -55,6 +56,12 @@ public:
 
     // Data directory
     std::string dataDir;            // Default data directory name
+
+    // Bech32m human-readable part (HRP) for native SegWit-style addresses.
+    // RESERVED for a later bech32m address-codec PR — no codec is wired here.
+    // Empty "" for all existing chains (DIL/DilV/Testnet/Regtest keep Base58);
+    // ION sets "ion" so the future codec PR has a per-chain HRP to key on.
+    std::string bech32Prefix{""};
 
     // Consensus parameters
     uint32_t blockTime;             // Target seconds per block
@@ -502,6 +509,7 @@ public:
     static ChainParams Mainnet();
     static ChainParams Testnet();
     static ChainParams DilV();
+    static ChainParams Ion();      // ION (Dilithion v2): VDF chain — additive scaffold
     static ChainParams Regtest();  // Phase 5: regression-test mode
 
     // Helper methods
@@ -510,6 +518,7 @@ public:
             case MAINNET: return "mainnet";
             case TESTNET: return "testnet";
             case DILV:    return "dilv";
+            case ION:     return "ion";
             case REGTEST: return "regtest";
             default:      return "unknown";
         }
@@ -518,7 +527,21 @@ public:
     bool IsMainnet() const { return network == MAINNET; }
     bool IsTestnet() const { return network == TESTNET; }
     bool IsDilV() const { return network == DILV; }
+    bool IsIon() const { return network == ION; }
     bool IsRegtest() const { return network == REGTEST; }
+
+    // VDF-chain class predicate. TRUE for the VDF-consensus chains (DilV and
+    // ION), FALSE for the RandomX/PoW chains (DIL mainnet, testnet). Regtest is
+    // configured as a VDF chain but is gated separately at each site (it takes
+    // its own air-gap/fast-path arms), so it is intentionally NOT folded in here.
+    //
+    // BYTE-NEUTRAL sweep property: replacing a chain-*class* `IsDilV()` gate
+    // with `IsVdfChain()` changes truth value ONLY for ION — DIL stays false,
+    // DilV stays true — and only newly-includes ION in the VDF arm. Use this
+    // for VDF-CLASS dispatch (proof checker, fixed nBits, fork-detection no-op,
+    // heat-penalty disable). Do NOT use it for DilV-*identity* special-cases
+    // (genesis block, seed lists, unit labels) — those need an explicit ION arm.
+    bool IsVdfChain() const { return IsDilV() || IsIon(); }
 
     /**
      * MAINNET SECURITY: Get the last checkpoint at or before given height

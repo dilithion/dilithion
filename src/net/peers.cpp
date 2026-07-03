@@ -721,6 +721,7 @@ void CPeerManager::InitializeSeedNodes() {
     // Check which network we're on
     bool isTestnet = Dilithion::g_chainParams && Dilithion::g_chainParams->IsTestnet();
     bool isDilV = Dilithion::g_chainParams && Dilithion::g_chainParams->IsDilV();
+    bool isIon = Dilithion::g_chainParams && Dilithion::g_chainParams->IsIon();
     bool isRegtest = Dilithion::g_chainParams && Dilithion::g_chainParams->IsRegtest();
 
     // Regtest must NEVER reach out to public seed nodes. The 4-node harness
@@ -730,6 +731,18 @@ void CPeerManager::InitializeSeedNodes() {
     // attempts to dial 138.197.68.128:8444 etc., which causes peer churn,
     // CPU contention, and stalled mining templates.
     if (isRegtest) {
+        dns_seeds.clear();
+        return;
+    }
+
+    // ION (identity site, 2026-07): ION is a distinct chain (magic 0xD1150200,
+    // port 10444) with NO seed infrastructure yet. It must NEVER fall through to
+    // the mainnet-DIL branch below — dialing DIL seeds (seed.dilithion.org /
+    // 138.197.68.128:8444) would spam production DIL infra with connections that
+    // DIL rejects at handshake on magic mismatch (churn + noise) and give ION
+    // zero real peers. Empty seeds is correct until ION seeds exist; peers are
+    // wired via --addnode meanwhile (same air-gap discipline as regtest).
+    if (isIon) {
         dns_seeds.clear();
         return;
     }
