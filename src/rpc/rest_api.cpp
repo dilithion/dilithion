@@ -659,20 +659,22 @@ std::string CRestAPI::FormatAmount(int64_t amount) const {
 }
 
 bool CRestAPI::ValidateAddress(const std::string& address) const {
-    // Route through the gated CDilithiumAddress parser so this accepts whatever
-    // the active chain's address format is: Base58Check ("D…") on DIL/DilV/testnet
-    // and bech32m ("ion1…") on ION. The old hardcoded 'D'-prefix + Base58-charset
-    // pre-filter rejected every ION bech32m address before SetString could parse
-    // it, breaking the REST light-wallet surface on ION. SetString/IsValid still
-    // reject garbage (bad checksum, wrong version byte, wrong length).
-    if (address.empty()) {
+    // Basic validation: Dilithion addresses start with 'D' and are ~34 chars
+    if (address.empty() || address[0] != 'D') {
         return false;
     }
-    CDilithiumAddress addr;
-    if (!addr.SetString(address)) {
+    if (address.size() < 25 || address.size() > 40) {
         return false;
     }
-    return addr.IsValid();
+    // Check for valid Base58 characters
+    for (char c : address) {
+        if (!((c >= '1' && c <= '9') || (c >= 'A' && c <= 'H') ||
+              (c >= 'J' && c <= 'N') || (c >= 'P' && c <= 'Z') ||
+              (c >= 'a' && c <= 'k') || (c >= 'm' && c <= 'z'))) {
+            return false;
+        }
+    }
+    return true;
 }
 
 bool CRestAPI::ValidateTxid(const std::string& txid) const {

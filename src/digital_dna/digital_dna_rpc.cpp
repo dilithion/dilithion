@@ -639,17 +639,13 @@ std::string DigitalDNARpc::address_to_hex(const std::array<uint8_t, 20>& addr) c
     return oss.str();
 }
 
-// Convert raw 20-byte pubkey hash to the active chain's textual address.
-// Routes through the gated CDilithiumAddress so ION renders bech32m ("ion1…")
-// while DIL/DilV/testnet stay Base58Check ("D…") BYTE-UNCHANGED — avoids the
-// "same address shown two ways" hazard (wallet shows ion1…, DNA RPC would
-// otherwise show the D… Base58 form for the same 20-byte hash).
+// Convert raw 20-byte pubkey hash to base58check D... address
 static std::string pubkeyhash_to_address(const std::array<uint8_t, 20>& hash) {
-    // Version byte 0x1E + 20-byte hash is the canonical payload.
+    // Version byte 0x1E produces addresses starting with 'D'
     std::vector<uint8_t> data;
     data.push_back(0x1E);
     data.insert(data.end(), hash.begin(), hash.end());
-    return CDilithiumAddress::FromData(data).ToString();
+    return EncodeBase58Check(data);
 }
 
 std::array<uint8_t, 20> DigitalDNARpc::hex_to_address(const std::string& hex) const {
