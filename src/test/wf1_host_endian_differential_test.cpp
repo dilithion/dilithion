@@ -20,7 +20,6 @@
 //   - A2  : new==old mirror, compensated by == A1 canonical (production anchor)
 //   - A3s : GetShortID() -> FillShortTxIDSelector()       (production) vs the
 //           SipHash key derived from the OLD host-endian preimage
-//   - A3w : CBlockHeaderAndShortTxIDs::Serialize/Deserialize round-trip (production)
 //   - A4  : WriteMiningHeaderLE() — the SAME helper the miner hot loop calls —
 //           and additionally asserted byte-equal to A1 SerializeHeader()
 //   - C1  : vdf preimage mirror new==old
@@ -235,31 +234,11 @@ BOOST_AUTO_TEST_CASE(a3_selector_production_driving) {
     }
 }
 
-// A3-wire: PRODUCTION Serialize()/Deserialize() round-trips header scalars,
-// selector nonce and short-txids identically. (The wire framing itself is P2P-
-// only and lives on a separate branch; this just proves the round-trip holds.)
-BOOST_AUTO_TEST_CASE(a3_wire_roundtrip_production) {
-    for (const auto& x : kHvs) {
-        bool vdf = (x.v >= CBlockHeader::VDF_VERSION);
-        CBlockHeader h = make_header(x.v, x.t, x.bits, x.nonce, vdf);
-        uint64_t sel_nonce = 0x1122334455667788ULL ^ x.nonce;
-
-        CBlockHeaderAndShortTxIDs comp;
-        comp.header = h;
-        comp.nonce = sel_nonce;
-        comp.shorttxids = { 0x010203040506ULL, 0x0A0B0C0D0E0FULL };
-        std::vector<uint8_t> wire = comp.Serialize();
-
-        CBlockHeaderAndShortTxIDs back;
-        BOOST_REQUIRE(back.Deserialize(wire.data(), wire.size()));
-        BOOST_CHECK_EQUAL(back.header.nVersion, h.nVersion);
-        BOOST_CHECK_EQUAL(back.header.nTime, h.nTime);
-        BOOST_CHECK_EQUAL(back.header.nBits, h.nBits);
-        BOOST_CHECK_EQUAL(back.header.nNonce, h.nNonce);
-        BOOST_CHECK_EQUAL(back.nonce, comp.nonce);
-        BOOST_CHECK(back.shorttxids == comp.shorttxids);
-    }
-}
+// NOTE: former A3-wire case (a3_wire_roundtrip_production) removed — it drove
+// CBlockHeaderAndShortTxIDs::Serialize()/Deserialize(), which were dead
+// (never-wired) code and have been deleted. The live CMPCTBLOCK wire is the
+// net.cpp CDataStream path. A3-selector above still drives the production
+// FillShortTxIDSelector() via GetShortID(), so the WF-1 endian proof is intact.
 
 // A4: PRODUCTION-DRIVING. WriteMiningHeaderLE() is the exact helper the miner
 // hot loop (controller.cpp MiningWorker) calls to assemble its 80-byte PoW
