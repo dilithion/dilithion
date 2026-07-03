@@ -3233,7 +3233,9 @@ static std::string DecodeScriptPubKeyToAddress(const std::vector<uint8_t>& scrip
         std::vector<uint8_t> addrData;
         addrData.push_back(0x1E);  // Dilithion version byte ('D' prefix)
         addrData.insert(addrData.end(), scriptPubKey.begin() + 3, scriptPubKey.begin() + 23);
-        return EncodeBase58Check(addrData);
+        // Route through the gated encoder so ION emits bech32m and DIL/DilV keep
+        // Base58Check (byte-unchanged).
+        return CDilithiumAddress::FromData(addrData).ToString();
     }
     return "";
 }
@@ -4327,7 +4329,8 @@ std::string CRPCServer::RPC_GetTopHolders(const std::string& params) {
         std::vector<uint8_t> addrData;
         addrData.push_back(0x1E);  // Dilithion version byte ('D' prefix)
         addrData.insert(addrData.end(), sorted[i].first.begin(), sorted[i].first.end());
-        std::string address = EncodeBase58Check(addrData);
+        // Gated encoder: ION → bech32m, DIL/DilV → Base58Check (byte-unchanged).
+        std::string address = CDilithiumAddress::FromData(addrData).ToString();
 
         rank++;  // Overall rank (before filtering)
 

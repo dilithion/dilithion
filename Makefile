@@ -339,6 +339,7 @@ WALLET_SOURCES := src/wallet/wallet.cpp \
 UTIL_SOURCES := src/util/strencodings.cpp \
                 src/util/stacktrace.cpp \
                 src/util/base58.cpp \
+                src/util/bech32m.cpp \
                 src/util/system.cpp \
                 src/util/assert.cpp \
                 src/util/logging.cpp \
@@ -993,6 +994,7 @@ BOOST_TEST_OBJECTS := $(OBJ_DIR)/test/test_dilithion.o \
 	$(OBJ_DIR)/test/seed_attestation_glue_tests.o \
 	$(OBJ_DIR)/test/wf1_host_endian_differential_test.o \
 	$(OBJ_DIR)/test/ion_vdf_dispatch_tests.o \
+	$(OBJ_DIR)/test/bech32m_tests.o \
 	$(CRYPTO_PROPERTY_OBJECTS)
 
 # Link test objects + full library (CORE_OBJECTS) to avoid hand-picked object drift

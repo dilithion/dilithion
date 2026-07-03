@@ -8,6 +8,7 @@
 #include <vdf/vdf.h>
 #include <crypto/sha3.h>
 #include <util/base58.h>
+#include <wallet/wallet.h>
 #include <iostream>
 #include <sstream>
 #include <random>
@@ -256,12 +257,15 @@ std::string CFacilitator::HandleDnaAttest(const std::string& query, const std::s
         return BuildErrorResponse(400, "Empty address parameter");
     }
 
-    // Decode the DilV address to get the 20-byte pubkey hash
-    // Address format: Base58Check(0x1E || hash20)
-    std::vector<uint8_t> decoded;
-    if (!DecodeBase58Check(address, decoded) || decoded.size() != 21 || decoded[0] != 0x1E) {
+    // Decode the address to get the 20-byte pubkey hash. Route through the gated
+    // CDilithiumAddress so ION accepts the native bech32m ("ion1…") form as well
+    // as the Base58Check ("D…") form; DIL/DilV parse unchanged. Both yield the
+    // same 21-byte payload (0x1E || hash20).
+    CDilithiumAddress dnaAddr;
+    if (!dnaAddr.SetString(address) || !dnaAddr.IsValid()) {
         return BuildErrorResponse(400, "Invalid DilV address");
     }
+    const std::vector<uint8_t>& decoded = dnaAddr.GetData();
     std::array<uint8_t, 20> addr_key;
     std::memcpy(addr_key.data(), decoded.data() + 1, 20);
 
@@ -608,9 +612,11 @@ std::string CFacilitator::HandleSiwxVerify(const std::string& body, const std::s
     SHA3_256(pubkeyBytes.data(), pubkeyBytes.size(), hash1);
     SHA3_256(hash1, 32, hash2);
 
-    // Decode claimed address to get the expected 20-byte pubkey hash
-    std::vector<uint8_t> addrDecoded;
-    if (!DecodeBase58Check(address, addrDecoded) || addrDecoded.size() != 21 || addrDecoded[0] != 0x1E) {
+    // Decode claimed address to get the expected 20-byte pubkey hash. Gated
+    // CDilithiumAddress accepts the active chain's format (bech32m ion1… on ION,
+    // Base58Check D… on DilV); both decode to the same 21-byte 0x1E||hash20.
+    CDilithiumAddress claimedAddr;
+    if (!claimedAddr.SetString(address) || !claimedAddr.IsValid()) {
         SIWXResult fail;
         fail.valid = false;
         fail.address = address;
@@ -618,6 +624,7 @@ std::string CFacilitator::HandleSiwxVerify(const std::string& body, const std::s
         fail.network = NETWORK_ID;
         return BuildHTTPResponse(400, fail.ToJSON());
     }
+    const std::vector<uint8_t>& addrDecoded = claimedAddr.GetData();
 
     // Compare pubkey hash against address hash
     if (std::memcmp(hash2, addrDecoded.data() + 1, 20) != 0) {

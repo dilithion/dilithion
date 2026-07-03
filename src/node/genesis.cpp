@@ -9,6 +9,7 @@
 #include <core/chainparams.h>
 #include <vdf/coinbase_vdf.h>
 #include <util/base58.h>
+#include <util/bech32m.h>  // ION: accept bech32m pre-fund addresses (ION-gated)
 
 #include <cstring>
 #include <iostream>
@@ -175,9 +176,25 @@ CBlock CreateDilVGenesisBlock() {
 
     // Pre-funded outputs: balance restoration from chain reset
     // Each address gets a P2PKH output with their preserved balance
+    // Decode a pre-fund address string to its 21-byte [version||hash] payload.
+    // ION (non-empty bech32Prefix) accepts bech32m "<hrp>1..." strings; all
+    // other chains use Base58Check unchanged. Same 20-byte hash either way, so
+    // the resulting P2PKH scriptPubKey is identical regardless of encoding.
+    auto decodeAddr = [](const std::string& address, std::vector<uint8_t>& out) -> bool {
+        const std::string& hrp = Dilithion::g_chainParams->bech32Prefix;
+        if (!hrp.empty() && address.size() > hrp.size() &&
+            address.compare(0, hrp.size(), hrp) == 0 && address[hrp.size()] == '1') {
+            bech32m::DecodeResult dec = bech32m::Decode(address);
+            if (!dec.ok || dec.hrp != hrp) return false;
+            out.clear();
+            return bech32m::ConvertBits(out, dec.data, 5, 8, /*pad=*/false);
+        }
+        return DecodeBase58Check(address, out);
+    };
+
     for (const auto& [address, amount] : Dilithion::g_chainParams->preFundAddresses) {
         std::vector<uint8_t> addrData;
-        if (!DecodeBase58Check(address, addrData) || addrData.size() != 21) {
+        if (!decodeAddr(address, addrData) || addrData.size() != 21) {
             continue;  // Skip invalid addresses
         }
         // Extract 20-byte pubkey hash (skip version byte)
