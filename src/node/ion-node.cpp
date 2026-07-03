@@ -78,7 +78,6 @@
 #include <rpc/auth.h>      // CVE-2026-RPC-AUTH: RPCAuth::InitializeAuth
 #include <rpc/rest_api.h>  // REST API for light wallet
 #include <rpc/ratelimiter.h>  // LP-12: per-IP rate limiter for the HTTP REST path
-#include <x402/facilitator.h>  // x402 payment facilitator
 #include <core/chainparams.h>
 #include <consensus/pow.h>
 #include <consensus/chain.h>
@@ -3656,7 +3655,7 @@ load_genesis_block:  // Bug #29: Label for automatic retry after blockchain wipe
 
         // Create and start HTTP API server for dashboard
         // Use port 18334 for testnet, 8334 for mainnet (Bitcoin convention)
-        int api_port = 10334;  // ION REST API port (distinct from dilv-node's 9334; parallels ION rpc 10332)
+        int api_port = 10334;  // ION REST API port (distinct from dilv-node's REST port; parallels ION rpc 10332)
         // CVE-2026-RPC-CORS: gate all-interfaces bind on --public-api
         CHttpServer http_server(api_port, config.public_api);
         g_node_state.http_server = &http_server;
