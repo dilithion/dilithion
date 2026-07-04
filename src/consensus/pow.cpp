@@ -1123,14 +1123,8 @@ uint32_t GetNextWorkRequired(const CBlockIndex* pindexLast, int64_t nBlockTime) 
     // a VDF chain here matches its declared semantics and resolves the
     // pre-existing two-local-process regtest peering issue (Phase 5
     // carryover #2 / Phase 6 PR6.3 scope).
-    // ION widen (2026-07): ION is a VDF chain (asertActivationHeight=999999999,
-    // difficultyAdjustment=0) — without the fixed-nBits early return it falls
-    // into the legacy periodic-retarget branch where `newBlockHeight % nInterval`
-    // is a modulo-by-zero at pow.cpp:1188. IsVdfChain() covers DilV+ION;
-    // regtest is still ORed in explicitly (it is not IsVdfChain()). Byte-neutral
-    // for DIL/DilV/regtest — only ION newly early-returns.
     if (Dilithion::g_chainParams &&
-        (Dilithion::g_chainParams->IsVdfChain() || Dilithion::g_chainParams->IsRegtest())) {
+        (Dilithion::g_chainParams->IsDilV() || Dilithion::g_chainParams->IsRegtest())) {
         return Dilithion::g_chainParams->genesisNBits;
     }
 

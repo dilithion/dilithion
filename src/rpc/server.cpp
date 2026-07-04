@@ -1303,9 +1303,7 @@ void CRPCServer::HandleClient(int clientSocket) {
             size_t cp = wallet_html.find(chain_ph);
             if (cp != std::string::npos) {
                 wallet_html.replace(cp, chain_ph.size(),
-                    Dilithion::g_chainParams->IsDilV() ? "dilv"
-                    : Dilithion::g_chainParams->IsIon() ? "ion"
-                    : "dil");
+                    Dilithion::g_chainParams->IsDilV() ? "dilv" : "dil");
             }
         }
 
@@ -3233,9 +3231,7 @@ static std::string DecodeScriptPubKeyToAddress(const std::vector<uint8_t>& scrip
         std::vector<uint8_t> addrData;
         addrData.push_back(0x1E);  // Dilithion version byte ('D' prefix)
         addrData.insert(addrData.end(), scriptPubKey.begin() + 3, scriptPubKey.begin() + 23);
-        // Route through the gated encoder so ION emits bech32m and DIL/DilV keep
-        // Base58Check (byte-unchanged).
-        return CDilithiumAddress::FromData(addrData).ToString();
+        return EncodeBase58Check(addrData);
     }
     return "";
 }
@@ -4329,8 +4325,7 @@ std::string CRPCServer::RPC_GetTopHolders(const std::string& params) {
         std::vector<uint8_t> addrData;
         addrData.push_back(0x1E);  // Dilithion version byte ('D' prefix)
         addrData.insert(addrData.end(), sorted[i].first.begin(), sorted[i].first.end());
-        // Gated encoder: ION → bech32m, DIL/DilV → Base58Check (byte-unchanged).
-        std::string address = CDilithiumAddress::FromData(addrData).ToString();
+        std::string address = EncodeBase58Check(addrData);
 
         rank++;  // Overall rank (before filtering)
 
@@ -8999,12 +8994,7 @@ std::string CRPCServer::RPC_InitiateSwap(const std::string& params) {
     swap.swap_id             = swap_id;
     swap.role                = SwapRole::INITIATOR;
     swap.state               = SwapState::HTLC_FUNDED;
-    // ION widen (2026-07): 3-way chain label — ION must self-identify as "ion"
-    // to a swap counterparty, NOT "dil" (wrong-chain settlement risk). DIL/DilV
-    // labels unchanged.
-    swap.our_chain           = (Dilithion::g_chainParams->network == Dilithion::DILV) ? "dilv"
-                              : (Dilithion::g_chainParams->network == Dilithion::ION)  ? "ion"
-                              : "dil";
+    swap.our_chain           = (Dilithion::g_chainParams->network == Dilithion::DILV) ? "dilv" : "dil";
     swap.their_chain         = their_chain;
     swap.our_amount          = send_amount;
     swap.their_amount        = receive_amount;
@@ -9195,12 +9185,7 @@ std::string CRPCServer::RPC_AcceptSwap(const std::string& params) {
     swap.swap_id             = swap_id;
     swap.role                = SwapRole::RESPONDER;
     swap.state               = SwapState::HTLC_FUNDED;
-    // ION widen (2026-07): 3-way chain label — ION must self-identify as "ion"
-    // to a swap counterparty, NOT "dil" (wrong-chain settlement risk). DIL/DilV
-    // labels unchanged.
-    swap.our_chain           = (Dilithion::g_chainParams->network == Dilithion::DILV) ? "dilv"
-                              : (Dilithion::g_chainParams->network == Dilithion::ION)  ? "ion"
-                              : "dil";
+    swap.our_chain           = (Dilithion::g_chainParams->network == Dilithion::DILV) ? "dilv" : "dil";
     swap.their_chain         = their_chain;
     swap.our_amount          = amount;
     swap.their_amount        = static_cast<CAmount>(receive_amount_dbl * 100000000);

@@ -5113,7 +5113,7 @@ inline const std::string& GetWalletHTML() {
             const nativeAddr = document.getElementById('bridgeWithdrawNativeAddr').value.trim();
 
             if (!amount || parseFloat(amount) <= 0) { showNotification('Enter a valid amount', 'error'); return; }
-            if (!nativeAddr || !(nativeAddr.startsWith('D') || /^ion1/i.test(nativeAddr))) { showNotification('Enter a valid Dilithion address (D… or ion1…)', 'error'); return; }
+            if (!nativeAddr || !nativeAddr.startsWith('D')) { showNotification('Enter a valid Dilithion address (starts with D)', 'error'); return; }
 
             const contractAddr = bridgeWithdrawChain === 'dil' ? BRIDGE_CONFIG.wdilContract : BRIDGE_CONFIG.wdilvContract;
             const resultDiv = document.getElementById('bridgeWithdrawResult');

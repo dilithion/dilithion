@@ -200,24 +200,6 @@ std::string GetDataDir(Dilithion::Network network) {
         return home + "/.dilv";
 #endif
     }
-    if (network == Dilithion::ION) {
-        // ION (Dilithion v2): separate data directory from DIL/DilV/testnet.
-        const char* env_datadir = std::getenv("DILITHION_DATADIR");
-        if (env_datadir) {
-            std::string path(env_datadir);
-            if (IsPathSafe(path)) {
-                return path + "-ion";
-            }
-            std::cerr << "WARNING: DILITHION_DATADIR contains unsafe path, ignoring" << std::endl;
-        }
-
-        std::string home = GetHomeDir();
-#ifdef _WIN32
-        return home + "\\.ion";
-#else
-        return home + "/.ion";
-#endif
-    }
     // MAINNET (default)
     return GetDataDir();
 }

@@ -293,7 +293,7 @@ private:
     // DisconnectToHeight recovery branch fires for EVERY fork the consensus
     // cap will accept. If this exceeded the cap, forks in the (cap, this]
     // band would skip in-place recovery, get consensus-rejected, and force a
-    // wasteful full datadir wipe + genesis re-sync. (ION F-02 retune fold.)
+    // wasteful full datadir wipe + genesis re-sync.
     static constexpr int MAX_AUTO_REORG_DEPTH = Consensus::MAX_REORG_DEPTH;
 
     // Resync tracking for completion message

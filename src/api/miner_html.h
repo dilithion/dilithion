@@ -1842,11 +1842,9 @@ async function handleSend() {
     const btn = document.getElementById('sendBtn');
 
     // Validate
-    // Client-side pre-check only (server does authoritative validation): accept
-    // Base58Check ("D…") and ION bech32m ("ion1…", case-insensitive) forms.
-    if (!address || !(address.startsWith('D') || /^ion1/i.test(address))) {
+    if (!address || !address.startsWith('D')) {
         alertEl.className = 'send-alert error';
-        alertEl.textContent = 'Please enter a valid Dilithion address (D… or ion1…).';
+        alertEl.textContent = 'Please enter a valid Dilithion address (starts with D).';
         return;
     }
 

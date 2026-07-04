@@ -17,7 +17,6 @@ static const uint32_t MAINNET_MAGIC = 0xD1714102;  // "DIL" + version
 static const uint32_t TESTNET_MAGIC = 0xDAB5BFFA;
 static const uint32_t REGTEST_MAGIC = 0xFABFB5DA;
 static const uint32_t DILV_MAGIC    = 0xD17FD100;  // DilV chain
-static const uint32_t ION_MAGIC     = 0xD1150200;  // ION chain (must equal ChainParams::Ion().networkMagic)
 
 /** Protocol version */
 static const int PROTOCOL_VERSION = 70011;          // v4.0.18: DNA Phase 1.5 signed sample envelope
