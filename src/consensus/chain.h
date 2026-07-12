@@ -570,7 +570,7 @@ public:
      * Test-only: Set tip without mapBlockIndex invariant check.
      * Used by unit tests that construct CBlockIndex objects directly.
      */
-    void SetTipForTest(CBlockIndex* pindex) { pindexTip = pindex; }
+    void SetTipForTest(CBlockIndex* pindex) { pindexTip = pindex; m_chainTipsCacheDirty = true; }
 
     /**
      * Add (or merge) a block index entry in the in-memory map.
@@ -746,6 +746,33 @@ public:
     };
     std::vector<ChainTip> GetChainTips() const;
 
+    /**
+     * Perf fix 2026-07-12: force the next GetChainTips() call to recompute.
+     * mapBlockIndex insert/erase/clear already trigger this internally.
+     * Call this too whenever code mutates an already-indexed CBlockIndex's
+     * nStatus/pprev directly (bypassing AddBlockIndex) in a way that could
+     * change a tip's reported status or membership — e.g. flagging a block
+     * BLOCK_FAILED_VALID after the fact. Cheap and safe to over-call.
+     */
+    void InvalidateChainTipsCache() const {
+        std::lock_guard<std::recursive_mutex> lock(cs_main);
+        m_chainTipsCacheDirty = true;
+    }
+
+private:
+    // Perf fix 2026-07-12: GetChainTips() did a full double-scan of
+    // mapBlockIndex on every call (44% of sampled CPU on a DilV seed
+    // whose mapBlockIndex has grown to 161K+ entries — explorer polls
+    // this RPC frequently). Cache the result and invalidate it only
+    // when mapBlockIndex membership or pprev topology actually changes:
+    // AddBlockIndex (insert or merge-adopt-pprev), EvictLowestWorkNotOnBestChain
+    // (erase), and Cleanup (clear) all flip this dirty. GetChainTips()
+    // itself is the only reader/recomputer, always called under cs_main,
+    // so no separate cache mutex is needed.
+    mutable std::vector<ChainTip> m_chainTipsCache;
+    mutable bool m_chainTipsCacheDirty{true};
+
+public:
     /**
      * Clean up in-memory index
      * Deletes all CBlockIndex pointers
