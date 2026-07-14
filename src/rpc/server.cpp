@@ -4242,6 +4242,22 @@ std::string CRPCServer::RPC_GetHolderCount(const std::string& params) {
         throw std::runtime_error("UTXO set not initialized");
     }
 
+    // Perf fix 2026-07-12: this used to do a full UTXO-set scan on every
+    // call. Result only changes when a block connects/disconnects — cache
+    // by tip HASH (not height — see GAP-3 comment in server.h; a same-height
+    // VDF sibling replacement changes the holder set without changing
+    // height). GetTip() is O(1), cs_main-protected, so cheap to call on
+    // every request.
+    CBlockIndex* pTipNow = m_chainstate ? m_chainstate->GetTip() : nullptr;
+    bool haveTip = (pTipNow != nullptr);
+    uint256 currentTipHash = haveTip ? pTipNow->GetBlockHash() : uint256();
+    {
+        std::lock_guard<std::mutex> cacheLock(m_holderCountCacheMutex);
+        if (haveTip && m_holderCountCacheValid && currentTipHash == m_holderCountCacheTipHash) {
+            return m_holderCountCacheJson;
+        }
+    }
+
     // Iterate all UTXOs and collect unique pubkey hashes (addresses)
     std::set<std::vector<uint8_t>> uniqueAddresses;
     uint64_t totalUTXOs = 0;
@@ -4265,7 +4281,32 @@ std::string CRPCServer::RPC_GetHolderCount(const std::string& params) {
     oss << "\"utxos\":" << totalUTXOs << ",";
     oss << "\"total_amount\":" << FormatAmount(totalAmount);
     oss << "}";
-    return oss.str();
+    std::string result = oss.str();
+
+    // Perf fix 2026-07-12 (Fable review MEDIUM): re-check the tip hash
+    // AFTER the scan before caching. The scan reflects whatever tip was
+    // active while ForEach ran (cs_utxo-protected), which is NOT
+    // necessarily currentTipHash if a block connected mid-scan. Storing
+    // under the STALE pre-scan hash unconditionally is a write-back race:
+    // if the tip later returns to that same pre-scan hash (fork-recovery
+    // rewind via DisconnectToHeight, or operator invalidateblock), the
+    // cache would serve the wrong-tip result indefinitely rather than
+    // just transiently. Only cache when the tip hasn't moved during the
+    // scan; otherwise drop the result — the next caller recomputes
+    // against whatever the tip actually is by then.
+    CBlockIndex* pTipAfter = m_chainstate ? m_chainstate->GetTip() : nullptr;
+    uint256 tipHashAfter = pTipAfter ? pTipAfter->GetBlockHash() : uint256();
+    bool tipUnchangedDuringScan = haveTip && pTipAfter && (tipHashAfter == currentTipHash);
+    {
+        std::lock_guard<std::mutex> cacheLock(m_holderCountCacheMutex);
+        if (tipUnchangedDuringScan) {
+            m_holderCountCacheJson = result;
+            m_holderCountCacheTipHash = currentTipHash;
+            m_holderCountCacheValid = true;
+        }
+    }
+
+    return result;
 }
 
 std::string CRPCServer::RPC_GetTopHolders(const std::string& params) {

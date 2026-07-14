@@ -62,6 +62,10 @@ void CChainState::Cleanup() {
     // would dereference dangling pointers via the comparator.
     m_setBlockIndexCandidates.clear();
 
+    // Perf fix 2026-07-12: mapBlockIndex is about to be cleared below —
+    // the cached tip set is now stale.
+    m_chainTipsCacheDirty = true;
+
     // Phase 5 red-team CONCERN fix: drop registered callbacks too. External
     // components (HeadersManager, wallet) hold std::function<>s captured
     // with raw const CBlockIndex* pointers from prior callback invocations.
@@ -146,6 +150,12 @@ bool CChainState::AddBlockIndex(const uint256& hash, std::unique_ptr<CBlockIndex
         // on identical-flag re-adds.
         existing->nStatus |= pindex->nStatus;
 
+        // Perf fix 2026-07-12: a merge can adopt a previously-null pprev
+        // (line above) or change validity flags that GetChainTips()'s
+        // status taxonomy depends on ("invalid"/"valid-fork"/etc) — either
+        // can change tip membership or a tip's reported status.
+        m_chainTipsCacheDirty = true;
+
         return true;
     }
 
@@ -165,6 +175,11 @@ bool CChainState::AddBlockIndex(const uint256& hash, std::unique_ptr<CBlockIndex
 
     // Transfer ownership to map using move semantics
     mapBlockIndex[hash] = std::move(pindex);
+
+    // Perf fix 2026-07-12: a brand-new entry is itself a new tip, and if it
+    // has a parent, that parent just gained a child and stops being a tip.
+    m_chainTipsCacheDirty = true;
+
     return true;
 }
 
@@ -237,6 +252,11 @@ bool CChainState::EvictLowestWorkNotOnBestChain() {
     // Erase from mapBlockIndex. unique_ptr cleanup destroys CBlockIndex.
     uint256 worst_hash = worst->GetBlockHash();
     mapBlockIndex.erase(worst_hash);
+
+    // Perf fix 2026-07-12: eviction can remove a tip outright, or (if the
+    // evicted block was the last child of its parent) restore its parent
+    // to tip status — either way the cached set is stale.
+    m_chainTipsCacheDirty = true;
 
     return true;
 }
@@ -353,6 +373,13 @@ bool CChainState::ActivateBestChain(CBlockIndex* pindexNew, const CBlock& block,
     // CRITICAL-1 FIX: Acquire lock before accessing shared state
     // This protects pindexTip, mapBlockIndex, and all chain operations
     std::lock_guard<std::recursive_mutex> lock(cs_main);
+
+    // Perf fix 2026-07-12: this function (and ConnectTip/MarkBlockAsFailed
+    // it calls into) can flip nStatus/pprev on already-indexed entries
+    // directly, bypassing AddBlockIndex's dirty-flag hook. Called once per
+    // block/reorg attempt, not per RPC poll, so unconditional over-marking
+    // here is free relative to the cost it saves in GetChainTips().
+    m_chainTipsCacheDirty = true;
 
     reorgOccurred = false;
 
@@ -1803,6 +1830,11 @@ bool CChainState::DisconnectTip(CBlockIndex* pindex, bool force_skip_utxo) {
         return false;
     }
 
+    // Perf fix 2026-07-12: disconnect changes pindexTip and possibly
+    // nStatus; caller holds cs_main. Unconditional — this runs once per
+    // disconnected block, not per RPC poll.
+    m_chainTipsCacheDirty = true;
+
     // Phase 5 TEST-ONLY override hook (chain_case_2_5_equivalence_tests).
     // Production never sets this; default-empty std::function falls through.
     if (m_testDisconnectTipOverride) {
@@ -1965,6 +1997,10 @@ bool CChainState::DisconnectTip(CBlockIndex* pindex, bool force_skip_utxo) {
 int CChainState::DisconnectToHeight(int targetHeight, CBlockchainDB& db, int batchSize) {
     std::unique_lock<std::recursive_mutex> lock(cs_main);
 
+    // Perf fix 2026-07-12: this loop reassigns pindexTip directly (not via
+    // SetTip); called once per bulk-disconnect operation, not per RPC poll.
+    m_chainTipsCacheDirty = true;
+
     if (!pindexTip || targetHeight < 0) return -1;
     if (pindexTip->nHeight <= targetHeight) return 0;
 
@@ -2075,8 +2111,20 @@ std::vector<uint256> CChainState::GetBlocksAtHeight(int height) const {
 std::vector<CChainState::ChainTip> CChainState::GetChainTips() const {
     std::lock_guard<std::recursive_mutex> lock(cs_main);
 
+    // Perf fix 2026-07-12: serve from cache when nothing has changed since
+    // the last call. Callers (explorer RPC polling) hammer this far more
+    // often than mapBlockIndex actually mutates, and recomputing did a full
+    // double-scan of mapBlockIndex (44% of CPU on DilV/NYC at 161K+ blocks).
+    if (!m_chainTipsCacheDirty) {
+        return m_chainTipsCache;
+    }
+
     std::vector<ChainTip> tips;
-    if (!pindexTip) return tips;
+    if (!pindexTip) {
+        m_chainTipsCache = tips;
+        m_chainTipsCacheDirty = false;
+        return tips;
+    }
 
     // Build set of blocks that have children (i.e., are referenced as pprev)
     std::set<const CBlockIndex*> hasChildren;
@@ -2161,6 +2209,8 @@ std::vector<CChainState::ChainTip> CChainState::GetChainTips() const {
         return a.height > b.height;
     });
 
+    m_chainTipsCache = tips;
+    m_chainTipsCacheDirty = false;
     return tips;
 }
 
@@ -2280,6 +2330,10 @@ void CChainState::SetTip(CBlockIndex* pindex) {
     }
     
     pindexTip = pindex;
+    // Perf fix 2026-07-12: which entry is "active" in GetChainTips() is
+    // derived entirely from pindexTip, independent of any mapBlockIndex
+    // membership change.
+    m_chainTipsCacheDirty = true;
     // BUG #74 FIX: Update atomic cached height for lock-free reads
     m_cachedHeight.store(pindex ? pindex->nHeight : -1, std::memory_order_release);
     
@@ -2625,6 +2679,10 @@ void CChainState::MarkBlockAsFailed(CBlockIndex* pindex)
     if (!pindex) return;
     std::lock_guard<std::recursive_mutex> lock(cs_main);
 
+    // Perf fix 2026-07-12: flips nStatus on already-indexed entries below,
+    // outside AddBlockIndex's dirty-flag hook.
+    m_chainTipsCacheDirty = true;
+
     pindex->nStatus |= CBlockIndex::BLOCK_FAILED_VALID;
 
     // Propagate BLOCK_FAILED_CHILD to all descendants. Worklist-style
@@ -2658,6 +2716,10 @@ void CChainState::MarkBlockAsValid(CBlockIndex* pindex)
 {
     if (!pindex) return;
     std::lock_guard<std::recursive_mutex> lock(cs_main);
+
+    // Perf fix 2026-07-12: flips nStatus on already-indexed entries below,
+    // outside AddBlockIndex's dirty-flag hook.
+    m_chainTipsCacheDirty = true;
 
     // Clear failure flags on the target.
     pindex->nStatus &= ~CBlockIndex::BLOCK_FAILED_MASK;
@@ -2790,6 +2852,13 @@ CBlockIndex* CChainState::FindMostWorkChainImpl()
             // with the next-best candidate.
             if (!pindexNew->IsInvalid()) {
                 pindexNew->nStatus |= CBlockIndex::BLOCK_FAILED_CHILD;
+                // Perf fix 2026-07-12 (port-reviewer GAP-2): mutates an
+                // already-indexed leaf's status directly. Currently only
+                // reached via ActivateBestChain (already dirty at its top),
+                // but FindMostWorkChainImpl is also exposed standalone
+                // through ChainSelectorAdapter — flag here too so a future
+                // direct caller can't serve a stale "invalid" tip status.
+                m_chainTipsCacheDirty = true;
             }
             m_setBlockIndexCandidates.erase(it);
         } else {
@@ -2842,6 +2911,10 @@ bool CChainState::ActivateBestChainStep(CBlockIndex* pindexMostWork,
 
     if (!pindexMostWork) return false;
     if (pindexMostWork == pindexTip) return true;  // already there — no-op success
+
+    // Perf fix 2026-07-12: this reorg step reassigns pindexTip and can flip
+    // nStatus directly; runs once per activation step, not per RPC poll.
+    m_chainTipsCacheDirty = true;
 
     // 1) Common ancestor.
     CBlockIndex* pindexFork = pindexTip ? FindFork(pindexTip, pindexMostWork) : nullptr;
