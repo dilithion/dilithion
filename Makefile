@@ -507,6 +507,14 @@ miner_tests: $(CORE_OBJECTS) $(OBJ_DIR)/test/miner_tests.o $(DILITHIUM_OBJECTS) 
 	@echo "$(COLOR_BLUE)[LINK]$(COLOR_RESET) $@"
 	@$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS) $(LIBS)
 
+# src/test/randomx_mode_test.cpp existed with no way to build it. It asserts LIGHT
+# and FULL mode hash identically, which is also the control that proves the
+# large-page allocation path does not perturb hash output: LIGHT is allocated on
+# standard pages, FULL requests large pages, and the two must still agree.
+randomx_mode_test: $(CORE_OBJECTS) $(OBJ_DIR)/test/randomx_mode_test.o $(DILITHIUM_OBJECTS) $(CHIAVDF_OBJECTS)
+	@echo "$(COLOR_BLUE)[LINK]$(COLOR_RESET) $@"
+	@$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS) $(LIBS)
+
 wallet_tests: $(CORE_OBJECTS) $(OBJ_DIR)/test/wallet_tests.o $(DILITHIUM_OBJECTS) $(CHIAVDF_OBJECTS)
 	@echo "$(COLOR_BLUE)[LINK]$(COLOR_RESET) $@"
 	@$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS) $(LIBS)
