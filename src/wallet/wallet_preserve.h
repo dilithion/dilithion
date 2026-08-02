@@ -68,15 +68,21 @@ inline std::string PreserveUnreadableWallet(const std::string& wallet_path) {
     // byte-for-byte this same file, that copy IS the backup — return it and
     // write nothing. Compared by size first, then content, because these files
     // are small and a false match here would silently skip a real backup.
-    const std::string prefix = wallet_path + ".unreadable-";
+    // Compare BASENAMES, not full paths: wallet_path is built by string
+    // concatenation and carries '/' separators, while directory_iterator emits
+    // the platform form ('\' on Windows). Prefix-matching full paths therefore
+    // never matched on Windows and this dedup was silently dead there.
+    const std::filesystem::path wallet_fs(wallet_path);
+    const std::string name_prefix = wallet_fs.filename().string() + ".unreadable-";
+    auto dir = wallet_fs.parent_path();
+    if (dir.empty()) dir = std::filesystem::path(".");
     const auto src_size = std::filesystem::file_size(wallet_path, ec);
     if (!ec) {
         std::error_code scan_ec;
-        const auto dir = std::filesystem::path(wallet_path).parent_path();
         for (std::filesystem::directory_iterator it(dir, scan_ec), end;
              !scan_ec && it != end; it.increment(scan_ec)) {
+            if (it->path().filename().string().rfind(name_prefix, 0) != 0) continue;
             const std::string candidate = it->path().string();
-            if (candidate.rfind(prefix, 0) != 0) continue;
             std::error_code cmp_ec;
             if (std::filesystem::file_size(candidate, cmp_ec) != src_size || cmp_ec) continue;
             std::ifstream a(wallet_path, std::ios::binary);
@@ -92,7 +98,7 @@ inline std::string PreserveUnreadableWallet(const std::string& wallet_path) {
     // Second-resolution stamps collide if the node restarts twice inside one
     // second, so never overwrite an existing backup: walk a suffix until a free
     // name is found. Losing an older preserved copy defeats the whole point.
-    std::string backup = prefix + stamp;
+    std::string backup = (dir / (wallet_fs.filename().string() + ".unreadable-" + stamp)).string();
     ec.clear();
     if (std::filesystem::exists(backup, ec)) {
         bool placed = false;
@@ -112,11 +118,17 @@ inline std::string PreserveUnreadableWallet(const std::string& wallet_path) {
     ec.clear();
     std::filesystem::copy_file(wallet_path, backup, ec);
     if (ec) {
-        // A failure part-way through (ENOSPC especially) can leave a truncated
-        // file behind. Reporting "no backup was written" while a decoy copy sits
-        // next to the wallet is worse than either outcome alone — remove it.
-        std::error_code rm_ec;
-        std::filesystem::remove(backup, rm_ec);
+        // NEVER remove on file_exists. Without overwrite_existing that is the
+        // MOST LIKELY error, and the file it names was written by somebody else
+        // — a concurrent process that won the race, or a copy that appeared
+        // between the exists() check above and here. Deleting it would destroy
+        // a complete backup and leave zero, on the one path whose entire job is
+        // to guarantee one. Only clean up a partial file we ourselves wrote
+        // (ENOSPC, I/O error part-way through).
+        if (ec != std::errc::file_exists) {
+            std::error_code rm_ec;
+            std::filesystem::remove(backup, rm_ec);
+        }
         return std::string();
     }
     return backup;

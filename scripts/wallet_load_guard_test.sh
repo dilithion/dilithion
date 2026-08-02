@@ -78,8 +78,12 @@ for NODE in "${NODES[@]}"; do
 
     BEFORE_SUM=$(sha256sum "$D/wallet.dat" | awk '{print $1}')
 
+    # --connect to a dead local address: never peer with production seeds from
+    # a CI runner. -k so a node ignoring SIGTERM cannot wedge the job forever.
+    NOPEER="--connect=127.0.0.1:1"
+
     # stdin from /dev/null: never block on the interactive create/restore prompt.
-    timeout 180 "$NODE" --datadir="$D" < /dev/null > "$D/node.log" 2>&1
+    timeout -k 15 180 "$NODE" --datadir="$D" $NOPEER < /dev/null > "$D/node.log" 2>&1
     RC=$?
 
     AFTER_SUM=$(sha256sum "$D/wallet.dat" 2>/dev/null | awk '{print $1}')
@@ -101,6 +105,17 @@ for NODE in "${NODES[@]}"; do
         pass "wallet.dat is byte-identical (not overwritten)"
     else
         fail "wallet.dat was modified or removed (before=$BEFORE_SUM after=${AFTER_SUM:-MISSING})"
+    fi
+
+    # DISCRIMINATOR. Without this, deleting the entire refusal block while
+    # keeping the PreserveUnreadableWallet() call still passes every other
+    # assertion: with stdin not a TTY the PRE-EXISTING non-TTY guard already
+    # exits non-zero and already leaves wallet.dat intact, so those arms say
+    # nothing about whether our guard exists. Pin the refusal itself.
+    if grep -q "Refusing to start" "$D/node.log"; then
+        pass "node refused explicitly (guard fired, not the non-TTY fallback)"
+    else
+        fail "no refusal message — the guard did not fire; a non-TTY exit is not the same thing"
     fi
 
     BACKUP=$(ls "$D"/wallet.dat.unreadable-* 2>/dev/null | head -1)
@@ -156,6 +171,35 @@ for NODE in "${NODES[@]}"; do
         pass "restore: unreadable wallet preserved before restore proceeds"
     else
         fail "restore: proceeded without preserving the unreadable wallet"
+    fi
+
+    # --- PTY arm: the ONLY arm that reaches the actually-destructive path.
+    # --- Every other arm runs without a TTY, where the pre-existing non-TTY
+    # --- guard stops the node before wallet creation, so none of them can
+    # --- observe the overwrite this whole change exists to prevent. Under a
+    # --- real pty the node reaches the CREATE/RESTORE prompt; answering "1"
+    # --- on an UNGUARDED binary creates a wallet and Save()s it over
+    # --- wallet.dat. Skipped where no pty helper exists (e.g. plain Windows).
+    if command -v script >/dev/null 2>&1 && [ "$(uname -s 2>/dev/null)" != "" ] \
+       && ! uname -s 2>/dev/null | grep -qiE "mingw|msys|cygwin"; then
+        P="$WORK/$(basename "$NODE").pty"
+        mkdir -p "$P"
+        printf 'NOT A VALID WALLET FILE - corrupt on purpose\x00\x01\x02\x03' > "$P/wallet.dat"
+        P_BEFORE=$(sha256sum "$P/wallet.dat" | awk '{print $1}')
+        printf '1\n' > "$P/answers"
+        # -q quiet, -c command, output discarded; feed "1" = CREATE new wallet.
+        timeout -k 15 120 script -q -c \
+            "'$NODE' --datadir='$P' $NOPEER < '$P/answers'" /dev/null \
+            > "$P/node.log" 2>&1 || true
+        P_AFTER=$(sha256sum "$P/wallet.dat" 2>/dev/null | awk '{print $1}')
+        if [ "$P_BEFORE" = "$P_AFTER" ]; then
+            pass "pty: wallet.dat survived an interactive CREATE (destructive path blocked)"
+        else
+            fail "pty: wallet.dat was OVERWRITTEN via the interactive create path"
+        fi
+    else
+        echo "    [SKIP] pty arm (no usable pty helper on this platform) — the" >&2
+        echo "           destructive path is NOT covered here; it is covered on Linux CI." >&2
     fi
 
     if [ "$FAILED" -ne 0 ]; then
