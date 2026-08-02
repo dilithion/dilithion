@@ -257,17 +257,50 @@ bool ChainSelectorAdapter::ProcessNewHeader(const CBlockHeader& header)
     // makes that structurally impossible. It also drops the evicted node from
     // m_setBlockIndexCandidates before the unique_ptr destroys it.
     //
-    // Fail-closed fallback: if no eligible unpinned leaf exists (pathological,
-    // unreachable at production cap sizes: DIL/DilV=500K cap vs ~24K chain
-    // height), eviction returns false and we reject the new header. Safety net
-    // for misconfigured caps, not the primary path.
+    // THE CAP IS ADVISORY. Eviction failure must NEVER reject a header.
+    //
+    // This used to fail closed, justified as "pathological, unreachable at
+    // production cap sizes: DIL/DilV=500K cap vs ~24K chain height". That
+    // argument was wrong, and dangerously so: it asserted unreachability about a
+    // MONOTONICALLY INCREASING quantity. It is a countdown, not an invariant.
+    //
+    // Why it is a countdown. The pinned set (chain.cpp, clause (a)) pins every
+    // ancestor of the active tip back to genesis, and mapBlockIndex is erased at
+    // exactly one site — the evictor, which cannot touch a pinned entry. So
+    // mapBlockIndex.size() >= activeChainHeight + 1 always. At active height
+    // ~= cap, EVERY entry is an active-chain ancestor and therefore pinned,
+    // no evictable leaf exists, and eviction returns false permanently. Failing
+    // closed there halts the node at height 500,000 — forever, on a timer.
+    //
+    // Nodes configured with a different cap would keep following the chain, so
+    // failing closed also breaks the "different caps still converge on the same
+    // best chain" property the cap's consensus-neutrality rests on.
+    //
+    // Advisory is the right shape regardless of the ceiling: this cap exists to
+    // bound memory under FORK SPAM, where evictable leaves are exactly what the
+    // map is full of and eviction succeeds. When it fails, the map is full of
+    // things we must not evict — and refusing to extend the chain is a strictly
+    // worse outcome than exceeding a soft memory target.
     if (Dilithion::g_chainParams) {
         const int cap = Dilithion::g_chainParams->nMapBlockIndexCap;
         if (cap > 0 && m_chainstate.GetBlockIndexSize() >= static_cast<size_t>(cap)) {
             // Make room for exactly one new header: evict down to cap-1.
             const size_t target_max = static_cast<size_t>(cap) - 1;
             if (!m_chainstate.EvictLowestWorkLeafNotPinned(target_max)) {
-                return false;
+                // Rate-limited: at or over cap this fires on every insert, and the
+                // steady state past the height ceiling is "every insert".
+                static std::atomic<uint64_t> s_overCapLogged{0};
+                const uint64_t n = s_overCapLogged.fetch_add(1, std::memory_order_relaxed);
+                if (n == 0 || (n % 10000) == 0) {
+                    std::cerr << "[ChainSelector] NOTE: mapBlockIndex is at the "
+                              << cap << "-entry cap and no evictable unpinned leaf "
+                              << "remains (the map is active-chain ancestors, which are "
+                              << "never evicted). Continuing WITHOUT enforcing the cap — "
+                              << "the cap is advisory and must never gate chain progress. "
+                              << "Memory use will exceed the target. Occurrence " << (n + 1)
+                              << "." << std::endl;
+                }
+                // Deliberately fall through and accept the header.
             }
         }
     }

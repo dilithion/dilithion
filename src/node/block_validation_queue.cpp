@@ -3,6 +3,7 @@
 
 #include <node/block_validation_queue.h>
 
+#include <atomic>                  // advisory-cap log rate-limiter
 #include <consensus/chain.h>
 #include <consensus/pow.h>
 #include <consensus/validation.h>  // For CheckCoinbase
@@ -434,14 +435,16 @@ bool CBlockValidationQueue::ProcessBlock(const QueuedBlock& queued_block) {
            "BLOCKER-1: pindex must come from the by-hash re-resolve, never the cached QueuedBlock::pindex");
 
     if (!pindex) {
-        // MEDIUM-1 (PR #129 re-red-team): enforce the mapBlockIndex cap as a REAL
-        // CEILING on this create-path too. ProcessNewHeader evicts down to cap-1
-        // before adding a header, but the queue's create path used to call
-        // AddBlockIndex with NO cap check — so under sustained header pressure the
-        // index could overshoot to cap + queue_depth (up to +MAX_QUEUE_DEPTH=100)
-        // via this path. We mirror ProcessNewHeader exactly: if at/over cap, evict
-        // the lowest-work unpinned leaf down to cap-1 to make room for this one;
-        // if that still cannot get under cap, fail closed gracefully.
+        // MEDIUM-1 (PR #129 re-red-team): apply the mapBlockIndex cap on this
+        // create-path too. ProcessNewHeader evicts down to cap-1 before adding a
+        // header, but the queue's create path used to call AddBlockIndex with NO
+        // cap check — so under sustained header pressure the index could overshoot
+        // to cap + queue_depth (up to +MAX_QUEUE_DEPTH=100) via this path. We
+        // mirror ProcessNewHeader: if at/over cap, evict the lowest-work unpinned
+        // leaf down to cap-1 to make room for this one.
+        //
+        // NOT a ceiling. An earlier revision of this fold made it one and that was
+        // a scheduled chain halt — see the advisory-cap note below.
         //
         // ORDERING IS LOAD-BEARING: we run eviction BEFORE looking up this block's
         // parent, and we resolve the parent by hash AFTER eviction. Eviction
@@ -453,22 +456,51 @@ bool CBlockValidationQueue::ProcessBlock(const QueuedBlock& queued_block) {
         // pre-eviction parent pointer across the eviction, and a parent freed by
         // the cascade is observed as a clean null (fail-closed), exactly like the
         // BLOCKER-1 by-hash discipline.
+        // THE CAP IS ADVISORY HERE TOO — this must never reject a block.
+        //
+        // The version this replaces failed closed, and that was the single most
+        // dangerous line in this PR. On origin/main this create path had NO cap
+        // check at all, so blocks still connected when eviction failed. Adding a
+        // hard ceiling here converted a header-layer degradation into a
+        // BLOCK-CONNECT HALT, i.e. it turned a bounded overshoot into a scheduled
+        // outage:
+        //
+        //   the pinned set pins every active-chain ancestor back to genesis, and
+        //   mapBlockIndex is only ever erased by the evictor (which cannot touch a
+        //   pinned entry), so size >= activeHeight + 1 always. At active height
+        //   ~= cap, every entry is pinned, eviction returns false permanently, and
+        //   a fail-closed create path means NO NODE CAN EVER SYNC PAST height
+        //   500,000. Nodes already at the tip keep running via the uncapped
+        //   synchronous path, so the network partitions into "already-synced" and
+        //   "can-never-sync".
+        //
+        // Reproduce cheaply: regtest sets the cap to 1000 (chainparams.cpp), so the
+        // old behaviour halts at height 1000 without flooding anything.
+        //
+        // The overshoot this check was written for (up to cap + MAX_QUEUE_DEPTH)
+        // is a bounded, benign memory excess. Trading a liveness guarantee for it
+        // was never a good trade. Evict opportunistically, log if we cannot, and
+        // ALWAYS proceed.
         if (Dilithion::g_chainParams) {
             const int cap = Dilithion::g_chainParams->nMapBlockIndexCap;
             if (cap > 0 &&
                 m_chainstate.GetBlockIndexSize() >= static_cast<size_t>(cap)) {
                 const size_t target_max = static_cast<size_t>(cap) - 1;
                 m_chainstate.EvictLowestWorkLeafNotPinned(target_max);
-                // Fail closed if eviction could not bring us under cap (pin set
-                // floors the index above cap-1 — pathological at production cap
-                // sizes). Adding here would breach the ceiling, so reject.
                 if (m_chainstate.GetBlockIndexSize() >= static_cast<size_t>(cap)) {
-                    std::cerr << "[ValidationQueue] ERROR: mapBlockIndex at cap ("
-                              << cap << ") and no evictable leaf; rejecting block at height "
-                              << expected_height << std::endl;
-                    m_watchdog.ReportValidationComplete();
-                    return false;
+                    // Rate-limited: past the height ceiling this is every block.
+                    static std::atomic<uint64_t> s_overCapLogged{0};
+                    const uint64_t n = s_overCapLogged.fetch_add(1, std::memory_order_relaxed);
+                    if (n == 0 || (n % 10000) == 0) {
+                        std::cerr << "[ValidationQueue] NOTE: mapBlockIndex at the "
+                                  << cap << "-entry cap with no evictable unpinned leaf "
+                                  << "(the map is active-chain ancestors). Connecting the "
+                                  << "block anyway — the cap is advisory and must never "
+                                  << "gate chain progress. Memory use exceeds the target. "
+                                  << "Occurrence " << (n + 1) << "." << std::endl;
+                    }
                 }
+                // Deliberately fall through and create the index either way.
             }
         }
 

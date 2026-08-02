@@ -385,6 +385,19 @@ bool CChainState::EvictLowestWorkLeafNotPinned(size_t target_max) {
         CBlockIndex* worst = nullptr;
         uint256      worst_work;
         bool         worst_set = false;
+        // MEDIUM-3 (round-3 red-team): capture the MAP'S OWN KEY, never re-derive
+        // it from the entry at erase time. CBlockIndex::GetBlockHash() has a
+        // documented fallback (block_index.cpp) that returns a NULL hash when
+        // phashBlock is null, and nothing enforces phashBlock == key —
+        // AddBlockIndex does not check it and the constructors do not set it, so
+        // the invariant rests on all 8 call sites remembering. If that fallback
+        // fired here, erase(uint256()) would remove nothing while the in-degree
+        // bookkeeping below had ALREADY been applied: the parent would show
+        // in-degree 0 with `worst` still in the map still pointing at it via
+        // pprev, so the next pass frees the parent and `worst->pprev` dangles.
+        // That reconstructs the exact v4.5.0 interior-node dangle out of a
+        // bookkeeping desync. The key is free right here — take it.
+        uint256      worst_key;
         for (auto& kv : mapBlockIndex) {
             CBlockIndex* p = kv.second.get();
             if (!p) continue;
@@ -396,14 +409,19 @@ bool CChainState::EvictLowestWorkLeafNotPinned(size_t target_max) {
             if (!worst_set || ChainWorkGreaterThan(worst_work, p->nChainWork)) {
                 worst = p;
                 worst_work = p->nChainWork;
+                worst_key = kv.first;
                 worst_set = true;
             }
         }
 
         if (!worst_set) {
-            // No eligible unpinned leaf remains. Either we are under cap with
-            // only pinned/interior entries, or (pathological, unreachable at
-            // production cap sizes) everything is pinned — caller fail-closes.
+            // No eligible unpinned leaf remains: either we are under cap with only
+            // pinned/interior entries, or every entry is pinned. The latter is the
+            // STEADY STATE once active height approaches the cap (the pinned set
+            // includes every active-chain ancestor), NOT a pathological case — see
+            // BLOCKER-1. Callers must treat a false return as "cap not enforced"
+            // and CONTINUE; treating it as a reason to reject a header or block
+            // halts the chain at height ~= cap.
             break;
         }
 
@@ -418,8 +436,8 @@ bool CChainState::EvictLowestWorkLeafNotPinned(size_t target_max) {
         m_setBlockIndexCandidates.erase(worst);  // a leaf is normally a
                                                  // candidate; erase keeps the
                                                  // non-owning set clean.
-        const uint256 worst_hash = worst->GetBlockHash();
-        mapBlockIndex.erase(worst_hash);         // unique_ptr frees CBlockIndex
+        // Erase by the map's own key (MEDIUM-3), not by worst->GetBlockHash().
+        mapBlockIndex.erase(worst_key);          // unique_ptr frees CBlockIndex
         evicted_any = true;
     }
 
