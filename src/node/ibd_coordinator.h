@@ -5,6 +5,7 @@
 #define DILITHION_NODE_IBD_COORDINATOR_H
 
 #include <uint256.h>
+#include <consensus/params.h>  // Consensus::MAX_REORG_DEPTH (auto-reorg bound tracks the consensus cap)
 #include <atomic>
 #include <chrono>
 #include <set>
@@ -287,7 +288,13 @@ private:
     std::atomic<int64_t> m_last_block_connected_ticks;
     // Layer 3: Deep fork handling - requires manual reindex for security
     bool m_requires_reindex{false};
-    static constexpr int MAX_AUTO_REORG_DEPTH = 100;  // Max blocks to auto-reorg
+    // Max blocks to auto-reorg in place. Tracks the consensus reorg cap
+    // (Consensus::MAX_REORG_DEPTH, currently 60) so the cheap in-place
+    // DisconnectToHeight recovery branch fires for EVERY fork the consensus
+    // cap will accept. If this exceeded the cap, forks in the (cap, this]
+    // band would skip in-place recovery, get consensus-rejected, and force a
+    // wasteful full datadir wipe + genesis re-sync.
+    static constexpr int MAX_AUTO_REORG_DEPTH = Consensus::MAX_REORG_DEPTH;
 
     // Resync tracking for completion message
     bool m_resync_in_progress{false};

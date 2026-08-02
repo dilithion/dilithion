@@ -1707,6 +1707,10 @@ std::optional<CBlockTemplate> BuildMiningTemplate(CBlockchainDB& blockchain, CWa
         int dfmpV34ActivationHeight = Dilithion::g_chainParams ?
             Dilithion::g_chainParams->dfmpV34ActivationHeight : 999999999;
 
+        // C-3: saturating heat math gate (must match validator pow.cpp exactly).
+        bool dfmpSat = Dilithion::g_chainParams &&
+            static_cast<int>(nHeight) >= Dilithion::g_chainParams->dfmpOverflowFixActivationHeight;
+
         int64_t multiplierFP;
         double payoutHeatMult = 1.0;
 
@@ -1714,17 +1718,23 @@ std::optional<CBlockTemplate> BuildMiningTemplate(CBlockchainDB& blockchain, CWa
             // DFMP v3.4: Verification-aware free tier
             // Verified MIKs: 12 free blocks, Unverified: 3 free blocks
 
-            // Determine verification status of this MIK
-            bool isVerified = true;  // Default: verified (safe fallback)
-            if (g_node_context.dna_registry) {
-                std::array<uint8_t, 20> mikArr;
-                std::memcpy(mikArr.data(), mikIdentity.data, 20);
-                auto status = g_node_context.dna_registry->get_verification_status(mikArr);
-                isVerified = (status == digital_dna::verification::VerificationStatus::VERIFIED);
-            }
+            // Simplified Option C (D-7): blind verification status — isVerified is forced false
+            // so Q1=STRICT (everyone gets the unverified free-tier=3). The get_verification_status
+            // read is dropped entirely.
+            //
+            // Safety premise: isVerified has ZERO live consensus effect outside this V34 gate.
+            // Every CONSENSUS reader of isVerified / get_verification_status is enumerated here
+            // (pow.cpp, dilithion-node.cpp, dilv-node.cpp — all inside `height >= dfmpV34ActivationHeight`
+            // guards). The only other reader is NON-consensus: an RPC reporter at src/rpc/server.cpp:5623
+            // (getdfmpstatus display) — it still reads real status, so if v3.4 is ever activated its
+            // reported penalty must also be blinded to match consensus (tracked pre-activation item).
+            // dfmpV34ActivationHeight=999999999 on all chains (src/core/chainparams.cpp:96 DIL,
+            // :315 testnet, :468 DilV) — this branch is dead code today. Blinding in place is not a live
+            // consensus change; it is safe-by-construction if v3.4 ever activates.
+            bool isVerified = false;
 
             // MIK identity heat penalty (v3.4 - verification-aware)
-            int64_t mikHeatPenalty = DFMP::CalculateHeatMultiplierFP_V34(heat, isVerified);
+            int64_t mikHeatPenalty = DFMP::CalculateHeatMultiplierFP_V34(heat, isVerified, dfmpSat);
 
             // Payout address heat penalty (uses same verification status as the MIK)
             int64_t payoutHeatPenalty = DFMP::FP_SCALE;  // 1.0x default
@@ -1732,7 +1742,7 @@ std::optional<CBlockTemplate> BuildMiningTemplate(CBlockchainDB& blockchain, CWa
                 DFMP::Identity payoutIdentity = DFMP::DeriveIdentityFromScript(
                     coinbaseTx.vout[0].scriptPubKey);
                 int payoutHeat = DFMP::g_payoutHeatTracker->GetHeat(payoutIdentity);
-                payoutHeatPenalty = DFMP::CalculateHeatMultiplierFP_V34(payoutHeat, isVerified);
+                payoutHeatPenalty = DFMP::CalculateHeatMultiplierFP_V34(payoutHeat, isVerified, dfmpSat);
                 payoutHeatMult = static_cast<double>(payoutHeatPenalty) / DFMP::FP_SCALE;
             }
 
@@ -1743,11 +1753,11 @@ std::optional<CBlockTemplate> BuildMiningTemplate(CBlockchainDB& blockchain, CWa
             int64_t maturityPenalty = DFMP::CalculatePendingPenaltyFP_V34(nHeight, firstSeen);
 
             // Total = maturity x heat
-            multiplierFP = (maturityPenalty * effectiveHeatPenalty) / DFMP::FP_SCALE;
+            multiplierFP = DFMP::CombineMaturityHeatFP(maturityPenalty, effectiveHeatPenalty, dfmpSat);
 
         } else if (static_cast<int>(nHeight) >= dfmpV33ActivationHeight) {
             // DFMP v3.3: No dynamic scaling, linear+exponential penalty (must match validator exactly)
-            int64_t mikHeatPenalty = DFMP::CalculateHeatMultiplierFP_V33(heat);
+            int64_t mikHeatPenalty = DFMP::CalculateHeatMultiplierFP_V33(heat, dfmpSat);
 
             // Payout address heat penalty (v3.3, no dynamic scaling)
             int64_t payoutHeatPenalty = DFMP::FP_SCALE;  // 1.0x default
@@ -1755,7 +1765,7 @@ std::optional<CBlockTemplate> BuildMiningTemplate(CBlockchainDB& blockchain, CWa
                 DFMP::Identity payoutIdentity = DFMP::DeriveIdentityFromScript(
                     coinbaseTx.vout[0].scriptPubKey);
                 int payoutHeat = DFMP::g_payoutHeatTracker->GetHeat(payoutIdentity);
-                payoutHeatPenalty = DFMP::CalculateHeatMultiplierFP_V33(payoutHeat);
+                payoutHeatPenalty = DFMP::CalculateHeatMultiplierFP_V33(payoutHeat, dfmpSat);
                 payoutHeatMult = static_cast<double>(payoutHeatPenalty) / DFMP::FP_SCALE;
             }
 
@@ -1766,11 +1776,11 @@ std::optional<CBlockTemplate> BuildMiningTemplate(CBlockchainDB& blockchain, CWa
             int64_t maturityPenalty = DFMP::CalculatePendingPenaltyFP_V33(nHeight, firstSeen);
 
             // Total = maturity × effective heat
-            multiplierFP = (maturityPenalty * effectiveHeatPenalty) / DFMP::FP_SCALE;
+            multiplierFP = DFMP::CombineMaturityHeatFP(maturityPenalty, effectiveHeatPenalty, dfmpSat);
 
         } else if (static_cast<int>(nHeight) >= dfmpV32ActivationHeight) {
             // DFMP v3.2: Tightened anti-whale (must match validator exactly)
-            int64_t mikHeatPenalty = DFMP::CalculateHeatMultiplierFP_V32(heat, uniqueMiners);
+            int64_t mikHeatPenalty = DFMP::CalculateHeatMultiplierFP_V32(heat, uniqueMiners, dfmpSat);
 
             // Payout address heat penalty (v3.2 aggressive)
             int64_t payoutHeatPenalty = DFMP::FP_SCALE;  // 1.0x default
@@ -1782,7 +1792,7 @@ std::optional<CBlockTemplate> BuildMiningTemplate(CBlockchainDB& blockchain, CWa
                 if (static_cast<int>(nHeight) >= dfmpDynamicScalingHeight) {
                     payoutUniqueMiners = DFMP::g_payoutHeatTracker->GetUniqueMinerCount();
                 }
-                payoutHeatPenalty = DFMP::CalculateHeatMultiplierFP_V32(payoutHeat, payoutUniqueMiners);
+                payoutHeatPenalty = DFMP::CalculateHeatMultiplierFP_V32(payoutHeat, payoutUniqueMiners, dfmpSat);
                 payoutHeatMult = static_cast<double>(payoutHeatPenalty) / DFMP::FP_SCALE;
             }
 
@@ -1793,11 +1803,11 @@ std::optional<CBlockTemplate> BuildMiningTemplate(CBlockchainDB& blockchain, CWa
             int64_t maturityPenalty = DFMP::CalculatePendingPenaltyFP_V32(nHeight, firstSeen);
 
             // Total = maturity × effective heat
-            multiplierFP = (maturityPenalty * effectiveHeatPenalty) / DFMP::FP_SCALE;
+            multiplierFP = DFMP::CombineMaturityHeatFP(maturityPenalty, effectiveHeatPenalty, dfmpSat);
 
         } else if (static_cast<int>(nHeight) >= dfmpV31ActivationHeight) {
             // DFMP v3.1: Softened parameters (must match validator exactly)
-            int64_t mikHeatPenalty = DFMP::CalculateHeatMultiplierFP_V31(heat, uniqueMiners);
+            int64_t mikHeatPenalty = DFMP::CalculateHeatMultiplierFP_V31(heat, uniqueMiners, dfmpSat);
 
             // Payout address heat penalty (v3.1 softened)
             int64_t payoutHeatPenalty = DFMP::FP_SCALE;  // 1.0x default
@@ -1809,7 +1819,7 @@ std::optional<CBlockTemplate> BuildMiningTemplate(CBlockchainDB& blockchain, CWa
                 if (static_cast<int>(nHeight) >= dfmpDynamicScalingHeight) {
                     payoutUniqueMiners = DFMP::g_payoutHeatTracker->GetUniqueMinerCount();
                 }
-                payoutHeatPenalty = DFMP::CalculateHeatMultiplierFP_V31(payoutHeat, payoutUniqueMiners);
+                payoutHeatPenalty = DFMP::CalculateHeatMultiplierFP_V31(payoutHeat, payoutUniqueMiners, dfmpSat);
                 payoutHeatMult = static_cast<double>(payoutHeatPenalty) / DFMP::FP_SCALE;
             }
 
@@ -1820,11 +1830,11 @@ std::optional<CBlockTemplate> BuildMiningTemplate(CBlockchainDB& blockchain, CWa
             int64_t maturityPenalty = DFMP::CalculatePendingPenaltyFP_V31(nHeight, firstSeen);
 
             // Total = maturity × effective heat
-            multiplierFP = (maturityPenalty * effectiveHeatPenalty) / DFMP::FP_SCALE;
+            multiplierFP = DFMP::CombineMaturityHeatFP(maturityPenalty, effectiveHeatPenalty, dfmpSat);
 
         } else if (static_cast<int>(nHeight) >= dfmpV3ActivationHeight) {
             // DFMP v3.0: Multi-layer penalty (must match validator exactly)
-            int64_t mikHeatPenalty = DFMP::CalculateHeatMultiplierFP(heat, uniqueMiners);
+            int64_t mikHeatPenalty = DFMP::CalculateHeatMultiplierFP(heat, uniqueMiners, dfmpSat);
 
             // Payout address heat penalty
             int64_t payoutHeatPenalty = DFMP::FP_SCALE;  // 1.0x default
@@ -1836,7 +1846,7 @@ std::optional<CBlockTemplate> BuildMiningTemplate(CBlockchainDB& blockchain, CWa
                 if (static_cast<int>(nHeight) >= dfmpDynamicScalingHeight) {
                     payoutUniqueMiners = DFMP::g_payoutHeatTracker->GetUniqueMinerCount();
                 }
-                payoutHeatPenalty = DFMP::CalculateHeatMultiplierFP(payoutHeat, payoutUniqueMiners);
+                payoutHeatPenalty = DFMP::CalculateHeatMultiplierFP(payoutHeat, payoutUniqueMiners, dfmpSat);
                 payoutHeatMult = static_cast<double>(payoutHeatPenalty) / DFMP::FP_SCALE;
             }
 
@@ -1847,7 +1857,7 @@ std::optional<CBlockTemplate> BuildMiningTemplate(CBlockchainDB& blockchain, CWa
             int64_t maturityPenalty = DFMP::CalculatePendingPenaltyFP(nHeight, firstSeen);
 
             // Total = maturity × effective heat
-            multiplierFP = (maturityPenalty * effectiveHeatPenalty) / DFMP::FP_SCALE;
+            multiplierFP = DFMP::CombineMaturityHeatFP(maturityPenalty, effectiveHeatPenalty, dfmpSat);
         } else {
             // DFMP v2.0: Standard penalty
             multiplierFP = DFMP::CalculateTotalMultiplierFP(nHeight, firstSeen, heat, uniqueMiners);
@@ -1861,17 +1871,12 @@ std::optional<CBlockTemplate> BuildMiningTemplate(CBlockchainDB& blockchain, CWa
         if (multiplier > 1.01) {
             const char* versionTag;
             double maturityMult, heatMult;
-            bool logIsVerified = true;  // For v3.4 logging
+            // Simplified Option C (D-7): log-path mirrors dispatch — logIsVerified forced false
+            // (see dispatch-site comment above for full safety premise).
+            bool logIsVerified = false;
             if (static_cast<int>(nHeight) >= dfmpV34ActivationHeight) {
                 versionTag = "v3.4";
                 maturityMult = DFMP::GetPendingPenalty_V34(nHeight, firstSeen);
-                // Determine verification status for logging
-                if (g_node_context.dna_registry) {
-                    std::array<uint8_t, 20> mikArr;
-                    std::memcpy(mikArr.data(), mikIdentity.data, 20);
-                    auto status = g_node_context.dna_registry->get_verification_status(mikArr);
-                    logIsVerified = (status == digital_dna::verification::VerificationStatus::VERIFIED);
-                }
                 heatMult = DFMP::GetHeatMultiplier_V34(heat, logIsVerified);
             } else if (static_cast<int>(nHeight) >= dfmpV33ActivationHeight) {
                 versionTag = "v3.3";
@@ -2514,13 +2519,16 @@ load_genesis_block:  // Bug #29: Label for automatic retry after blockchain wipe
         }
 
         std::cout << "  Network: " << Dilithion::g_chainParams->GetNetworkName() << std::endl;
-        std::cout << "  Genesis hash: " << genesis.GetHash().GetHex() << std::endl;
+        std::cout << "  Genesis hash: " << Genesis::GetGenesisHash().GetHex() << std::endl;
         std::cout << "  Genesis time: " << genesis.nTime << std::endl;
         std::cout << " ✓" << std::endl;
         std::cout << "  [OK] Genesis block verified" << std::endl;
 
-        // Initialize blockchain with genesis block if needed
-        uint256 genesisHash = genesis.GetHash();
+        // Initialize blockchain with genesis block if needed.
+        // Single-source, integrity-validated accessor (see node/genesis.cpp
+        // GetGenesisHash): self-corrects a transient genesis miscompute to the
+        // chainparams-pinned value so the DB key is never a wrong genesis.
+        uint256 genesisHash = Genesis::GetGenesisHash();
         if (!blockchain.BlockExists(genesisHash)) {
             std::cout << "Initializing blockchain with genesis block..." << std::endl;
 

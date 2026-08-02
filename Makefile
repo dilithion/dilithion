@@ -180,6 +180,7 @@ CONSENSUS_SOURCES := src/consensus/fees.cpp \
                      src/consensus/chain_verifier.cpp \
                      src/consensus/tx_validation.cpp \
                      src/consensus/signature_batch_verifier.cpp \
+                     src/consensus/sighash_preimage.cpp \
                      src/consensus/validation.cpp \
                      src/consensus/vdf_validation.cpp \
                      src/consensus/port/chain_selector_impl.cpp
@@ -400,6 +401,7 @@ TX_VALIDATION_TEST_SOURCE := src/test/tx_validation_tests.cpp
 TX_RELAY_TEST_SOURCE := src/test/tx_relay_tests.cpp
 MINING_INTEGRATION_TEST_SOURCE := src/test/mining_integration_tests.cpp
 DFMP_MIK_TEST_SOURCE := src/test/dfmp_mik_tests.cpp
+DFMP_HEAT_OVERFLOW_TEST_SOURCE := src/test/dfmp_heat_overflow_tests.cpp
 MIK_REG_PERSIST_TEST_SOURCE := src/test/mik_registration_persistence_tests.cpp
 REGISTRATION_MANAGER_TEST_SOURCE := src/test/registration_manager_tests.cpp
 DNA_PROPAGATION_TEST_SOURCE := src/test/dna_propagation_tests.cpp
@@ -494,7 +496,7 @@ dilv-genesis-vdf: $(CORE_OBJECTS) $(OBJ_DIR)/tools/dilv_genesis_vdf.o $(DILITHIU
 # Test Binaries
 # ============================================================================
 
-tests: phase1_test miner_tests wallet_tests rpc_tests rpc_auth_tests rpc_host_header_tests http_server_wallet_gate_tests ratelimiter_tests timestamp_tests crypter_tests seed_attestation_key_tests wallet_encryption_integration_tests wallet_persistence_tests integration_tests net_tests connman_tests tx_validation_tests tx_relay_tests mining_integration_tests bug_003_block_size_tests dfmp_mik_tests mik_registration_persistence_tests dna_propagation_tests test_passphrase_validator script_tests addrman_v2_tests peer_scorer_tests peer_scorer_banman_integration_tests header_proof_checker_tests chain_selector_tests getchaintips_equivalence_tests chain_case_2_5_equivalence_tests chain_work_smoke_tests reorg_wal_crash_injection_tests competing_sibling_below_checkpoint_tests headers_manager_to_chain_selector_wiring_tests fast_path_2_boundary_tests v4_1_checkpoint_enforcement_tests v4_1_chain_selector_suppression_tests auto_rebuild_marker_mode_symmetry_tests add_block_index_flag_merge_tests port_chain_selector_invariants_tests legacy_vs_port_differential_tests chainstate_integrity_tests
+tests: phase1_test miner_tests wallet_tests rpc_tests rpc_auth_tests rpc_host_header_tests http_server_wallet_gate_tests ratelimiter_tests timestamp_tests crypter_tests seed_attestation_key_tests wallet_encryption_integration_tests wallet_persistence_tests integration_tests net_tests connman_tests tx_validation_tests tx_relay_tests mining_integration_tests bug_003_block_size_tests dfmp_mik_tests dfmp_heat_overflow_tests mik_registration_persistence_tests dna_propagation_tests test_passphrase_validator script_tests addrman_v2_tests peer_scorer_tests peer_scorer_banman_integration_tests header_proof_checker_tests chain_selector_tests getchaintips_equivalence_tests chain_case_2_5_equivalence_tests chain_work_smoke_tests reorg_wal_crash_injection_tests competing_sibling_below_checkpoint_tests headers_manager_to_chain_selector_wiring_tests fast_path_2_boundary_tests v4_1_checkpoint_enforcement_tests v4_1_chain_selector_suppression_tests auto_rebuild_marker_mode_symmetry_tests add_block_index_flag_merge_tests port_chain_selector_invariants_tests legacy_vs_port_differential_tests chainstate_integrity_tests magnet_canonical_health_tests
 	@echo "$(COLOR_GREEN)✓ All tests built successfully$(COLOR_RESET)"
 
 phase1_test: $(CORE_OBJECTS) $(OBJ_DIR)/test/phase1_simple_test.o $(DILITHIUM_OBJECTS) $(CHIAVDF_OBJECTS)
@@ -502,6 +504,14 @@ phase1_test: $(CORE_OBJECTS) $(OBJ_DIR)/test/phase1_simple_test.o $(DILITHIUM_OB
 	@$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS) $(LIBS)
 
 miner_tests: $(CORE_OBJECTS) $(OBJ_DIR)/test/miner_tests.o $(DILITHIUM_OBJECTS) $(CHIAVDF_OBJECTS)
+	@echo "$(COLOR_BLUE)[LINK]$(COLOR_RESET) $@"
+	@$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS) $(LIBS)
+
+# src/test/randomx_mode_test.cpp existed with no way to build it. It asserts LIGHT
+# and FULL mode hash identically, which is also the control that proves the
+# large-page allocation path does not perturb hash output: LIGHT is allocated on
+# standard pages, FULL requests large pages, and the two must still agree.
+randomx_mode_test: $(CORE_OBJECTS) $(OBJ_DIR)/test/randomx_mode_test.o $(DILITHIUM_OBJECTS) $(CHIAVDF_OBJECTS)
 	@echo "$(COLOR_BLUE)[LINK]$(COLOR_RESET) $@"
 	@$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS) $(LIBS)
 
@@ -608,6 +618,10 @@ bug_003_block_size_tests: $(CORE_OBJECTS) $(OBJ_DIR)/test/bug_003_block_size_tes
 	@$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS) $(LIBS)
 
 dfmp_mik_tests: $(CORE_OBJECTS) $(OBJ_DIR)/test/dfmp_mik_tests.o $(DILITHIUM_OBJECTS) $(CHIAVDF_OBJECTS)
+	@echo "$(COLOR_BLUE)[LINK]$(COLOR_RESET) $@"
+	@$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS) $(LIBS)
+
+dfmp_heat_overflow_tests: $(CORE_OBJECTS) $(OBJ_DIR)/test/dfmp_heat_overflow_tests.o $(DILITHIUM_OBJECTS) $(CHIAVDF_OBJECTS)
 	@echo "$(COLOR_BLUE)[LINK]$(COLOR_RESET) $@"
 	@$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS) $(LIBS)
 
@@ -803,6 +817,14 @@ port_chain_selector_invariants_tests: $(CORE_OBJECTS) $(OBJ_DIR)/test/port_chain
 	@$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS) $(LIBS)
 	@echo "$(COLOR_GREEN)✓ port_chain_selector_invariants_tests built successfully$(COLOR_RESET)"
 
+# Magnet v1a (fork-resistance, OBSERVABILITY ONLY): canonical node-health
+# accessor tests — IsOnCanonical() / OffCanonicalReason() / off-canonical
+# edge-trigger. See src/test/magnet_canonical_health_tests.cpp.
+magnet_canonical_health_tests: $(CORE_OBJECTS) $(OBJ_DIR)/test/magnet_canonical_health_tests.o $(DILITHIUM_OBJECTS) $(CHIAVDF_OBJECTS)
+	@echo "$(COLOR_BLUE)[LINK]$(COLOR_RESET) $@"
+	@$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS) $(LIBS)
+	@echo "$(COLOR_GREEN)✓ magnet_canonical_health_tests built successfully$(COLOR_RESET)"
+
 # v4.3.3 T2: differential testing harness — legacy vs port path equivalence
 # enforcement (audit modality 3 from feedback_audit_techniques_beyond_code_review).
 # Permanent CI infrastructure: every future port change that introduces an
@@ -942,6 +964,8 @@ BOOST_TEST_OBJECTS := $(OBJ_DIR)/test/test_dilithion.o \
 	$(OBJ_DIR)/test/consensus_validation_tests.o \
 	$(OBJ_DIR)/test/utxo_tests.o \
 	$(OBJ_DIR)/test/tx_validation_tests.o \
+	$(OBJ_DIR)/test/phase4_5_consensus_fixes_tests.o \
+	$(OBJ_DIR)/test/sighash_preimage_tests.o \
 	$(OBJ_DIR)/test/ibd_coordinator_tests.o \
 	$(OBJ_DIR)/test/misbehavior_scoring_tests.o \
 	$(OBJ_DIR)/test/ibd_functional_tests.o \
@@ -959,6 +983,7 @@ BOOST_TEST_OBJECTS := $(OBJ_DIR)/test/test_dilithion.o \
 	$(OBJ_DIR)/test/fee_wiring_tests.o \
 	$(OBJ_DIR)/test/zmq_tests.o \
 	$(OBJ_DIR)/test/seed_attestation_glue_tests.o \
+	$(OBJ_DIR)/test/wf1_host_endian_differential_test.o \
 	$(CRYPTO_PROPERTY_OBJECTS)
 
 # Link test objects + full library (CORE_OBJECTS) to avoid hand-picked object drift
@@ -976,6 +1001,14 @@ difficulty_determinism_test: $(OBJ_DIR)/test/difficulty_determinism_test.o $(OBJ
 	@echo "$(COLOR_BLUE)[LINK]$(COLOR_RESET) $@"
 	@$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS) $(LIBS)
 	@echo "$(COLOR_GREEN)✓ Difficulty determinism test built successfully$(COLOR_RESET)"
+
+# Differential byte-equality proof for the single-source sighash preimage.
+# Links only the helper + sha3 + block (uint256) — no full-node dependency.
+# Exit 0 = the refactored builder is byte-equal to the legacy open-coded form.
+sighash_differential_tests: $(OBJ_DIR)/test/sighash_differential_tests.o $(OBJ_DIR)/consensus/sighash_preimage.o $(OBJ_DIR)/crypto/sha3.o $(OBJ_DIR)/crypto/randomx_hash.o $(OBJ_DIR)/primitives/block.o $(DILITHIUM_OBJECTS)
+	@echo "$(COLOR_BLUE)[LINK]$(COLOR_RESET) $@"
+	@$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS) $(LIBS)
+	@echo "$(COLOR_GREEN)✓ Sighash differential test built successfully$(COLOR_RESET)"
 
 eda_test:
 	@echo "$(COLOR_BLUE)[CXX+LINK]$(COLOR_RESET) src/test/eda_test.cpp (standalone)"
@@ -1458,6 +1491,7 @@ FUZZ_CONSENSUS_OBJECTS := $(OBJ_DIR)/consensus/pow.o \
                           $(OBJ_DIR)/consensus/fees.o \
                           $(OBJ_DIR)/consensus/tx_validation.o \
                           $(OBJ_DIR)/consensus/validation.o \
+                          $(OBJ_DIR)/consensus/sighash_preimage.o \
                           $(OBJ_DIR)/consensus/signature_batch_verifier.o
 
 FUZZ_DFMP_OBJECTS := $(OBJ_DIR)/dfmp/dfmp.o \

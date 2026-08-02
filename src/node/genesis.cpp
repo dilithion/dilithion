@@ -9,6 +9,7 @@
 #include <core/chainparams.h>
 #include <vdf/coinbase_vdf.h>
 #include <util/base58.h>
+#include <util/logging.h>
 
 #include <cstring>
 #include <iostream>
@@ -213,9 +214,39 @@ CBlock CreateDilVGenesisBlock() {
 
 uint256 GetGenesisHash() {
     static uint256 hash;
-    static bool initialized = false;
+    static std::once_flag genesisHashOnce;
 
-    if (!initialized) {
+    // ── SINGLE-SOURCE GENESIS HASH + INTEGRITY GUARD (2026-06-28) ─────────────
+    // call_once: the previous `static bool initialized` lazy-init was an unguarded
+    // data race — C++ magic-statics protect only the FIRST default construction of
+    // `hash`, NOT the later assignment inside the `if`, so two threads racing the
+    // first call could both enter the block (or read `hash` before the other's
+    // write was visible). call_once serializes it.
+    //
+    // Integrity: this accessor is the SINGLE canonical source of the genesis hash
+    // consumed across the node — the startup DB key (dilithion-node/dilv-node), the
+    // headers manager, the P2P version message AND the per-peer genesis/ban check
+    // (net.cpp:2248/:582). The RandomX (legacy) / SHA3 (VDF) recompute was observed
+    // once, on an 8GB+ miner, to transiently produce a WRONG value; persisting OR
+    // advertising it strands the node on a private 1-block chain and gets its IP
+    // banned (`invalid_genesis`). chainparams pins the canonical hash for mainnet +
+    // DilV and the pin cannot be attacker-influenced, so when a pin exists we TRUST
+    // IT: if the recompute disagrees, log loudly (fault stays visible) and use the
+    // pinned value — no consumer ever sees a miscomputed genesis. Testnet leaves the
+    // pin empty (computed at startup) → unguarded, as before.
+    std::call_once(genesisHashOnce, []() {
+        // Refuse to populate the cache before chainparams are selected: caching an
+        // UNVALIDATED (un-pinned) hash for the process lifetime would silently
+        // defeat the integrity check below. CreateGenesisBlock() already throws on
+        // null params, but enforce the invariant locally so it is self-documenting
+        // and survives a future refactor of that helper. Throwing leaves the
+        // once_flag un-armed, so a correctly-ordered later call performs the
+        // validated compute rather than poisoning the cache. (No such early caller
+        // exists today — g_chainParams is set at startup before any genesis work.)
+        if (!Dilithion::g_chainParams) {
+            throw std::runtime_error("GetGenesisHash() called before chainparams initialized");
+        }
+
         // Use VDF genesis for any chain with VDF active from genesis (DilV, or testnet in VDF-only mode)
         bool useVdfGenesis = Dilithion::g_chainParams &&
             (Dilithion::g_chainParams->IsDilV() ||
@@ -223,9 +254,21 @@ uint256 GetGenesisHash() {
               Dilithion::g_chainParams->vdfExclusiveHeight == 0));
         CBlock genesis = useVdfGenesis ?
             CreateDilVGenesisBlock() : CreateGenesisBlock();
-        hash = genesis.GetHash();
-        initialized = true;
-    }
+        uint256 computed = genesis.GetHash();
+
+        if (Dilithion::g_chainParams && !Dilithion::g_chainParams->genesisHash.empty()) {
+            const uint256 pinned = uint256S(Dilithion::g_chainParams->genesisHash);
+            if (!(computed == pinned)) {
+                LogPrintf(ALL, ERROR,
+                    "[GENESIS] recomputed genesis hash %s does not match the value pinned in "
+                    "chainparams %s — using the pinned value (transient compute fault; see ops "
+                    "board randomx-genesis-init-corruption)",
+                    computed.GetHex().c_str(), pinned.GetHex().c_str());
+                computed = pinned;
+            }
+        }
+        hash = computed;
+    });
 
     return hash;
 }
@@ -266,22 +309,24 @@ static std::mutex g_resultMutex;
 static uint32_t g_winningNonce = 0;
 static uint256 g_winningHash;
 
-// Serialize block header to 80 bytes (for thread-safe hashing)
-static void SerializeBlockHeader(const CBlock& block, uint32_t nonce, std::vector<uint8_t>& data) {
+// Serialize block header to 80 bytes (for thread-safe hashing).
+// Exposed (non-static, declared in genesis.h) so the WF-1 byte-equality test can
+// drive the REAL production emitter instead of a hand-copied mirror.
+void SerializeBlockHeader(const CBlock& block, uint32_t nonce, std::vector<uint8_t>& data) {
     data.clear();
     data.reserve(80);
 
     // version (4) + prevBlock (32) + merkleRoot (32) + time (4) + bits (4) + nonce (4) = 80
-    const uint8_t* versionBytes = reinterpret_cast<const uint8_t*>(&block.nVersion);
-    data.insert(data.end(), versionBytes, versionBytes + 4);
+    // WF-1: explicit little-endian for the four 32-bit scalars, byte-identical to
+    // CBlockHeader::SerializeHeader() (the canonical serializer) for a legacy
+    // (v1) block. This helper is the offline genesis-mining hasher; it must emit
+    // the same 80 bytes the validator's GetHash() path consumes.
+    AppendLE32(data, static_cast<uint32_t>(block.nVersion));
     data.insert(data.end(), block.hashPrevBlock.begin(), block.hashPrevBlock.end());
     data.insert(data.end(), block.hashMerkleRoot.begin(), block.hashMerkleRoot.end());
-    const uint8_t* timeBytes = reinterpret_cast<const uint8_t*>(&block.nTime);
-    data.insert(data.end(), timeBytes, timeBytes + 4);
-    const uint8_t* bitsBytes = reinterpret_cast<const uint8_t*>(&block.nBits);
-    data.insert(data.end(), bitsBytes, bitsBytes + 4);
-    const uint8_t* nonceBytes = reinterpret_cast<const uint8_t*>(&nonce);
-    data.insert(data.end(), nonceBytes, nonceBytes + 4);
+    AppendLE32(data, block.nTime);
+    AppendLE32(data, block.nBits);
+    AppendLE32(data, nonce);
 }
 
 void MineWorker(int threadId, int numThreads, const CBlock& templateBlock, const uint256& target) {

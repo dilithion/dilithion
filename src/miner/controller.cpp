@@ -224,6 +224,11 @@ bool CMiningController::StartMining(const CBlockTemplate& blockTemplate) {
         if (total_ram_mb >= 3072) {
             // BUG FIX: Actually start FULL mode initialization (was missing!)
             const char* rx_key = "Dilithion-RandomX-v1";
+            // We are unambiguously mining here, so opt in to large pages. This is the
+            // path that builds the dataset on machines between 3GB and 8GB of RAM,
+            // which never hit the 8GB+ IBD-speedup init in dilithion-node.cpp -- miss
+            // it and those miners silently stay on 4KB pages.
+            randomx_set_large_pages_allowed(1);
             randomx_init_mining_mode_async(rx_key, strlen(rx_key));
             std::cout << "[Mining] FULL mode initializing in background - will auto-upgrade" << std::endl;
         }
@@ -421,29 +426,14 @@ void CMiningController::MiningWorker(uint32_t threadId) {
         if (needNewTemplate) {
             // Template changed - re-serialize the static parts of header
             // Format: version(4) + prevBlock(32) + merkleRoot(32) + time(4) + bits(4) + nonce(4)
-            size_t offset = 0;
-
-            // Version (4 bytes)
-            std::memcpy(header + offset, &currentBlock.nVersion, 4);
-            offset += 4;
-
-            // Previous block hash (32 bytes)
-            std::memcpy(header + offset, currentBlock.hashPrevBlock.begin(), 32);
-            offset += 32;
-
-            // Merkle root (32 bytes)
-            std::memcpy(header + offset, currentBlock.hashMerkleRoot.begin(), 32);
-            offset += 32;
-
-            // Time (4 bytes)
-            std::memcpy(header + offset, &currentBlock.nTime, 4);
-            offset += 4;
-
-            // Difficulty bits (4 bytes)
-            std::memcpy(header + offset, &currentBlock.nBits, 4);
-            offset += 4;
-
-            // Nonce will be updated in hot loop (last 4 bytes at offset 76)
+            //
+            // WF-1: assemble the 80-byte legacy PoW preimage through the single
+            // canonical helper (WriteMiningHeaderLE), which routes the four 32-bit
+            // scalars through WriteLE32 so the miner's PoW input is byte-identical
+            // to the validator's CBlockHeader::SerializeHeader() on any host. The
+            // nonce field (offset 76) is (re)written per iteration in the hot loop
+            // below; the value passed here is a placeholder that gets overwritten.
+            WriteMiningHeaderLE(header, currentBlock, currentBlock.nNonce);
 
             cachedBlock = currentBlock;
             lastHashTarget = currentHashTarget;
@@ -456,7 +446,7 @@ void CMiningController::MiningWorker(uint32_t threadId) {
         // BUG #24 FIX: Fast nonce update (only 4 bytes, no allocations)
         // Update nonce in place at offset 76 (last 4 bytes of 80-byte header)
         uint32_t nonce32 = static_cast<uint32_t>(nonce64 & 0xFFFFFFFF);
-        std::memcpy(header + 76, &nonce32, 4);
+        WriteLE32(header + 76, nonce32);  // WF-1: explicit LE, byte-equal on LE hosts
 
         // Compute RandomX hash
         try {
@@ -1191,15 +1181,18 @@ std::optional<CBlockTemplate> CMiningController::CreateBlockTemplate(
                 Dilithion::g_chainParams->dfmpV32ActivationHeight : 999999999;
             int dfmpV33Height = Dilithion::g_chainParams ?
                 Dilithion::g_chainParams->dfmpV33ActivationHeight : 999999999;
+            // C-3: saturating heat math gate (must match validator pow.cpp exactly).
+            bool dfmpSat = Dilithion::g_chainParams &&
+                static_cast<int>(nHeight) >= Dilithion::g_chainParams->dfmpOverflowFixActivationHeight;
             int64_t multiplierFP;
             if (static_cast<int>(nHeight) >= dfmpV33Height) {
-                multiplierFP = DFMP::CalculateTotalMultiplierFP_V33(nHeight, firstSeen, heat);
+                multiplierFP = DFMP::CalculateTotalMultiplierFP_V33(nHeight, firstSeen, heat, dfmpSat);
             } else if (static_cast<int>(nHeight) >= dfmpV32Height) {
-                multiplierFP = DFMP::CalculateTotalMultiplierFP_V32(nHeight, firstSeen, heat);
+                multiplierFP = DFMP::CalculateTotalMultiplierFP_V32(nHeight, firstSeen, heat, 0, dfmpSat);
             } else if (static_cast<int>(nHeight) >= dfmpV31Height) {
-                multiplierFP = DFMP::CalculateTotalMultiplierFP_V31(nHeight, firstSeen, heat);
+                multiplierFP = DFMP::CalculateTotalMultiplierFP_V31(nHeight, firstSeen, heat, 0, dfmpSat);
             } else {
-                multiplierFP = DFMP::CalculateTotalMultiplierFP(nHeight, firstSeen, heat);
+                multiplierFP = DFMP::CalculateTotalMultiplierFP(nHeight, firstSeen, heat, 0, dfmpSat);
             }
 
             // Apply multiplier to get effective target

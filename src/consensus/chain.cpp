@@ -2,6 +2,7 @@
 // Distributed under the MIT software license
 
 #include <consensus/chain.h>
+#include <consensus/params.h>    // Consensus::MAX_REORG_DEPTH (single source of truth)
 #include <consensus/pow.h>
 #include <consensus/reorg_wal.h>  // P1-4: WAL for atomic reorgs
 #include <consensus/validation.h> // BUG #109 FIX: DeserializeBlockTransactions
@@ -60,6 +61,10 @@ void CChainState::Cleanup() {
     // mapBlockIndex is cleared first, the set's destructor / further accesses
     // would dereference dangling pointers via the comparator.
     m_setBlockIndexCandidates.clear();
+
+    // Perf fix 2026-07-12: mapBlockIndex is about to be cleared below —
+    // the cached tip set is now stale.
+    m_chainTipsCacheDirty = true;
 
     // Phase 5 red-team CONCERN fix: drop registered callbacks too. External
     // components (HeadersManager, wallet) hold std::function<>s captured
@@ -145,6 +150,12 @@ bool CChainState::AddBlockIndex(const uint256& hash, std::unique_ptr<CBlockIndex
         // on identical-flag re-adds.
         existing->nStatus |= pindex->nStatus;
 
+        // Perf fix 2026-07-12: a merge can adopt a previously-null pprev
+        // (line above) or change validity flags that GetChainTips()'s
+        // status taxonomy depends on ("invalid"/"valid-fork"/etc) — either
+        // can change tip membership or a tip's reported status.
+        m_chainTipsCacheDirty = true;
+
         return true;
     }
 
@@ -164,6 +175,11 @@ bool CChainState::AddBlockIndex(const uint256& hash, std::unique_ptr<CBlockIndex
 
     // Transfer ownership to map using move semantics
     mapBlockIndex[hash] = std::move(pindex);
+
+    // Perf fix 2026-07-12: a brand-new entry is itself a new tip, and if it
+    // has a parent, that parent just gained a child and stops being a tip.
+    m_chainTipsCacheDirty = true;
+
     return true;
 }
 
@@ -407,6 +423,28 @@ bool CChainState::EvictLowestWorkLeafNotPinned(size_t target_max) {
         evicted_any = true;
     }
 
+    // MERGE NOTE (origin/main -> this branch, 2026-08-02). main's version of this
+    // function evicted exactly one entry and did its candidate-set/mapBlockIndex
+    // erasure here, at the tail. This branch replaced that with the leaf-only LOOP
+    // above, which performs both erasures per iteration (see the in_degree
+    // bookkeeping), so main's tail erasures are genuinely redundant here and are
+    // dropped — they would operate on `worst` after the loop, which is a freed
+    // pointer.
+    //
+    // What is NOT redundant, and must survive the merge: main added
+    // m_chainTipsCacheDirty (c6b43a01, GetChainTips/GetHolderCount caching) to that
+    // same tail. Eviction can remove a tip outright, or restore a parent to tip
+    // status when its last child goes, so the cached tip set is stale after ANY
+    // eviction. Taking this branch's side wholesale would have silently dropped
+    // that invalidation and left GetChainTips serving stale tips over RPC.
+    //
+    // Set once after the loop rather than per-iteration: the flag is idempotent and
+    // nothing reads it mid-loop. Guarded on evicted_any because a run that frees
+    // nothing leaves the cache valid.
+    if (evicted_any) {
+        m_chainTipsCacheDirty = true;
+    }
+
     return evicted_any;
 }
 
@@ -522,6 +560,13 @@ bool CChainState::ActivateBestChain(CBlockIndex* pindexNew, const CBlock& block,
     // CRITICAL-1 FIX: Acquire lock before accessing shared state
     // This protects pindexTip, mapBlockIndex, and all chain operations
     std::lock_guard<std::recursive_mutex> lock(cs_main);
+
+    // Perf fix 2026-07-12: this function (and ConnectTip/MarkBlockAsFailed
+    // it calls into) can flip nStatus/pprev on already-indexed entries
+    // directly, bypassing AddBlockIndex's dirty-flag hook. Called once per
+    // block/reorg attempt, not per RPC poll, so unconditional over-marking
+    // here is free relative to the cost it saves in GetChainTips().
+    m_chainTipsCacheDirty = true;
 
     reorgOccurred = false;
 
@@ -880,9 +925,10 @@ bool CChainState::ActivateBestChain(CBlockIndex* pindexNew, const CBlock& block,
         //
         // Phase 5 byte-equivalence proof (commit ff1947c) demonstrated that the
         // new chain-selector path's symmetric-reapply failure handling produces
-        // byte-identical on-disk state to legacy Case 2.5 + Patch B. The new
-        // path is now the default (env-var unset → useNewPath=true); legacy
-        // path remains under env-var=0 for operator rollback during burn-in.
+        // byte-identical on-disk state to legacy Case 2.5 + Patch B. The LEGACY
+        // path is the production default (env-var unset → useNewPath=false; see
+        // the useNewPath computation ~line 489); the new path is opt-in under
+        // env-var=1 for burn-in (BLOCKER-#2 revert, ~line 466).
         //
         // On Case 2.5 ConnectTip failure WITHOUT Patch B: m_chain_needs_rebuild
         // is set and the caller (IBDCoordinator) writes the auto_rebuild marker.
@@ -1010,16 +1056,17 @@ bool CChainState::ActivateBestChain(CBlockIndex* pindexNew, const CBlock& block,
     // VULN-008 FIX: Protect against excessively deep reorganizations
     // CID 1675248 FIX: Use int64_t to prevent overflow when computing reorg depth
     // and add validation to ensure reorg_depth is non-negative
-    static const int64_t MAX_REORG_DEPTH = 100;  // Similar to Bitcoin's practical limit
+    // Single source of truth: Consensus::MAX_REORG_DEPTH (consensus/params.h).
+    const int64_t reorg_cap = static_cast<int64_t>(Consensus::MAX_REORG_DEPTH);
     int64_t reorg_depth = static_cast<int64_t>(pindexTip->nHeight) - static_cast<int64_t>(pindexFork->nHeight);
     if (reorg_depth < 0) {
         std::cerr << "[Chain] ERROR: Invalid reorg depth (negative): " << reorg_depth << std::endl;
         std::cerr << "  Tip height: " << pindexTip->nHeight << ", Fork height: " << pindexFork->nHeight << std::endl;
         return false;
     }
-    if (reorg_depth > MAX_REORG_DEPTH) {
+    if (reorg_depth > reorg_cap) {
         std::cerr << "[Chain] ERROR: Reorganization too deep: " << reorg_depth << " blocks" << std::endl;
-        std::cerr << "  Maximum allowed: " << MAX_REORG_DEPTH << " blocks" << std::endl;
+        std::cerr << "  Maximum allowed: " << reorg_cap << " blocks" << std::endl;
         std::cerr << "  This may indicate a long-range attack or network partition" << std::endl;
         return false;
     }
@@ -1970,6 +2017,11 @@ bool CChainState::DisconnectTip(CBlockIndex* pindex, bool force_skip_utxo) {
         return false;
     }
 
+    // Perf fix 2026-07-12: disconnect changes pindexTip and possibly
+    // nStatus; caller holds cs_main. Unconditional — this runs once per
+    // disconnected block, not per RPC poll.
+    m_chainTipsCacheDirty = true;
+
     // Phase 5 TEST-ONLY override hook (chain_case_2_5_equivalence_tests).
     // Production never sets this; default-empty std::function falls through.
     if (m_testDisconnectTipOverride) {
@@ -2132,6 +2184,10 @@ bool CChainState::DisconnectTip(CBlockIndex* pindex, bool force_skip_utxo) {
 int CChainState::DisconnectToHeight(int targetHeight, CBlockchainDB& db, int batchSize) {
     std::unique_lock<std::recursive_mutex> lock(cs_main);
 
+    // Perf fix 2026-07-12: this loop reassigns pindexTip directly (not via
+    // SetTip); called once per bulk-disconnect operation, not per RPC poll.
+    m_chainTipsCacheDirty = true;
+
     if (!pindexTip || targetHeight < 0) return -1;
     if (pindexTip->nHeight <= targetHeight) return 0;
 
@@ -2242,8 +2298,20 @@ std::vector<uint256> CChainState::GetBlocksAtHeight(int height) const {
 std::vector<CChainState::ChainTip> CChainState::GetChainTips() const {
     std::lock_guard<std::recursive_mutex> lock(cs_main);
 
+    // Perf fix 2026-07-12: serve from cache when nothing has changed since
+    // the last call. Callers (explorer RPC polling) hammer this far more
+    // often than mapBlockIndex actually mutates, and recomputing did a full
+    // double-scan of mapBlockIndex (44% of CPU on DilV/NYC at 161K+ blocks).
+    if (!m_chainTipsCacheDirty) {
+        return m_chainTipsCache;
+    }
+
     std::vector<ChainTip> tips;
-    if (!pindexTip) return tips;
+    if (!pindexTip) {
+        m_chainTipsCache = tips;
+        m_chainTipsCacheDirty = false;
+        return tips;
+    }
 
     // Build set of blocks that have children (i.e., are referenced as pprev)
     std::set<const CBlockIndex*> hasChildren;
@@ -2328,6 +2396,8 @@ std::vector<CChainState::ChainTip> CChainState::GetChainTips() const {
         return a.height > b.height;
     });
 
+    m_chainTipsCache = tips;
+    m_chainTipsCacheDirty = false;
     return tips;
 }
 
@@ -2357,6 +2427,83 @@ CBlockIndex* CChainState::GetTip() const {
     return pindexTip;
 }
 
+// ============================================================================
+// Magnet v1a (fork-resistance): canonical node-health signal.
+// OBSERVABILITY ONLY — pure read + report. No fork-choice / reorg / validation
+// / mining behavior is touched here. See chain.h IsOnCanonical() doc.
+// ============================================================================
+
+std::string CChainState::OffCanonicalReason() const {
+    // v1a signals ONE precise off-canonical condition: a depth-rejection
+    // chain-rebuild. A pending rebuild caused by DepthRejection means a
+    // strictly-better chain exists beyond MAX_REORG_DEPTH that the node
+    // cannot auto-switch to — i.e. the node is genuinely stuck behind a
+    // better chain. Lock-free acquire-load pair (FlagChainRebuild stores the
+    // reason with release semantics BEFORE the flag).
+    //
+    // A prior draft also emitted a "work-drift" signal whenever the heaviest
+    // entry in m_setBlockIndexCandidates out-worked the active tip. That was
+    // dropped (red-team MED-1): its only *unique* cases are false-positives.
+    // A within-reorg-cap heavier chain is auto-adopted by ActivateBestChain
+    // (nothing to detect); a beyond-cap heavier chain already surfaces here as
+    // depth-rejection; and a checkpoint/depth-*rejected* heavier fork is the
+    // node behaving CORRECTLY — but on restart RecomputeCandidates re-adds that
+    // rejected leaf to m_setBlockIndexCandidates, so the old predicate fired on
+    // a healthy on-canonical node → cry-wolf monitor.py alerts. Genuine drift
+    // detection (distinct from depth-rejection) is a v2 item (F7 anchored-root).
+    if (m_chain_needs_rebuild.load(std::memory_order_acquire) &&
+        m_chain_rebuild_reason.load(std::memory_order_acquire) ==
+            ChainRebuildReason::DepthRejection) {
+        return "depth-rejection";
+    }
+
+    return "";  // on-canonical
+}
+
+bool CChainState::IsOnCanonical() const {
+    return OffCanonicalReason().empty();
+}
+
+void CChainState::LogOffCanonicalTransition(const std::string& reason,
+                                            int64_t best_known_ht) const {
+    // Edge-trigger: only emit on the on→off-canonical transition. The
+    // latch is cleared when the node returns on-canonical (see
+    // ClearChainRebuildFlag), so a later re-entry logs again.
+    bool expected = false;
+    if (!m_off_canonical_logged.compare_exchange_strong(
+            expected, true,
+            std::memory_order_acq_rel, std::memory_order_acquire)) {
+        return;  // already logged this off-canonical episode
+    }
+
+    // Test-observable emit counter (increment ONLY on the winning transition,
+    // so a broken latch — double-log or missing re-arm — is detectable by the
+    // unit test). Observability-only; production never reads it.
+    m_off_canonical_emit_count.fetch_add(1, std::memory_order_acq_rel);
+
+    const int local_tip_height = m_cachedHeight.load(std::memory_order_acquire);
+
+    // ONE greppable structured ERROR line. Includes the reason, local tip
+    // height, and best-known height when available (< 0 → "unknown").
+    // Built with std::string concatenation (no <sstream> needed here).
+    const std::string msg =
+        "[Magnet] OFF-CANONICAL: node is not on the best-known chain (reason=" +
+        (reason.empty() ? std::string("unknown") : reason) +
+        " local_tip_height=" + std::to_string(local_tip_height) +
+        " best_known_height=" +
+        (best_known_ht >= 0 ? std::to_string(best_known_ht)
+                            : std::string("unknown")) +
+        ")";
+
+    // Route through the structured logger at ERROR level. Call the CLogger
+    // method DIRECTLY rather than via the LogPrintConsensus/LogError macros:
+    // those token-paste `LVL_##level`, and on Windows the <windows.h> `ERROR`
+    // macro (=0) pre-expands the `ERROR` argument to `0`, yielding `LVL_0`.
+    // Calling LogPrintFormat with the enum value sidesteps the macro entirely.
+    CLogger::GetInstance().LogPrintFormat(
+        LogCategory::CONSENSUS, LogLevel::LVL_ERROR, "%s", msg.c_str());
+}
+
 void CChainState::SetTip(CBlockIndex* pindex) {
     std::lock_guard<std::recursive_mutex> lock(cs_main);
     
@@ -2370,6 +2517,10 @@ void CChainState::SetTip(CBlockIndex* pindex) {
     }
     
     pindexTip = pindex;
+    // Perf fix 2026-07-12: which entry is "active" in GetChainTips() is
+    // derived entirely from pindexTip, independent of any mapBlockIndex
+    // membership change.
+    m_chainTipsCacheDirty = true;
     // BUG #74 FIX: Update atomic cached height for lock-free reads
     m_cachedHeight.store(pindex ? pindex->nHeight : -1, std::memory_order_release);
     
@@ -2496,6 +2647,11 @@ void CChainState::ClearChainRebuildFlag() {
     // reason. No active caller relies on this today; defensive symmetry.
     m_chain_rebuild_reason.store(ChainRebuildReason::UndoFailure,
                                   std::memory_order_release);
+    // Magnet v1a (OBSERVABILITY ONLY): re-arm the off-canonical edge-trigger
+    // so that if the node later re-enters the off-canonical state, the single
+    // structured ERROR line is emitted again. Clearing the rebuild flag is the
+    // node returning on-canonical (recovery initiated), so the latch resets.
+    m_off_canonical_logged.store(false, std::memory_order_release);
     ResetUndoFailureCounter();
 }
 
@@ -2718,6 +2874,10 @@ void CChainState::MarkBlockAsFailed(CBlockIndex* pindex)
     if (!pindex) return;
     std::lock_guard<std::recursive_mutex> lock(cs_main);
 
+    // Perf fix 2026-07-12: flips nStatus on already-indexed entries below,
+    // outside AddBlockIndex's dirty-flag hook.
+    m_chainTipsCacheDirty = true;
+
     pindex->nStatus |= CBlockIndex::BLOCK_FAILED_VALID;
 
     // Propagate BLOCK_FAILED_CHILD to all descendants. Worklist-style
@@ -2751,6 +2911,10 @@ void CChainState::MarkBlockAsValid(CBlockIndex* pindex)
 {
     if (!pindex) return;
     std::lock_guard<std::recursive_mutex> lock(cs_main);
+
+    // Perf fix 2026-07-12: flips nStatus on already-indexed entries below,
+    // outside AddBlockIndex's dirty-flag hook.
+    m_chainTipsCacheDirty = true;
 
     // Clear failure flags on the target.
     pindex->nStatus &= ~CBlockIndex::BLOCK_FAILED_MASK;
@@ -2883,6 +3047,13 @@ CBlockIndex* CChainState::FindMostWorkChainImpl()
             // with the next-best candidate.
             if (!pindexNew->IsInvalid()) {
                 pindexNew->nStatus |= CBlockIndex::BLOCK_FAILED_CHILD;
+                // Perf fix 2026-07-12 (port-reviewer GAP-2): mutates an
+                // already-indexed leaf's status directly. Currently only
+                // reached via ActivateBestChain (already dirty at its top),
+                // but FindMostWorkChainImpl is also exposed standalone
+                // through ChainSelectorAdapter — flag here too so a future
+                // direct caller can't serve a stale "invalid" tip status.
+                m_chainTipsCacheDirty = true;
             }
             m_setBlockIndexCandidates.erase(it);
         } else {
@@ -2936,13 +3107,18 @@ bool CChainState::ActivateBestChainStep(CBlockIndex* pindexMostWork,
     if (!pindexMostWork) return false;
     if (pindexMostWork == pindexTip) return true;  // already there — no-op success
 
+    // Perf fix 2026-07-12: this reorg step reassigns pindexTip and can flip
+    // nStatus directly; runs once per activation step, not per RPC poll.
+    m_chainTipsCacheDirty = true;
+
     // 1) Common ancestor.
     CBlockIndex* pindexFork = pindexTip ? FindFork(pindexTip, pindexMostWork) : nullptr;
     // For genesis activation, pindexTip is null — pindexFork stays null and
     // disconnect list is empty; connect list walks pindexMostWork all the way back.
 
     // 1.5) v4.3.3 F4 (audit modality 1 I2 / modality 2 MEDIUM-6): reorg depth
-    // cap on the port path. Mirrors legacy chain.cpp:780-792 MAX_REORG_DEPTH=100.
+    // cap on the port path. Mirrors the legacy cap using the single-source
+    // Consensus::MAX_REORG_DEPTH (consensus/params.h) — no literal copy here.
     //
     // Pre-fix, the port path's ActivateBestChainStep had no depth check —
     // canary 3 attempted a 441-block reorg unconstrained. The legacy cap
@@ -2972,13 +3148,14 @@ bool CChainState::ActivateBestChainStep(CBlockIndex* pindexMostWork,
     // M1 helper's plumbing is the only path that respects --datadir=PATH
     // (the H1 defect Layer-3 caught on v4.3.2-M1).
     if (pindexTip != nullptr && pindexFork != nullptr) {
-        static const int64_t MAX_REORG_DEPTH = 100;  // matches legacy chain.cpp:780
+        // Single source of truth: Consensus::MAX_REORG_DEPTH (consensus/params.h).
+        const int64_t reorg_cap = static_cast<int64_t>(Consensus::MAX_REORG_DEPTH);
         const int64_t reorg_depth =
             static_cast<int64_t>(pindexTip->nHeight) -
             static_cast<int64_t>(pindexFork->nHeight);
-        if (reorg_depth > MAX_REORG_DEPTH) {
+        if (reorg_depth > reorg_cap) {
             std::cerr << "[Chain] ActivateBestChainStep: reorg depth " << reorg_depth
-                      << " exceeds MAX_REORG_DEPTH=" << MAX_REORG_DEPTH
+                      << " exceeds MAX_REORG_DEPTH=" << reorg_cap
                       << " (tip h=" << pindexTip->nHeight
                       << ", fork h=" << pindexFork->nHeight
                       << "). Dropping candidate (NOT marking failed); flagging "
@@ -2993,6 +3170,19 @@ bool CChainState::ActivateBestChainStep(CBlockIndex* pindexMostWork,
             // any observer of m_chain_needs_rebuild=true via acquire-load
             // also sees DepthRejection as the cause.
             FlagChainRebuild(ChainRebuildReason::DepthRejection);
+            // Magnet v1a (OBSERVABILITY ONLY): the node now knows a strictly-
+            // better chain exists beyond MAX_REORG_DEPTH but cannot auto-switch
+            // — the canonical "I am off the best chain" transition. Emit ONE
+            // greppable structured ERROR line (edge-triggered; latch prevents
+            // per-block spam). best-known height = the heaviest rejected
+            // candidate's height (pindexMostWork). This is a pure log call: it
+            // changes no consensus/reorg/mining behavior and mutates only the
+            // observability latch.
+            LogOffCanonicalTransition(
+                "depth-rejection",
+                pindexMostWork != nullptr
+                    ? static_cast<int64_t>(pindexMostWork->nHeight)
+                    : -1);
             return false;
         }
     }

@@ -409,6 +409,11 @@ bool CheckProofOfWorkDFMP(
     int dfmpV34ActivationHeight = Dilithion::g_chainParams ?
         Dilithion::g_chainParams->dfmpV34ActivationHeight : 999999999;
 
+    // C-3: saturating heat math gate. At/above the activation height, heat-penalty fns
+    // saturate at FP_HEAT_MULTIPLIER_MAX instead of overflowing int64 (which wrapped the
+    // heaviest miner to the easiest 1.0x target). Below the gate: byte-identical legacy math.
+    bool dfmpSat = Dilithion::g_chainParams && height >= Dilithion::g_chainParams->dfmpOverflowFixActivationHeight;
+
     int64_t multiplierFP;
 
     if (height >= dfmpV34ActivationHeight) {
@@ -417,17 +422,23 @@ bool CheckProofOfWorkDFMP(
         // Verified MIKs: 12 free blocks, Unverified: 3 free blocks
         // ====================================================================
 
-        // Determine verification status of this MIK
-        bool isVerified = true;  // Default: verified (safe fallback during IBD)
-        if (g_node_context.dna_registry) {
-            std::array<uint8_t, 20> mikArr;
-            std::memcpy(mikArr.data(), identity.data, 20);
-            auto status = g_node_context.dna_registry->get_verification_status(mikArr);
-            isVerified = (status == digital_dna::verification::VerificationStatus::VERIFIED);
-        }
+        // Simplified Option C (D-7): blind verification status — isVerified is forced false
+        // so Q1=STRICT (everyone gets the unverified free-tier=3). The get_verification_status
+        // read is dropped entirely.
+        //
+        // Safety premise: isVerified has ZERO live consensus effect outside this V34 gate.
+        // Every CONSENSUS reader of isVerified / get_verification_status is enumerated here
+        // (pow.cpp, dilithion-node.cpp, dilv-node.cpp — all inside `height >= dfmpV34ActivationHeight`
+        // guards). The only other reader is NON-consensus: an RPC reporter at src/rpc/server.cpp:5623
+        // (getdfmpstatus display) — it still reads real status, so if v3.4 is ever activated its
+        // reported penalty must also be blinded to match consensus (tracked pre-activation item).
+        // dfmpV34ActivationHeight=999999999 on all chains (src/core/chainparams.cpp:96 DIL,
+        // :315 testnet, :468 DilV) — this branch is dead code today. Blinding in place is not a live
+        // consensus change; it is safe-by-construction if v3.4 ever activates.
+        bool isVerified = false;
 
         // MIK identity heat penalty (v3.4 - verification-aware)
-        int64_t mikHeatPenalty = DFMP::CalculateHeatMultiplierFP_V34(blocksInWindow, isVerified);
+        int64_t mikHeatPenalty = DFMP::CalculateHeatMultiplierFP_V34(blocksInWindow, isVerified, dfmpSat);
 
         // Payout address heat penalty (uses same verification status as the MIK)
         int64_t payoutHeatPenalty = DFMP::FP_SCALE;  // 1.0x default
@@ -435,7 +446,7 @@ bool CheckProofOfWorkDFMP(
             DFMP::Identity payoutIdentity = DFMP::DeriveIdentityFromScript(
                 coinbaseTx.vout[0].scriptPubKey);
             int payoutHeat = DFMP::g_payoutHeatTracker->GetHeat(payoutIdentity);
-            payoutHeatPenalty = DFMP::CalculateHeatMultiplierFP_V34(payoutHeat, isVerified);
+            payoutHeatPenalty = DFMP::CalculateHeatMultiplierFP_V34(payoutHeat, isVerified, dfmpSat);
         }
 
         // Effective heat = max(MIK heat, payout heat)
@@ -445,7 +456,7 @@ bool CheckProofOfWorkDFMP(
         int64_t maturityPenalty = DFMP::CalculatePendingPenaltyFP_V34(height, effectiveFirstSeen);
 
         // Total = maturity x heat
-        multiplierFP = (maturityPenalty * effectiveHeatPenalty) / DFMP::FP_SCALE;
+        multiplierFP = DFMP::CombineMaturityHeatFP(maturityPenalty, effectiveHeatPenalty, dfmpSat);
 
     } else if (height >= dfmpV33ActivationHeight) {
         // ====================================================================
@@ -454,7 +465,7 @@ bool CheckProofOfWorkDFMP(
         // ====================================================================
 
         // MIK identity heat penalty (v3.3 - no dynamic scaling, no uniqueMiners param)
-        int64_t mikHeatPenalty = DFMP::CalculateHeatMultiplierFP_V33(blocksInWindow);
+        int64_t mikHeatPenalty = DFMP::CalculateHeatMultiplierFP_V33(blocksInWindow, dfmpSat);
 
         // Payout address heat penalty (v3.3 - same formula, no dynamic scaling)
         int64_t payoutHeatPenalty = DFMP::FP_SCALE;  // 1.0x default
@@ -462,7 +473,7 @@ bool CheckProofOfWorkDFMP(
             DFMP::Identity payoutIdentity = DFMP::DeriveIdentityFromScript(
                 coinbaseTx.vout[0].scriptPubKey);
             int payoutHeat = DFMP::g_payoutHeatTracker->GetHeat(payoutIdentity);
-            payoutHeatPenalty = DFMP::CalculateHeatMultiplierFP_V33(payoutHeat);
+            payoutHeatPenalty = DFMP::CalculateHeatMultiplierFP_V33(payoutHeat, dfmpSat);
         }
 
         // Effective heat = max(MIK heat, payout heat)
@@ -472,7 +483,7 @@ bool CheckProofOfWorkDFMP(
         int64_t maturityPenalty = DFMP::CalculatePendingPenaltyFP_V33(height, effectiveFirstSeen);
 
         // Total = maturity x heat
-        multiplierFP = (maturityPenalty * effectiveHeatPenalty) / DFMP::FP_SCALE;
+        multiplierFP = DFMP::CombineMaturityHeatFP(maturityPenalty, effectiveHeatPenalty, dfmpSat);
 
     } else if (height >= dfmpV32ActivationHeight) {
         // ====================================================================
@@ -481,7 +492,7 @@ bool CheckProofOfWorkDFMP(
         // ====================================================================
 
         // MIK identity heat penalty (v3.2 aggressive)
-        int64_t mikHeatPenalty = DFMP::CalculateHeatMultiplierFP_V32(blocksInWindow, uniqueMiners);
+        int64_t mikHeatPenalty = DFMP::CalculateHeatMultiplierFP_V32(blocksInWindow, uniqueMiners, dfmpSat);
 
         // Payout address heat penalty (v3.2 aggressive)
         int64_t payoutHeatPenalty = DFMP::FP_SCALE;  // 1.0x default
@@ -493,7 +504,7 @@ bool CheckProofOfWorkDFMP(
             if (height >= dfmpDynamicScalingHeight) {
                 payoutUniqueMiners = DFMP::g_payoutHeatTracker->GetUniqueMinerCount();
             }
-            payoutHeatPenalty = DFMP::CalculateHeatMultiplierFP_V32(payoutHeat, payoutUniqueMiners);
+            payoutHeatPenalty = DFMP::CalculateHeatMultiplierFP_V32(payoutHeat, payoutUniqueMiners, dfmpSat);
         }
 
         // Effective heat = max(MIK heat, payout heat)
@@ -503,7 +514,7 @@ bool CheckProofOfWorkDFMP(
         int64_t maturityPenalty = DFMP::CalculatePendingPenaltyFP_V32(height, effectiveFirstSeen);
 
         // Total = maturity x heat
-        multiplierFP = (maturityPenalty * effectiveHeatPenalty) / DFMP::FP_SCALE;
+        multiplierFP = DFMP::CombineMaturityHeatFP(maturityPenalty, effectiveHeatPenalty, dfmpSat);
 
     } else if (height >= dfmpV31ActivationHeight) {
         // ====================================================================
@@ -512,7 +523,7 @@ bool CheckProofOfWorkDFMP(
         // ====================================================================
 
         // MIK identity heat penalty (v3.1 softened)
-        int64_t mikHeatPenalty = DFMP::CalculateHeatMultiplierFP_V31(blocksInWindow, uniqueMiners);
+        int64_t mikHeatPenalty = DFMP::CalculateHeatMultiplierFP_V31(blocksInWindow, uniqueMiners, dfmpSat);
 
         // Payout address heat penalty (v3.1 softened)
         int64_t payoutHeatPenalty = DFMP::FP_SCALE;  // 1.0x default
@@ -524,7 +535,7 @@ bool CheckProofOfWorkDFMP(
             if (height >= dfmpDynamicScalingHeight) {
                 payoutUniqueMiners = DFMP::g_payoutHeatTracker->GetUniqueMinerCount();
             }
-            payoutHeatPenalty = DFMP::CalculateHeatMultiplierFP_V31(payoutHeat, payoutUniqueMiners);
+            payoutHeatPenalty = DFMP::CalculateHeatMultiplierFP_V31(payoutHeat, payoutUniqueMiners, dfmpSat);
         }
 
         // Effective heat = max(MIK heat, payout heat)
@@ -534,7 +545,7 @@ bool CheckProofOfWorkDFMP(
         int64_t maturityPenalty = DFMP::CalculatePendingPenaltyFP_V31(height, effectiveFirstSeen);
 
         // Total = maturity x heat
-        multiplierFP = (maturityPenalty * effectiveHeatPenalty) / DFMP::FP_SCALE;
+        multiplierFP = DFMP::CombineMaturityHeatFP(maturityPenalty, effectiveHeatPenalty, dfmpSat);
 
     } else if (height >= dfmpV3ActivationHeight) {
         // ====================================================================
@@ -542,7 +553,7 @@ bool CheckProofOfWorkDFMP(
         // ====================================================================
 
         // MIK identity heat penalty (with dynamic scaling)
-        int64_t mikHeatPenalty = DFMP::CalculateHeatMultiplierFP(blocksInWindow, uniqueMiners);
+        int64_t mikHeatPenalty = DFMP::CalculateHeatMultiplierFP(blocksInWindow, uniqueMiners, dfmpSat);
 
         // Payout address heat penalty (closes primary exploit)
         int64_t payoutHeatPenalty = DFMP::FP_SCALE;  // 1.0x default
@@ -554,7 +565,7 @@ bool CheckProofOfWorkDFMP(
             if (height >= dfmpDynamicScalingHeight) {
                 payoutUniqueMiners = DFMP::g_payoutHeatTracker->GetUniqueMinerCount();
             }
-            payoutHeatPenalty = DFMP::CalculateHeatMultiplierFP(payoutHeat, payoutUniqueMiners);
+            payoutHeatPenalty = DFMP::CalculateHeatMultiplierFP(payoutHeat, payoutUniqueMiners, dfmpSat);
         }
 
         // Effective heat = max(MIK heat, payout heat)
@@ -564,7 +575,7 @@ bool CheckProofOfWorkDFMP(
         int64_t maturityPenalty = DFMP::CalculatePendingPenaltyFP(height, effectiveFirstSeen);
 
         // Total = maturity x heat
-        multiplierFP = (maturityPenalty * effectiveHeatPenalty) / DFMP::FP_SCALE;
+        multiplierFP = DFMP::CombineMaturityHeatFP(maturityPenalty, effectiveHeatPenalty, dfmpSat);
     } else {
         // ====================================================================
         // DFMP v2.0: Standard penalty (MIK heat only, original thresholds)
@@ -579,14 +590,9 @@ bool CheckProofOfWorkDFMP(
     double multiplier = static_cast<double>(multiplierFP) / DFMP::FP_SCALE;
     if (multiplier > 1.01) {
         if (height >= dfmpV34ActivationHeight) {
-            // Determine verification status for logging
-            bool logIsVerified = true;
-            if (g_node_context.dna_registry) {
-                std::array<uint8_t, 20> mikArr;
-                std::memcpy(mikArr.data(), identity.data, 20);
-                auto status = g_node_context.dna_registry->get_verification_status(mikArr);
-                logIsVerified = (status == digital_dna::verification::VerificationStatus::VERIFIED);
-            }
+            // Simplified Option C (D-7): log-path mirrors dispatch — logIsVerified forced false
+            // (see dispatch-site comment above for full safety premise).
+            bool logIsVerified = false;
             double maturityMult = DFMP::GetPendingPenalty_V34(height, effectiveFirstSeen);
             double heatMult = DFMP::GetHeatMultiplier_V34(blocksInWindow, logIsVerified);
 

@@ -108,7 +108,10 @@ CHeadersManager::CHeadersManager()
     // Without this, block 1's pprev is nullptr and chainWork doesn't include genesis work
     CBlock genesis = (Dilithion::g_chainParams && Dilithion::g_chainParams->IsDilV()) ?
         Genesis::CreateDilVGenesisBlock() : Genesis::CreateGenesisBlock();
-    uint256 genesisHash = genesis.GetHash();
+    // Single-source, integrity-validated genesis hash (see node/genesis.cpp
+    // GetGenesisHash): keeps the headers-manager key consistent with the DB key
+    // and the P2P-advertised hash, and never keys off a transient miscompute.
+    uint256 genesisHash = Genesis::GetGenesisHash();
     uint256 genesisWork = GetBlockWork(genesis.nBits);
 
     HeaderWithChainWork genesisData(static_cast<CBlockHeader>(genesis), 0);  // height 0
@@ -452,10 +455,12 @@ bool CHeadersManager::ProcessHeaders(NodeId peer, const std::vector<CBlockHeader
                 // Parent not found - this is a competing chain (fork on PoW, normal on VDF)
 
                 // STALE FORK FILTER: If the expected height is far below our chain tip,
-                // this fork can never trigger an automatic reorg (MAX_AUTO_REORG_DEPTH=100).
-                // Skip fork detection to avoid log noise, unnecessary GETHEADERS, and
-                // wasted CPU on obviously-stale competing chains.
-                static const int STALE_FORK_THRESHOLD = 100;
+                // this fork can never trigger an automatic reorg (its depth exceeds the
+                // consensus reorg cap Consensus::MAX_REORG_DEPTH, which the in-place
+                // auto-reorg bound MAX_AUTO_REORG_DEPTH also tracks). Skip fork detection
+                // to avoid log noise, unnecessary GETHEADERS, and wasted CPU on
+                // obviously-stale competing chains. Keep in lockstep with the reorg cap.
+                static const int STALE_FORK_THRESHOLD = Consensus::MAX_REORG_DEPTH;
                 if (chainstateHeightPreFetched > 0 && expectedHeight > 0 &&
                     (chainstateHeightPreFetched - expectedHeight) > STALE_FORK_THRESHOLD) {
                     if (g_verbose.load(std::memory_order_relaxed)) {

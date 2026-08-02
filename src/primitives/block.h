@@ -52,6 +52,63 @@ public:
 // Stream output operator for Boost.Test (defined in block.cpp)
 std::ostream& operator<<(std::ostream& os, const uint256& h);
 
+// ---------------------------------------------------------------------------
+// Canonical little-endian 32-bit serialization primitives (WF-1).
+//
+// The block-header hash preimage MUST be byte-identical on every architecture.
+// These helpers write a uint32_t in explicit little-endian byte order (LSB
+// first) regardless of host endianness — matching the house idiom already used
+// by transaction.cpp (SerializeUint32) and digital_dna.cpp (write_u32).
+//
+// ALL header-serialization sites (primitives/block.cpp canonical serializer,
+// node/genesis.cpp mining helper, net/blockencodings.cpp compact-block wire,
+// miner/controller.cpp hot-loop buffer) MUST route their nVersion/nTime/nBits/
+// nNonce bytes through these so they agree byte-for-byte. On little-endian
+// hosts the emitted bytes are identical to the previous host-endian copy, so
+// the frozen genesis hash and every existing block hash are unchanged.
+// ---------------------------------------------------------------------------
+
+/** Write a uint32_t in little-endian order into a raw 4-byte buffer. */
+inline void WriteLE32(uint8_t* dst, uint32_t v) {
+    dst[0] = static_cast<uint8_t>(v);
+    dst[1] = static_cast<uint8_t>(v >> 8);
+    dst[2] = static_cast<uint8_t>(v >> 16);
+    dst[3] = static_cast<uint8_t>(v >> 24);
+}
+
+/** Append a uint32_t in little-endian order to a byte vector. */
+inline void AppendLE32(std::vector<uint8_t>& out, uint32_t v) {
+    out.push_back(static_cast<uint8_t>(v));
+    out.push_back(static_cast<uint8_t>(v >> 8));
+    out.push_back(static_cast<uint8_t>(v >> 16));
+    out.push_back(static_cast<uint8_t>(v >> 24));
+}
+
+/** Write a uint64_t in little-endian order into a raw 8-byte buffer. */
+inline void WriteLE64(uint8_t* dst, uint64_t v) {
+    for (int i = 0; i < 8; i++) dst[i] = static_cast<uint8_t>(v >> (i * 8));
+}
+
+/** Append a uint64_t in little-endian order to a byte vector. */
+inline void AppendLE64(std::vector<uint8_t>& out, uint64_t v) {
+    for (int i = 0; i < 8; i++) out.push_back(static_cast<uint8_t>(v >> (i * 8)));
+}
+
+/** Read a uint32_t stored little-endian from a raw 4-byte buffer. */
+inline uint32_t ReadLE32(const uint8_t* src) {
+    return static_cast<uint32_t>(src[0])
+         | (static_cast<uint32_t>(src[1]) << 8)
+         | (static_cast<uint32_t>(src[2]) << 16)
+         | (static_cast<uint32_t>(src[3]) << 24);
+}
+
+/** Read a uint64_t stored little-endian from a raw 8-byte buffer. */
+inline uint64_t ReadLE64(const uint8_t* src) {
+    uint64_t v = 0;
+    for (int i = 0; i < 8; i++) v |= static_cast<uint64_t>(src[i]) << (i * 8);
+    return v;
+}
+
 /** Helper function to construct uint256 from hex string (like Bitcoin Core's uint256S) */
 inline uint256 uint256S(const std::string& str) {
     uint256 result;
@@ -118,6 +175,28 @@ public:
     // InvalidateCache() - Call after modifying header fields
     void InvalidateCache() { fHashCached = false; }
 };
+
+// ---------------------------------------------------------------------------
+// Miner hot-loop header assembly (WF-1).
+//
+// The mining controller builds the 80-byte legacy PoW preimage directly into a
+// raw buffer at fixed offsets (it cannot allocate a std::vector per nonce). This
+// helper is the single canonical assembler for that buffer, routing the four
+// 32-bit scalars through WriteLE32 so the miner's PoW input is byte-identical to
+// the validator's CBlockHeader::SerializeHeader() for a legacy (80-byte) header.
+// Both miner/controller.cpp AND the WF-1 differential test call THIS function, so
+// the test drives the real production assembly (no hand-copied mirror).
+//
+// `dst` MUST point to at least 80 writable bytes. `nonce32` is written at offset
+// 76 (the field the hot loop mutates each iteration); h.nNonce is ignored.
+inline void WriteMiningHeaderLE(uint8_t* dst, const CBlockHeader& h, uint32_t nonce32) {
+    WriteLE32(dst + 0, static_cast<uint32_t>(h.nVersion));
+    memcpy(dst + 4,  h.hashPrevBlock.begin(), 32);
+    memcpy(dst + 36, h.hashMerkleRoot.begin(), 32);
+    WriteLE32(dst + 68, h.nTime);
+    WriteLE32(dst + 72, h.nBits);
+    WriteLE32(dst + 76, nonce32);
+}
 
 class CBlock : public CBlockHeader {
 public:

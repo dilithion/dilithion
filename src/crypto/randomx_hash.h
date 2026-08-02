@@ -52,6 +52,31 @@ void randomx_init_validation_mode(const void* key, size_t key_len);
 // Mining can proceed with LIGHT mode while FULL mode initializes
 void randomx_init_mining_mode_async(const void* key, size_t key_len);
 
+// Opt in to large-page backing for the FULL-mode dataset and mining scratchpads.
+// Worth roughly 2x hashrate when the OS grants it, and a silent no-op when it does
+// not (allocation falls back to standard pages).
+//
+// OFF by default, and it must stay that way: FULL mode is also initialized on
+// NON-mining nodes with 8GB+ RAM purely to speed up IBD verification. Large pages
+// are locked, non-swappable memory, so enabling this unconditionally would pin ~2GB
+// on every relay node that never mines a block -- memory the kernel could otherwise
+// reclaim under pressure. Relay nodes gain almost nothing in exchange, because IBD
+// verification runs at ~100 H/s where TLB pressure is not the bottleneck.
+//
+// Call with allowed=1 only on a path that is actually about to mine.
+void randomx_set_large_pages_allowed(int allowed);
+
+// Did the most recently allocated FULL-mode dataset actually get large pages?
+// Returns 1 if yes, 0 if it fell back to standard pages or was never requested.
+//
+// This is the observable half of the feature. Without it, "I enabled large pages
+// and nothing happened" is diagnosable only by reading source: the request can be
+// silently ignored (flag set after the dataset was already built), or silently
+// refused (privilege missing, or the hugetlb pool too small for the 1040 pages the
+// dataset needs). It is also what lets a test distinguish this feature working from
+// this feature having been deleted.
+int randomx_large_pages_active();
+
 // Check if mining (FULL) mode is ready
 // Returns 1 if FULL mode is ready, 0 if still initializing or LIGHT mode only
 int randomx_is_mining_mode_ready();
