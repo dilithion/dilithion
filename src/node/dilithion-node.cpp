@@ -2626,6 +2626,10 @@ int main(int argc, char* argv[]) {
         // Step 3: For 8GB+ systems, start FULL mode init NOW for faster IBD verification
         // This makes IBD ~20x faster since FULL mode verifies at ~100 H/s vs ~5 H/s
         if (total_ram_mb >= 8192) {
+            // Large pages only if this node actually mines. This branch also fires on
+            // relay-only nodes, which would otherwise pin ~2GB of non-swappable memory
+            // for an IBD speedup they do not need.
+            randomx_set_large_pages_allowed(config.start_mining ? 1 : 0);
             std::cout << "  Starting FULL mode init for faster IBD (8GB+ RAM detected)..." << std::endl;
             randomx_init_mining_mode_async(rx_key, strlen(rx_key));
         }
@@ -7698,6 +7702,7 @@ load_genesis_block:  // Bug #29: Label for automatic retry after blockchain wipe
                     // BUG #98 FIX: Must INITIALIZE FULL mode before waiting for it!
                     // The "already synced" path was waiting but never calling init_mining_mode_async
                     std::cout << "  Initializing RandomX mining mode (FULL)..." << std::endl;
+                    randomx_set_large_pages_allowed(1);  // this path only runs when mining
                     randomx_init_mining_mode_async(rx_key, strlen(rx_key));
                     std::cout << "  [WAIT] Waiting for RandomX FULL mode..." << std::endl;
                     auto wait_start = std::chrono::steady_clock::now();
@@ -7934,6 +7939,7 @@ load_genesis_block:  // Bug #29: Label for automatic retry after blockchain wipe
                     // This prevents "[MINING] Initializing dataset..." messages during wallet setup
                     if (!randomx_is_mining_mode_ready()) {
                         std::cout << "  Initializing RandomX mining mode (FULL)..." << std::endl;
+                        randomx_set_large_pages_allowed(1);  // this path only runs when mining
                         randomx_init_mining_mode_async(rx_key, strlen(rx_key));
                         std::cout << "  [WAIT] Waiting for dataset initialization..." << std::endl;
                         auto wait_start = std::chrono::steady_clock::now();
