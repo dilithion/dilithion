@@ -66,6 +66,17 @@ void randomx_init_mining_mode_async(const void* key, size_t key_len);
 // Call with allowed=1 only on a path that is actually about to mine.
 void randomx_set_large_pages_allowed(int allowed);
 
+// Did the most recently allocated FULL-mode dataset actually get large pages?
+// Returns 1 if yes, 0 if it fell back to standard pages or was never requested.
+//
+// This is the observable half of the feature. Without it, "I enabled large pages
+// and nothing happened" is diagnosable only by reading source: the request can be
+// silently ignored (flag set after the dataset was already built), or silently
+// refused (privilege missing, or the hugetlb pool too small for the 1040 pages the
+// dataset needs). It is also what lets a test distinguish this feature working from
+// this feature having been deleted.
+int randomx_large_pages_active();
+
 // Check if mining (FULL) mode is ready
 // Returns 1 if FULL mode is ready, 0 if still initializing or LIGHT mode only
 int randomx_is_mining_mode_ready();

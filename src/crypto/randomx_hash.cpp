@@ -63,9 +63,16 @@ namespace {
     // randomx_get_flags() deliberately omits RANDOMX_FLAG_LARGE_PAGES -- upstream's
     // header says it "must be added manually if desired" -- because the allocation
     // needs OS privileges that may not be present:
-    //     Linux:   vm.nr_hugepages, or transparent hugepages
-    //     Windows: the "Lock pages in memory" right (SeLockMemoryPrivilege)
-    //     macOS:   not supported by RandomX
+    //     Linux:   the EXPLICIT hugetlb pool (vm.nr_hugepages). NOT transparent
+    //              hugepages -- upstream allocates with mmap(MAP_HUGETLB)
+    //              (depends/randomx/src/virtual_memory.c:226), which draws from the
+    //              reserved pool and ignores THP entirely. Setting
+    //              transparent_hugepage=always accomplishes nothing here.
+    //     Windows: the "Lock pages in memory" right (SeLockMemoryPrivilege). Upstream
+    //              enables it in the process token itself before allocating
+    //              (virtual_memory.c:210), so granting the right is sufficient -- but
+    //              note it stays enabled on the token for the process lifetime.
+    //     macOS:   supported, via VM_FLAGS_SUPERPAGE_SIZE_2MB (virtual_memory.c:220).
     //
     // So we request it explicitly and MUST survive it being refused. Every RandomX
     // allocator returns nullptr (never throws) when large pages are unavailable, so
@@ -74,10 +81,18 @@ namespace {
     // fallback is load-bearing, not defensive dressing: without it this change would
     // stop every such miner from starting at all.
     //
-    // Scope note: applied to the mining/full-mode path only. The light-mode
-    // validation cache is deliberately left on standard pages so it cannot consume
-    // the limited large-page pool that the 2GB mining dataset and the per-thread
-    // scratchpads need.
+    // Scope note: the DATASET and the per-thread VM scratchpads get large pages. The
+    // 256MB cache deliberately does NOT, and neither does the light-mode validation
+    // cache. This is not squeamishness -- it is an ordering hazard. Exact page counts
+    // (2MiB pages, from depends/randomx/src/common.hpp:83-86):
+    //     cache      CacheSize      = 268,435,456 B =  128 pages
+    //     dataset    DatasetSize  ~= 2,181,038,016 B = 1040 pages (rounded up by mmap)
+    //     scratchpad ScratchpadSize =   2,097,152 B =    1 page, per mining thread
+    // The cache is allocated first. If it took large pages, then on the very common
+    // `vm.nr_hugepages=1024` recipe it would consume 128 of them and leave too few for
+    // the dataset -- so the 256MB win would destroy the 2GB win that is the entire
+    // point of this change, and the failure would be silent. Skipping the cache makes
+    // pool exhaustion degrade monotonically instead of inverting.
     //
     // Gating: OFF unless the node explicitly opts in via
     // randomx_set_large_pages_allowed(1). FULL mode is initialized on non-mining
@@ -87,25 +102,26 @@ namespace {
 
     std::atomic<bool> g_large_pages_allowed{false};
 
-    randomx_cache* AllocCacheLargePages(randomx_flags flags, bool& got_large_pages) {
-        if (g_large_pages_allowed.load(std::memory_order_relaxed)) {
-            if (randomx_cache* cache = randomx_alloc_cache(flags | RANDOMX_FLAG_LARGE_PAGES)) {
-                got_large_pages = true;
-                return cache;
-            }
-        }
-        got_large_pages = false;
-        return randomx_alloc_cache(flags);
+    // Whether the most recent FULL-mode dataset allocation actually landed on large
+    // pages. Reported via randomx_large_pages_active().
+    std::atomic<bool> g_large_pages_active{false};
+
+    bool LargePagesAllowed() {
+        return g_large_pages_allowed.load(std::memory_order_relaxed);
     }
 
-    randomx_dataset* AllocDatasetLargePages(randomx_flags flags, bool& got_large_pages) {
-        if (g_large_pages_allowed.load(std::memory_order_relaxed)) {
+    // Takes the caller's snapshot of the flag rather than re-reading it, so a setter
+    // call landing mid-init cannot make the allocations and the log line disagree.
+    randomx_dataset* AllocDatasetLargePages(randomx_flags flags, bool allowed, bool& got_large_pages) {
+        if (allowed) {
             if (randomx_dataset* dataset = randomx_alloc_dataset(flags | RANDOMX_FLAG_LARGE_PAGES)) {
                 got_large_pages = true;
+                g_large_pages_active.store(true, std::memory_order_relaxed);
                 return dataset;
             }
         }
         got_large_pages = false;
+        g_large_pages_active.store(false, std::memory_order_relaxed);
         return randomx_alloc_dataset(flags);
     }
 
@@ -114,17 +130,52 @@ namespace {
     // its own. Mining threads call this once each at startup; a partial pool simply
     // means some threads get large pages and the rest do not.
     randomx_vm* CreateVmLargePages(randomx_flags flags, randomx_cache* cache, randomx_dataset* dataset) {
-        if (g_large_pages_allowed.load(std::memory_order_relaxed)) {
+        if (LargePagesAllowed()) {
             if (randomx_vm* vm = randomx_create_vm(flags | RANDOMX_FLAG_LARGE_PAGES, cache, dataset)) {
                 return vm;
             }
         }
         return randomx_create_vm(flags, cache, dataset);
     }
+
+    // Single place that reports the outcome, so both full-mode entry points say the
+    // same thing and neither can silently skip it.
+    void ReportLargePageStatus(bool allowed, bool dataset_got_large_pages) {
+        if (!allowed) {
+            return;  // never requested (relay node): the warning would be meaningless
+        }
+        if (dataset_got_large_pages) {
+            std::cout << "  [MINING] Large pages: ENABLED (2GB dataset)" << std::endl;
+        } else {
+            std::cout << "  [MINING] Large pages: UNAVAILABLE - mining on standard 4KB pages,"
+                      << " expect roughly half the achievable hashrate." << std::endl;
+            std::cout << "  [MINING] To enable, see docs/MINING-LARGE-PAGES.md"
+                      << " (Linux: vm.nr_hugepages; Windows: Lock pages in memory)." << std::endl;
+        }
+    }
+}
+
+extern "C" int randomx_large_pages_active() {
+    return g_large_pages_active.load(std::memory_order_relaxed) ? 1 : 0;
 }
 
 extern "C" void randomx_set_large_pages_allowed(int allowed) {
-    g_large_pages_allowed.store(allowed != 0, std::memory_order_relaxed);
+    const bool want = (allowed != 0);
+    const bool was = g_large_pages_allowed.exchange(want, std::memory_order_relaxed);
+
+    // Turning the flag on after the dataset already exists does nothing: the FULL-mode
+    // init is idempotent (it early-returns once g_mining_ready is set), so the dataset
+    // built on standard pages is the one that will be used for the process lifetime.
+    // This happens to a node started WITHOUT --mine on a 8GB+ box -- the IBD-speedup
+    // init builds the dataset before any mining path can opt in. Re-allocating here is
+    // not safe (live mining VMs hold pointers into the dataset), so say so loudly
+    // instead of leaving the operator to wonder why their hashrate did not move.
+    if (want && !was && g_mining_ready.load()) {
+        std::cout << "  [MINING] Large pages requested, but the RandomX dataset is already"
+                  << " allocated on standard pages - request ignored." << std::endl;
+        std::cout << "  [MINING] Restart the node with --mine to allocate it with large pages."
+                  << std::endl;
+    }
 }
 
 extern "C" void randomx_init_for_hashing(const void* key, size_t key_len, int light_mode) {
@@ -170,14 +221,13 @@ extern "C" void randomx_init_for_hashing(const void* key, size_t key_len, int li
         flags = randomx_get_flags() | RANDOMX_FLAG_FULL_MEM;
     }
 
-    // Allocate and initialize cache (required for both modes). Large pages are only
-    // requested for full/mining mode -- see the scope note on the helpers above.
-    if (light_mode) {
-        g_randomx_cache = randomx_alloc_cache(flags);
-    } else {
-        bool cache_large_pages = false;
-        g_randomx_cache = AllocCacheLargePages(flags, cache_large_pages);
-    }
+    // Snapshot the opt-in once, so the allocations below and the status line reported
+    // afterwards cannot disagree if a setter call lands mid-init.
+    const bool large_pages_allowed = !light_mode && LargePagesAllowed();
+
+    // Allocate and initialize cache (required for both modes). The cache never takes
+    // large pages -- see the ordering hazard in the scope note on the helpers above.
+    g_randomx_cache = randomx_alloc_cache(flags);
     if (g_randomx_cache == nullptr) {
         throw std::runtime_error("Failed to allocate RandomX cache");
     }
@@ -195,12 +245,13 @@ extern "C" void randomx_init_for_hashing(const void* key, size_t key_len, int li
         // FULL MODE: Allocate dataset, initialize it from cache, create VM from dataset
         // This is the correct mode for production mining and consensus verification
         bool dataset_large_pages = false;
-        g_randomx_dataset = AllocDatasetLargePages(flags, dataset_large_pages);
+        g_randomx_dataset = AllocDatasetLargePages(flags, large_pages_allowed, dataset_large_pages);
         if (g_randomx_dataset == nullptr) {
             randomx_release_cache(g_randomx_cache);
             g_randomx_cache = nullptr;
             throw std::runtime_error("Failed to allocate RandomX dataset");
         }
+        ReportLargePageStatus(large_pages_allowed, dataset_large_pages);
 
         // BUG #51 FIX: Thread-safe multi-threaded dataset initialization
         // Following XMRig PR #1146 and Monero patterns for proper synchronization
@@ -583,9 +634,14 @@ extern "C" void randomx_init_mining_mode_async(const void* key, size_t key_len) 
             // FULL mode flags
             randomx_flags flags = randomx_get_flags() | RANDOMX_FLAG_FULL_MEM;
 
-            // Allocate cache (large pages if the OS allows, standard pages otherwise)
-            bool cache_large_pages = false;
-            g_mining_cache = AllocCacheLargePages(flags, cache_large_pages);
+            // Snapshot the opt-in once: the allocation below and the status line
+            // afterwards must describe the same decision even if a setter call lands
+            // in between.
+            const bool large_pages_allowed = LargePagesAllowed();
+
+            // Allocate cache. Never large pages -- it would eat the pages the dataset
+            // needs; see the ordering hazard in the scope note on the helpers above.
+            g_mining_cache = randomx_alloc_cache(flags);
             if (g_mining_cache == nullptr) {
                 throw std::runtime_error("Failed to allocate RandomX mining cache");
             }
@@ -593,27 +649,16 @@ extern "C" void randomx_init_mining_mode_async(const void* key, size_t key_len) 
 
             // Allocate dataset (2GB) -- this is the allocation that dominates hashrate
             bool dataset_large_pages = false;
-            g_mining_dataset = AllocDatasetLargePages(flags, dataset_large_pages);
+            g_mining_dataset = AllocDatasetLargePages(flags, large_pages_allowed, dataset_large_pages);
             if (g_mining_dataset == nullptr) {
                 randomx_release_cache(g_mining_cache);
                 g_mining_cache = nullptr;
                 throw std::runtime_error("Failed to allocate RandomX mining dataset");
             }
 
-            // Tell the miner which path they got. Without this line a user has no way
-            // to tell a ~2x hashrate deficit from normal behaviour for their hardware.
-            // Stay quiet when large pages were never requested (non-mining node): the
-            // "half your hashrate" warning would be alarming and meaningless there.
-            if (g_large_pages_allowed.load(std::memory_order_relaxed)) {
-                if (dataset_large_pages && cache_large_pages) {
-                    std::cout << "  [MINING] Large pages: ENABLED" << std::endl;
-                } else {
-                    std::cout << "  [MINING] Large pages: UNAVAILABLE - mining on standard 4KB pages,"
-                              << " expect roughly half the achievable hashrate." << std::endl;
-                    std::cout << "  [MINING] To enable, see docs/MINING-LARGE-PAGES.md"
-                              << " (Linux: vm.nr_hugepages; Windows: Lock pages in memory)." << std::endl;
-                }
-            }
+            // Tell the miner which path they got. Without this a user has no way to
+            // tell a ~2x hashrate deficit from normal behaviour for their hardware.
+            ReportLargePageStatus(large_pages_allowed, dataset_large_pages);
 
             // Multi-threaded dataset initialization
             std::atomic_thread_fence(std::memory_order_release);

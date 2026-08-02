@@ -224,6 +224,11 @@ bool CMiningController::StartMining(const CBlockTemplate& blockTemplate) {
         if (total_ram_mb >= 3072) {
             // BUG FIX: Actually start FULL mode initialization (was missing!)
             const char* rx_key = "Dilithion-RandomX-v1";
+            // We are unambiguously mining here, so opt in to large pages. This is the
+            // path that builds the dataset on machines between 3GB and 8GB of RAM,
+            // which never hit the 8GB+ IBD-speedup init in dilithion-node.cpp -- miss
+            // it and those miners silently stay on 4KB pages.
+            randomx_set_large_pages_allowed(1);
             randomx_init_mining_mode_async(rx_key, strlen(rx_key));
             std::cout << "[Mining] FULL mode initializing in background - will auto-upgrade" << std::endl;
         }
