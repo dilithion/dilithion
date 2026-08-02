@@ -928,10 +928,11 @@ four_node_test:
 	@echo "$(COLOR_GREEN)✓ four_node_test passed$(COLOR_RESET)"
 
 # Regression: an unreadable wallet.dat must never be overwritten by the
-# create-new-wallet path. Drives the real binary, so it needs dilithion-node
-# built first. See the script header for the v4.5.0 incident this pins.
+# create-new-wallet path. Drives the real binaries, so both are built first.
+# BOTH node binaries own a wallet and both carried the bug — see the script
+# header for the v4.5.0 incident this pins.
 .PHONY: wallet_load_guard_test
-wallet_load_guard_test: dilithion-node
+wallet_load_guard_test: dilithion-node dilv-node
 	@echo "$(COLOR_BLUE)[TEST]$(COLOR_RESET) unreadable-wallet preservation guard (scripts/wallet_load_guard_test.sh)"
 	@bash scripts/wallet_load_guard_test.sh
 	@echo "$(COLOR_GREEN)✓ wallet_load_guard_test passed$(COLOR_RESET)"
@@ -1060,7 +1061,7 @@ batch_verifier_race_control: $(OBJ_DIR)/test/lp5_control/signature_batch_verifie
 # Run Tests
 # ============================================================================
 
-test: tests test_dilithion asert_test
+test: tests test_dilithion asert_test wallet_load_guard_test
 	@echo "$(COLOR_YELLOW)========================================$(COLOR_RESET)"
 	@echo "$(COLOR_YELLOW)Running Boost Unit Test Suite$(COLOR_RESET)"
 	@echo "$(COLOR_YELLOW)========================================$(COLOR_RESET)"
