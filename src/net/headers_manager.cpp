@@ -108,7 +108,10 @@ CHeadersManager::CHeadersManager()
     // Without this, block 1's pprev is nullptr and chainWork doesn't include genesis work
     CBlock genesis = (Dilithion::g_chainParams && Dilithion::g_chainParams->IsDilV()) ?
         Genesis::CreateDilVGenesisBlock() : Genesis::CreateGenesisBlock();
-    uint256 genesisHash = genesis.GetHash();
+    // Single-source, integrity-validated genesis hash (see node/genesis.cpp
+    // GetGenesisHash): keeps the headers-manager key consistent with the DB key
+    // and the P2P-advertised hash, and never keys off a transient miscompute.
+    uint256 genesisHash = Genesis::GetGenesisHash();
     uint256 genesisWork = GetBlockWork(genesis.nBits);
 
     HeaderWithChainWork genesisData(static_cast<CBlockHeader>(genesis), 0);  // height 0
