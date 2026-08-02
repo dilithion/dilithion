@@ -224,27 +224,58 @@ for NODE in "${NODES[@]}"; do
         # deleted. Several lines, because the create flow prompts more than
         # once and dilithion-node.cpp's confirm loop has no EOF guard: running
         # out of input there spins rather than exiting.
-        { printf '1\n'; for _ in 1 2 3 4 5 6 7 8; do printf 'yes\n'; done; } > "$P/answers"
-        timeout -k 15 120 script -q -c "'$NODE' --datadir='$P' $NOPEER" /dev/null \
-            < "$P/answers" > "$P/node.log" 2>&1 || true
-        P_AFTER=$(sha256sum "$P/wallet.dat" 2>/dev/null | awk '{print $1}')
+        # DELIBERATELY TWO RUNS. One run cannot prove both things. On a GUARDED
+        # binary the refusal happens BEFORE the wallet menu prints, so demanding
+        # "we reached the menu" as proof the pty was live condemns the CORRECT
+        # binary — CI goes red on good code. On an UNGUARDED binary the UPnP
+        # [Y/n] prompt (~250 lines earlier) swallows the first answer, the menu
+        # rejects the rest, the run blocks to the timeout without reaching
+        # Save(), and the byte check then reports "destructive path blocked" on
+        # a binary with no guard at all. Inverted in both directions.
+        # So: prove the pty works where the menu is legitimately reachable,
+        # then check the guard where the menu must NOT be reached.
+        # Answers start with 'n' for the UPnP prompt; without it every
+        # subsequent answer is off by one.
 
-        # PROOF THE ARM IS LIVE. Without this the arm cannot tell "the guard
-        # stopped the overwrite" from "we never got a pty, so the non-TTY
-        # fallback stopped it" — the exact vacuity that has now recurred twice.
-        # Reaching the wallet-setup prompt proves isatty(0) was true.
-        if grep -qiE "WALLET SETUP|CREATE a new wallet" "$P/node.log"; then
-            pass "pty: reached the interactive wallet prompt (pty is real, isatty passed)"
+        # (i) LIVENESS CONTROL — clean datadir, no wallet. The menu SHOULD
+        #     appear. If it does not, the pty machinery is broken and part (ii)
+        #     proves nothing, so fail loudly instead of letting (ii) pass for
+        #     the wrong reason.
+        L="$WORK/$(basename "$NODE").ptylive"
+        mkdir -p "$L"
+        printf 'n\n' > "$L/answers"
+        timeout -k 15 90 script -q -c "'$NODE' --datadir='$L' $NOPEER" /dev/null \
+            < "$L/answers" > "$L/node.log" 2>&1 || true
+        # Match the menu text ONLY, case-sensitively: matching "wallet setup"
+        # case-insensitively also matches the non-TTY guard's own refusal
+        # ("Wallet setup requires an interactive terminal"), which would score
+        # a DEAD pty as live.
+        if grep -q "CREATE a new wallet" "$L/node.log"; then
+            pass "pty: menu reached on a clean datadir (pty is real, isatty passed)"
+            PTY_LIVE=1
+        else
+            fail "pty: menu never appeared even with NO wallet — pty setup broken, guard arm below would prove nothing"
+            PTY_LIVE=0
+        fi
+
+        # (ii) GUARD CHECK — same pty, corrupt wallet. The guard must refuse
+        #      BEFORE the menu; an unguarded binary reaches the menu here.
+        if [ "$PTY_LIVE" -eq 1 ]; then
+            P_BEFORE=$(sha256sum "$P/wallet.dat" | awk '{print $1}')
+            printf 'n\n1\n' > "$P/answers"
+            timeout -k 15 120 script -q -c "'$NODE' --datadir='$P' $NOPEER" /dev/null \
+                < "$P/answers" > "$P/node.log" 2>&1 || true
+            P_AFTER=$(sha256sum "$P/wallet.dat" 2>/dev/null | awk '{print $1}')
+            if grep -q "CREATE a new wallet" "$P/node.log"; then
+                fail "pty: reached the create menu with an unreadable wallet — guard did not fire under a real tty"
+            else
+                pass "pty: guard fired before the create menu under a real tty"
+            fi
             if [ "$P_BEFORE" = "$P_AFTER" ]; then
-                pass "pty: wallet.dat survived an interactive CREATE (destructive path blocked)"
+                pass "pty: wallet.dat is byte-identical after an interactive run"
             else
                 fail "pty: wallet.dat was OVERWRITTEN via the interactive create path"
             fi
-        else
-            # Do NOT score the byte-comparison here: it would pass for the
-            # wrong reason. An arm that could not reach the prompt proves
-            # nothing and must say so.
-            fail "pty: never reached the interactive prompt — arm proved nothing (pty setup broken?)"
         fi
     else
         echo "    [SKIP] pty arm (no usable pty helper on this platform) — the" >&2

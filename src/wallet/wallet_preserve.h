@@ -134,8 +134,26 @@ inline std::string PreserveUnreadableWallet(const std::string& wallet_path) {
             std::ifstream a(wallet_path, std::ios::binary);
             std::ifstream b(candidate, std::ios::binary);
             if (!a || !b) continue;
-            if (std::equal(std::istreambuf_iterator<char>(a), std::istreambuf_iterator<char>(),
-                           std::istreambuf_iterator<char>(b))) {
+            // FOUR-argument std::equal, and check the stream state afterwards.
+            // The three-argument form walks the second range only as far as the
+            // first, and an I/O error part-way through ends both iterators
+            // early — so a read failure reports "identical" for the bytes it
+            // happened to read. That matters here more than anywhere: the
+            // precondition for this whole function is a wallet that would not
+            // load, which is exactly the file most likely to be on failing
+            // media. Declaring a DIFFERENT backup identical would return it as
+            // "the preserved copy", after which the restore path overwrites the
+            // original leaving only a non-matching file behind.
+            const bool identical = std::equal(
+                std::istreambuf_iterator<char>(a), std::istreambuf_iterator<char>(),
+                std::istreambuf_iterator<char>(b), std::istreambuf_iterator<char>());
+            // Require BOTH streams to have reached a clean end-of-file. The
+            // four-argument form's length equality is a weaker guarantee than
+            // saying this outright: an error that ends a stream early looks
+            // like exhaustion to the iterator, so without the explicit eof()
+            // check a truncated read of a failing wallet could still be
+            // reported as a match against a stale backup.
+            if (identical && a.eof() && b.eof() && !a.bad() && !b.bad()) {
                 return candidate;  // identical copy already preserved
             }
         }
