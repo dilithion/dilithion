@@ -101,6 +101,22 @@ jobs:
           --run_test='!wallet_hd_tests:!rpc_hd_wallet_tests:!hd_wallet_standalone_tests'
         echo "✅ Boost unit tests completed (HD wallet tests skipped - BUG-77)"
 
+    # PR #129 MEDIUM-5: the block-index eviction / UAF regression suite is a
+    # standalone int main() binary with no BOOST_AUTO_TEST_SUITE, so it is NOT
+    # part of test_dilithion and every CI job here runs only test_dilithion.
+    # Until this step existed, all 11 eviction tests — the entire regression
+    # suite for a use-after-free that reached a release and got past five
+    # reviewers — ran only when a human remembered to type the make target.
+    # A regression suite outside CI is decoration.
+    #
+    # Deliberately NOT suffixed with `|| true`: this must be able to fail the
+    # build. That is the whole point.
+    - name: Run block-index eviction / UAF regression suite
+      run: |
+        make headers_manager_to_chain_selector_wiring_tests -j$(nproc)
+        ./headers_manager_to_chain_selector_wiring_tests
+        echo "✅ eviction/UAF regression suite passed"
+
   sanitizer-asan:
     name: AddressSanitizer (Memory Safety)
     runs-on: ubuntu-24.04
@@ -174,6 +190,22 @@ jobs:
         echo "Running tests with AddressSanitizer..."
         ./test_dilithion --log_level=test_suite --report_level=short --run_test='!wallet_hd_tests:!rpc_hd_wallet_tests:!hd_wallet_standalone_tests' || true
         echo "✅ ASan tests completed (check output above for memory errors)"
+
+    # PR #129 MEDIUM-5: run the eviction/UAF suite under ASan specifically.
+    # Tests 6 and 7b contain use-after-free probes that are inert without
+    # -fsanitize=address — the plain build cannot detect the very defect class
+    # this suite exists for, so a green run outside ASan proves little.
+    #
+    # NO `|| true` here, unlike the step above. This suite is the regression net
+    # for a UAF that shipped in v4.5.0; if ASan trips in it, CI must go red
+    # rather than print a tick and move on. (The `|| true` on test_dilithion
+    # above is pre-existing and deliberately left alone — changing it is a
+    # separate decision about the whole suite, not this PR's to make.)
+    - name: Run eviction/UAF regression suite under ASan
+      run: |
+        make headers_manager_to_chain_selector_wiring_tests -j$(nproc)
+        ASAN_OPTIONS=detect_leaks=0 ./headers_manager_to_chain_selector_wiring_tests
+        echo "✅ eviction/UAF regression suite passed under ASan"
 
   sanitizer-ubsan:
     name: UndefinedBehaviorSanitizer

@@ -919,9 +919,9 @@ void test_medium2_provider_unrelated_hash_does_not_overpin()
 // cannot get under cap and size stays >= cap — exactly the condition on which the
 // queue create-path fails closed.
 // ============================================================================
-void test_medium1_queue_path_cap_is_hard_ceiling()
+void test_blocker1_queue_path_cap_is_advisory()
 {
-    std::cout << "  test_medium1_queue_path_cap_is_hard_ceiling..." << std::flush;
+    std::cout << "  test_blocker1_queue_path_cap_is_advisory..." << std::flush;
 
     // Use a tiny explicit cap for clarity (Regtest cap=1000 is large; we model
     // the decision with a hand-built index and a local cap value).
@@ -970,27 +970,73 @@ void test_medium1_queue_path_cap_is_hard_ceiling()
     }
     assert(chainstate.GetBlockIndexSize() <= cap);       // CEILING held
 
-    // ---- (b) Fail-closed branch: drive the index to a state where ONLY pinned
-    //      entries remain at/over cap, so eviction cannot get under cap. Drain
-    //      every non-pinned leaf first, then the remaining set is the pinned
-    //      active chain. Re-derive a small cap equal to the pinned size and show
-    //      EvictLowestWorkLeafNotPinned(pinnedCap-1) leaves size >= pinnedCap
-    //      (the condition on which the queue create-path returns false).
-    // Drain all eligible leaves (explicit 0 = drain-all; the LOW-c-documented
-    // test/diagnostic use).
+    // ---- (b) ADVISORY branch: the state where eviction CANNOT get under cap,
+    //      because every survivor is a pinned active-chain ancestor.
+    //
+    //      This branch previously asserted the opposite conclusion. It ran the
+    //      same two asserts below and then closed with "the queue create-path
+    //      would observe GetBlockIndexSize() >= cap after eviction and FAIL
+    //      CLOSED. Verified." — encoding the halt as correct behaviour rather
+    //      than catching it (round-3 red-team, BLOCKER-1).
+    //
+    //      The state itself is not pathological, it is the STEADY STATE once
+    //      active height approaches the cap: the pinned set contains every
+    //      active-chain ancestor, and mapBlockIndex.size() >= activeHeight + 1
+    //      always, so at height ~= cap every entry is pinned. Failing closed here
+    //      halts the chain at height ~= cap permanently.
+    //
+    //      Note what these asserts do and do not cover: eviction returning false
+    //      is UNCHANGED by the advisory fix, so (b) alone cannot distinguish the
+    //      old fail-closed caller from the new advisory one. That is exactly why
+    //      it passed while asserting the wrong thing. The discriminating check is
+    //      (c) below, which drives the real caller.
     chainstate.EvictLowestWorkLeafNotPinned(0);
     const size_t pinnedOnly = chainstate.GetBlockIndexSize();  // == active chain
-    // Every survivor is on the active chain (pinned). Asking to go below that is
-    // impossible — mirrors the queue path's "at cap, nothing evictable" case.
     bool evicted_b = chainstate.EvictLowestWorkLeafNotPinned(pinnedOnly - 1);
     assert(!evicted_b);                                   // nothing evictable
     assert(chainstate.GetBlockIndexSize() == pinnedOnly); // floor == pinned set
-    // => if pinnedOnly were the cap, the queue create-path would observe
-    //    GetBlockIndexSize() >= cap after eviction and FAIL CLOSED. Verified.
 
-    std::cout << " OK (queue-path cap ceiling: evict-to-cap-1 makes room (a); "
-              << "all-pinned leaves => eviction floors at pinned set, "
-              << "create-path fails closed (b))\n";
+    // ---- (c) THE LOAD-BEARING ASSERTION: with the index wedged at the pinned
+    //      floor — eviction permanently impossible — the caller must STILL accept
+    //      a new header.
+    //
+    //      MUST drive the REAL cap check, not a modelled one. `cap` above is a
+    //      local size_t; ProcessNewHeader reads
+    //      Dilithion::g_chainParams->nMapBlockIndexCap. A first version of this
+    //      assertion used the local and was VACUOUS — the global cap (regtest
+    //      1000) was never reached, so the eviction branch never executed and the
+    //      header was accepted for the wrong reason. Re-introducing BLOCKER-1 did
+    //      not turn it red. That is the same defect MEDIUM-4 found in Test 7, in a
+    //      test written to fix BLOCKER-1. Point the global at the wedged size so
+    //      the production branch actually runs.
+    //
+    //      MUTATION-VERIFIED 2026-08-02: replace the fall-through on the eviction
+    //      failure path in chain_selector_impl.cpp with `return false` and this
+    //      assert goes RED. Re-run that check if you touch either side.
+    {
+        Dilithion::ChainParams advisory_params;
+        advisory_params.nMapBlockIndexCap = static_cast<int>(pinnedOnly);
+        Dilithion::ChainParams* saved = Dilithion::g_chainParams;
+        Dilithion::g_chainParams = &advisory_params;
+
+        const size_t before = chainstate.GetBlockIndexSize();
+        assert(before >= static_cast<size_t>(advisory_params.nMapBlockIndexCap));  // we ARE at/over cap
+        auto Adv = MakeHeader(chainstate.GetTip()->GetBlockHash(),
+                              0x1d00ffff, 1700000700, 0xD1);
+        // Cap is advisory: "no evictable leaf" must NOT mean "reject the header".
+        const bool accepted = adapter.ProcessNewHeader(Adv);
+        const size_t after = chainstate.GetBlockIndexSize();
+
+        Dilithion::g_chainParams = saved;   // restore before asserting, so a
+                                            // failure here cannot poison later tests
+
+        assert(accepted);              // <-- dies if the cap fails closed
+        assert(after == before + 1);   // admitted over the floor, not dropped
+    }
+
+    std::cout << " OK (queue-path cap: evict-to-cap-1 makes room (a); all-pinned "
+              << "=> eviction floors at pinned set (b); cap is ADVISORY — header "
+              << "still accepted with eviction impossible (c))\n";
 }
 
 // ============================================================================
@@ -1013,7 +1059,7 @@ int main()
         test_evict_multipass_cascade_to_zero();
         test_medium2_provider_pins_queued_block_and_ancestors();
         test_medium2_provider_unrelated_hash_does_not_overpin();
-        test_medium1_queue_path_cap_is_hard_ceiling();
+        test_blocker1_queue_path_cap_is_advisory();
     } catch (const std::exception& e) {
         std::cerr << "\nFAILED: " << e.what() << "\n";
         return 1;
