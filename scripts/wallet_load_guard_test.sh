@@ -136,13 +136,34 @@ for NODE in "${NODES[@]}"; do
     mkdir -p "$R"
     printf 'NOT A VALID WALLET FILE - corrupt on purpose\x00\x01\x02\x03' > "$R/wallet.dat"
     R_BEFORE=$(sha256sum "$R/wallet.dat" | awk '{print $1}')
-    timeout 60 "$NODE" --datadir="$R" --relay-only < /dev/null > "$R/node.log" 2>&1
+    # $NOPEER here too — this arm leaves a node RUNNING, so without it the test
+    # dials the production seed list from a CI runner. -k for the same reason.
+    timeout -k 15 60 "$NODE" --datadir="$R" --relay-only $NOPEER < /dev/null > "$R/node.log" 2>&1
     R_RC=$?
     R_AFTER=$(sha256sum "$R/wallet.dat" 2>/dev/null | awk '{print $1}')
     if [ "$R_BEFORE" = "$R_AFTER" ]; then
         pass "relay-only: wallet.dat is byte-identical"
     else
         fail "relay-only: wallet.dat was modified (rc=$R_RC)"
+    fi
+    # Relay-only must CONTINUE past an unreadable wallet rather than aborting
+    # on it — seed nodes run this way and must not fail fleet-wide on a rolling
+    # deploy. Assert that it got past wallet init, NOT that the process
+    # survived: a node can legitimately abort later for reasons that have
+    # nothing to do with us (e.g. the seed attestation key being plaintext
+    # without DILITHION_SEED_KEY_PASSPHRASE aborts startup, and does so
+    # identically with no wallet.dat present at all — verified). Keying on the
+    # exit code made this arm fail on any host in that state, which is a test
+    # bug, not a guard bug.
+    if grep -qE "P2P networking started|chain notification callbacks registered" "$R/node.log"; then
+        pass "relay-only: continued past wallet init (did not abort on the wallet)"
+    else
+        fail "relay-only: never got past wallet init (rc=$R_RC) — it aborted on the wallet"
+    fi
+    if grep -q "Refusing to start" "$R/node.log"; then
+        fail "relay-only: node printed the interactive refusal — wrong branch taken"
+    else
+        pass "relay-only: took the continue-with-warning branch, not the refusal"
     fi
     if ls "$R"/wallet.dat.unreadable-* >/dev/null 2>&1; then
         pass "relay-only: preserved copy written"
@@ -157,7 +178,8 @@ for NODE in "${NODES[@]}"; do
     M="$WORK/$(basename "$NODE").restore"
     mkdir -p "$M"
     printf 'NOT A VALID WALLET FILE - corrupt on purpose\x00\x01\x02\x03' > "$M/wallet.dat"
-    timeout 90 "$NODE" --datadir="$M" \
+    M_BEFORE=$(sha256sum "$M/wallet.dat" | awk '{print $1}')
+    timeout -k 15 90 "$NODE" --datadir="$M" $NOPEER \
         --restore-mnemonic="abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon art" \
         < /dev/null > "$M/node.log" 2>&1
     if grep -qi "could not be loaded" "$M/node.log" && \
@@ -167,8 +189,17 @@ for NODE in "${NODES[@]}"; do
     else
         fail "restore: guard blocked --restore-mnemonic, its own printed remedy"
     fi
-    if ls "$M"/wallet.dat.unreadable-* >/dev/null 2>&1; then
+    # This is the ONE arm where wallet.dat may legitimately be replaced, so the
+    # preserved copy is the only remaining record. Checking that a file merely
+    # EXISTS is not enough — verify its bytes are the original wallet.
+    M_BACKUP=$(ls "$M"/wallet.dat.unreadable-* 2>/dev/null | head -1)
+    if [ -n "$M_BACKUP" ]; then
         pass "restore: unreadable wallet preserved before restore proceeds"
+        if [ "$(sha256sum "$M_BACKUP" | awk '{print $1}')" = "$M_BEFORE" ]; then
+            pass "restore: preserved copy holds the ORIGINAL wallet bytes"
+        else
+            fail "restore: preserved copy does not match the original wallet bytes"
+        fi
     else
         fail "restore: proceeded without preserving the unreadable wallet"
     fi
@@ -186,16 +217,34 @@ for NODE in "${NODES[@]}"; do
         mkdir -p "$P"
         printf 'NOT A VALID WALLET FILE - corrupt on purpose\x00\x01\x02\x03' > "$P/wallet.dat"
         P_BEFORE=$(sha256sum "$P/wallet.dat" | awk '{print $1}')
-        printf '1\n' > "$P/answers"
-        # -q quiet, -c command, output discarded; feed "1" = CREATE new wallet.
-        timeout -k 15 120 script -q -c \
-            "'$NODE' --datadir='$P' $NOPEER < '$P/answers'" /dev/null \
-            > "$P/node.log" 2>&1 || true
+        # Answers go on SCRIPT's stdin, never inside -c. A redirect inside the
+        # -c string makes the child's fd 0 a regular file, isatty(0) is false,
+        # and the PRE-EXISTING non-TTY guard fires instead of the create path —
+        # which made the previous version of this arm pass with the guard
+        # deleted. Several lines, because the create flow prompts more than
+        # once and dilithion-node.cpp's confirm loop has no EOF guard: running
+        # out of input there spins rather than exiting.
+        { printf '1\n'; for _ in 1 2 3 4 5 6 7 8; do printf 'yes\n'; done; } > "$P/answers"
+        timeout -k 15 120 script -q -c "'$NODE' --datadir='$P' $NOPEER" /dev/null \
+            < "$P/answers" > "$P/node.log" 2>&1 || true
         P_AFTER=$(sha256sum "$P/wallet.dat" 2>/dev/null | awk '{print $1}')
-        if [ "$P_BEFORE" = "$P_AFTER" ]; then
-            pass "pty: wallet.dat survived an interactive CREATE (destructive path blocked)"
+
+        # PROOF THE ARM IS LIVE. Without this the arm cannot tell "the guard
+        # stopped the overwrite" from "we never got a pty, so the non-TTY
+        # fallback stopped it" — the exact vacuity that has now recurred twice.
+        # Reaching the wallet-setup prompt proves isatty(0) was true.
+        if grep -qiE "WALLET SETUP|CREATE a new wallet" "$P/node.log"; then
+            pass "pty: reached the interactive wallet prompt (pty is real, isatty passed)"
+            if [ "$P_BEFORE" = "$P_AFTER" ]; then
+                pass "pty: wallet.dat survived an interactive CREATE (destructive path blocked)"
+            else
+                fail "pty: wallet.dat was OVERWRITTEN via the interactive create path"
+            fi
         else
-            fail "pty: wallet.dat was OVERWRITTEN via the interactive create path"
+            # Do NOT score the byte-comparison here: it would pass for the
+            # wrong reason. An arm that could not reach the prompt proves
+            # nothing and must say so.
+            fail "pty: never reached the interactive prompt — arm proved nothing (pty setup broken?)"
         fi
     else
         echo "    [SKIP] pty arm (no usable pty helper on this platform) — the" >&2

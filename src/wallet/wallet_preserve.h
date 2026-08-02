@@ -3,12 +3,21 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdio>
 #include <ctime>
 #include <filesystem>
 #include <fstream>
 #include <iterator>
 #include <string>
 #include <system_error>
+
+#ifdef _WIN32
+#include <io.h>
+#include <windows.h>
+#else
+#include <fcntl.h>
+#include <unistd.h>
+#endif
 
 // ---------------------------------------------------------------------------
 // Wallet-preservation guard — shared by every node binary that owns a wallet.
@@ -35,6 +44,43 @@
 // string if no copy could be written — callers MUST handle the empty case and
 // tell the user to copy the file themselves.
 // ---------------------------------------------------------------------------
+// Force a just-written file, and the directory entry naming it, to stable
+// storage. copy_file is NOT durable: it returns once the data is in the page
+// cache. The caller then goes on to overwrite the ORIGINAL wallet (the restore
+// path does temp-write + fsync + rename over it), so a power loss between the
+// copy and that rename would leave the user with neither file — on the one
+// path whose whole justification is "only after a copy has been preserved".
+// Best-effort by design: a preserved-but-unflushed copy still beats refusing
+// to preserve at all, so failures here do not fail the preservation.
+inline void DurablySync(const std::string& file_path,
+                        const std::filesystem::path& dir) {
+#ifdef _WIN32
+    HANDLE h = CreateFileA(file_path.c_str(), GENERIC_READ | GENERIC_WRITE,
+                           FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
+                           OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h != INVALID_HANDLE_VALUE) {
+        FlushFileBuffers(h);
+        CloseHandle(h);
+    }
+    // Windows has no directory-handle fsync equivalent for this purpose;
+    // NTFS metadata for the created entry is journalled. Nothing further.
+    (void)dir;
+#else
+    int fd = ::open(file_path.c_str(), O_RDONLY);
+    if (fd >= 0) {
+        ::fsync(fd);
+        ::close(fd);
+    }
+    // The directory entry itself must be flushed, or the file can survive
+    // while its name does not.
+    int dfd = ::open(dir.string().c_str(), O_RDONLY);
+    if (dfd >= 0) {
+        ::fsync(dfd);
+        ::close(dfd);
+    }
+#endif
+}
+
 inline std::string PreserveUnreadableWallet(const std::string& wallet_path) {
     std::error_code ec;
 
@@ -131,6 +177,10 @@ inline std::string PreserveUnreadableWallet(const std::string& wallet_path) {
         }
         return std::string();
     }
+
+    // Only now is the copy real. Without this the caller may overwrite the
+    // original while this copy exists solely in the page cache.
+    DurablySync(backup, dir);
     return backup;
 }
 
