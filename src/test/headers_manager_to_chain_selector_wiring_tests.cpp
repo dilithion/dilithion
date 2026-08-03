@@ -32,6 +32,10 @@
 #include <memory>
 #include <set>      // PR #129 MEDIUM-2: PendingBlockHashProvider returns std::set<uint256>
 #include <vector>
+#include <atomic>    // PR #129 HIGH-1 concurrency regression
+#include <mutex>     // PR #129 HIGH-1 concurrency regression
+#include <thread>    // PR #129 HIGH-1 concurrency regression
+#include <utility>   // PR #129 HIGH-1: std::pair
 
 namespace {
 
@@ -1040,10 +1044,193 @@ void test_blocker1_queue_path_cap_is_advisory()
 }
 
 // ============================================================================
+// Test 13 — HIGH-1 REGRESSION (PR #129 re-red-team): a CONCURRENT evictor must
+// not be able to free a parent that another thread has resolved but not yet
+// linked.
+//
+// THE BUG. ProcessNewHeader used to run
+//     pprev = GetBlockIndex(prevHash);   // cs_main taken AND RELEASED
+//     ... deref pprev for height / chain work / IsInvalid ...
+//     AddBlockIndex(hash, std::move(pindex));   // cs_main RE-taken
+// with `pprev` living on the calling thread's stack across that release. A
+// concurrent EvictLowestWorkLeafNotPinned frees it in the window: the child is
+// not inserted yet so the parent's in-degree is 0, header-only entries never
+// reach BLOCK_VALID_TRANSACTIONS so they are never candidates, and the
+// lowest-work unpinned leaf is exactly what eviction picks. The thread then
+// dereferences freed memory and STORES the dangling pointer into mapBlockIndex.
+// Same end state as the v4.5.0 interior dangle, through a different door — and
+// the second evictor that arms it is the one PR #129 itself adds to the
+// validation queue.
+//
+// WHY THIS TEST DOES NOT DEPEND ON ASAN. A thread race detected only by
+// -fsanitize=address is evidence only in the builds that enable it, and
+// Makefile:736-738 builds this binary with plain $(CXXFLAGS) — so an ASAN-only
+// assertion here would be inert in every run anyone actually does (MEDIUM-5).
+// Instead this asserts the bug's PERSISTENT END STATE, which is deterministic
+// and needs no sanitizer:
+//
+//     for every entry E still in mapBlockIndex with E->pprev != nullptr,
+//     E->pprev must be a pointer that mapBlockIndex still owns.
+//
+// A dangling pprev fails that by construction — the parent was erased from the
+// map, so no live entry has its address. Checked by POINTER IDENTITY against
+// GetBlockIndex(parentHash), never by dereferencing E->pprev, so the check
+// itself cannot fault on freed memory.
+//
+// MUTATION-VERIFIED (2026-08-03), and the mutation was confirmed to APPLY before
+// the result was trusted — a sed that silently stops matching reports as "killed"
+// and is indistinguishable from a passing guard:
+//
+//   $ grep -c 'MainLockGuard main_lock' chain_selector_impl.cpp   -> 1
+//   $ sed -i 's|^    CChainState::MainLockGuard main_lock.*||' ...
+//   $ grep -c 'MainLockGuard main_lock' chain_selector_impl.cpp   -> 0   [APPLIED]
+//
+// Result against the mutant: RED, and more sharply than this test's own audit —
+// AddBlockIndex's ConsensusInvariant at chain.cpp:167 trips first:
+//
+//   CONSENSUS INVARIANT VIOLATION: mapBlockIndex.count(parentHash) > 0
+//   File: src/consensus/chain.cpp:167   Function: AddBlockIndex
+//
+// That line reaches parentHash via `pindex->pprev->GetBlockHash()` — i.e. the
+// invariant fires BY performing the use-after-free read. The race is real,
+// reachable in a plain non-ASAN build, and hit within 1500 rounds every run.
+// Guard restored: 13/13 green, ~150 links audited, 0 dangling.
+//
+// !! HONEST COVERAGE LIMIT — READ BEFORE TRUSTING THIS SUITE !!
+// This test drives ProcessNewHeader ONLY. The SECOND HIGH-1 site — the guard in
+// CBlockValidationQueue::ProcessBlock's create path — is NOT covered. Verified,
+// not assumed: deleting that guard too and re-running leaves this suite fully
+// GREEN (13/13). Its window is the WIDER of the two (a LevelDB WriteBlockIndex
+// sits inside it), so the uncovered site is the more exposed one. Covering it
+// needs a CBlockValidationQueue harness with a real CBlockchainDB, which this
+// binary has no fixture for. Until that exists the queue-path guard is protected
+// by review and by this note, not by an executable check — which is exactly the
+// criticism MEDIUM-4 levelled at Tests 7 and 11. Do not read "13/13 green" as
+// "HIGH-1 is covered"; it covers one of two sites.
+// ============================================================================
+void test_high1_concurrent_evictor_cannot_free_unlinked_parent()
+{
+    std::cout << "  test_high1_concurrent_evictor_cannot_free_unlinked_parent..." << std::flush;
+
+    static Dilithion::ChainParams regtest_params = Dilithion::ChainParams::Regtest();
+    Dilithion::ChainParams* prev_chainparams = Dilithion::g_chainParams;
+    Dilithion::g_chainParams = &regtest_params;
+
+    CChainState chainstate;
+    ::dilithion::consensus::port::ChainSelectorAdapter adapter(chainstate);
+
+    uint256 null_hash;
+    std::memset(null_hash.data, 0, 32);
+    auto genesis = MakeHeader(null_hash, 0x1d00ffff, 1700000000, 0);
+    assert(adapter.ProcessNewHeader(genesis));
+    CBlockIndex* genesis_idx = chainstate.GetBlockIndex(genesis.GetHash());
+    assert(genesis_idx != nullptr);
+    chainstate.SetTip(genesis_idx);
+
+    // A short pinned active chain, so eviction always has SOMETHING it may not
+    // touch and the map never drains to nothing.
+    uint256 prev = genesis.GetHash();
+    for (int i = 1; i <= 8; ++i) {
+        auto h = MakeHeader(prev, 0x1d00ffff, 1700000000 + i, static_cast<uint8_t>(i));
+        assert(adapter.ProcessNewHeader(h));
+        CBlockIndex* idx = chainstate.GetBlockIndex(h.GetHash());
+        assert(idx != nullptr);
+        chainstate.SetTip(idx);
+        prev = h.GetHash();
+    }
+    const uint256 fork_root = prev;
+
+    // Producer: build low-work off-chain fork leaves, then extend them. Each
+    // extension is a resolve->deref->insert against a parent that is, at that
+    // instant, an unpinned lowest-work leaf — exactly the shape the evictor
+    // races. Record (child, parent) so the audit below can check the linkage.
+    std::vector<std::pair<uint256, uint256>> links;
+    std::mutex links_mu;
+    std::atomic<bool> stop{false};
+
+    const int kRounds = 1500;
+
+    std::thread producer([&]() {
+        for (int i = 0; i < kRounds; ++i) {
+            auto leaf = MakeHeader(fork_root, 0x1d00ffff,
+                                   1700100000 + i, static_cast<uint8_t>(0x40 + (i % 64)));
+            if (!adapter.ProcessNewHeader(leaf)) continue;
+            const uint256 leaf_hash = leaf.GetHash();
+
+            // The racy one: `leaf` is now an unpinned, in-degree-0, low-work leaf
+            // — the evictor's preferred victim — and we are about to resolve it
+            // as a parent and link a child to it.
+            auto child = MakeHeader(leaf_hash, 0x1d00ffff,
+                                    1700200000 + i, static_cast<uint8_t>(0x80 + (i % 64)));
+            if (adapter.ProcessNewHeader(child)) {
+                std::lock_guard<std::mutex> lk(links_mu);
+                links.emplace_back(child.GetHash(), leaf_hash);
+            }
+        }
+        stop.store(true, std::memory_order_release);
+    });
+
+    // Evictor: hammer the same structure from a second thread.
+    //
+    // kEvictTarget is tuned, and the first value was WRONG in a way worth
+    // recording. Draining to the pinned floor (10) evicted every unpinned entry
+    // including the children, so the audit below had nothing to inspect and the
+    // test would have "passed" while proving nothing. The non-vacuity assertion
+    // caught it on the first run. Leaving headroom keeps eviction firing
+    // continuously — it still selects the fresh low-work fork leaves, which is
+    // the race we want — while letting linked children survive to be audited.
+    const size_t kEvictTarget = 300;
+    std::thread evictor([&]() {
+        while (!stop.load(std::memory_order_acquire)) {
+            chainstate.EvictLowestWorkLeafNotPinned(kEvictTarget);
+        }
+    });
+
+    producer.join();
+    evictor.join();
+
+    // ---- THE LOAD-BEARING ASSERTION ----
+    // Every surviving child must either be gone, or point at a parent the map
+    // still owns. Pointer identity only — E->pprev is compared, never
+    // dereferenced, so a dangling value cannot fault this check.
+    size_t checked = 0, dangling = 0;
+    {
+        std::lock_guard<std::mutex> lk(links_mu);
+        for (const auto& link : links) {
+            CBlockIndex* child_idx = chainstate.GetBlockIndex(link.first);
+            if (child_idx == nullptr) continue;   // child itself evicted — fine
+            ++checked;
+            CBlockIndex* live_parent = chainstate.GetBlockIndex(link.second);
+            if (child_idx->pprev != live_parent) {
+                // Either the parent was freed while this child still references
+                // it (live_parent == nullptr, pprev != nullptr — the UAF), or
+                // the linkage disagrees with the map — both are the defect.
+                ++dangling;
+            }
+        }
+    }
+
+    if (dangling != 0) {
+        std::cerr << "\n    HIGH-1 REGRESSION: " << dangling << " of " << checked
+                  << " surviving children hold a pprev the map no longer owns — a"
+                  << " concurrent evictor freed a resolved-but-unlinked parent.\n";
+    }
+    assert(dangling == 0);
+
+    // Non-vacuity: if the race never actually ran, this test proves nothing. Both
+    // arms must have done real work.
+    assert(checked > 0 && "no surviving child links — producer never raced");
+
+    Dilithion::g_chainParams = prev_chainparams;
+    std::cout << " OK (" << checked << " child->parent links audited after "
+              << kRounds << " racing rounds; 0 dangling)\n";
+}
+
+// ============================================================================
 int main()
 {
     std::cout << "Phase 6 PR6.1 — HeadersManager → chain_selector wiring tests\n";
-    std::cout << "  (12-test suite per v1.5 plan §4 PR6.1 + leaf-eviction regression\n";
+    std::cout << "  (13-test suite per v1.5 plan §4 PR6.1 + leaf-eviction regression\n";
     std::cout << "   + BLOCKER-1 re-resolve + clause (c) belt + MEDIUM-2 cascade\n";
     std::cout << "   + MEDIUM-2 provider-pin + MEDIUM-1 cap-ceiling, PR #129)\n\n";
 
@@ -1060,11 +1247,12 @@ int main()
         test_medium2_provider_pins_queued_block_and_ancestors();
         test_medium2_provider_unrelated_hash_does_not_overpin();
         test_blocker1_queue_path_cap_is_advisory();
+        test_high1_concurrent_evictor_cannot_free_unlinked_parent();
     } catch (const std::exception& e) {
         std::cerr << "\nFAILED: " << e.what() << "\n";
         return 1;
     }
 
-    std::cout << "\nAll 12 PR6.1 wiring tests passed.\n";
+    std::cout << "\nAll 13 PR6.1 wiring tests passed.\n";
     return 0;
 }

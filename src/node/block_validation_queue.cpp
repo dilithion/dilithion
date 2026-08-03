@@ -504,6 +504,41 @@ bool CBlockValidationQueue::ProcessBlock(const QueuedBlock& queued_block) {
             }
         }
 
+        // PR #129 HIGH-1: the parent resolve, the derefs, the DB write and the
+        // insert all run under ONE cs_main acquisition from here.
+        //
+        // The ORDERING note above closes the SELF-eviction case — we evict before
+        // resolving the parent, so we never carry a pre-eviction parent pointer
+        // across our own eviction call. It does not close the CONCURRENT case, and
+        // that is the wider hole. Three threads can be in these paths at once: the
+        // P2P message handler and the header-validation worker, both via
+        // ProcessNewHeader, and this queue worker. Any of them can run eviction
+        // while this function sits between "resolved pprev" and "inserted the
+        // child", and `pblockIndex->pprev` is a raw pointer on this thread's stack
+        // for that entire span. This window is the widest of the two in the PR: a
+        // LevelDB WriteBlockIndex sits inside it, so it is milliseconds, not
+        // instructions.
+        //
+        // The parent is eligible for eviction in that window by construction — the
+        // child is not in the map yet, so the parent's in-degree is 0 and it is a
+        // leaf. Losing that race means dereferencing freed memory below and then
+        // storing the dangling pprev permanently into mapBlockIndex.
+        //
+        // Keeping the DB write inside the guard is deliberate and not a new cost:
+        // chain.cpp already calls pdb->WriteBlockIndex under cs_main at ~10 sites
+        // on the ActivateBestChain path, so this matches established practice
+        // rather than introducing a novel hold. Moving the write out would mean
+        // either serialising a copy of the index or reading the live entry after
+        // release — both strictly more subtle than holding the lock we already
+        // need to hold for correctness.
+        //
+        // cs_main is recursive, so every CChainState call below nests as a no-op.
+        // Lock order is preserved: ProcessBlock is invoked by the worker AFTER its
+        // m_queue_mutex scope has closed, so we take cs_main holding nothing, and
+        // the documented cs_main -> m_queue_mutex order still holds when eviction
+        // calls back into GetPendingBlockHashes.
+        CChainState::MainLockGuard main_lock(m_chainstate);
+
         // Create block index
         auto pblockIndex = std::make_unique<CBlockIndex>(block);
         pblockIndex->phashBlock = blockHash;

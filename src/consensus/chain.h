@@ -617,8 +617,79 @@ public:
     bool AddBlockIndex(const uint256& hash, std::unique_ptr<CBlockIndex> pindex);
 
     /**
+     * PR #129 HIGH-1: scoped hold of cs_main, for the ONE pattern that needs it.
+     *
+     * THE BUG THIS EXISTS TO CLOSE. Every CChainState method acquires and
+     * RELEASES cs_main individually, so a caller that does
+     *
+     *     pprev = GetBlockIndex(prevHash);   // lock taken AND released
+     *     ... build a CBlockIndex from pprev ...
+     *     AddBlockIndex(hash, std::move(pindex));   // lock re-taken
+     *
+     * is holding a raw CBlockIndex* on its own stack across a lock release.
+     * A concurrent EvictLowestWorkLeafNotPinned on another thread can free
+     * `pprev` in that window: it is a leaf (the child is not inserted yet, so
+     * in-degree 0), header-only entries are never candidates, and the lowest-work
+     * unpinned leaf is exactly what eviction selects. The caller then dereferences
+     * freed memory and — worse — STORES the dangling pointer permanently into
+     * mapBlockIndex as the new entry's pprev. That is the identical end state to
+     * the v4.5.0 interior-node dangle, reached through a different door.
+     *
+     * The eviction-safety argument in EvictLowestWorkLeafNotPinned reasons about
+     * pointers held INSIDE mapBlockIndex plus the enumerated cached-member holders
+     * in the landmine ledger. It does not cover STACK-LOCAL holders across a lock
+     * release, and cannot: they are invisible to it.
+     *
+     * THE CRITICAL SECTION IS EXACTLY [resolve pprev, insert the child]. Once the
+     * child is in the map pointing at pprev, pprev has in-degree >= 1, is no longer
+     * a leaf, and is ineligible for eviction. Before that instant it is naked.
+     * Holding cs_main across those two calls is the whole fix.
+     *
+     * WHY A GUARD RATHER THAN A NEW ATOMIC METHOD. The two call sites build
+     * materially different CBlockIndex objects (a header-only entry with
+     * BLOCK_VALID_HEADER and a sequence id, vs. a received block with
+     * MarkBlockReceived and a LevelDB write), and both run caller-specific checks
+     * against pprev in between. Folding them into one CChainState method would
+     * either need a callback invoked under the lock or duplicate the divergent
+     * logic. A guard keeps each call site's semantics byte-identical and makes the
+     * change reviewable as "the lock is now held across this region", nothing else.
+     *
+     * SELF-DEADLOCK IS SAFE. cs_main is a recursive_mutex (BUG #200), so the
+     * acquisitions inside GetBlockIndex / AddBlockIndex / EvictLowestWorkLeafNotPinned
+     * nest as no-ops while this guard is held.
+     *
+     * LOCK ORDER IS PRESERVED. The documented order is cs_main -> queue mutex
+     * (eviction holds cs_main and calls GetPendingBlockHashes, which takes
+     * m_queue_mutex). This guard only ever ADDS cs_main at the outermost level of
+     * the two call sites, both of which hold no other lock when they enter:
+     * CBlockValidationQueue::ProcessBlock is invoked after the worker's
+     * m_queue_mutex scope has closed, and ProcessNewHeader is called from the P2P
+     * and header-validation threads with no queue lock held. Taking m_queue_mutex
+     * first and then cs_main would invert the order — do NOT use this guard
+     * anywhere that already holds the queue mutex.
+     *
+     * SCOPE IT TIGHTLY. Widening a cs_main hold is a real cost: it is the lock
+     * block processing, ActivateBestChain and the RPC tip-cache all contend on.
+     * Hold it across the resolve->insert region and nothing more.
+     */
+    class MainLockGuard {
+    public:
+        explicit MainLockGuard(CChainState& chainstate)
+            : m_lock(chainstate.cs_main) {}
+        MainLockGuard(const MainLockGuard&) = delete;
+        MainLockGuard& operator=(const MainLockGuard&) = delete;
+    private:
+        std::lock_guard<std::recursive_mutex> m_lock;
+    };
+
+    /**
      * Get block index by hash
      * Returns nullptr if not found
+     *
+     * PR #129 HIGH-1: the returned raw pointer is only guaranteed valid while
+     * cs_main is held. If you intend to dereference it, or store it, after any
+     * other CChainState call returns, you MUST hold a MainLockGuard across the
+     * whole region — a concurrent evictor can free it otherwise. See MainLockGuard.
      */
     CBlockIndex* GetBlockIndex(const uint256& hash);
 

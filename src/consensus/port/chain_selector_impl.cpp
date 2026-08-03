@@ -305,6 +305,31 @@ bool ChainSelectorAdapter::ProcessNewHeader(const CBlockHeader& header)
         }
     }
 
+    // PR #129 HIGH-1: everything from here to AddBlockIndex runs under ONE cs_main
+    // acquisition.
+    //
+    // Without this guard, `pprev` below is a raw CBlockIndex* living on this
+    // thread's stack across a lock release: GetBlockIndex takes cs_main and gives
+    // it back, and AddBlockIndex re-takes it. In that window a concurrent
+    // EvictLowestWorkLeafNotPinned — on the header-validation worker, or on the
+    // validation-queue worker, whose eviction call site PR #129 itself adds — can
+    // free `pprev`. It is eligible by construction: the child is not inserted yet
+    // so its in-degree is 0, header-only entries never reach
+    // BLOCK_VALID_TRANSACTIONS so they are never candidates, and the lowest-work
+    // unpinned leaf is precisely what eviction picks. We would then deref freed
+    // memory at IsInvalid()/nHeight/nChainWork below and, far worse, STORE the
+    // dangling pointer into mapBlockIndex at AddBlockIndex — the v4.5.0
+    // interior-node dangle, rebuilt through a new door, in the PR whose entire
+    // premise is closing that class.
+    //
+    // The critical section ends at insertion, not at the last deref: once the
+    // child is in the map, pprev has in-degree >= 1 and is no longer an evictable
+    // leaf. cs_main is recursive, so the nested acquisitions below are no-ops.
+    //
+    // Deliberately opened AFTER the advisory-cap eviction above: that call takes
+    // cs_main itself and there is no pointer to protect yet.
+    CChainState::MainLockGuard main_lock(m_chainstate);
+
     // Locate parent. A null hashPrevBlock means genesis (height 0, no parent).
     CBlockIndex* pprev = nullptr;
     int nHeight = 0;
