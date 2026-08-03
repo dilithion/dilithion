@@ -1180,9 +1180,12 @@ void test_high1_concurrent_evictor_cannot_free_unlinked_parent()
     // continuously — it still selects the fresh low-work fork leaves, which is
     // the race we want — while letting linked children survive to be audited.
     const size_t kEvictTarget = 300;
+    std::atomic<uint64_t> evictions_succeeded{0};
     std::thread evictor([&]() {
         while (!stop.load(std::memory_order_acquire)) {
-            chainstate.EvictLowestWorkLeafNotPinned(kEvictTarget);
+            if (chainstate.EvictLowestWorkLeafNotPinned(kEvictTarget)) {
+                evictions_succeeded.fetch_add(1, std::memory_order_relaxed);
+            }
         }
     });
 
@@ -1217,13 +1220,27 @@ void test_high1_concurrent_evictor_cannot_free_unlinked_parent()
     }
     assert(dangling == 0);
 
-    // Non-vacuity: if the race never actually ran, this test proves nothing. Both
-    // arms must have done real work.
+    // Non-vacuity. BOTH arms must have done real work, and they need SEPARATE
+    // assertions.
+    //
+    // `checked > 0` alone is not enough, and a fresh-context review was right to
+    // say so: it counts SURVIVING children, which is MAXIMISED by an evictor that
+    // never evicts anything. A broken or no-op evictor arm would push this number
+    // UP while making the test prove nothing — the metric moves the wrong way
+    // against the failure it is supposed to detect. Exactly the shape of vacuity
+    // this file already documents twice.
+    //
+    // So assert the evictor's own work directly. EvictLowestWorkLeafNotPinned
+    // returns true only when it actually freed something, so a non-zero count is
+    // proof the race had a live opponent rather than a spinning no-op.
+    const uint64_t evictions = evictions_succeeded.load(std::memory_order_relaxed);
     assert(checked > 0 && "no surviving child links — producer never raced");
+    assert(evictions > 0 && "evictor never freed anything — the race had no opponent");
 
     Dilithion::g_chainParams = prev_chainparams;
     std::cout << " OK (" << checked << " child->parent links audited after "
-              << kRounds << " racing rounds; 0 dangling)\n";
+              << kRounds << " racing rounds; " << evictions
+              << " real evictions; 0 dangling)\n";
 }
 
 // ============================================================================

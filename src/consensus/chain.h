@@ -658,15 +658,36 @@ public:
      * acquisitions inside GetBlockIndex / AddBlockIndex / EvictLowestWorkLeafNotPinned
      * nest as no-ops while this guard is held.
      *
-     * LOCK ORDER IS PRESERVED. The documented order is cs_main -> queue mutex
+     * LOCK ORDER — read this before adding a third use site.
+     *
+     * vs. m_queue_mutex: CLEAN. The documented order is cs_main -> queue mutex
      * (eviction holds cs_main and calls GetPendingBlockHashes, which takes
-     * m_queue_mutex). This guard only ever ADDS cs_main at the outermost level of
-     * the two call sites, both of which hold no other lock when they enter:
-     * CBlockValidationQueue::ProcessBlock is invoked after the worker's
-     * m_queue_mutex scope has closed, and ProcessNewHeader is called from the P2P
-     * and header-validation threads with no queue lock held. Taking m_queue_mutex
-     * first and then cs_main would invert the order — do NOT use this guard
-     * anywhere that already holds the queue mutex.
+     * m_queue_mutex). CBlockValidationQueue::ProcessBlock is invoked at
+     * block_validation_queue.cpp:307, AFTER the worker's m_queue_mutex scope closes
+     * at :299, and nothing under either guard takes m_queue_mutex, m_stats_mutex or
+     * a watchdog lock. Taking m_queue_mutex first and then cs_main WOULD invert the
+     * order — do NOT use this guard anywhere that already holds the queue mutex.
+     *
+     * vs. cs_headers: NOT CLEAN, and this guard sits on the wrong side of it.
+     *
+     * An earlier version of this comment claimed both call sites "hold no other
+     * lock when they enter". That is FALSE and was corrected after a fresh-context
+     * review caught it. CHeadersManager::ProcessHeaders takes cs_headers at
+     * headers_manager.cpp:218 and calls ProcessNewHeader at :365 INSIDE that scope
+     * (likewise :542 and :685 from their own cs_headers holders). So on those paths
+     * the order is cs_headers -> cs_main.
+     *
+     * The opposing edge is live and documented in-repo at headers_manager.cpp:1082-1085:
+     * "OnBlockActivated holds cs_main and wants cs_headers". That is cs_main ->
+     * cs_headers. Both directions exist: a textbook ABBA.
+     *
+     * THIS GUARD DOES NOT CREATE THAT INVERSION — before it, ProcessNewHeader
+     * already called GetBlockIndex and AddBlockIndex, each taking cs_main
+     * internally, so cs_headers -> cs_main was already on this path. What the guard
+     * does is WIDEN the hold, which enlarges the window in which the ABBA can be
+     * hit. That is a real increase in deadlock exposure traded for closing a real
+     * UAF, and it must not be described as "lock order preserved". The underlying
+     * ABBA is pre-existing and is tracked separately; it is not fixed here.
      *
      * SCOPE IT TIGHTLY. Widening a cs_main hold is a real cost: it is the lock
      * block processing, ActivateBestChain and the RPC tip-cache all contend on.
