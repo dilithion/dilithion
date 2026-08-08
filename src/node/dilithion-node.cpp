@@ -3219,9 +3219,31 @@ load_genesis_block:  // Bug #29: Label for automatic retry after blockchain wipe
         //
         // Shutdown() is idempotent (every step is null-guarded and resets its
         // pointer), so the explicit call on the normal path leaves this a no-op.
+        //
+        // K2-(2): the NORMAL shutdown sequence arms a deadline and names every
+        // stage it enters. Early returns and exception unwinds do not run that
+        // sequence -- they land here instead, and used to call
+        // g_node_context.Shutdown() (and through it CConnman::Stop(), the very
+        // call measured hanging past 120s) with no bound and no stage logging.
+        // That traded a deterministic abort for a potentially unbounded,
+        // invisible hang on exactly the paths an operator is least able to
+        // diagnose. Arm the same instrumented bound here.
+        //
+        // ArmWatchdog() returns false -- so this stays a silent no-op -- when
+        // the normal sequence already ran (Disarmed) or is still in flight
+        // (Armed). Only a genuine unwind takes ownership.
         struct NodeContextShutdownGuard {
-            ~NodeContextShutdownGuard() { g_node_context.Shutdown(); }
-        } node_context_shutdown_guard;
+            int timeout_seconds;
+            ~NodeContextShutdownGuard() {
+                const bool owned = Dilithion::ShutdownProgress::ArmWatchdog(timeout_seconds);
+                if (owned) {
+                    Dilithion::ShutdownProgress::Stage(
+                        "NodeContext::Shutdown (early-return / unwind path)");
+                }
+                g_node_context.Shutdown();
+                if (owned) Dilithion::ShutdownProgress::Disarm();
+            }
+        } node_context_shutdown_guard{config.shutdown_timeout};
 
         // Phase 2: Initialize async block validation queue for IBD performance
         std::cout << "Initializing async block validation queue..." << std::endl;
