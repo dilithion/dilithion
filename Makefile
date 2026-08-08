@@ -515,6 +515,14 @@ randomx_mode_test: $(CORE_OBJECTS) $(OBJ_DIR)/test/randomx_mode_test.o $(DILITHI
 	@echo "$(COLOR_BLUE)[LINK]$(COLOR_RESET) $@"
 	@$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS) $(LIBS)
 
+# Ordering test for the large-page opt-in. randomx_mode_test proves the allocation is
+# SAFE; this proves it is REACHED -- the opt-in shipped unreachable on the primary path
+# (dataset already built by the 8GB+ IBD speedup before mining ever asked) and no log
+# line said so. Re-execs itself once per ordering; the module's mode state is global.
+large_pages_optin_test: $(CORE_OBJECTS) $(OBJ_DIR)/test/large_pages_optin_test.o $(DILITHIUM_OBJECTS) $(CHIAVDF_OBJECTS)
+	@echo "$(COLOR_BLUE)[LINK]$(COLOR_RESET) $@"
+	@$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS) $(LIBS)
+
 wallet_tests: $(CORE_OBJECTS) $(OBJ_DIR)/test/wallet_tests.o $(DILITHIUM_OBJECTS) $(CHIAVDF_OBJECTS)
 	@echo "$(COLOR_BLUE)[LINK]$(COLOR_RESET) $@"
 	@$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS) $(LIBS)

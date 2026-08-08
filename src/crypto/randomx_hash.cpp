@@ -101,22 +101,22 @@ namespace {
     // non-swappable memory on a relay node that never mines is a bad trade -- see
     // the header comment for the full reasoning.
 
-    // The opt-in and the mining dataset's use of it. All four fields live under one
-    // mutex because the interesting questions are compound ones -- "was the flag set
-    // before or after the dataset committed to a page size?" -- and answering them
-    // from independent atomics is a race, not an answer. See LatchLargePagesForMining()
-    // below for why that matters.
+    // The opt-in, and what the FULL-mode mining dataset did with it. Both under one
+    // mutex because the question that matters is a compound one -- "was the flag set
+    // before or after the dataset committed to a page size?" -- and answering that from
+    // independent atomics is a race, not an answer.
     std::mutex g_lp_mutex;
     bool g_lp_allowed = false;    // current opt-in
-    bool g_lp_latched = false;    // the mining dataset's allocation has READ the opt-in
-    bool g_lp_latched_value = false;  // ...and this is what it read
-    // What the mining dataset's allocation actually got. Distinct from g_lp_latched
-    // because the 2GB allocation sits between the read and the answer.
+    // Single state variable for the dataset's use of the opt-in. Deliberately ONE
+    // variable and not a (latched, latched_value, outcome) trio: the trio had a member
+    // no test could distinguish, and an untestable field in a correctness mechanism is
+    // where the next silent regression lives.
     enum class LargePageOutcome {
-        Pending,       // no mining dataset has been allocated yet
+        Pending,       // the mining dataset has not read the opt-in yet
+        Requested,     // read with the opt-in ON; allocating, result not known yet
         Granted,       // requested and the OS gave large pages
         Refused,       // requested and the OS refused; running on 4KB pages
-        NotRequested   // allocated while the opt-in was off -- too late to change
+        NotRequested   // read with the opt-in OFF -- committed to 4KB, too late to change
     };
     LargePageOutcome g_lp_outcome = LargePageOutcome::Pending;
     // Last line emitted by randomx_log_large_page_status_for_mining(), for change-only
@@ -133,24 +133,25 @@ namespace {
     }
 
     // Called once by the FULL-mode mining init, immediately before it allocates the
-    // dataset. Returns the opt-in it must honour, and -- atomically with that read --
-    // records that the decision is now made.
+    // dataset. Returns the opt-in it must honour and, atomically with that read, moves
+    // the state off Pending.
     //
-    // The latch is the whole point. Without it, "is it too late to opt in?" could only
-    // be approximated by g_mining_ready, which is not set until the 2GB dataset has
-    // finished building 30-120s later. A set(1) arriving inside that window was
-    // silently swallowed: the dataset was already committed to standard pages, and
-    // nothing said so. Latching at the read makes the boundary exact in both
-    // directions -- before it, the request is honoured; after it, the request is
-    // known-too-late and can be reported as such.
+    // Recording it HERE rather than after the allocation is the fix. "Is it too late to
+    // opt in?" was previously approximated by g_mining_ready, which is not set until the
+    // 2GB dataset has finished BUILDING 30-120 seconds later -- so a request landing in
+    // that window was swallowed in silence while the dataset it was meant to affect had
+    // already been committed to 4KB pages. Deciding at the read makes the boundary
+    // exact: before it the request is honoured, after it the request is known-too-late
+    // and reportable as such.
     //
     // Lock ordering note: callers may hold g_mining_mutex when they get here. Nothing
     // takes g_lp_mutex and then g_mining_mutex, so the two cannot deadlock.
-    bool LatchLargePagesForMining() {
+    bool DecideLargePagesForMining() {
         std::lock_guard<std::mutex> lock(g_lp_mutex);
-        g_lp_latched = true;
-        g_lp_latched_value = g_lp_allowed;
-        return g_lp_latched_value;
+        const bool requested = g_lp_allowed;
+        g_lp_outcome = requested ? LargePageOutcome::Requested
+                                 : LargePageOutcome::NotRequested;
+        return requested;
     }
 
     void RecordMiningDatasetOutcome(bool requested, bool got_large_pages) {
@@ -213,12 +214,12 @@ extern "C" void randomx_set_large_pages_allowed(int allowed) {
     std::lock_guard<std::mutex> lock(g_lp_mutex);
     g_lp_allowed = (allowed != 0);
     // Deliberately silent. Whether this request will be honoured is not knowable from
-    // the setter alone -- it depends on whether the mining dataset has already latched
-    // the flag (see LatchLargePagesForMining) -- and an earlier revision that guessed
-    // from g_mining_ready got it wrong in the common case: a set(1) landing while the
-    // dataset build was still in flight saw g_mining_ready==false, printed nothing, and
-    // was swallowed anyway. Reporting is single-sourced in
-    // randomx_log_large_page_status_for_mining(), which reads the latch.
+    // the setter alone -- it depends on whether the mining dataset has already read the
+    // flag (see DecideLargePagesForMining) -- and an earlier revision that guessed from
+    // g_mining_ready got it wrong in the common case: a set(1) landing while the dataset
+    // build was still in flight saw g_mining_ready==false, printed nothing, and was
+    // swallowed anyway. Reporting is single-sourced in
+    // randomx_log_large_page_status_for_mining(), which reads the recorded decision.
 }
 
 // One line, always, for a node that is actually mining. See the contract in the header.
@@ -230,13 +231,11 @@ extern "C" void randomx_set_large_pages_allowed(int allowed) {
 // early, and the log contained no large-page line of any kind. The operator saw half the
 // hashrate and nothing explaining it.
 extern "C" void randomx_log_large_page_status_for_mining(int full_mode_expected) {
-    bool allowed, latched, latched_value;
+    bool allowed;
     LargePageOutcome outcome;
     {
         std::lock_guard<std::mutex> lock(g_lp_mutex);
         allowed = g_lp_allowed;
-        latched = g_lp_latched;
-        latched_value = g_lp_latched_value;
         outcome = g_lp_outcome;
     }
 
@@ -247,18 +246,14 @@ extern "C" void randomx_log_large_page_status_for_mining(int full_mode_expected)
         // Say that rather than saying nothing -- silence is what hid the original defect.
         msg = "  [MINING] Large pages: N/A - LIGHT mode only (the 2GB FULL-mode dataset"
               " that large pages back needs >= 3072 MB RAM).";
-    } else if (outcome == LargePageOutcome::Pending && latched && latched_value) {
-        // In flight: the allocation has read the opt-in but has not reported what it got.
-        msg = "  [MINING] Large pages: REQUESTED - the 2GB dataset is being allocated now;"
-              " the ENABLED/UNAVAILABLE result follows.";
     } else {
-        // The in-flight window with the opt-in NOT latched is already a settled "too
-        // late": the dataset committed to standard pages. This is the window in which
-        // the old g_mining_ready-gated warning stayed silent -- the defect.
-        if (outcome == LargePageOutcome::Pending && latched && !latched_value) {
-            outcome = LargePageOutcome::NotRequested;
-        }
         switch (outcome) {
+        case LargePageOutcome::Requested:
+            // In flight: the allocation has read the opt-in but has not reported what it
+            // got. Promise the follow-up rather than claiming an outcome.
+            msg = "  [MINING] Large pages: REQUESTED - the 2GB dataset is being allocated"
+                  " now; the ENABLED/UNAVAILABLE result follows.";
+            break;
         case LargePageOutcome::Granted:
             msg = "  [MINING] Large pages: ENABLED (2GB dataset)";
             break;
@@ -269,10 +264,11 @@ extern "C" void randomx_log_large_page_status_for_mining(int full_mode_expected)
                   " (Linux: vm.nr_hugepages; Windows: Lock pages in memory).";
             break;
         case LargePageOutcome::NotRequested:
-            // The dataset was committed to standard pages before mining asked for large
-            // ones -- the node was started without --mine on an 8GB+ host, so the IBD
-            // speedup built it first. Re-allocating is not safe (mining VMs hold pointers
-            // into the dataset), so this is terminal for the process.
+            // The dataset READ the opt-in while it was off, so it is committed to 4KB
+            // pages -- whether or not it has finished building. The node was started
+            // without --mine on an 8GB+ host and the IBD speedup got there first.
+            // Re-allocating is not safe (mining VMs hold pointers into the dataset), so
+            // this is terminal for the process.
             msg = "  [MINING] Large pages: IGNORED - the 2GB dataset was already allocated on"
                   " standard pages before mining started, and cannot be moved.\n"
                   "  [MINING] Restart the node with --mine to allocate it with large pages.";
@@ -756,11 +752,12 @@ extern "C" void randomx_init_mining_mode_async(const void* key, size_t key_len) 
             // FULL mode flags
             randomx_flags flags = randomx_get_flags() | RANDOMX_FLAG_FULL_MEM;
 
-            // Latch the opt-in once: the allocation below and the status line
-            // afterwards must describe the same decision even if a setter call lands
-            // in between, and any set(1) arriving after this point must be reportable
-            // as too-late instead of being silently swallowed.
-            const bool large_pages_allowed = LatchLargePagesForMining();
+            // Read the opt-in once, and record the decision atomically with the read:
+            // the allocation below and the status line afterwards must describe the same
+            // decision even if a setter call lands in between, and any set(1) arriving
+            // after this point must be reportable as too-late instead of being silently
+            // swallowed.
+            const bool large_pages_allowed = DecideLargePagesForMining();
 
             // Allocate cache. Never large pages -- it would eat the pages the dataset
             // needs; see the ordering hazard in the scope note on the helpers above.
