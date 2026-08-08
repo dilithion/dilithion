@@ -11,6 +11,7 @@
 #include <miner/controller.h>
 #include <consensus/validation.h>
 #include <consensus/tx_validation.h>
+#include <consensus/params.h>
 #include <node/mempool.h>
 #include <node/utxo_set.h>
 #include <primitives/transaction.h>
@@ -120,22 +121,47 @@ TEST(coinbase_transaction_creation) {
     ASSERT(coinbase1 != nullptr, "Coinbase transaction should not be null");
     ASSERT(coinbase1->IsCoinBase(), "Transaction should be coinbase");
     ASSERT_EQ(coinbase1->vin.size(), 1, "Coinbase should have exactly 1 input");
-    ASSERT_EQ(coinbase1->vout.size(), 1, "Coinbase should have exactly 1 output");
     ASSERT(coinbase1->vin[0].prevout.IsNull(), "Coinbase input prevout should be null");
 
-    // Check coinbase value (should be 50 DIL subsidy + 0 fees)
-    uint64_t expectedValue = 50 * COIN;
-    ASSERT_EQ(coinbase1->vout[0].nValue, expectedValue, "Coinbase value incorrect");
+    // K3 FIX (stale test): this asserted a single output and the full 50 DIL on
+    // vout[0]. Mainnet coinbases have carried three outputs — miner, Dev Fund,
+    // Dev Reward — since cb07e238 (2026-01-15) added the 2% mining development
+    // contribution. The assertion has been wrong for ~7 months; nothing caught it
+    // because this suite had never been executed.
+    ASSERT_EQ(coinbase1->vout.size(), 3, "Mainnet coinbase should have 3 outputs (miner + dev fund + dev reward)");
 
-    // Create coinbase with fees
+    // Miner takes 98% of subsidy; Dev Fund and Dev Reward take 1% each.
+    const uint64_t subsidy = 50 * COIN;
+    const uint64_t taxTotal = (subsidy * Consensus::MINING_TAX_PERCENT) / 100;
+    const uint64_t expectedDevFund = (taxTotal * Consensus::DEV_FUND_SHARE) / 100;
+    const uint64_t expectedDevReward = taxTotal - expectedDevFund;
+    const uint64_t expectedMiner = subsidy - taxTotal;
+
+    ASSERT_EQ(coinbase1->vout[0].nValue, expectedMiner, "Miner output should be 98% of subsidy");
+    ASSERT_EQ(coinbase1->vout[1].nValue, expectedDevFund, "Dev Fund output should be 1% of subsidy");
+    ASSERT_EQ(coinbase1->vout[2].nValue, expectedDevReward, "Dev Reward output should be 1% of subsidy");
+
+    // Total across all outputs must still equal exactly the subsidy — the tax
+    // redistributes the reward, it does not mint extra.
+    uint64_t total1 = 0;
+    for (const auto& o : coinbase1->vout) total1 += o.nValue;
+    ASSERT_EQ(total1, subsidy, "Total coinbase value must equal the subsidy");
+
+    // Create coinbase with fees — fees go entirely to the miner output.
     uint64_t fees = 0.5 * COIN;  // 0.5 DIL in fees
     CTransactionRef coinbase2 = miner.CreateCoinbaseTransaction(1, fees, minerAddr, mikData);
 
-    uint64_t expectedValue2 = 50 * COIN + fees;
-    ASSERT_EQ(coinbase2->vout[0].nValue, expectedValue2, "Coinbase with fees value incorrect");
+    ASSERT_EQ(coinbase2->vout[0].nValue, expectedMiner + fees, "Fees should be added to the miner output");
+    uint64_t total2 = 0;
+    for (const auto& o : coinbase2->vout) total2 += o.nValue;
+    ASSERT_EQ(total2, subsidy + fees, "Total coinbase value must equal subsidy + fees");
 
-    std::cout << "    Coinbase value (no fees): " << coinbase1->vout[0].nValue / COIN << " DIL" << std::endl;
-    std::cout << "    Coinbase value (with 0.5 DIL fees): " << (coinbase2->vout[0].nValue / (double)COIN) << " DIL" << std::endl;
+    std::cout << "    Coinbase outputs: " << coinbase1->vout.size()
+              << " (miner " << (coinbase1->vout[0].nValue / (double)COIN)
+              << " DIL, dev fund " << (coinbase1->vout[1].nValue / (double)COIN)
+              << " DIL, dev reward " << (coinbase1->vout[2].nValue / (double)COIN) << " DIL)" << std::endl;
+    std::cout << "    Total (no fees): " << (total1 / (double)COIN) << " DIL" << std::endl;
+    std::cout << "    Total (with 0.5 DIL fees): " << (total2 / (double)COIN) << " DIL" << std::endl;
 }
 
 // =======================================================================
@@ -217,9 +243,32 @@ TEST(block_template_empty_mempool) {
 // Test 5: Block Validation - Coinbase Check
 // =======================================================================
 TEST(block_validation_coinbase) {
+    // K3 FIX (mis-targeted test): this test previously called CheckCoinbase with
+    // nHeight == 0. Height 0 is genesis, and CheckCoinbase returns true
+    // unconditionally at that height (consensus/validation.cpp:255-257) because
+    // genesis pre-funded addresses legitimately exceed the subsidy. The
+    // "excessive value should be rejected" assertion could therefore never hold,
+    // and the test proved nothing about the subsidy cap.
+    //
+    // It also hand-built a single-output coinbase, which has been invalid on
+    // mainnet since cb07e238 (2026-01-15) introduced the 2% dev contribution —
+    // mainnet coinbases must carry Dev Fund and Dev Reward outputs.
+    //
+    // Both are fixed by exercising a real height with a miner-built coinbase.
     CBlockValidator validator;
 
-    // Create valid coinbase
+    const uint32_t kHeight = 1;
+    const uint64_t kFees = 0;
+
+    const uint64_t subsidy = 50 * COIN;
+    const uint64_t taxTotal = (subsidy * Consensus::MINING_TAX_PERCENT) / 100;
+    const uint64_t devFundAmount = (taxTotal * Consensus::DEV_FUND_SHARE) / 100;
+    const uint64_t devRewardAmount = taxTotal - devFundAmount;
+    const uint64_t minerAmount = subsidy - taxTotal;
+
+    // Build a mainnet-shaped coinbase: miner + Dev Fund + Dev Reward.
+    // (Built here rather than via CMiningController::CreateCoinbaseTransaction,
+    // which is private with an explicit per-test friend list.)
     CTransaction coinbase;
     coinbase.nVersion = 1;
     coinbase.nLockTime = 0;
@@ -227,28 +276,62 @@ TEST(block_validation_coinbase) {
     CTxIn coinbaseIn;
     coinbaseIn.prevout.SetNull();
     coinbaseIn.scriptSig.push_back(0x01);
-    coinbaseIn.scriptSig.push_back(0x00);  // Height 0
+    coinbaseIn.scriptSig.push_back(static_cast<uint8_t>(kHeight));
     coinbaseIn.scriptSig.insert(coinbaseIn.scriptSig.end(), {'t', 'e', 's', 't'});
     coinbase.vin.push_back(coinbaseIn);
 
-    CTxOut coinbaseOut;
-    coinbaseOut.nValue = 50 * COIN;  // Exactly the subsidy
-    coinbaseOut.scriptPubKey = CreateMinerAddress();
-    coinbase.vout.push_back(coinbaseOut);
+    auto p2pkh = [](const uint8_t* pubKeyHash) {
+        std::vector<uint8_t> s{0x76, 0xa9, 0x14};
+        s.insert(s.end(), pubKeyHash, pubKeyHash + 20);
+        s.push_back(0x88);
+        s.push_back(0xac);
+        return s;
+    };
+
+    CTxOut minerOut;
+    minerOut.nValue = minerAmount;
+    minerOut.scriptPubKey = CreateMinerAddress();
+    coinbase.vout.push_back(minerOut);
+
+    CTxOut devFundOut;
+    devFundOut.nValue = devFundAmount;
+    devFundOut.scriptPubKey = p2pkh(Consensus::DEV_FUND_PUBKEY_HASH);
+    coinbase.vout.push_back(devFundOut);
+
+    CTxOut devRewardOut;
+    devRewardOut.nValue = devRewardAmount;
+    devRewardOut.scriptPubKey = p2pkh(Consensus::DEV_REWARD_PUBKEY_HASH);
+    coinbase.vout.push_back(devRewardOut);
 
     std::string error;
 
-    // Test valid coinbase
-    bool valid = validator.CheckCoinbase(coinbase, 0, 0, error);
+    // A miner-built coinbase at the exact subsidy must be accepted.
+    bool valid = validator.CheckCoinbase(coinbase, kHeight, kFees, error);
     ASSERT(valid, std::string("Valid coinbase rejected: ") + error);
 
-    // Test coinbase with excessive value
-    coinbase.vout[0].nValue = 100 * COIN;  // Too much!
-    valid = validator.CheckCoinbase(coinbase, 0, 0, error);
+    // Paying one extra satoshi over subsidy + fees must be rejected. One satoshi
+    // (not 50 DIL) pins the boundary exactly: a check that is off by any amount,
+    // or absent, fails this.
+    coinbase.vout[0].nValue += 1;
+    valid = validator.CheckCoinbase(coinbase, kHeight, kFees, error);
+    ASSERT(!valid, "Coinbase exceeding subsidy by 1 satoshi should be rejected");
+    ASSERT(error.find("exceeds subsidy") != std::string::npos,
+           std::string("Rejected for the wrong reason: ") + error);
+
+    // Grossly excessive value must also be rejected.
+    coinbase.vout[0].nValue = 100 * COIN;
+    valid = validator.CheckCoinbase(coinbase, kHeight, kFees, error);
     ASSERT(!valid, "Coinbase with excessive value should be rejected");
 
-    std::cout << "    Valid coinbase accepted" << std::endl;
+    // Genesis (height 0) is a deliberate exemption — pin it so the exemption
+    // cannot be widened silently.
+    valid = validator.CheckCoinbase(coinbase, 0, kFees, error);
+    ASSERT(valid, "Height 0 is exempt from the subsidy cap by design");
+
+    std::cout << "    Valid coinbase accepted at height 1" << std::endl;
+    std::cout << "    Coinbase over subsidy by 1 satoshi rejected" << std::endl;
     std::cout << "    Excessive coinbase rejected" << std::endl;
+    std::cout << "    Genesis exemption confirmed" << std::endl;
 }
 
 // =======================================================================

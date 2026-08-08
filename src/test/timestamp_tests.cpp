@@ -241,8 +241,17 @@ void TestPostForkTimestamp() {
     std::cout << "\nTesting post-fork timestamp validation (600s limit)..." << std::endl;
 
     // Set up g_chainParams with a known activation height
-    Dilithion::ChainParams testParams;
+    // K3: MUST start from a fully-populated ChainParams. `ChainParams` is an
+    // aggregate whose POD members (minBlockTimestampGap, minBlockTimestampGapHeight,
+    // ...) have NO default member initialisers, so a bare `ChainParams testParams;`
+    // on the stack leaves them INDETERMINATE. That made this test read garbage into
+    // CheckBlockTimestamp()'s Rule-3 minimum-gap comparison and fail roughly 1 run
+    // in 3 with a nonsense required gap (observed: 1410859008s ≈ 44 years).
+    // Mainnet() sets every field explicitly; override only what this test varies.
+    Dilithion::ChainParams testParams = Dilithion::ChainParams::Mainnet();
     testParams.timestampValidationHeight = 24500;
+    testParams.minBlockTimestampGap = 0;        // Rule 3 not under test here
+    testParams.minBlockTimestampGapHeight = 0;
     Dilithion::ChainParams* prevParams = Dilithion::g_chainParams;
     Dilithion::g_chainParams = &testParams;
 
@@ -288,6 +297,59 @@ void TestPostForkTimestamp() {
     std::cout << "  ✓ Default (no height): block +3600s accepted (pre-fork 7200s limit)" << std::endl;
 
     // Restore previous g_chainParams
+    Dilithion::g_chainParams = prevParams;
+}
+
+/**
+ * Test: CheckBlockTimestamp() Rule 3 — minimum inter-block timestamp gap
+ *
+ * K3: this consensus rule (pow.cpp:1421-1440) had NO test coverage at all.
+ * Its inputs, minBlockTimestampGap / minBlockTimestampGapHeight, are POD
+ * members of ChainParams with no default member initialisers, so the gap
+ * was only ever exercised here by accident, via uninitialised stack memory.
+ * Pin the real behaviour: gap enforced at/above the activation height,
+ * not enforced below it, and disabled entirely when the gap is 0.
+ */
+void TestMinBlockTimestampGap() {
+    std::cout << "\nTesting minimum inter-block timestamp gap (Rule 3)..." << std::endl;
+
+    Dilithion::ChainParams testParams = Dilithion::ChainParams::Mainnet();
+    testParams.timestampValidationHeight = 0;   // keep the 600s future limit out of the way
+    testParams.minBlockTimestampGap = 45;
+    testParams.minBlockTimestampGapHeight = 1000;
+    Dilithion::ChainParams* prevParams = Dilithion::g_chainParams;
+    Dilithion::g_chainParams = &testParams;
+
+    int64_t now = GetTime();
+
+    CBlockIndex parent;
+    parent.nHeight = 999;
+    parent.nTime = static_cast<uint32_t>(now - 100);
+    parent.pprev = nullptr;
+
+    CBlockHeader block;
+
+    // At activation height: gap of exactly 45s is accepted (boundary, >=).
+    block.nTime = parent.nTime + 45;
+    assert(CheckBlockTimestamp(block, &parent, 1000) == true);
+    std::cout << "  ✓ Post-activation: gap of exactly 45s accepted" << std::endl;
+
+    // At activation height: gap of 44s is rejected.
+    block.nTime = parent.nTime + 44;
+    assert(CheckBlockTimestamp(block, &parent, 1000) == false);
+    std::cout << "  ✓ Post-activation: gap of 44s rejected" << std::endl;
+
+    // Below activation height: the same 44s gap is accepted.
+    block.nTime = parent.nTime + 44;
+    assert(CheckBlockTimestamp(block, &parent, 999) == true);
+    std::cout << "  ✓ Pre-activation: gap of 44s accepted (rule not yet active)" << std::endl;
+
+    // Gap of 0 disables the rule entirely (DIL mainnet / regtest configuration).
+    testParams.minBlockTimestampGap = 0;
+    block.nTime = parent.nTime + 1;
+    assert(CheckBlockTimestamp(block, &parent, 1000) == true);
+    std::cout << "  ✓ minBlockTimestampGap=0 disables the rule" << std::endl;
+
     Dilithion::g_chainParams = prevParams;
 }
 
@@ -404,6 +466,7 @@ int main() {
         TestEdgeCases();
         TestRealisticChain();
         TestPostForkTimestamp();
+        TestMinBlockTimestampGap();
         TestMTPBumpForward();
 
         std::cout << std::endl;
