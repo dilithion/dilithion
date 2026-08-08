@@ -411,7 +411,17 @@ bool CheckProofOfWorkDFMP(
 
     // C-3: saturating heat math gate. At/above the activation height, heat-penalty fns
     // saturate at FP_HEAT_MULTIPLIER_MAX instead of overflowing int64 (which wrapped the
-    // heaviest miner to the easiest 1.0x target). Below the gate: byte-identical legacy math.
+    // heaviest miner to the easiest 1.0x target).
+    //
+    // BELOW the gate (the LIVE rule today — dfmpOverflowFixActivationHeight is 999999999 on
+    // all three chains) the legacy math is NOT merely "byte-identical"; it is byte-identical
+    // ONLY BECAUSE THE BUILD PASSES -fwrapv. The legacy heat exponential deliberately runs
+    // int64 signed overflow past heat == effectiveFreeThreshold + 60, and relies on the
+    // wrapped-negative product being caught by the floor in CalculateEffectiveTarget().
+    // In standard C++ that overflow is undefined behaviour; -fwrapv (Makefile, `override
+    // CXXFLAGS += -fwrapv`) is what makes it a defined two's-complement wrap and therefore
+    // identical across the GCC/Linux, GCC/MSYS2 and Clang/macOS binaries we ship.
+    // Removing -fwrapv re-opens a consensus split on this exact path.
     bool dfmpSat = Dilithion::g_chainParams && height >= Dilithion::g_chainParams->dfmpOverflowFixActivationHeight;
 
     int64_t multiplierFP;

@@ -187,15 +187,29 @@ public:
 // Both miner/controller.cpp AND the WF-1 differential test call THIS function, so
 // the test drives the real production assembly (no hand-copied mirror).
 //
-// `dst` MUST point to at least 80 writable bytes. `nonce32` is written at offset
-// 76 (the field the hot loop mutates each iteration); h.nNonce is ignored.
+// `dst` MUST point to at least MINING_HEADER_SIZE (80) writable bytes. `nonce32` is
+// written at MINING_HEADER_NONCE_OFFSET (76) — the field the hot loop mutates each
+// iteration; h.nNonce is ignored.
+//
+// K1: these offsets are named constants because the bare literals were hand-copied into
+// several unrelated files and only some of them got unified. Any new site that needs the
+// legacy 80-byte layout MUST call WriteMiningHeaderLE() (or use these constants), never
+// re-type the numbers.
+constexpr size_t MINING_HEADER_VERSION_OFFSET = 0;
+constexpr size_t MINING_HEADER_PREVHASH_OFFSET = 4;
+constexpr size_t MINING_HEADER_MERKLE_OFFSET = 36;
+constexpr size_t MINING_HEADER_TIME_OFFSET = 68;
+constexpr size_t MINING_HEADER_BITS_OFFSET = 72;
+constexpr size_t MINING_HEADER_NONCE_OFFSET = 76;
+constexpr size_t MINING_HEADER_SIZE = 80;
+
 inline void WriteMiningHeaderLE(uint8_t* dst, const CBlockHeader& h, uint32_t nonce32) {
-    WriteLE32(dst + 0, static_cast<uint32_t>(h.nVersion));
-    memcpy(dst + 4,  h.hashPrevBlock.begin(), 32);
-    memcpy(dst + 36, h.hashMerkleRoot.begin(), 32);
-    WriteLE32(dst + 68, h.nTime);
-    WriteLE32(dst + 72, h.nBits);
-    WriteLE32(dst + 76, nonce32);
+    WriteLE32(dst + MINING_HEADER_VERSION_OFFSET, static_cast<uint32_t>(h.nVersion));
+    memcpy(dst + MINING_HEADER_PREVHASH_OFFSET, h.hashPrevBlock.begin(), 32);
+    memcpy(dst + MINING_HEADER_MERKLE_OFFSET, h.hashMerkleRoot.begin(), 32);
+    WriteLE32(dst + MINING_HEADER_TIME_OFFSET, h.nTime);
+    WriteLE32(dst + MINING_HEADER_BITS_OFFSET, h.nBits);
+    WriteLE32(dst + MINING_HEADER_NONCE_OFFSET, nonce32);
 }
 
 class CBlock : public CBlockHeader {
