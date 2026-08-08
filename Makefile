@@ -847,6 +847,18 @@ competing_sibling_below_checkpoint_tests: $(CORE_OBJECTS) $(OBJ_DIR)/test/compet
 	@$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS) $(LIBS)
 	@echo "$(COLOR_GREEN)✓ competing_sibling_below_checkpoint_tests built successfully$(COLOR_RESET)"
 
+# Genesis validity regression suite — pins that EVERY network's genesis block
+# constructs and passes the node's own boot-time IsGenesisBlock() gate.
+# Added 2026-08-08 after dilithion-node --testnet / --regtest were found
+# unbootable for ~4.5 months with no test covering it.
+# Run once per network to also cover GetGenesisHash() (call_once-cached):
+#   ./genesis_all_networks_tests mainnet && ./genesis_all_networks_tests testnet \
+#     && ./genesis_all_networks_tests dilv && ./genesis_all_networks_tests regtest
+genesis_all_networks_tests: $(CORE_OBJECTS) $(OBJ_DIR)/test/genesis_all_networks_tests.o $(DILITHIUM_OBJECTS) $(CHIAVDF_OBJECTS)
+	@echo "$(COLOR_BLUE)[LINK]$(COLOR_RESET) $@"
+	@$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS) $(LIBS)
+	@echo "$(COLOR_GREEN)✓ genesis_all_networks_tests built successfully$(COLOR_RESET)"
+
 # Phase 5 Day 5: regtest mode scaffold smoke test.
 regtest_chainparams_smoke: $(CORE_OBJECTS) $(OBJ_DIR)/test/regtest_chainparams_smoke.o $(DILITHIUM_OBJECTS) $(CHIAVDF_OBJECTS)
 	@echo "$(COLOR_BLUE)[LINK]$(COLOR_RESET) $@"
