@@ -1957,6 +1957,17 @@ std::optional<CBlockTemplate> BuildMiningTemplate(CBlockchainDB& blockchain, CWa
 }
 
 int main(int argc, char* argv[]) {
+    // FIRST local in main, so it is the LAST thing destroyed on the way out.
+    // DilV is VDF-only and does not start FULL-mode init itself, so today this
+    // guard is a no-op here. It is present anyway because the hazard is a
+    // property of the RandomX module, not of one binary: anything DilV links
+    // that calls randomx_init_mining_mode_async() (CMiningController::Start
+    // does, on the regtest/mining paths) would otherwise leave a joinable
+    // namespace-scope std::thread and abort at static destruction, replacing
+    // this binary's exit code the same way it did dilithion-node's. Omitting
+    // the DilV half is exactly how the wallet-guard fix was missed before.
+    RandomXShutdownGuard randomx_shutdown_guard;
+
 #ifdef _WIN32
     // Register crash handler to log crash info before terminating
     SetUnhandledExceptionFilter(CrashHandler);
@@ -3055,6 +3066,19 @@ load_genesis_block:  // Bug #29: Label for automatic retry after blockchain wipe
             return 1;
         }
         std::cout << "  [OK] NodeContext initialized" << std::endl;
+
+        // Identical guard to dilithion-node.cpp, for the identical reason: every
+        // early `return` after this point otherwise leaves g_node_context's worker
+        // threads (CConnman, validation queue, headers manager) to be torn down at
+        // static-destruction time, after main has returned. Measured on DIL before
+        // this guard: the process either aborted via std::terminate or hung past a
+        // 120s timeout inside CConnman::Stop(). Declared here rather than at the top
+        // of main so it runs after the servers declared below and before the chain
+        // database declared above. Shutdown() is idempotent, so the explicit call on
+        // the normal shutdown path leaves this a no-op.
+        struct NodeContextShutdownGuard {
+            ~NodeContextShutdownGuard() { g_node_context.Shutdown(); }
+        } node_context_shutdown_guard;
 
         // Phase 2: Initialize async block validation queue for IBD performance
         std::cout << "Initializing async block validation queue..." << std::endl;
@@ -6524,6 +6548,21 @@ load_genesis_block:  // Bug #29: Label for automatic retry after blockchain wipe
         // Phase 5: Updated to use CConnman instead of CConnectionManager
         std::cerr.flush();
         std::thread p2p_maint_thread;
+        // Same joiner as dilithion-node.cpp, and present for the same reason: this
+        // std::thread is joined only at the bottom of main, so any early `return`
+        // after this point destroys it while joinable and std::terminate() replaces
+        // the intended exit code. DilV carries an identical maintenance thread and
+        // identical early returns; fixing only the DIL copy is how the previous
+        // wallet-guard fix left DilV broken.
+        struct MaintThreadJoiner {
+            std::thread& t;
+            ~MaintThreadJoiner() {
+                if (t.joinable()) {
+                    g_node_state.running = false;  // break the maintenance loop
+                    t.join();
+                }
+            }
+        } p2p_maint_joiner{p2p_maint_thread};
         try {
             p2p_maint_thread = std::thread([&feeler_manager]() {
             // Phase 1.1: Wrap thread entry point in try/catch to prevent silent crashes
@@ -6867,8 +6906,13 @@ load_genesis_block:  // Bug #29: Label for automatic retry after blockchain wipe
                     }
 #endif
 
-                    // Sleep for 30 seconds between maintenance cycles
-                    std::this_thread::sleep_for(std::chrono::seconds(30));
+                    // Sleep for 30 seconds between maintenance cycles, polled in
+                    // 1s steps. This thread is JOINED on the way out (see the
+                    // joiner where it is declared); an uninterruptible 30s sleep
+                    // would add up to 30s to every exit, error returns included.
+                    for (int maint_tick = 0; maint_tick < 30 && g_node_state.running; ++maint_tick) {
+                        std::this_thread::sleep_for(std::chrono::seconds(1));
+                    }
                 } catch (const std::system_error& e) {
                     std::cerr << "[P2P-Maint] System error in maintenance loop: " << e.what()
                               << " (code: " << e.code() << ")" << std::endl;

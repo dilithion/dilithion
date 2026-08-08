@@ -16,13 +16,20 @@
 # address, and the affected user was then invited to overwrite it.
 #
 # This asserts the three properties that matter, against the real binary:
-#   1. the node refuses to start (non-zero exit)
+#   1. the node refuses to start, with EXACTLY the contracted exit code (1) —
+#      not merely "non-zero", which also matches an abort
 #   2. wallet.dat is byte-identical afterwards
 #   3. a .unreadable-<timestamp> copy is written, matching the original bytes
 #
 # Both node binaries own a wallet and BOTH had the unguarded path — the DilV
 # copy was missed on the first pass and caught by the evaluate overlay's
 # "missing DilV branch" pattern hunt. Defaults to checking both.
+#
+# REQUIRES A PTY. The pty arm is the only arm that reaches the destructive path;
+# without it every remaining assertion is satisfied by the pre-existing non-TTY
+# guard alone, and the suite passes against a guard that has been deleted
+# (demonstrated by mutation, see the pty block below). A platform with no pty
+# helper is therefore a FAILURE, not a skip. Run it on Linux or in CI.
 #
 # Usage: bash scripts/wallet_load_guard_test.sh [node-binary ...]
 # ============================================================================
@@ -62,6 +69,10 @@ FAILED=0
 pass() { echo "    [PASS] $1"; }
 fail() { echo "    [FAIL] $1"; FAILED=1; }
 
+# The exit code the interactive refusal is CONTRACTED to produce. `return 1` from
+# main(). Asserted exactly — see the arm below for why "any non-zero" was not enough.
+EXPECTED_REFUSAL_RC=1
+
 WORK="$(mktemp -d 2>/dev/null || echo /tmp/wallet_guard_$$)"
 mkdir -p "$WORK"
 cleanup() { rm -rf "$WORK"; }
@@ -88,17 +99,23 @@ for NODE in "${NODES[@]}"; do
 
     AFTER_SUM=$(sha256sum "$D/wallet.dat" 2>/dev/null | awk '{print $1}')
 
-    # 126/127 mean the binary could not be executed at all, and 124 is the
-    # timeout firing. None of those are the node deciding to refuse, and
-    # scoring them as a pass would make this whole test vacuous.
+    # EXACT code, not "any non-zero". The previous "non-zero except 124/126/127"
+    # rule scored an ABORT as a refusal: dilithion-node was terminating at static
+    # destruction on a still-joinable RandomX init thread, so this arm exited 3
+    # (MSVC runtime abort) / 134 (Linux SIGABRT) while printing the guard's "this
+    # is a deliberate stop, not a crash" text. The suite said PASS for months.
+    # Anything keying on exit 1 — this test, CI, a wrapper script, a user — was
+    # reading a crash as a deliberate refusal. Pin the contract: exit 1.
     if [ "$RC" -eq 0 ]; then
         fail "node started despite an unreadable wallet (exit 0)"
     elif [ "$RC" -eq 126 ] || [ "$RC" -eq 127 ]; then
         fail "binary could not be executed (exit $RC) — test did not exercise the guard"
     elif [ "$RC" -eq 124 ]; then
         fail "node hung until the timeout (exit 124) — it neither started nor refused"
+    elif [ "$RC" -eq "$EXPECTED_REFUSAL_RC" ]; then
+        pass "node refused to start with the intended exit code ($RC)"
     else
-        pass "node refused to start (exit $RC)"
+        fail "node exited $RC, expected exactly $EXPECTED_REFUSAL_RC — non-zero is not enough; 3/134 mean the process ABORTED (std::terminate) rather than returning the refusal code"
     fi
 
     if [ -n "$AFTER_SUM" ] && [ "$BEFORE_SUM" = "$AFTER_SUM" ]; then
@@ -278,8 +295,20 @@ for NODE in "${NODES[@]}"; do
             fi
         fi
     else
-        echo "    [SKIP] pty arm (no usable pty helper on this platform) — the" >&2
-        echo "           destructive path is NOT covered here; it is covered on Linux CI." >&2
+        # NOT a skip. A skip here is indistinguishable from a pass, and that is
+        # not a theory: mutation testing on MSYS deleted the guard's `return 1`
+        # while keeping its message, and this suite reported 12/12 PASS, exit 0.
+        # Every other arm runs without a TTY, where the PRE-EXISTING non-TTY guard
+        # exits non-zero and leaves wallet.dat alone all by itself — so with the
+        # pty arm gone, not one assertion in this file is sensitive to whether our
+        # guard exists. `make wallet_load_guard_test` was reporting success against
+        # a gutted guard on this project's primary dev platform.
+        #
+        # So: no pty, no verdict. Fail loudly and say what is missing. Run the
+        # suite on Linux (or in the Linux CI job) to get a real answer; there is
+        # deliberately no environment-variable escape hatch, because an escape
+        # hatch is how a green-but-vacuous run comes back.
+        fail "pty arm unavailable on this platform ($(uname -s 2>/dev/null || echo unknown)) — the destructive create-over-wallet.dat path is the ONLY thing this suite tests that a non-TTY run cannot fake, so a run without it proves nothing about the guard. Run on Linux/CI."
     fi
 
     if [ "$FAILED" -ne 0 ]; then
