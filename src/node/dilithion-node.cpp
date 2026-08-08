@@ -120,6 +120,7 @@
 #include <sstream>  // For mnemonic display parsing
 #include <memory>
 #include <csignal>
+#include <util/shutdown_progress.h>
 #include <cstring>
 #include <cassert>
 #include <thread>
@@ -559,6 +560,12 @@ struct NodeConfig {
     bool coinstatsindex_enabled = false;   // --coinstatsindex / -coinstatsindex: enable UTXO-set stats index (PR-BA-2)
     bool persistmempool = true;     // --persistmempool=<0|1>: save/restore mempool across restarts (PR-MP-2; default ON)
     bool feeestimates  = true;      // --feeestimates=<0|1>: enable adaptive fee estimator + persistence (PR-EF-2; default ON)
+    // J1: hard bound on the graceful-shutdown sequence. If shutdown has not
+    // completed within this many seconds, the process logs the stage it is
+    // stuck in and force-exits rather than hanging forever (see
+    // src/util/shutdown_progress.h for why that is safe). 0 disables the
+    // watchdog. 120s is far above any observed clean shutdown.
+    int shutdown_timeout = 120;     // --shutdowntimeout=<seconds>
     bool yes_flag = false;          // --yes: bypass --reset-chain confirmation prompt
     bool verbose = false;           // Show debug output (hidden by default)
     bool quiet = false;             // Quiet mode: only block lifecycle, errors, and warnings
@@ -745,6 +752,15 @@ struct NodeConfig {
                 // Wipe chain-derived state (blocks, chainstate, headers, dna_registry),
                 // preserve wallet.dat and mik_registration.dat. Exits after reset.
                 reset_chain = true;
+            }
+            else if (arg.find("--shutdowntimeout=") == 0) {
+                try {
+                    shutdown_timeout = std::stoi(arg.substr(18));
+                    if (shutdown_timeout < 0) shutdown_timeout = 0;
+                } catch (const std::exception&) {
+                    std::cerr << "ERROR: --shutdowntimeout= requires an integer number of seconds" << std::endl;
+                    return false;
+                }
             }
             else if (arg == "--yes" || arg == "-y") {
                 // Bypass interactive confirmation (currently only used by --reset-chain)
@@ -8620,6 +8636,13 @@ load_genesis_block:  // Bug #29: Label for automatic retry after blockchain wipe
         // Shutdown
         std::cout << std::endl;
         std::cout << "[Shutdown] Initiating graceful shutdown..." << std::endl;
+        // J1: from here on, every stage boundary is recorded and timed, and a
+        // deadline thread is armed. Before this, a stall anywhere below was
+        // invisible -- the process simply never exited and the operator had no
+        // way to tell which subsystem was holding it. See
+        // src/util/shutdown_progress.h.
+        Dilithion::ShutdownProgress::ArmWatchdog(config.shutdown_timeout);
+        Dilithion::ShutdownProgress::Stage("miners + VDF");
 
         // Clear ibd_coordinator pointer before local variable goes out of scope
         g_node_context.ibd_coordinator = nullptr;
@@ -8651,6 +8674,7 @@ load_genesis_block:  // Bug #29: Label for automatic retry after blockchain wipe
             g_resource_monitor = nullptr;
         }
 
+        Dilithion::ShutdownProgress::Stage("CConnman::Stop (P2P sockets + net threads)");
         std::cout << "[Shutdown] Stopping P2P server..." << std::flush;
         // Phase 5: Stop CConnman (handles all socket cleanup internally)
         if (g_node_context.connman) {
@@ -8663,6 +8687,7 @@ load_genesis_block:  // Bug #29: Label for automatic retry after blockchain wipe
         // via `sendrawtransaction` between the two cannot land in the
         // mempool but be missed by the dump. Mirrors Bitcoin Core's
         // shutdown sequence (init.cpp Shutdown()).
+        Dilithion::ShutdownProgress::Stage("CRPCServer::Stop (RPC + WebSocket threads)");
         std::cout << "[Shutdown] Stopping RPC server..." << std::flush;
         rpc_server.Stop();
         std::cout << " done" << std::endl;
@@ -8744,6 +8769,7 @@ load_genesis_block:  // Bug #29: Label for automatic retry after blockchain wipe
         }
 
         // Phase 3.2: Shutdown batch signature verifier
+        Dilithion::ShutdownProgress::Stage("batch signature verifier");
         std::cout << "[Shutdown] Stopping batch signature verifier..." << std::endl;
         ShutdownSignatureVerifier();
 
@@ -8757,11 +8783,13 @@ load_genesis_block:  // Bug #29: Label for automatic retry after blockchain wipe
         }
 
         // Phase 1.2: Shutdown NodeContext (Bitcoin Core pattern)
+        Dilithion::ShutdownProgress::Stage("NodeContext::Shutdown (validation queue, headers/blocks managers)");
         std::cout << "[Shutdown] NodeContext shutdown complete" << std::endl;
         g_node_context.Shutdown();
         
         // Phase 5: p2p_thread and p2p_recv_thread removed - handled by CConnman
         // Only join maintenance thread
+        Dilithion::ShutdownProgress::Stage("p2p maintenance thread join");
         if (p2p_maint_thread.joinable()) {
             p2p_maint_thread.join();
         }
@@ -8778,9 +8806,11 @@ load_genesis_block:  // Bug #29: Label for automatic retry after blockchain wipe
         // REMOVED: g_peer_manager cleanup - no longer used
 
         // DFMP: Shutdown Fair Mining Protocol subsystem (persist heat trackers)
+        Dilithion::ShutdownProgress::Stage("DFMP persist");
         std::cout << "  Shutting down DFMP..." << std::endl;
         DFMP::ShutdownDFMP(config.datadir, g_chainstate.GetHeight());
 
+        Dilithion::ShutdownProgress::Stage("UTXO database close");
         std::cout << "  Closing UTXO database..." << std::endl;
         utxo_set.Close();
 
@@ -8794,6 +8824,7 @@ load_genesis_block:  // Bug #29: Label for automatic retry after blockchain wipe
         // CBlockchainDB* / CUTXOSet* across blockchain teardown.
         g_coin_stats_index.reset();
 
+        Dilithion::ShutdownProgress::Stage("blockchain database close");
         std::cout << "  Closing blockchain database..." << std::endl;
         blockchain.Close();
 
@@ -8805,6 +8836,7 @@ load_genesis_block:  // Bug #29: Label for automatic retry after blockchain wipe
         Dilithion::g_chainParams = nullptr;
 
         std::cout << std::endl;
+        Dilithion::ShutdownProgress::Disarm();
         std::cout << "Dilithion node stopped cleanly" << std::endl;
 
     } catch (const std::exception& e) {
