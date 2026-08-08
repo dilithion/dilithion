@@ -1181,9 +1181,8 @@ std::optional<CBlockTemplate> CMiningController::CreateBlockTemplate(
                 Dilithion::g_chainParams->dfmpV32ActivationHeight : 999999999;
             int dfmpV33Height = Dilithion::g_chainParams ?
                 Dilithion::g_chainParams->dfmpV33ActivationHeight : 999999999;
-            // C-3: saturating heat math gate (must match validator pow.cpp exactly).
-            bool dfmpSat = Dilithion::g_chainParams &&
-                static_cast<int>(nHeight) >= Dilithion::g_chainParams->dfmpOverflowFixActivationHeight;
+            // C-3: saturating heat math gate — single-sourced with the validator.
+            bool dfmpSat = DFMP::DfmpSaturatingMathActive(static_cast<int>(nHeight));
             int64_t multiplierFP;
             if (static_cast<int>(nHeight) >= dfmpV33Height) {
                 multiplierFP = DFMP::CalculateTotalMultiplierFP_V33(nHeight, firstSeen, heat, dfmpSat);

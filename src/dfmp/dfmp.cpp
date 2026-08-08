@@ -3,6 +3,7 @@
 
 #include <dfmp/dfmp.h>
 #include <dfmp/identity_db.h>
+#include <core/chainparams.h>
 #include <crypto/sha3.h>
 
 #include <cstring>
@@ -29,6 +30,18 @@ static_assert(sizeof(__uint128_t) == 16,
 CHeatTracker* g_heatTracker = nullptr;
 CHeatTracker* g_payoutHeatTracker = nullptr;
 CIdentityDB* g_identityDb = nullptr;
+
+// ============================================================================
+// C-3 ACTIVATION GATE (SINGLE SOURCE OF TRUTH) — see dfmp.h for the contract
+// ============================================================================
+
+bool DfmpSaturatingMathActive(int height) {
+    // NOTE: this expression is consensus-critical and is deliberately the ONLY
+    // read of dfmpOverflowFixActivationHeight outside chainparams itself.
+    // Do not copy it to a call site — call this function.
+    return Dilithion::g_chainParams &&
+           height >= Dilithion::g_chainParams->dfmpOverflowFixActivationHeight;
+}
 
 // ============================================================================
 // IDENTITY IMPLEMENTATION
