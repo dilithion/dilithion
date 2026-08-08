@@ -446,7 +446,12 @@ void CMiningController::MiningWorker(uint32_t threadId) {
         // BUG #24 FIX: Fast nonce update (only 4 bytes, no allocations)
         // Update nonce in place at offset 76 (last 4 bytes of 80-byte header)
         uint32_t nonce32 = static_cast<uint32_t>(nonce64 & 0xFFFFFFFF);
-        WriteLE32(header + 76, nonce32);  // WF-1: explicit LE, byte-equal on LE hosts
+        // WF-1: explicit LE, byte-equal on LE hosts. The offset lives in
+        // WriteMiningNonceLE (primitives/block.h) so this hot-loop write and
+        // WriteMiningHeaderLE's template-change write cannot drift apart —
+        // the bare `header + 76` literal that used to be here was untested and
+        // a wrong offset silently invalidates every block this miner finds.
+        WriteMiningNonceLE(header, nonce32);
 
         // Compute RandomX hash
         try {
