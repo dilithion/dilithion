@@ -13,6 +13,7 @@
 #include <rpc/ssl_wrapper.h>  // Phase 3: SSL/TLS support
 #include <rpc/websocket.h>  // Phase 4: WebSocket support
 #include <api/wallet_html.h>  // Web wallet UI
+#include <api/wallet_assets.h>  // node-wallet-selfcontained: wallet page subresources
 #include <api/miner_html.h>  // Web miner dashboard
 #include <wallet/wallet.h>  // BUG #104 FIX: For CSentTx
 #include <crypto/sha3.h>  // For hashing params
@@ -186,6 +187,41 @@ static uint32_t SafeParseUInt32(const std::string& str, uint32_t min_val, uint32
     } catch (const std::out_of_range&) {
         throw std::runtime_error("Integer out of range");
     }
+}
+
+// node-wallet-selfcontained: strip every
+// <!--DILITHION_NODE_STRIP_BEGIN--> ... <!--DILITHION_NODE_STRIP_END--> block
+// from the wallet page before serving it.
+//
+// The single wallet source (website/wallet.html) is shipped two ways: hosted on
+// the website, and embedded in this binary. A few head elements make sense only
+// in the hosted deployment and are actively wrong (or harmful) when the node
+// serves the page — the PWA manifest/service worker describe the website's URL
+// layout and would cache this token-bearing document, and the Google Fonts
+// stylesheet is a third-party fetch that the node's own CSP blocks. Marking
+// them in the source and deleting them here keeps ONE wallet source of truth
+// instead of forking the file.
+//
+// Deliberately conservative: only well-formed BEGIN...END pairs are removed. An
+// unmatched BEGIN leaves the document untouched from that point on rather than
+// truncating it, so a future editing mistake degrades to "serves too much
+// chrome", never to "serves a truncated wallet".
+static std::string StripNodeOnlyBlocks(const std::string& html) {
+    static const std::string kBegin = "<!--DILITHION_NODE_STRIP_BEGIN-->";
+    static const std::string kEnd = "<!--DILITHION_NODE_STRIP_END-->";
+    std::string out;
+    out.reserve(html.size());
+    size_t pos = 0;
+    while (true) {
+        size_t b = html.find(kBegin, pos);
+        if (b == std::string::npos) break;
+        size_t e = html.find(kEnd, b + kBegin.size());
+        if (e == std::string::npos) break;  // unmatched BEGIN: keep the rest verbatim
+        out.append(html, pos, b - pos);
+        pos = e + kEnd.size();
+    }
+    out.append(html, pos, std::string::npos);
+    return out;
 }
 
 CRPCServer::CRPCServer(uint16_t port)
@@ -1267,7 +1303,9 @@ void CRPCServer::HandleClient(int clientSocket) {
         // (see the auth block below). Rotated per page load; bound to this
         // process via m_sessionTokens. Only injected when auth is configured
         // (cookie/rpcuser model) AND we captured the real creds to resolve to.
-        std::string wallet_html = GetWalletHTML();
+        // node-wallet-selfcontained: drop the hosted-site-only head chrome (PWA
+        // manifest/service worker + Google Fonts) — see StripNodeOnlyBlocks().
+        std::string wallet_html = StripNodeOnlyBlocks(GetWalletHTML());
         if (RPCAuth::IsAuthConfigured() && !m_sessionAuthPass.empty() && m_sessionTokens) {
             extern bool GetStrongRandBytes(uint8_t* buf, size_t len);
             std::vector<uint8_t> tok_bytes(32);
@@ -1319,13 +1357,113 @@ void CRPCServer::HandleClient(int clientSocket) {
                  << "X-Frame-Options: DENY\r\n"
                  << "X-Content-Type-Options: nosniff\r\n"
                  << "Referrer-Policy: no-referrer\r\n"
+                 // node-wallet-selfcontained: 'wasm-unsafe-eval' is added to
+                 // script-src, and NOTHING else about this policy changes. The
+                 // wallet's post-quantum signing module is a WebAssembly build
+                 // (js/dilithium.wasm), and WebAssembly.instantiate() is gated
+                 // by script-src: without this keyword the module cannot be
+                 // compiled at all, so the browser-side wallet has no ML-DSA.
+                 //
+                 // This is deliberately NOT the same as relaxing the policy:
+                 //   - it admits NO new origin. The .wasm is still subject to
+                 //     default-src 'self', so only WASM this node served can be
+                 //     compiled — a third-party CDN remains blocked, which is
+                 //     the whole point of keeping script-src at 'self'.
+                 //   - it does NOT enable eval()/new Function() for JavaScript.
+                 //     'wasm-unsafe-eval' exists precisely so a page can run
+                 //     WASM without opening the JS eval hole that the older
+                 //     'unsafe-eval' would.
+                 // Browsers too old to know the keyword ignore it and keep
+                 // blocking WASM — i.e. they degrade to today's behaviour.
                  << "Content-Security-Policy: default-src 'self'; "
-                    "script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; "
+                    "script-src 'self' 'unsafe-inline' 'wasm-unsafe-eval'; "
+                    "style-src 'self' 'unsafe-inline'; "
                     "img-src 'self' data:; connect-src 'self'; "
                     "frame-ancestors 'none'; base-uri 'none'; form-action 'none'\r\n"
                  << "\r\n"
                  << wallet_html;
         std::string resp_str = response.str();
+        send_response_and_cleanup(resp_str);
+        return;
+    }
+
+    // ========================================================================
+    // node-wallet-selfcontained: serve the wallet page's own subresources.
+    //
+    // The wallet HTML is served with `default-src 'self'` and a script-src of
+    // 'self', so every script/WASM it loads MUST come from this origin.
+    // Previously the node served ONLY the HTML: /js/*.js fell through
+    // to the REST branch below and came back as a 403 JSON body, and the two
+    // libraries the page used to pull from cdn.jsdelivr.net were CSP-blocked
+    // outright — so the page had no SHA3 and no light-wallet modules and could
+    // not do address/crypto work at all. Allowing the CDN in script-src would
+    // "fix" it by letting a third party ship signing code into users' wallets;
+    // instead the assets are compiled in (src/api/wallet_assets.h) and served
+    // from here.
+    //
+    // The three gates below intentionally MIRROR the wallet-HTML gates above
+    // (public-API off, loopback socket peer, loopback Host). These assets carry
+    // no session token, so the gates are not load-bearing for secrecy — they
+    // exist so the wallet surface as a whole has ONE reachability rule, and so
+    // a network-bound node exposes no more than it did before. Duplicated
+    // rather than refactored so the audited wallet-HTML path above is not
+    // touched by this change.
+    //
+    // Lookup is an exact string match against a fixed table — no path joining,
+    // no filesystem access, no traversal reachable.
+    // ========================================================================
+    if (request.compare(0, 8, "GET /js/") == 0 ||
+        request.compare(0, 17, "GET /favicon.ico ") == 0) {
+        // Extract the path, dropping any query string / fragment.
+        std::string asset_path;
+        {
+            size_t start = 4;  // after "GET "
+            size_t end = request.find(' ', start);
+            if (end != std::string::npos) asset_path = request.substr(start, end - start);
+            size_t q = asset_path.find_first_of("?#");
+            if (q != std::string::npos) asset_path.erase(q);
+        }
+
+        const std::string* asset_data = nullptr;
+        const char* asset_mime = nullptr;
+        const bool denied = m_publicAPI ||
+                            !rpc::HostValidator::IsLoopbackIP(clientIP) ||
+                            !m_hostValidatorReady ||
+                            !m_hostValidator.IsRequestLoopbackHost(request);
+
+        if (!denied && dilithion::walletassets::Lookup(asset_path, &asset_data, &asset_mime)) {
+            std::ostringstream response;
+            response << "HTTP/1.1 200 OK\r\n"
+                     << "Content-Type: " << asset_mime << "\r\n"
+                     << "Content-Length: " << asset_data->size() << "\r\n"
+                     << "Connection: close\r\n"
+                     // Revalidate every load: an upgraded binary must not be
+                     // shadowed by a stale copy of a signing-path script.
+                     << "Cache-Control: no-cache\r\n"
+                     << "X-Content-Type-Options: nosniff\r\n"
+                     << "X-Frame-Options: DENY\r\n"
+                     << "Referrer-Policy: no-referrer\r\n"
+                     << "\r\n"
+                     << *asset_data;
+            std::string resp_str = response.str();
+            send_response_and_cleanup(resp_str);
+            return;
+        }
+
+        // One uniform 404 for both "gated off" and "not in the table", so the
+        // response does not disclose which of the two applied.
+        const std::string body =
+            "{\"error\":\"Not found\",\"code\":-32601}";
+        std::ostringstream oss;
+        oss << "HTTP/1.1 404 Not Found\r\n"
+            << "Content-Type: application/json\r\n"
+            << "Content-Length: " << body.size() << "\r\n"
+            << "Connection: close\r\n"
+            << "X-Content-Type-Options: nosniff\r\n"
+            << "X-Frame-Options: DENY\r\n"
+            << "\r\n"
+            << body;
+        std::string resp_str = oss.str();
         send_response_and_cleanup(resp_str);
         return;
     }
