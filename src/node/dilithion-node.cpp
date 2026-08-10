@@ -2639,7 +2639,12 @@ int main(int argc, char* argv[]) {
         // Load and verify genesis block
 load_genesis_block:  // Bug #29: Label for automatic retry after blockchain wipe
         std::cout << "[1/6] Loading genesis block..." << std::flush;
-        CBlock genesis = Genesis::CreateGenesisBlock();
+        // Dispatch on the chain's real VDF configuration rather than hard-coding
+        // the legacy constructor. Hard-coding CreateGenesisBlock() here made
+        // `--testnet` and `--regtest` unbootable: both are VDF-from-genesis
+        // chains, so IsGenesisBlock() below expected a VDF (v4) genesis and was
+        // handed a legacy (v1) one -> "Genesis block verification failed".
+        CBlock genesis = Genesis::CreateGenesisBlockForChain();
 
         if (!Genesis::IsGenesisBlock(genesis)) {
             ErrorMessage error = CErrorFormatter::ValidationError("genesis block", 

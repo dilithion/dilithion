@@ -2500,7 +2500,10 @@ int main(int argc, char* argv[]) {
         // Load and verify genesis block
 load_genesis_block:  // Bug #29: Label for automatic retry after blockchain wipe
         std::cout << "[1/6] Loading DilV genesis block..." << std::flush;
-        CBlock genesis = Genesis::CreateDilVGenesisBlock();
+        // Both networks this binary serves (DilV, regtest) are VDF-from-genesis,
+        // so this resolves to CreateDilVGenesisBlock() exactly as before; routing
+        // through the shared dispatcher keeps it correct if that ever changes.
+        CBlock genesis = Genesis::CreateGenesisBlockForChain();
 
         if (!Genesis::IsGenesisBlock(genesis)) {
             ErrorMessage error = CErrorFormatter::ValidationError("genesis block", 
