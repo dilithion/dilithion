@@ -6179,10 +6179,46 @@ std::string CRPCServer::RPC_Stop(const std::string& params) {
         );
     }
 
-    // Confirmation received - proceed with graceful shutdown
-    std::thread([this]() {
+    // ========================================================================
+    // J1 FIX: `stop` must stop the NODE, not just the RPC listener.
+    // ========================================================================
+    // This used to call CRPCServer::Stop() and nothing else. CRPCServer::Stop()
+    // tears down the RPC listening socket, the worker pool and the WebSocket
+    // server -- and that is ALL it does. It never touches g_node_state.running,
+    // which is the flag both node binaries' main loops spin on and the only
+    // thing that starts the shutdown sequence at the bottom of main().
+    //
+    // The observed consequence, measured on the pre-fix binary against a node
+    // mid-IBD: `stop` returned {"result":"Dilithion server stopping"}, the RPC
+    // port went to connection-refused within a second, and the process then ran
+    // for 320+ seconds still downloading and connecting blocks, with zero
+    // "[Shutdown]" lines emitted. It was not slow -- it was never going to exit.
+    // Worse, because the RPC listener was already gone, `stop` had also removed
+    // the only remaining way to ask it to stop. The single escape was
+    // TerminateProcess/SIGKILL.
+    //
+    // That matters beyond a stuck test: the deploy procedure for the seed nodes
+    // is a rolling restart, one node at a time. Every such restart has been
+    // resolved either by a long wait or by an ungraceful kill of a process in
+    // the middle of chainstate writes.
+    //
+    // The fix is to do what `forcerebuild` a few hundred lines up already does
+    // correctly, and what Bitcoin Core's StartShutdown() does: flip the node's
+    // run flag and let main()'s own shutdown sequence run. Deliberately we do
+    // NOT call Stop() here any more --
+    //   * the shutdown sequence in main() calls rpc_server.Stop() itself, in the
+    //     right order (after CConnman, before DumpMempool), and
+    //   * calling it from here joined the RPC worker pool from a detached
+    //     thread while a worker was still returning this very response.
+    // Leaving the listener up for the ~1s until the main loop notices is both
+    // harmless and strictly more debuggable: the operator can still poll
+    // getblockchaininfo and watch the node wind down.
+    //
+    // The 100ms delay is only so this response reaches the client before the
+    // shutdown sequence closes the socket out from under it.
+    std::thread([]() {
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
-        Stop();
+        g_node_state.running = false;
     }).detach();
 
     return "\"Dilithion server stopping (confirmed)\"";

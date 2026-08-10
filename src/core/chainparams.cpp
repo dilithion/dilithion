@@ -721,13 +721,16 @@ ChainParams ChainParams::Regtest() {
     params.genesisCoinbaseMsg = "Dilithion Regtest";
     params.genesisHash = "";  // computed at startup
 
-    // Phase 5 (2026-04-26): regtest IS a VDF chain, run via dilv-node binary.
+    // Phase 5 (2026-04-26): regtest IS a VDF chain.
     //
-    // Why dilv-node: dilithion-node calls Genesis::CreateGenesisBlock() at
-    // boot (non-VDF path), which fails IsGenesisBlock's nVersion check
-    // when genesis params indicate VDF-from-genesis. dilv-node correctly
-    // calls CreateDilVGenesisBlock(), so a fresh regtest datadir loads
-    // cleanly there.
+    // HISTORICAL NOTE (fixed 2026-08-08): regtest was previously documented as
+    // "run via dilv-node binary" because dilithion-node hard-coded
+    // Genesis::CreateGenesisBlock() at boot, which fails IsGenesisBlock's
+    // nVersion check when genesis params indicate VDF-from-genesis. That was a
+    // call-site bug, not a property of the network — the same bug also made
+    // `dilithion-node --testnet` unbootable. Both binaries now dispatch through
+    // Genesis::CreateGenesisBlockForChain() (ChainParams::IsVdfFromGenesis()),
+    // so regtest loads cleanly under either binary.
     //
     // The chain-selection algorithm is chain-agnostic (same CChainState,
     // same m_setBlockIndexCandidates, same ActivateBestChainStep
