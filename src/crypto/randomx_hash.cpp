@@ -345,13 +345,44 @@ extern "C" void randomx_init_for_hashing(const void* key, size_t key_len, int li
 
             // Capture local pointer copies, not globals - prevents race condition
             init_threads.emplace_back([dataset_ptr, cache_ptr, start_item, count]() {
-                randomx_init_dataset(dataset_ptr, cache_ptr, start_item, count);
+                // K2-(4, related LOW): batched with a cancellation poll, same as
+                // the mining-mode build. This is exported API with no in-tree
+                // caller that can escape the async wrappers today, but an
+                // unbatched call here would make randomx_shutdown()'s join wait
+                // out an entire 2GB dataset build -- and the std::atexit
+                // backstop runs that join on every exit path.
+                const unsigned long kBatchItems = 65536;
+                for (unsigned long done = 0; done < count; done += kBatchItems) {
+                    if (g_randomx_shutdown.load(std::memory_order_acquire)) {
+                        return;  // partial dataset; discarded by the check below
+                    }
+                    const unsigned long n = std::min<unsigned long>(kBatchItems, count - done);
+                    randomx_init_dataset(dataset_ptr, cache_ptr, start_item + done, n);
+                }
             });
         }
 
         // Wait for all threads to complete
         for (auto& thread : init_threads) {
             thread.join();
+        }
+
+        // A cancelled build leaves a PARTIAL dataset. Never wrap a VM around it
+        // -- a VM over a half-built dataset would produce wrong hashes. Release
+        // and return; the process is exiting.
+        //
+        // g_randomx_ready is forced FALSE rather than merely left alone: the
+        // cleanup at the top of this function already destroyed any previous VM
+        // and nulled g_randomx_vm, so returning with a stale ready==true (which
+        // a direct caller of this legacy entry point could be carrying from an
+        // earlier successful init) would advertise a VM that no longer exists.
+        if (g_randomx_shutdown.load(std::memory_order_acquire)) {
+            randomx_release_dataset(g_randomx_dataset);
+            randomx_release_cache(g_randomx_cache);
+            g_randomx_dataset = nullptr;
+            g_randomx_cache = nullptr;
+            g_randomx_ready = false;
+            return;
         }
 
         // Ensure all dataset writes are visible before creating VM
@@ -450,9 +481,14 @@ extern "C" void randomx_init_async(const void* key, size_t key_len, int light_mo
         return;
     }
 
-    // Refuse to start new background work once shutdown has begun -- otherwise
-    // a late call could hand randomx_shutdown() a thread it has already joined
-    // past, and we would be back to terminating at static destruction.
+    // Refuse to start new background work once shutdown has begun. This early
+    // check is only a cheap fast path -- on its own it does NOT establish the
+    // property, because randomx_shutdown() can run to completion in the window
+    // between it and the handle lock below. The check that actually establishes
+    // it is the re-test UNDER g_init_threads_mutex further down; see K2-(4)
+    // there. (The comment that used to sit here credited this test with the
+    // full guarantee. It never had it: safety rested on the std::atexit
+    // backstop and on the lambda's own cancellation point, not on this line.)
     if (g_randomx_shutdown.load(std::memory_order_acquire)) {
         g_randomx_initializing = false;
         return;
@@ -469,6 +505,32 @@ extern "C" void randomx_init_async(const void* key, size_t key_len, int light_mo
     std::vector<uint8_t> key_copy((const uint8_t*)key, (const uint8_t*)key + key_len);
 
     std::lock_guard<std::mutex> thread_lock(g_init_threads_mutex);
+
+    // K2-(4): re-test the shutdown flag UNDER the handle lock, and only here is
+    // the "no thread is assigned after shutdown has joined" property actually
+    // established. randomx_shutdown() stores the flag, THEN takes this same
+    // mutex, THEN joins. The interleaving the pre-lock check cannot stop:
+    //
+    //   caller                          randomx_shutdown()
+    //   ------                          ------------------
+    //   reads flag == false
+    //                                   stores flag = true
+    //                                   locks g_init_threads_mutex
+    //                                   joins both handles
+    //                                   unlocks  <-- shutdown is DONE
+    //   locks g_init_threads_mutex
+    //   assigns a NEW thread to an already-joined handle
+    //
+    // That new thread has nothing left to join it, so its std::thread member
+    // is still joinable at static-destruction time -- std::terminate(), the
+    // exact fault this module exists to remove. Because randomx_shutdown()
+    // publishes the flag BEFORE acquiring the lock, any shutdown that has
+    // reached the lock is guaranteed visible to this acquire-load, so the
+    // window is closed rather than narrowed.
+    if (g_randomx_shutdown.load(std::memory_order_acquire)) {
+        g_randomx_initializing = false;
+        return;
+    }
 
     // Join any existing thread
     if (g_randomx_init_thread.joinable()) {
@@ -674,8 +736,9 @@ extern "C" void randomx_init_mining_mode_async(const void* key, size_t key_len) 
         return;  // Already initialized
     }
 
-    // Refuse to start new background work once shutdown has begun. See the same
-    // guard in randomx_init_async().
+    // Cheap fast path only -- not the guarantee. See the same pair of checks in
+    // randomx_init_async(); the one that establishes the property is under
+    // g_init_threads_mutex below.
     if (g_randomx_shutdown.load(std::memory_order_acquire)) {
         g_mining_initializing = false;
         return;
@@ -688,6 +751,16 @@ extern "C" void randomx_init_mining_mode_async(const void* key, size_t key_len) 
     std::vector<uint8_t> key_copy((const uint8_t*)key, (const uint8_t*)key + key_len);
 
     std::lock_guard<std::mutex> thread_lock(g_init_threads_mutex);
+
+    // K2-(4): re-test under the handle lock. Same race, same reasoning, same
+    // consequence as in randomx_init_async() -- see the interleaving diagram
+    // there. Without this, a call that passed the pre-lock check could assign a
+    // new thread to a handle randomx_shutdown() had already joined and walked
+    // away from.
+    if (g_randomx_shutdown.load(std::memory_order_acquire)) {
+        g_mining_initializing = false;
+        return;
+    }
 
     // Join any existing thread
     if (g_mining_init_thread.joinable()) {

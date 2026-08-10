@@ -12,7 +12,21 @@
 #include <iostream>
 #include <sstream>
 #include <cmath>
+#include <filesystem>
 #include <fstream>
+#include <system_error>
+
+#ifdef _WIN32
+// K2-(3): MoveFileExW for the atomic heat-file replace. LEAN_AND_MEAN + NOMINMAX
+// so windows.h cannot shadow std::min/std::max, which this TU uses.
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
 
 namespace DFMP {
 
@@ -226,37 +240,117 @@ std::map<Identity, int> CHeatTracker::GetAllHeat() const {
 static const uint32_t HEAT_FILE_MAGIC = 0x48454154;  // "HEAT"
 static const uint32_t HEAT_FILE_VERSION = 1;
 
+namespace {
+
+// K2-(3): atomically replace `dst` with `tmp`. Either the old complete file or
+// the new complete file is visible at `dst` at every instant -- never neither,
+// never a mixture. See the rationale above SaveToFile() for why
+// std::filesystem::rename() is NOT sufficient on Windows.
+bool AtomicReplaceFile(const std::filesystem::path& tmp,
+                       const std::filesystem::path& dst) {
+#ifdef _WIN32
+    const std::wstring wTmp = tmp.wstring();
+    const std::wstring wDst = dst.wstring();
+    return MoveFileExW(wTmp.c_str(), wDst.c_str(), MOVEFILE_REPLACE_EXISTING) != 0;
+#else
+    // POSIX rename(2) over an existing path is atomic by specification.
+    std::error_code ec;
+    std::filesystem::rename(tmp, dst, ec);
+    return !ec;
+#endif
+}
+
+}  // namespace
+
+// K2-(3): write via tmp+rename, NEVER in place.
+//
+// This runs inside the shutdown sequence, and the shutdown watchdog's deadline
+// is GLOBAL rather than per stage (src/util/shutdown_progress.h): a shutdown
+// that burns most of its budget in an earlier stage -- CConnman::Stop() is the
+// measured offender -- can reach this write with only moments left and be
+// _Exit()ed part-way through it. Truncating the real file first and then
+// streaming into it left a window where the on-disk file was neither the old
+// contents nor the new. LoadFromFile() detects the tear and rebuilds from
+// chain, so the cost was availability rather than silent corruption, but a
+// rebuild-from-chain on every forced shutdown is not a cost worth keeping when
+// the fix is the tmp+rename pattern already used by
+// src/dfmp/mik_registration_file.cpp and by mempool/fee persistence.
+//
+// The publish MUST be a genuine atomic replace, and on Windows that means
+// MoveFileExW(MOVEFILE_REPLACE_EXISTING) -- NOT std::filesystem::rename().
+// libstdc++ implements the latter with _wrename(), which FAILS when the
+// destination exists; the usual remove-then-rename fallback then leaves a real
+// window in which dfmp_heat.dat does not exist at all. Measured, not assumed:
+// a first cut of this function used the fallback and a kill-race probe caught
+// the file ABSENT on 15 of 15 killed writes. Absent is less bad than torn
+// (LoadFromFile treats it as first-run and rebuilds either way) but it is not
+// what "atomic" means, so it is not what this code does. src/attestation/
+// seed_attestation.cpp uses the same MoveFileExW pattern for the same reason.
+//
+// A forced exit therefore leaves EITHER the previous complete file or the new
+// complete file -- and at worst a stray .tmp, which nothing reads.
+//
+// Deliberately NOT fsync/FlushFileBuffers'd, unlike the attestation key: heat
+// is a cache that LoadFromFile() rebuilds from chain whenever it does not load.
+// The property being bought here is "never a half-file", not "survives power
+// loss" -- and the watchdog's _Exit is a process death, not a machine death.
 bool CHeatTracker::SaveToFile(const std::string& path, int tipHeight) const {
     std::lock_guard<std::mutex> lock(m_mutex);
 
-    std::ofstream file(path, std::ios::binary | std::ios::trunc);
-    if (!file.is_open()) {
-        std::cerr << "[DFMP] WARNING: Cannot open heat tracker file for writing: " << path << std::endl;
+    const std::filesystem::path finalPath(path);
+    std::filesystem::path tmpPath = finalPath;
+    tmpPath += ".tmp";
+
+    {
+        std::ofstream file(tmpPath, std::ios::binary | std::ios::trunc);
+        if (!file.is_open()) {
+            std::cerr << "[DFMP] WARNING: Cannot open heat tracker temp file for writing: "
+                      << tmpPath.string() << std::endl;
+            return false;
+        }
+
+        uint32_t magic = HEAT_FILE_MAGIC;
+        uint32_t version = HEAT_FILE_VERSION;
+        int32_t tip = static_cast<int32_t>(tipHeight);
+        uint32_t count = static_cast<uint32_t>(m_window.size());
+
+        file.write(reinterpret_cast<const char*>(&magic), 4);
+        file.write(reinterpret_cast<const char*>(&version), 4);
+        file.write(reinterpret_cast<const char*>(&tip), 4);
+        file.write(reinterpret_cast<const char*>(&count), 4);
+
+        for (const auto& entry : m_window) {
+            int32_t height = static_cast<int32_t>(entry.first);
+            file.write(reinterpret_cast<const char*>(&height), 4);
+            file.write(reinterpret_cast<const char*>(entry.second.data), sizeof(entry.second.data));
+        }
+
+        file.flush();
+        if (!file.good()) {
+            std::cerr << "[DFMP] WARNING: Error writing heat tracker file: "
+                      << tmpPath.string() << std::endl;
+            file.close();
+            std::error_code rm_ec;
+            std::filesystem::remove(tmpPath, rm_ec);
+            return false;
+        }
+        file.close();
+        if (file.fail()) {
+            std::cerr << "[DFMP] WARNING: Error closing heat tracker file: "
+                      << tmpPath.string() << std::endl;
+            std::error_code rm_ec;
+            std::filesystem::remove(tmpPath, rm_ec);
+            return false;
+        }
+    }
+
+    if (!AtomicReplaceFile(tmpPath, finalPath)) {
+        std::cerr << "[DFMP] WARNING: Cannot atomically install heat tracker file: "
+                  << finalPath.string() << " (previous file left intact)" << std::endl;
+        std::error_code rm_ec;
+        std::filesystem::remove(tmpPath, rm_ec);
         return false;
     }
-
-    uint32_t magic = HEAT_FILE_MAGIC;
-    uint32_t version = HEAT_FILE_VERSION;
-    int32_t tip = static_cast<int32_t>(tipHeight);
-    uint32_t count = static_cast<uint32_t>(m_window.size());
-
-    file.write(reinterpret_cast<const char*>(&magic), 4);
-    file.write(reinterpret_cast<const char*>(&version), 4);
-    file.write(reinterpret_cast<const char*>(&tip), 4);
-    file.write(reinterpret_cast<const char*>(&count), 4);
-
-    for (const auto& entry : m_window) {
-        int32_t height = static_cast<int32_t>(entry.first);
-        file.write(reinterpret_cast<const char*>(&height), 4);
-        file.write(reinterpret_cast<const char*>(entry.second.data), sizeof(entry.second.data));
-    }
-
-    if (!file.good()) {
-        std::cerr << "[DFMP] WARNING: Error writing heat tracker file: " << path << std::endl;
-        return false;
-    }
-
-    file.close();
     return true;
 }
 
