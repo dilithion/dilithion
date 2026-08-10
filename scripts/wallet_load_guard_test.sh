@@ -311,6 +311,205 @@ for NODE in "${NODES[@]}"; do
         fail "pty arm unavailable on this platform ($(uname -s 2>/dev/null || echo unknown)) — the destructive create-over-wallet.dat path is the ONLY thing this suite tests that a non-TTY run cannot fake, so a run without it proves nothing about the guard. Run on Linux/CI."
     fi
 
+    # ========================================================================
+    # INVERSE-FAILURE ARMS (F2)
+    # ========================================================================
+    # The arms above pin "an unreadable wallet is never overwritten". These pin
+    # the opposite defect: the guard must not brick a node over a file that
+    # provably holds no keys, or over a file it merely failed to OPEN.
+    #
+    # CWallet::Load() returns the same `false` for a 0-byte file, a file held by
+    # an antivirus scanner, and a corrupt wallet. Treating all three as
+    # corruption made the node exit 1 on EVERY start, forever, while telling the
+    # user not to delete the blocking file — a permanent brick from a transient
+    # cause, for users who never had a wallet at all.
+    #
+    # These arms key on LOG TEXT and FILE BYTES, not on exit codes. The exact
+    # refusal exit code is a separate contract, asserted by the first arm above;
+    # duplicating it here would couple these arms to the RandomX shutdown fix
+    # (PR #154) that makes the code reliably 1 rather than an abort.
+    # Distinct ports for every arm below. The arms above all use the default
+    # 8332/8444, and the relay-only arm deliberately leaves a node RUNNING for
+    # up to 60s — so a later arm that binds the same ports can exit 1 before it
+    # ever reaches wallet init, which looks exactly like a guard verdict. (Seen
+    # once on Windows: the first arm exited 1 with no wallet output at all.)
+    # Nothing here shares a port with anything else.
+    PORTS_E="--rpcport=18901 --port=18911"
+    PORTS_S="--rpcport=18902 --port=18912"
+    PORTS_T="--rpcport=18903 --port=18913"
+    PORTS_F="--rpcport=18904 --port=18914"
+    PORTS_K="--rpcport=18905 --port=18915"
+    PORTS_EP="--rpcport=18906 --port=18916"
+    PORTS_FP="--rpcport=18907 --port=18917"
+
+    E="$WORK/$(basename "$NODE").empty"
+    mkdir -p "$E"
+    : > "$E/wallet.dat"        # exactly 0 bytes
+    timeout -k 15 120 "$NODE" --datadir="$E" $NOPEER $PORTS_E < /dev/null > "$E/node.log" 2>&1
+    if grep -qE "Refusing to start|could not be loaded|could not be OPENED" "$E/node.log"; then
+        fail "empty: a 0-byte wallet.dat was treated as unreadable — node is bricked on every start"
+    else
+        pass "empty: 0-byte wallet.dat not treated as an unreadable wallet"
+    fi
+    # Positive proof it got all the way to wallet creation rather than stopping
+    # somewhere earlier for an unrelated reason. Two accepted endings, because
+    # both mean "the empty file is now equivalent to no file", which is the
+    # property under test: on a real non-TTY stdin the creation path ends at the
+    # interactive-terminal guard, while on MSYS `< /dev/null` still satisfies
+    # isatty() so the run reaches the create MENU and stops one step later at
+    # "stdin closed during wallet setup". Accepting only the first string would
+    # make this arm fail on Windows against a correct binary.
+    if grep -qE "Wallet setup requires an interactive terminal|CREATE a new wallet" "$E/node.log"; then
+        pass "empty: reached wallet setup (0-byte file behaves like no wallet)"
+    else
+        fail "empty: never reached wallet setup — the empty file still blocked startup"
+    fi
+    if ls "$E"/wallet.dat.unreadable-* >/dev/null 2>&1; then
+        fail "empty: preserved a copy of a 0-byte file — it holds nothing to preserve"
+    else
+        pass "empty: no pointless .unreadable- copy written for an empty file"
+    fi
+
+    # Sub-magic file: 4 bytes cannot hold the 8-byte magic, so no wallet format
+    # this project ever wrote can be in there. Same treatment as 0 bytes.
+    S="$WORK/$(basename "$NODE").short"
+    mkdir -p "$S"
+    printf 'DILW' > "$S/wallet.dat"
+    timeout -k 15 120 "$NODE" --datadir="$S" $NOPEER $PORTS_S < /dev/null > "$S/node.log" 2>&1
+    if grep -qE "Refusing to start|could not be loaded|could not be OPENED" "$S/node.log"; then
+        fail "short: a 4-byte wallet.dat (below the magic) was treated as unreadable"
+    else
+        pass "short: sub-magic wallet.dat treated as no wallet present"
+    fi
+
+    # BOUND CHECK, the other direction. 12 bytes: enough for the magic, and the
+    # magic is VALID, so this IS a wallet — a truncated one. It must still
+    # refuse. This is what stops the empty-file relaxation above from being
+    # widened into "anything short is fair game to overwrite".
+    T="$WORK/$(basename "$NODE").trunc"
+    mkdir -p "$T"
+    printf 'DILWLT07\x01\x00\x00' > "$T/wallet.dat"
+    T_BEFORE=$(sha256sum "$T/wallet.dat" | awk '{print $1}')
+    timeout -k 15 120 "$NODE" --datadir="$T" $NOPEER $PORTS_T < /dev/null > "$T/node.log" 2>&1
+    if grep -q "Refusing to start" "$T/node.log"; then
+        pass "truncated: a short-but-valid-magic wallet still refuses"
+    else
+        fail "truncated: a truncated REAL wallet was not refused — the empty-file relaxation is too wide"
+    fi
+    if [ "$T_BEFORE" = "$(sha256sum "$T/wallet.dat" 2>/dev/null | awk '{print $1}')" ]; then
+        pass "truncated: wallet.dat is byte-identical"
+    else
+        fail "truncated: wallet.dat was modified"
+    fi
+
+    # --- --force-new-wallet: the escape hatch the refusal advertises. It must
+    # --- get past the guard AND preserve the original bytes, never overwrite
+    # --- them silently.
+    F="$WORK/$(basename "$NODE").force"
+    mkdir -p "$F"
+    printf 'NOT A VALID WALLET FILE - corrupt on purpose\x00\x01\x02\x03' > "$F/wallet.dat"
+    F_BEFORE=$(sha256sum "$F/wallet.dat" | awk '{print $1}')
+    timeout -k 15 120 "$NODE" --datadir="$F" $NOPEER $PORTS_F --force-new-wallet \
+        < /dev/null > "$F/node.log" 2>&1
+    if grep -q "force-new-wallet was given" "$F/node.log" && \
+       ! grep -q "Refusing to start" "$F/node.log"; then
+        pass "force: --force-new-wallet gets past the guard (advertised remedy works)"
+    else
+        fail "force: guard blocked --force-new-wallet, its own printed remedy"
+    fi
+    # Same positive-reach proof as the empty arm: getting past the guard is only
+    # useful if it lands in wallet creation. See that arm for the two endings.
+    if grep -qE "Wallet setup requires an interactive terminal|CREATE a new wallet" "$F/node.log"; then
+        pass "force: reached wallet setup after the guard let it through"
+    else
+        fail "force: got past the guard but never reached wallet setup"
+    fi
+    F_BACKUP=$(ls "$F"/wallet.dat.unreadable-* 2>/dev/null | head -1)
+    if [ -n "$F_BACKUP" ]; then
+        pass "force: unreadable wallet preserved before proceeding"
+        if [ "$(sha256sum "$F_BACKUP" | awk '{print $1}')" = "$F_BEFORE" ]; then
+            pass "force: preserved copy holds the ORIGINAL wallet bytes"
+        else
+            fail "force: preserved copy does not match the original wallet bytes"
+        fi
+    else
+        fail "force: proceeded without preserving the unreadable wallet"
+    fi
+    # The refusal must NAME the escape hatch. A route out that is not printed is
+    # not a route out — the whole defect is a user reading "do not delete
+    # wallet.dat" with nothing else to try.
+    if grep -q -- "--force-new-wallet" "$D/node.log"; then
+        pass "force: the refusal message names --force-new-wallet"
+    else
+        fail "force: the refusal never tells the user about --force-new-wallet"
+    fi
+
+    # --- transient OPEN failure: must be reported as a lock, not as corruption,
+    # --- and must not claim the wallet is damaged.
+    # chmod is meaningless for root (and for MSYS), so probe whether the mode
+    # actually denied a read before asserting anything on it.
+    K="$WORK/$(basename "$NODE").locked"
+    mkdir -p "$K"
+    printf 'NOT A VALID WALLET FILE - corrupt on purpose\x00\x01\x02\x03' > "$K/wallet.dat"
+    chmod 000 "$K/wallet.dat" 2>/dev/null || true
+    if head -c 1 "$K/wallet.dat" >/dev/null 2>&1; then
+        echo "    [SKIP] lock arm — chmod 000 did not deny reads here (root, or a" >&2
+        echo "           filesystem without POSIX modes). Not a verdict on the guard." >&2
+    else
+        timeout -k 15 120 "$NODE" --datadir="$K" $NOPEER $PORTS_K < /dev/null > "$K/node.log" 2>&1
+        if grep -q "could not be OPENED" "$K/node.log"; then
+            pass "locked: reported as an open failure, not as an unreadable wallet"
+        else
+            fail "locked: an unopenable wallet was not reported as a lock/permissions problem"
+        fi
+        if grep -q "destroy the keys in it" "$K/node.log"; then
+            fail "locked: told the user their wallet may be corrupt when it was merely locked"
+        else
+            pass "locked: did not describe a locked file as corruption"
+        fi
+    fi
+    chmod 644 "$K/wallet.dat" 2>/dev/null || true
+
+    # --- pty coverage for the two non-refusing paths. Non-TTY runs can only
+    # --- prove the node reached wallet setup; only a real tty proves it can
+    # --- actually get to the create menu, which is what "not bricked" means to
+    # --- a user. Detection duplicated from the arm above deliberately: sharing
+    # --- a variable would mean editing that block, which PR #154 also edits.
+    if command -v script >/dev/null 2>&1 \
+       && ! uname -s 2>/dev/null | grep -qiE "mingw|msys|cygwin"; then
+        EP="$WORK/$(basename "$NODE").emptypty"
+        mkdir -p "$EP"
+        : > "$EP/wallet.dat"
+        printf 'n\n' > "$EP/answers"
+        timeout -k 15 90 script -q -c "'$NODE' --datadir='$EP' $NOPEER $PORTS_EP" /dev/null \
+            < "$EP/answers" > "$EP/node.log" 2>&1 || true
+        if grep -q "CREATE a new wallet" "$EP/node.log"; then
+            pass "pty/empty: create menu reached with a 0-byte wallet.dat (not bricked)"
+        else
+            fail "pty/empty: a 0-byte wallet.dat still blocked the create menu under a real tty"
+        fi
+
+        FP="$WORK/$(basename "$NODE").forcepty"
+        mkdir -p "$FP"
+        printf 'NOT A VALID WALLET FILE - corrupt on purpose\x00\x01\x02\x03' > "$FP/wallet.dat"
+        FP_BEFORE=$(sha256sum "$FP/wallet.dat" | awk '{print $1}')
+        printf 'n\n' > "$FP/answers"
+        timeout -k 15 90 script -q -c "'$NODE' --datadir='$FP' $NOPEER $PORTS_FP --force-new-wallet" /dev/null \
+            < "$FP/answers" > "$FP/node.log" 2>&1 || true
+        if grep -q "CREATE a new wallet" "$FP/node.log"; then
+            pass "pty/force: create menu reached with --force-new-wallet"
+        else
+            fail "pty/force: --force-new-wallet did not reach the create menu under a real tty"
+        fi
+        FP_BACKUP=$(ls "$FP"/wallet.dat.unreadable-* 2>/dev/null | head -1)
+        if [ -n "$FP_BACKUP" ] && \
+           [ "$(sha256sum "$FP_BACKUP" | awk '{print $1}')" = "$FP_BEFORE" ]; then
+            pass "pty/force: original bytes preserved before the create menu was offered"
+        else
+            fail "pty/force: reached the create menu without a matching preserved copy"
+        fi
+    fi
+
     if [ "$FAILED" -ne 0 ]; then
         echo "--- $(basename "$NODE") interactive log ---" >&2
         tail -20 "$D/node.log" >&2

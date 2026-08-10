@@ -70,6 +70,7 @@
 #include <consensus/vdf_validation.h>
 #include <wallet/wallet.h>
 #include <wallet/wallet_preserve.h>  // PreserveUnreadableWallet (shared with dilv-node)
+#include <wallet/wallet_load_guard.h>  // ClassifyWalletFileWithRetry (shared with dilv-node)
 #include <wallet/passphrase_validator.h>
 #include <rpc/server.h>
 #include <rpc/auth.h>      // CVE-2026-RPC-AUTH: RPCAuth::InitializeAuth
@@ -551,6 +552,11 @@ struct NodeConfig {
     std::string mining_address_override = "";  // --mining-address=Dxxx (empty = use wallet)
     bool rotate_mining_address = false;        // --rotate-mining-address (new HD address per block)
     std::string restore_mnemonic = "";        // --restore-mnemonic="word1 word2..." (restore wallet from seed)
+    bool force_new_wallet = false;            // --force-new-wallet: start a new wallet over an unloadable
+                                              // wallet.dat, AFTER preserving a copy of it. The escape hatch
+                                              // for a user with no recovery phrase and no keys to lose;
+                                              // without it the unreadable-wallet guard has no route out
+                                              // except deleting the file it tells you not to delete.
     std::vector<std::string> connect_nodes;  // --connect nodes (exclusive)
     std::vector<std::string> add_nodes;      // --addnode nodes (additional)
     bool reindex = false;           // Phase 4.2: Rebuild block index from blocks on disk
@@ -691,6 +697,9 @@ struct NodeConfig {
             }
             else if (arg == "--rotate-mining-address") {
                 rotate_mining_address = true;
+            }
+            else if (arg == "--force-new-wallet") {
+                force_new_wallet = true;
             }
             else if (arg.find("--restore-mnemonic=") == 0) {
                 restore_mnemonic = arg.substr(19);
@@ -930,6 +939,8 @@ struct NodeConfig {
         std::cout << "  --mining-address=<addr> Send mining rewards to this address" << std::endl;
         std::cout << "  --rotate-mining-address Use a new HD address for each mined block" << std::endl;
         std::cout << "  --restore-mnemonic=\"words\" Restore wallet from 24-word recovery phrase" << std::endl;
+        std::cout << "  --force-new-wallet     Start a NEW wallet even if wallet.dat cannot be loaded" << std::endl;
+        std::cout << "                         (the old file is copied to wallet.dat.unreadable-<time> first)" << std::endl;
         std::cout << "  --verbose, -v         Show debug output (hidden by default)" << std::endl;
         std::cout << "  --quiet, -q           Quiet mode: only block events, errors, and warnings" << std::endl;
         std::cout << "  --reindex             Rebuild blockchain from scratch (use after crash)" << std::endl;
@@ -5281,70 +5292,146 @@ load_genesis_block:  // Bug #29: Label for automatic retry after blockchain wipe
         // Build wallet file path
         std::cout << "  Wallet file: " << wallet_path << std::endl;
 
-        // Try to load existing wallet from disk
-        if (std::filesystem::exists(wallet_path)) {
-            std::cout << "[3/6] Loading wallet..." << std::flush;
-            std::cout.flush();
-            if (wallet.Load(wallet_path)) {
-                wallet_loaded = true;
-                std::cout << " ✓" << std::endl;
-                std::cout << "  [OK] Wallet loaded (" << wallet.GetAddresses().size() << " addresses)" << std::endl;
-                std::cout << "       Best block: height " << wallet.GetBestBlockHeight() << std::endl;
+        // Classify the file on disk BEFORE handing it to CWallet::Load().
+        // Load() returns one undifferentiated `false` for a 0-byte file, a file
+        // held open by an antivirus scanner, and a genuinely corrupt wallet —
+        // and only the last of those is worth refusing to start over. Treating
+        // all three as corruption bricked the node on EVERY subsequent start,
+        // with a message that told the user not to remove the blocking file.
+        // See wallet/wallet_load_guard.h.
+        std::string wallet_probe_detail;
+        const WalletFileState wallet_state =
+            ClassifyWalletFileWithRetry(wallet_path, &wallet_probe_detail);
+
+        // Fail-closed cases only. `wallet_locked` picks the wording: a lock is
+        // not corruption and must not be described as such.
+        bool wallet_unreadable = false;
+        bool wallet_locked = false;
+
+        switch (wallet_state) {
+            case WalletFileState::Absent:
+                std::cout << "  No existing wallet found." << std::endl;
+                break;
+            case WalletFileState::Empty:
+                // Shorter than the 8-byte magic, so it cannot contain a key in
+                // any wallet format this project has ever written. Nothing can
+                // be lost by proceeding. This is the installer-pre-creates-the-
+                // file / unhydrated-cloud-placeholder / interrupted-first-run
+                // case, which used to be permanently fatal.
+                std::cout << "  Existing wallet.dat is empty (no wallet header), "
+                          << "treating as no wallet found." << std::endl;
+                break;
+            case WalletFileState::Unopenable:
+                wallet_unreadable = true;
+                wallet_locked = true;
+                break;
+            case WalletFileState::Invalid:
+                wallet_unreadable = true;
+                break;
+            case WalletFileState::Present:
+                std::cout << "[3/6] Loading wallet..." << std::flush;
                 std::cout.flush();
-            } else {
-                // An existing-but-unreadable wallet must NEVER fall through to
-                // creation: the create path ends in Save(wallet_path), which
-                // atomically renames over this file and destroys the keys.
-                // Preserve a copy, tell the user what to do, and stop.
-                const std::string preserved = PreserveUnreadableWallet(wallet_path);
-                if (!config.restore_mnemonic.empty()) {
-                    // The user explicitly asked to restore from a phrase, which is
-                    // the remedy this guard advertises. Honour it: the restore path
-                    // below will Save() over wallet_path, so this IS destructive —
-                    // but it is destruction the user asked for, and only after a
-                    // copy has been preserved. Refusing here would make the printed
-                    // instructions impossible to follow.
-                    if (preserved.empty()) {
-                        std::cerr << std::endl;
-                        std::cerr << "  ERROR: wallet.dat could not be loaded, and no backup copy" << std::endl;
-                        std::cerr << "         could be written. Refusing to restore over it." << std::endl;
-                        std::cerr << "         Copy wallet.dat somewhere safe, then retry." << std::endl;
-                        std::cerr.flush();
-                        return 1;
-                    }
-                    std::cerr << std::endl;
-                    std::cerr << "  NOTE: the existing wallet.dat could not be loaded." << std::endl;
-                    std::cerr << "        A copy has been preserved at:" << std::endl;
-                    std::cerr << "          " << preserved << std::endl;
-                    std::cerr << "        Continuing with the requested restore, which will replace" << std::endl;
-                    std::cerr << "        wallet.dat with a wallet derived from your recovery phrase." << std::endl;
-                    std::cerr.flush();
+                if (wallet.Load(wallet_path)) {
+                    wallet_loaded = true;
+                    std::cout << " ✓" << std::endl;
+                    std::cout << "  [OK] Wallet loaded (" << wallet.GetAddresses().size() << " addresses)" << std::endl;
+                    std::cout << "       Best block: height " << wallet.GetBestBlockHeight() << std::endl;
+                    std::cout.flush();
                 } else {
+                    wallet_unreadable = true;
+                }
+                break;
+        }
+
+        if (wallet_unreadable) {
+            // An existing-but-unreadable wallet must NEVER fall through to
+            // creation: the create path ends in Save(wallet_path), which
+            // atomically renames over this file and destroys the keys.
+            // Preserve a copy, tell the user what to do, and stop.
+            const std::string preserved = PreserveUnreadableWallet(wallet_path);
+            // Both overrides are explicit, destructive-by-request instructions
+            // from the user, and both are honoured ONLY after a copy exists.
+            const bool user_override =
+                !config.restore_mnemonic.empty() || config.force_new_wallet;
+            if (user_override) {
+                // The user explicitly asked to restore from a phrase, or to
+                // start a new wallet anyway. Those are the remedies this guard
+                // advertises. Honour them: the path below will Save() over
+                // wallet_path, so this IS destructive — but it is destruction
+                // the user asked for, and only after a copy has been preserved.
+                // Refusing here would make the printed instructions impossible
+                // to follow.
+                if (preserved.empty()) {
                     std::cerr << std::endl;
-                    std::cerr << "  ERROR: wallet.dat exists but could not be loaded." << std::endl;
-                    std::cerr << "         Refusing to start, because creating a new wallet here would" << std::endl;
-                    std::cerr << "         overwrite this file and destroy the keys in it." << std::endl;
-                    if (!preserved.empty()) {
-                        std::cerr << "         A copy has been preserved at:" << std::endl;
-                        std::cerr << "           " << preserved << std::endl;
-                    } else {
-                        std::cerr << "         WARNING: a backup copy could NOT be written. Copy" << std::endl;
-                        std::cerr << "         wallet.dat somewhere safe before doing anything else." << std::endl;
-                    }
-                    std::cerr << "         Your coins live on the chain, not in this file." << std::endl;
-                    std::cerr << "         If you HAVE your 24-word recovery phrase, rerun with:" << std::endl;
-                    std::cerr << "           --restore-mnemonic=\"<your 24 words>\"" << std::endl;
-                    std::cerr << "         which will restore over this file (the preserved copy is kept)." << std::endl;
-                    std::cerr << "         If you do NOT have the phrase, do not delete wallet.dat —" << std::endl;
-                    std::cerr << "         keep it and report this with the version you upgraded from." << std::endl;
-                    std::cerr << "         Stopping now. This is a deliberate stop, not a crash —" << std::endl;
-                    std::cerr << "         your wallet file was left exactly as it was." << std::endl;
+                    std::cerr << "  ERROR: wallet.dat could not be loaded, and no backup copy" << std::endl;
+                    std::cerr << "         could be written. Refusing to write over it." << std::endl;
+                    std::cerr << "         Copy wallet.dat somewhere safe, then retry." << std::endl;
                     std::cerr.flush();
                     return 1;
                 }
+                std::cerr << std::endl;
+                std::cerr << "  NOTE: the existing wallet.dat could not be loaded." << std::endl;
+                std::cerr << "        A copy has been preserved at:" << std::endl;
+                std::cerr << "          " << preserved << std::endl;
+                if (!config.restore_mnemonic.empty()) {
+                    std::cerr << "        Continuing with the requested restore, which will replace" << std::endl;
+                    std::cerr << "        wallet.dat with a wallet derived from your recovery phrase." << std::endl;
+                } else {
+                    std::cerr << "        Continuing because --force-new-wallet was given, which will" << std::endl;
+                    std::cerr << "        replace wallet.dat with a NEW, EMPTY wallet. The old file is" << std::endl;
+                    std::cerr << "        kept only at the path above — keep it safe." << std::endl;
+                }
+                std::cerr.flush();
+            } else if (wallet_locked) {
+                // Nothing is known about the contents: the file could not be
+                // opened at all, after retries. That reads as a lock or a
+                // permissions problem, NOT as corruption, and saying "corrupt"
+                // here sends users to recovery procedures they do not need.
+                std::cerr << std::endl;
+                std::cerr << "  ERROR: wallet.dat exists but could not be OPENED." << std::endl;
+                if (!wallet_probe_detail.empty()) {
+                    std::cerr << "         Reason: " << wallet_probe_detail << std::endl;
+                }
+                std::cerr << "         This usually means another process is holding the file" << std::endl;
+                std::cerr << "         (a second node, antivirus, a backup or cloud-sync client)," << std::endl;
+                std::cerr << "         or that the file is not readable by this user." << std::endl;
+                std::cerr << "         It does NOT mean your wallet is damaged, and nothing was" << std::endl;
+                std::cerr << "         written to it. Retried several times before giving up." << std::endl;
+                std::cerr << "         Try: close any other Dilithion node, make sure the file has" << std::endl;
+                std::cerr << "         hydrated if it lives in OneDrive/Dropbox/iCloud, check the" << std::endl;
+                std::cerr << "         file's permissions, then start again." << std::endl;
+                std::cerr << "         Stopping now. This is a deliberate stop, not a crash —" << std::endl;
+                std::cerr << "         your wallet file was left exactly as it was." << std::endl;
+                std::cerr.flush();
+                return 1;
+            } else {
+                std::cerr << std::endl;
+                std::cerr << "  ERROR: wallet.dat exists but could not be loaded." << std::endl;
+                std::cerr << "         Refusing to start, because creating a new wallet here would" << std::endl;
+                std::cerr << "         overwrite this file and destroy the keys in it." << std::endl;
+                if (!preserved.empty()) {
+                    std::cerr << "         A copy has been preserved at:" << std::endl;
+                    std::cerr << "           " << preserved << std::endl;
+                } else {
+                    std::cerr << "         WARNING: a backup copy could NOT be written. Copy" << std::endl;
+                    std::cerr << "         wallet.dat somewhere safe before doing anything else." << std::endl;
+                }
+                std::cerr << "         Your coins live on the chain, not in this file." << std::endl;
+                std::cerr << "         If you HAVE your 24-word recovery phrase, rerun with:" << std::endl;
+                std::cerr << "           --restore-mnemonic=\"<your 24 words>\"" << std::endl;
+                std::cerr << "         which will restore over this file (the preserved copy is kept)." << std::endl;
+                std::cerr << "         If you never had a wallet here and just want to start with a" << std::endl;
+                std::cerr << "         fresh one, rerun with:" << std::endl;
+                std::cerr << "           --force-new-wallet" << std::endl;
+                std::cerr << "         which also keeps the preserved copy. Do NOT use it if this" << std::endl;
+                std::cerr << "         file might hold coins you have no recovery phrase for." << std::endl;
+                std::cerr << "         If you do NOT have the phrase, do not delete wallet.dat —" << std::endl;
+                std::cerr << "         keep it and report this with the version you upgraded from." << std::endl;
+                std::cerr << "         Stopping now. This is a deliberate stop, not a crash —" << std::endl;
+                std::cerr << "         your wallet file was left exactly as it was." << std::endl;
+                std::cerr.flush();
+                return 1;
             }
-        } else {
-            std::cout << "  No existing wallet found." << std::endl;
         }
 
         // Generate HD wallet if wallet is empty (new wallet creation) or restore from mnemonic
