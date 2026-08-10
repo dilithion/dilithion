@@ -354,6 +354,33 @@ public:
  */
 int64_t CalculatePendingPenaltyFP(int currentHeight, int firstSeenHeight);
 
+// ============================================================================
+// C-3 ACTIVATION GATE (SINGLE SOURCE OF TRUTH)
+// ============================================================================
+
+/**
+ * C-3: is the saturating heat math active at `height`?
+ *
+ * THE single source of truth for the `saturate` flag threaded through every
+ * CalculateHeatMultiplierFP* / CalculateTotalMultiplierFP* / CombineMaturityHeatFP
+ * call. The consensus validator (consensus/pow.cpp), the miner
+ * (miner/controller.cpp) and both node mining-state mirrors
+ * (node/dilithion-node.cpp, node/dilv-node.cpp) MUST route through this function
+ * and MUST NOT re-derive the comparison locally: a single `>` vs `>=` divergence
+ * between miner and validator is a chain split at exactly the activation boundary.
+ * `dfmp_heat_overflow_tests` enforces that by scanning the sources.
+ *
+ * Semantics (frozen — byte-identical to the four hand-written sites it replaces):
+ *   - null g_chainParams            -> false (legacy math)
+ *   - height <  activation height   -> false (legacy math)
+ *   - height >= activation height   -> true  (saturating math)
+ *
+ * @param height Block height being validated/mined (validator passes `height`;
+ *               callers holding an unsigned nHeight pass static_cast<int>(nHeight),
+ *               exactly as the replaced inline expressions did).
+ */
+bool DfmpSaturatingMathActive(int height);
+
 /**
  * Calculate heat multiplier (fixed-point) with dynamic scaling
  *

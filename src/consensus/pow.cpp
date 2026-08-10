@@ -412,7 +412,9 @@ bool CheckProofOfWorkDFMP(
     // C-3: saturating heat math gate. At/above the activation height, heat-penalty fns
     // saturate at FP_HEAT_MULTIPLIER_MAX instead of overflowing int64 (which wrapped the
     // heaviest miner to the easiest 1.0x target). Below the gate: byte-identical legacy math.
-    bool dfmpSat = Dilithion::g_chainParams && height >= Dilithion::g_chainParams->dfmpOverflowFixActivationHeight;
+    // Single-sourced in DFMP::DfmpSaturatingMathActive (src/dfmp/dfmp.cpp) so miner and
+    // validator cannot drift at the activation boundary.
+    bool dfmpSat = DFMP::DfmpSaturatingMathActive(height);
 
     int64_t multiplierFP;
 

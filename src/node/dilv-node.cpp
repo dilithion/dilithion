@@ -1708,9 +1708,8 @@ std::optional<CBlockTemplate> BuildMiningTemplate(CBlockchainDB& blockchain, CWa
         int dfmpV34ActivationHeight = Dilithion::g_chainParams ?
             Dilithion::g_chainParams->dfmpV34ActivationHeight : 999999999;
 
-        // C-3: saturating heat math gate (must match validator pow.cpp exactly).
-        bool dfmpSat = Dilithion::g_chainParams &&
-            static_cast<int>(nHeight) >= Dilithion::g_chainParams->dfmpOverflowFixActivationHeight;
+        // C-3: saturating heat math gate — single-sourced with the validator.
+        bool dfmpSat = DFMP::DfmpSaturatingMathActive(static_cast<int>(nHeight));
 
         int64_t multiplierFP;
         double payoutHeatMult = 1.0;
