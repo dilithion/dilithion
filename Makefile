@@ -496,7 +496,7 @@ dilv-genesis-vdf: $(CORE_OBJECTS) $(OBJ_DIR)/tools/dilv_genesis_vdf.o $(DILITHIU
 # Test Binaries
 # ============================================================================
 
-tests: phase1_test miner_tests wallet_tests rpc_tests rpc_auth_tests rpc_host_header_tests http_server_wallet_gate_tests ratelimiter_tests timestamp_tests crypter_tests seed_attestation_key_tests wallet_encryption_integration_tests wallet_persistence_tests integration_tests net_tests connman_tests tx_validation_tests tx_relay_tests mining_integration_tests bug_003_block_size_tests dfmp_mik_tests dfmp_heat_overflow_tests mik_registration_persistence_tests dna_propagation_tests test_passphrase_validator script_tests addrman_v2_tests peer_scorer_tests peer_scorer_banman_integration_tests header_proof_checker_tests chain_selector_tests getchaintips_equivalence_tests chain_case_2_5_equivalence_tests chain_work_smoke_tests reorg_wal_crash_injection_tests competing_sibling_below_checkpoint_tests headers_manager_to_chain_selector_wiring_tests fast_path_2_boundary_tests v4_1_checkpoint_enforcement_tests v4_1_chain_selector_suppression_tests auto_rebuild_marker_mode_symmetry_tests add_block_index_flag_merge_tests port_chain_selector_invariants_tests legacy_vs_port_differential_tests chainstate_integrity_tests magnet_canonical_health_tests
+tests: phase1_test miner_tests wallet_tests wallet_load_guard_tests rpc_tests rpc_auth_tests rpc_host_header_tests http_server_wallet_gate_tests ratelimiter_tests timestamp_tests crypter_tests seed_attestation_key_tests wallet_encryption_integration_tests wallet_persistence_tests integration_tests net_tests connman_tests tx_validation_tests tx_relay_tests mining_integration_tests bug_003_block_size_tests dfmp_mik_tests dfmp_heat_overflow_tests mik_registration_persistence_tests dna_propagation_tests test_passphrase_validator script_tests addrman_v2_tests peer_scorer_tests peer_scorer_banman_integration_tests header_proof_checker_tests chain_selector_tests getchaintips_equivalence_tests chain_case_2_5_equivalence_tests chain_work_smoke_tests reorg_wal_crash_injection_tests competing_sibling_below_checkpoint_tests headers_manager_to_chain_selector_wiring_tests fast_path_2_boundary_tests v4_1_checkpoint_enforcement_tests v4_1_chain_selector_suppression_tests auto_rebuild_marker_mode_symmetry_tests add_block_index_flag_merge_tests port_chain_selector_invariants_tests legacy_vs_port_differential_tests chainstate_integrity_tests magnet_canonical_health_tests
 	@echo "$(COLOR_GREEN)✓ All tests built successfully$(COLOR_RESET)"
 
 phase1_test: $(CORE_OBJECTS) $(OBJ_DIR)/test/phase1_simple_test.o $(DILITHIUM_OBJECTS) $(CHIAVDF_OBJECTS)
@@ -573,6 +573,13 @@ wallet_encryption_integration_tests: $(CORE_OBJECTS) $(OBJ_DIR)/test/wallet_encr
 wallet_persistence_tests: $(CORE_OBJECTS) $(OBJ_DIR)/test/wallet_persistence_tests.o $(DILITHIUM_OBJECTS) $(CHIAVDF_OBJECTS)
 	@echo "$(COLOR_BLUE)[LINK]$(COLOR_RESET) $@"
 	@$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS) $(LIBS)
+
+# wallet/wallet_load_guard.h is header-only and depends on nothing but the
+# standard library, so this test links against its own object alone — no
+# CORE_OBJECTS, and it builds in seconds.
+wallet_load_guard_tests: $(OBJ_DIR)/test/wallet_load_guard_tests.o
+	@echo "$(COLOR_BLUE)[LINK]$(COLOR_RESET) $@"
+	@$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS)
 
 # LP-7: wallet encryption-at-rest fix tests (secrecy regression + negative control,
 # migration round-trip + interrupted migration, auth-tamper rejection).
@@ -855,6 +862,18 @@ competing_sibling_below_checkpoint_tests: $(CORE_OBJECTS) $(OBJ_DIR)/test/compet
 	@$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS) $(LIBS)
 	@echo "$(COLOR_GREEN)✓ competing_sibling_below_checkpoint_tests built successfully$(COLOR_RESET)"
 
+# Genesis validity regression suite — pins that EVERY network's genesis block
+# constructs and passes the node's own boot-time IsGenesisBlock() gate.
+# Added 2026-08-08 after dilithion-node --testnet / --regtest were found
+# unbootable for ~4.5 months with no test covering it.
+# Run once per network to also cover GetGenesisHash() (call_once-cached):
+#   ./genesis_all_networks_tests mainnet && ./genesis_all_networks_tests testnet \
+#     && ./genesis_all_networks_tests dilv && ./genesis_all_networks_tests regtest
+genesis_all_networks_tests: $(CORE_OBJECTS) $(OBJ_DIR)/test/genesis_all_networks_tests.o $(DILITHIUM_OBJECTS) $(CHIAVDF_OBJECTS)
+	@echo "$(COLOR_BLUE)[LINK]$(COLOR_RESET) $@"
+	@$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS) $(LIBS)
+	@echo "$(COLOR_GREEN)✓ genesis_all_networks_tests built successfully$(COLOR_RESET)"
+
 # Phase 5 Day 5: regtest mode scaffold smoke test.
 regtest_chainparams_smoke: $(CORE_OBJECTS) $(OBJ_DIR)/test/regtest_chainparams_smoke.o $(DILITHIUM_OBJECTS) $(CHIAVDF_OBJECTS)
 	@echo "$(COLOR_BLUE)[LINK]$(COLOR_RESET) $@"
@@ -1002,6 +1021,8 @@ BOOST_TEST_OBJECTS := $(OBJ_DIR)/test/test_dilithion.o \
 	$(OBJ_DIR)/test/zmq_tests.o \
 	$(OBJ_DIR)/test/seed_attestation_glue_tests.o \
 	$(OBJ_DIR)/test/wf1_host_endian_differential_test.o \
+	$(OBJ_DIR)/test/miner_nonce_write_tests.o \
+	$(OBJ_DIR)/test/chain_tips_cache_invalidation_tests.o \
 	$(CRYPTO_PROPERTY_OBJECTS)
 
 # Link test objects + full library (CORE_OBJECTS) to avoid hand-picked object drift
@@ -1122,6 +1143,9 @@ test: tests test_dilithion asert_test wallet_load_guard_test
 	@echo ""
 	@echo "$(COLOR_YELLOW)Running wallet persistence tests...$(COLOR_RESET)"
 	@./wallet_persistence_tests
+	@echo ""
+	@echo "$(COLOR_YELLOW)Running wallet load-guard tests...$(COLOR_RESET)"
+	@./wallet_load_guard_tests
 	@echo ""
 	@echo "$(COLOR_YELLOW)Running passphrase validator tests...$(COLOR_RESET)"
 	@./test_passphrase_validator

@@ -521,6 +521,27 @@ public:
     bool IsRegtest() const { return network == REGTEST; }
 
     /**
+     * True when this chain runs VDF consensus from height 0, i.e. its genesis
+     * block is a VDF block (CBlockHeader::VDF_VERSION) rather than a legacy
+     * RandomX block.
+     *
+     * WHY THIS EXISTS: `IsDilV()` was used across the codebase as a proxy for
+     * "is a VDF chain". That proxy is WRONG for TESTNET (converted to VDF-only
+     * from genesis in d6e67172, 2026-03-25) and for REGTEST (which derives from
+     * Testnet). Each site that got bitten patched itself independently
+     * (pow.cpp::GetNextWorkRequired added `|| IsRegtest()`; genesis.cpp inlined
+     * the height check) while other sites silently kept the wrong answer —
+     * which is exactly how `dilithion-node --testnet` / `--regtest` came to
+     * build a legacy genesis and fail its own IsGenesisBlock() check.
+     *
+     * Use this predicate for any "which genesis / which consensus" question.
+     * Do NOT re-derive it inline.
+     */
+    bool IsVdfFromGenesis() const {
+        return IsDilV() || (vdfActivationHeight == 0 && vdfExclusiveHeight == 0);
+    }
+
+    /**
      * MAINNET SECURITY: Get the last checkpoint at or before given height
      *
      * Used during chain reorganization to reject reorgs that would

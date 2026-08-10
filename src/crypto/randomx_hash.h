@@ -35,6 +35,25 @@ int randomx_is_ready();
 // Wait for RandomX initialization to complete
 void randomx_wait_for_init();
 
+// Shut the module's background init threads down. MUST be called on every exit
+// path of any binary that can reach randomx_init_async() or
+// randomx_init_mining_mode_async() -- normal shutdown AND every early return.
+//
+// The async initializers run in namespace-scope std::thread objects. A joinable
+// std::thread destroyed at static-destruction time calls std::terminate(), which
+// happens after main() has returned and so REPLACES the process's intended exit
+// code with an abort code. Both node binaries therefore hold an RAII guard local
+// to main() whose destructor calls this; the module also registers it with
+// std::atexit as a backstop.
+//
+// Sets a cancellation flag first, so an in-flight FULL-mode dataset build stops
+// at the next batch boundary rather than making shutdown wait it out. Joins (never
+// detaches): the init threads write objects with static storage duration in the
+// RandomX translation unit, and letting them outlive teardown would be a
+// use-after-free. Safe to call more than once, and safe to call having never
+// initialized anything.
+void randomx_shutdown();
+
 // ============================================================================
 // BUG #55 FIX: Monero-Style Dual-Mode RandomX Architecture
 // ============================================================================
@@ -135,6 +154,21 @@ void randomx_hash_thread(void* vm, const void* input, size_t input_len, void* ou
 
 #ifdef __cplusplus
 }
+
+// Declare ONE of these as the first local in main(). Its destructor runs on
+// every return from main -- the early config/genesis/wallet-refusal returns
+// included -- so no exit path can forget randomx_shutdown() and leave a joinable
+// namespace-scope std::thread to std::terminate() at static destruction.
+//
+// Single-sourced here on purpose: dilithion-node and dilv-node both need it, and
+// a copy per binary is exactly how the DilV half of the previous wallet-guard fix
+// got missed.
+struct RandomXShutdownGuard {
+    RandomXShutdownGuard() = default;
+    ~RandomXShutdownGuard() { randomx_shutdown(); }
+    RandomXShutdownGuard(const RandomXShutdownGuard&) = delete;
+    RandomXShutdownGuard& operator=(const RandomXShutdownGuard&) = delete;
+};
 #endif
 
 #endif // BITCOIN_CRYPTO_RANDOMX_HASH_H

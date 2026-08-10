@@ -468,7 +468,12 @@ void CMiningController::MiningWorker(uint32_t threadId) {
         // BUG #24 FIX: Fast nonce update (only 4 bytes, no allocations)
         // Update nonce in place at offset 76 (last 4 bytes of 80-byte header)
         uint32_t nonce32 = static_cast<uint32_t>(nonce64 & 0xFFFFFFFF);
-        WriteLE32(header + 76, nonce32);  // WF-1: explicit LE, byte-equal on LE hosts
+        // WF-1: explicit LE, byte-equal on LE hosts. The offset lives in
+        // WriteMiningNonceLE (primitives/block.h) so this hot-loop write and
+        // WriteMiningHeaderLE's template-change write cannot drift apart —
+        // the bare `header + 76` literal that used to be here was untested and
+        // a wrong offset silently invalidates every block this miner finds.
+        WriteMiningNonceLE(header, nonce32);
 
         // Compute RandomX hash
         try {
@@ -1203,9 +1208,8 @@ std::optional<CBlockTemplate> CMiningController::CreateBlockTemplate(
                 Dilithion::g_chainParams->dfmpV32ActivationHeight : 999999999;
             int dfmpV33Height = Dilithion::g_chainParams ?
                 Dilithion::g_chainParams->dfmpV33ActivationHeight : 999999999;
-            // C-3: saturating heat math gate (must match validator pow.cpp exactly).
-            bool dfmpSat = Dilithion::g_chainParams &&
-                static_cast<int>(nHeight) >= Dilithion::g_chainParams->dfmpOverflowFixActivationHeight;
+            // C-3: saturating heat math gate — single-sourced with the validator.
+            bool dfmpSat = DFMP::DfmpSaturatingMathActive(static_cast<int>(nHeight));
             int64_t multiplierFP;
             if (static_cast<int>(nHeight) >= dfmpV33Height) {
                 multiplierFP = DFMP::CalculateTotalMultiplierFP_V33(nHeight, firstSeen, heat, dfmpSat);
