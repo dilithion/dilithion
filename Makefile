@@ -1532,10 +1532,16 @@ FUZZ_CXX ?= $(shell command -v clang++-14 2>/dev/null || command -v clang++ 2>/d
 #  3. Harness TUs (src/test/fuzz/*.cpp) are test code and must never rely on
 #     signed wrapping. They keep full UBSan, signed-integer-overflow included.
 #
-# Verified with clang++-14: with -fwrapv the harness objects contain NO
-# __ubsan_handle_*_overflow relocation at all; without it the check is present
-# and fires, while the attributed DFMP functions stay silent even when the same
-# TU is compiled with -fsanitize=undefined.
+# Measured with clang++-14 (a deliberate int64 overflow injected into a fuzz
+# harness TU, then reverted):
+#   with    -fwrapv: no __ubsan_handle_{mul,add,sub}_overflow reference is
+#                    emitted at all, and the run completes silently with the
+#                    wrapped value -- the check is not merely quiet, it is gone.
+#   without -fwrapv: the reference is emitted and UBSan reports the overflow at
+#                    the exact source line.
+# And with src/dfmp/dfmp.cpp itself compiled under -fsanitize=undefined: the
+# attributed heat functions overflow silently, while an unattributed function in
+# the SAME translation unit still reports -- so the exemption does not leak.
 # ---------------------------------------------------------------------------
 FUZZ_CXXFLAGS := -fsanitize=fuzzer,address,undefined -std=c++17 -O1 -g $(INCLUDES) -DDILITHIUM_MODE=3
 

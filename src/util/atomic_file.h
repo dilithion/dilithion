@@ -9,29 +9,50 @@
 // that the destination is, at EVERY instant, either the complete old file or
 // the complete new file. Never torn. Never absent.
 //
-// WHY THIS IS NOT `std::filesystem::rename`
-// -----------------------------------------
-// On POSIX, rename(2) over an existing path is atomic by specification, and
-// std::filesystem::rename is a thin wrapper over it. Correct, nothing to do.
+// WHY NOT JUST std::filesystem::rename -- WHAT WAS ACTUALLY MEASURED
+// -------------------------------------------------------------------
+// On POSIX, rename(2) over an existing path is atomic by specification and
+// fs::rename is a thin wrapper over it. Nothing to fix there.
 //
-// On Windows it is NOT. libstdc++'s std::filesystem::rename is implemented with
-// _wrename(), and the C runtime's rename FAILS with EEXIST when the destination
-// already exists. Two things follow, and BOTH have been found in this tree:
+// On Windows the situation is more subtle than the folklore, so this comment
+// records what was MEASURED rather than what is commonly asserted. On the
+// toolchain this project ships with (MinGW-w64, GCC 15.2, __GLIBCXX__
+// 20250808 -- the same rolling MSYS2 the release workflows install):
 //
-//   (a) Code that calls fs::rename with no fallback silently fails on every
-//       save after the first — the file is written once and then never
-//       updated again, while the caller's "atomic" comment says otherwise.
+//     fs::rename(tmp, dst)   with dst existing -> SUCCEEDS, dst replaced
+//     std::rename(tmp, dst)  with dst existing -> FAILS, errno EEXIST (17)
 //
-//   (b) Code that "fixes" (a) with a remove-then-rename fallback opens a
-//       window in which the destination DOES NOT EXIST. Measured, not assumed:
-//       a kill-race probe against that fallback caught the file absent on
-//       15 of 15 killed writes. Absent is not atomic.
+// i.e. libstdc++ is NOT calling _wrename here; it is making a Win32 replace
+// call, so the operation is already a genuine atomic replace. Code on this
+// path was therefore NOT producing torn or absent files today. Do not "fix"
+// anything by citing the _wrename story as a current fact -- for this
+// toolchain it is not one.
 //
-// The correct Windows primitive is MoveFileExW(MOVEFILE_REPLACE_EXISTING),
-// which performs the replace as a single filesystem operation. That is what
-// src/wallet/wallet.cpp and src/attestation/seed_attestation.cpp already do;
-// this header exists so that pattern has ONE implementation rather than a
-// fourth hand-rolled copy.
+// What this helper buys anyway, and why the callers were moved onto it:
+//
+//   (1) The guarantee stops resting on an unspecified libstdc++ implementation
+//       detail. The standard's replace semantics for fs::rename have not always
+//       been delivered by MinGW libstdc++ (older releases did use _wrename,
+//       which cannot replace), and this project ships three separately-built
+//       binaries. MoveFileExW states the requirement in the source instead of
+//       hoping the library keeps its current behaviour.
+//
+//   (2) Durability. MOVEFILE_WRITE_THROUGH makes the replace itself durable;
+//       fs::rename gives no such guarantee.
+//
+//   (3) It retires the remove-then-rename FALLBACK that callers had grown to
+//       paper over (1). That shape is genuinely destructive wherever it is
+//       reached: a condition-triggered kill placed between the remove and the
+//       rename left mik_registration.dat ABSENT on 20 of 20 killed writes. On
+//       the current toolchain the fallback is dead code -- fs::rename succeeds
+//       so it never runs, and in the two realistic triggers that DO make
+//       fs::rename fail (destination held open by another handle; destination
+//       marked read-only) the fallback's remove() also fails, so nothing was
+//       lost. It is a loaded gun that currently happens not to fire.
+//
+//   (4) One implementation. src/wallet/wallet.cpp and
+//       src/attestation/seed_attestation.cpp already hand-rolled this
+//       MoveFileExW dance; this is the shared version rather than a fourth copy.
 //
 // DURABILITY IS A SEPARATE PROPERTY
 // ---------------------------------

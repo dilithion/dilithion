@@ -151,14 +151,15 @@ std::string AtomicWrite(const std::filesystem::path& target,
 
     // Publish atomically, and NOT with std::filesystem::rename.
     //
-    // This used to be a bare fs::rename(tmp, target). On POSIX that is correct.
-    // On Windows libstdc++ implements it with _wrename(), which FAILS when the
-    // destination already exists -- so on Windows every dump after the very
-    // first one failed at this line, and mempool.dat silently stopped being
-    // updated. util::AtomicReplaceFile uses MoveFileExW(MOVEFILE_REPLACE_EXISTING
-    // | MOVEFILE_WRITE_THROUGH) there and rename(2) + parent-dir fsync on POSIX,
-    // so `target` is at every instant either the complete old file or the
-    // complete new one. See src/util/atomic_file.h.
+    // This used to be a bare fs::rename(tmp, target). On POSIX that is correct,
+    // and on the libstdc++ we currently ship it is correct on Windows too
+    // (measured: it performs a real replace). But that is library behaviour we
+    // do not control and MinGW has not always provided it.
+    // util::AtomicReplaceFile states the requirement instead:
+    // MoveFileExW(MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) on
+    // Windows, rename(2) + parent-dir fsync on POSIX -- so `target` is at every
+    // instant either the complete old file or the complete new one, and the
+    // replace is durable. See src/util/atomic_file.h.
     //
     // durable=true subsumes the parent-directory fsync this function used to do
     // via its own local FsyncParentDir (now removed -- one implementation, in

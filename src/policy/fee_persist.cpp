@@ -182,13 +182,13 @@ std::string AtomicWrite(const std::filesystem::path& target,
     }
     std::fclose(f);
 
-    // Publish atomically. Identical defect and identical fix to
-    // src/node/mempool_persist.cpp (these two writers are line-for-line
-    // clones): std::filesystem::rename is _wrename() on Windows and FAILS when
-    // the destination exists, so every save after the first one failed here.
-    // util::AtomicReplaceFile uses MoveFileExW(MOVEFILE_REPLACE_EXISTING |
-    // MOVEFILE_WRITE_THROUGH) on Windows, rename(2) + parent-dir fsync on
-    // POSIX. durable=true subsumes the FsyncParentDir call that used to follow.
+    // Publish atomically. Same change as src/node/mempool_persist.cpp (these
+    // two writers are line-for-line clones): the publish no longer depends on
+    // std::filesystem::rename's Windows behaviour, which is a libstdc++
+    // implementation detail rather than a guarantee. util::AtomicReplaceFile
+    // uses MoveFileExW(MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) on
+    // Windows and rename(2) + parent-dir fsync on POSIX; durable=true subsumes
+    // the FsyncParentDir call that used to follow. See src/util/atomic_file.h.
     std::string move_err;
     if (!util::AtomicReplaceFile(tmp, target, &move_err, /*durable=*/true)) {
         // No-op if the replace succeeded and only the durability step failed;

@@ -52,10 +52,12 @@
 // torn, never absent. On any failure the .new file is removed and the prior
 // fee_estimates.dat is left intact.
 //
-// CORRECTION (M4): the publish previously used std::filesystem::rename, which
-// on Windows is _wrename() and FAILS when the destination exists -- so this
-// "atomicity" paragraph described a save that, on Windows, simply did not
-// happen after the first one. Do not reintroduce it; see src/util/atomic_file.h.
+// CORRECTION (M4): the publish previously used std::filesystem::rename and
+// this paragraph asserted the resulting atomicity as a property of the
+// platform. On the toolchain we ship, fs::rename does perform an atomic
+// replace -- but that is a libstdc++ implementation detail, not a guarantee,
+// and it has not always been true on MinGW. The requirement is now stated in
+// the source. Measured results are in src/util/atomic_file.h.
 //
 // Cold-start semantics: any of (file missing, version mismatch, footer
 // mismatch, malformed body, bucket-ladder mismatch) yields LoadResult{

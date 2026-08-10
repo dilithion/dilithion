@@ -86,12 +86,20 @@ bool SaveMIKRegistration(const std::string& datadir,
         out.flush();
     }
 
-    // Publish atomically. This file holds a MINED registration proof-of-work —
+    // Publish atomically. This file holds a MINED registration proof-of-work --
     // it is not reconstructible from chain, so losing it costs the operator real
-    // work. The previous code here did fs::rename and, on failure, fell back to
-    // remove-then-rename; on Windows fs::rename ALWAYS fails when the
-    // destination exists, so the fallback was the normal path and every update
-    // ran through a window in which mik_registration.dat did not exist at all.
+    // work.
+    //
+    // The previous code did fs::rename and, on any error, fell back to
+    // fs::remove(finalPath) followed by a second fs::rename. That fallback is
+    // what is being removed here. On the toolchain we ship it never ran
+    // (fs::rename succeeds over an existing destination -- measured), and in the
+    // realistic triggers where fs::rename DOES fail (destination held open by
+    // another handle; destination read-only) the fallback's remove() fails too,
+    // so nothing was actually lost. But the SHAPE is destructive wherever it is
+    // reached: a condition-triggered kill placed between the remove and the
+    // rename left this file ABSENT on 20 of 20 killed writes. A single
+    // MoveFileExW replace has no such point to be killed at.
     // durable=true: MOVEFILE_WRITE_THROUGH / parent-dir fsync.
     // See src/util/atomic_file.h.
     std::string moveErr;

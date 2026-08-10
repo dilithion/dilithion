@@ -51,14 +51,15 @@
 // complete new one: never torn, never absent. If the publish fails, the .new
 // file is removed and the prior mempool.dat is left intact.
 //
-// CORRECTION (M4): this comment previously claimed the publish used
-// std::filesystem::rename and that this "is also atomic on NTFS for same-volume
-// moves". That was wrong in a way that mattered. libstdc++ implements
-// std::filesystem::rename with _wrename(), which FAILS outright when the
-// destination already exists -- so on Windows the guarantee documented here was
-// not merely weaker than stated, the publish did not happen at all on any dump
-// after the first. Do not reintroduce std::filesystem::rename on this path; see
-// the rationale block in src/util/atomic_file.h.
+// CORRECTION (M4): this paragraph previously said the publish used
+// std::filesystem::rename, "which is also atomic on NTFS for same-volume
+// moves". The conclusion happened to hold on the toolchain we ship, but the
+// stated reason was wrong and the guarantee was not ours to make: the
+// atomicity comes from the Win32 replace call libstdc++ chooses to make, not
+// from NTFS, and older MinGW libstdc++ releases made a different choice
+// (_wrename, which cannot replace an existing file at all). The publish is now
+// stated explicitly in the source rather than inherited from library
+// behaviour. Measured results are recorded in src/util/atomic_file.h.
 
 #include <atomic>
 #include <cstddef>
@@ -114,7 +115,9 @@ struct LoadResult {
 };
 
 /**
- * Atomic save: write to <datadir>/mempool.dat.new, fsync, rename to mempool.dat.
+ * Atomic save: write to <datadir>/mempool.dat.new, fsync, then atomically
+ * replace mempool.dat via util::AtomicReplaceFile() (NOT std::filesystem::rename
+ * -- see the header comment above and src/util/atomic_file.h).
  * Caller must hold no mempool lock; this function takes the mempool lock
  * internally via GetAllEntries().
  *
