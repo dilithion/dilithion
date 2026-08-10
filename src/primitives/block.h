@@ -187,9 +187,14 @@ public:
 // Both miner/controller.cpp AND the WF-1 differential test call THIS function, so
 // the test drives the real production assembly (no hand-copied mirror).
 //
-// `dst` MUST point to at least 80 writable bytes. `nonce32` is written at
-// MINING_HEADER_NONCE_OFFSET (the field the hot loop mutates each iteration);
-// h.nNonce is ignored.
+// `dst` MUST point to at least MINING_HEADER_SIZE (80) writable bytes. `nonce32` is
+// written at MINING_HEADER_NONCE_OFFSET (76) — the field the hot loop mutates each
+// iteration; h.nNonce is ignored.
+//
+// K1: every offset below is a named constant because the bare literals were hand-copied
+// into several unrelated files and only some of them got unified. Any new site that needs
+// the legacy 80-byte layout MUST call WriteMiningHeaderLE() / WriteMiningNonceLE() (or use
+// these constants), never re-type the numbers.
 
 /**
  * Byte offset of the nonce field inside the 80-byte legacy PoW preimage.
@@ -206,6 +211,13 @@ public:
  */
 static constexpr size_t MINING_HEADER_NONCE_OFFSET = 76;
 
+static constexpr size_t MINING_HEADER_VERSION_OFFSET = 0;
+static constexpr size_t MINING_HEADER_PREVHASH_OFFSET = 4;
+static constexpr size_t MINING_HEADER_MERKLE_OFFSET = 36;
+static constexpr size_t MINING_HEADER_TIME_OFFSET = 68;
+static constexpr size_t MINING_HEADER_BITS_OFFSET = 72;
+static constexpr size_t MINING_HEADER_SIZE = 80;
+
 /**
  * Rewrite ONLY the nonce field of an already-assembled 80-byte mining header.
  * This is the per-iteration write in the miner hot loop.
@@ -215,11 +227,11 @@ inline void WriteMiningNonceLE(uint8_t* dst, uint32_t nonce32) {
 }
 
 inline void WriteMiningHeaderLE(uint8_t* dst, const CBlockHeader& h, uint32_t nonce32) {
-    WriteLE32(dst + 0, static_cast<uint32_t>(h.nVersion));
-    memcpy(dst + 4,  h.hashPrevBlock.begin(), 32);
-    memcpy(dst + 36, h.hashMerkleRoot.begin(), 32);
-    WriteLE32(dst + 68, h.nTime);
-    WriteLE32(dst + 72, h.nBits);
+    WriteLE32(dst + MINING_HEADER_VERSION_OFFSET, static_cast<uint32_t>(h.nVersion));
+    memcpy(dst + MINING_HEADER_PREVHASH_OFFSET, h.hashPrevBlock.begin(), 32);
+    memcpy(dst + MINING_HEADER_MERKLE_OFFSET, h.hashMerkleRoot.begin(), 32);
+    WriteLE32(dst + MINING_HEADER_TIME_OFFSET, h.nTime);
+    WriteLE32(dst + MINING_HEADER_BITS_OFFSET, h.nBits);
     WriteMiningNonceLE(dst, nonce32);
 }
 
