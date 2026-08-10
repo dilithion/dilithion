@@ -1724,9 +1724,8 @@ std::optional<CBlockTemplate> BuildMiningTemplate(CBlockchainDB& blockchain, CWa
         int dfmpV34ActivationHeight = Dilithion::g_chainParams ?
             Dilithion::g_chainParams->dfmpV34ActivationHeight : 999999999;
 
-        // C-3: saturating heat math gate (must match validator pow.cpp exactly).
-        bool dfmpSat = Dilithion::g_chainParams &&
-            static_cast<int>(nHeight) >= Dilithion::g_chainParams->dfmpOverflowFixActivationHeight;
+        // C-3: saturating heat math gate — single-sourced with the validator.
+        bool dfmpSat = DFMP::DfmpSaturatingMathActive(static_cast<int>(nHeight));
 
         int64_t multiplierFP;
         double payoutHeatMult = 1.0;
@@ -2528,7 +2527,10 @@ int main(int argc, char* argv[]) {
         // Load and verify genesis block
 load_genesis_block:  // Bug #29: Label for automatic retry after blockchain wipe
         std::cout << "[1/6] Loading DilV genesis block..." << std::flush;
-        CBlock genesis = Genesis::CreateDilVGenesisBlock();
+        // Both networks this binary serves (DilV, regtest) are VDF-from-genesis,
+        // so this resolves to CreateDilVGenesisBlock() exactly as before; routing
+        // through the shared dispatcher keeps it correct if that ever changes.
+        CBlock genesis = Genesis::CreateGenesisBlockForChain();
 
         if (!Genesis::IsGenesisBlock(genesis)) {
             ErrorMessage error = CErrorFormatter::ValidationError("genesis block", 
