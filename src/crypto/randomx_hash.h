@@ -82,8 +82,31 @@ void randomx_init_mining_mode_async(const void* key, size_t key_len);
 // reclaim under pressure. Relay nodes gain almost nothing in exchange, because IBD
 // verification runs at ~100 H/s where TLB pressure is not the bottleneck.
 //
-// Call with allowed=1 only on a path that is actually about to mine.
+// Call with allowed=1 only on a path that is actually about to mine, and call it
+// BEFORE anything checks randomx_is_mining_mode_ready() -- the request is honoured only
+// if it arrives before the FULL-mode dataset allocation reads it. This setter is silent;
+// use randomx_log_large_page_status_for_mining() to report the outcome.
 void randomx_set_large_pages_allowed(int allowed);
+
+// Emit the "Large pages:" line describing what a MINING node got. Call it from every
+// path that starts mining, after randomx_set_large_pages_allowed(1).
+//
+// full_mode_expected: 0 if this host will never build the 2GB FULL-mode dataset (RAM
+// below the FULL-mode threshold), in which case the line reports N/A. Pass 1 otherwise.
+//
+// Contract: a node that mines always gets a line -- ENABLED, UNAVAILABLE, REQUESTED
+// (dataset not allocated yet), IGNORED (the dataset was already built on standard pages
+// before mining asked, which is what happens when a node is started without --mine on an
+// 8GB+ host and told to mine later), or N/A. A relay node that never calls this stays
+// silent, which is correct: it never asked for large pages.
+//
+// The IGNORED case is reported off a latch taken at the moment the dataset allocation
+// reads the opt-in, NOT off "the dataset has finished building" -- so a request landing
+// during the 30-120s build is reported as ignored instead of vanishing.
+//
+// Prints only when the status text CHANGES, because mining restarts once per block
+// template; call it as often as you like.
+void randomx_log_large_page_status_for_mining(int full_mode_expected);
 
 // Did the most recently allocated FULL-mode dataset actually get large pages?
 // Returns 1 if yes, 0 if it fell back to standard pages or was never requested.
