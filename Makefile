@@ -34,6 +34,51 @@ CXXFLAGS += -MMD -MP
 CFLAGS ?= -O2 -fstack-protector-strong -D_FORTIFY_SOURCE=2 -Wformat -Wformat-security
 CFLAGS += -MMD -MP
 
+# ---------------------------------------------------------------------------
+# CONSENSUS-CRITICAL: -fwrapv is NOT optional and NOT a hardening nicety.
+#
+# The legacy (pre-C-3-gate) DFMP heat-penalty path grows an int64_t by repeated
+#   penalty = (penalty * FP_HEAT_GROWTH) / 100
+# with NO overflow guard (src/dfmp/dfmp.cpp CalculateHeatMultiplierFP, saturate=false;
+# likewise mik.cpp CalculateTotalMultiplierFP_V2). On the live V33/V34 curves that
+# product exceeds INT64_MAX once the exponent reaches 59 — i.e. at
+#   heat == effectiveFreeThreshold + 60
+# (heat 72 for the default 12-block free tier), which is ~20% of the 360-block
+# observation window and is reachable by exactly the concentrated miner DFMP exists
+# to penalise.
+#
+# In standard C++ that is signed integer overflow: UNDEFINED BEHAVIOUR. The
+# consensus rule then depends on the wrapped-negative product being caught by the
+# floor in CalculateEffectiveTarget() (`if (multiplierFP < FP_SCALE) multiplierFP =
+# FP_SCALE`), which only behaves as documented if the overflow actually WRAPS.
+#
+# The C-3 saturating fix is gated OFF (activation height 999999999) on all three
+# chains, so the UB path is the LIVE consensus rule today, not a historical one.
+# We ship three separately-compiled binaries (GCC/Linux, GCC/MSYS2, Clang/macOS);
+# today they agree only because both compilers happen to emit a wrapping imul at
+# -O2 and the floor tests the runtime value. That is a codegen accident, not a
+# language guarantee — it would break under LTO (cross-TU range propagation can
+# prove `penalty > 0` and fold the floor away), under any compiler upgrade, or
+# under a UBSan build.
+#
+# -fwrapv freezes today's de-facto two's-complement wrapping as a DEFINED language
+# guarantee, bit-for-bit identical across all three toolchains, with zero
+# behavioural delta on current binaries. Removing it re-opens a consensus split.
+#
+# WHY A SEPARATE VARIABLE, not `CXXFLAGS += -fwrapv`:
+# CXXFLAGS/CFLAGS above are `?=`, so a CI job, distro packager, or
+# `make CXXFLAGS=...` invocation would silently drop an appended flag and produce a
+# consensus-divergent binary. `override CXXFLAGS += -fwrapv` fixes that but has a
+# nasty side effect — it permanently marks CXXFLAGS as override-origin, after which
+# GNU make SILENTLY IGNORES every later plain `CXXFLAGS +=` in this file (-DZMQ_STATIC
+# and the whole platform-specific block below). Verified: it broke the link.
+#
+# So the flag lives in its own variable that nothing else ever assigns to, and is
+# injected directly into the compile recipes. `override` here is safe (no other
+# assignment to collide with) and stops `make CONSENSUS_CXXFLAGS=` from removing it.
+# Every first-party compile recipe MUST include $(CONSENSUS_CXXFLAGS).
+override CONSENSUS_CXXFLAGS := -fwrapv
+
 # Include paths (base)
 INCLUDES := -I src \
             -I depends/randomx/src \
@@ -1191,10 +1236,15 @@ $(OBJ_DIR)/test/fuzz:
 # Compile C++ source files
 $(OBJ_DIR)/%.o: src/%.cpp | $(OBJ_DIR)/attestation $(OBJ_DIR)/consensus $(OBJ_DIR)/consensus/port $(OBJ_DIR)/core $(OBJ_DIR)/crypto $(OBJ_DIR)/db $(OBJ_DIR)/dfmp $(OBJ_DIR)/index $(OBJ_DIR)/kernel $(OBJ_DIR)/miner $(OBJ_DIR)/net $(OBJ_DIR)/net/port $(OBJ_DIR)/node $(OBJ_DIR)/primitives $(OBJ_DIR)/rpc $(OBJ_DIR)/wallet $(OBJ_DIR)/util $(OBJ_DIR)/api $(OBJ_DIR)/vdf $(OBJ_DIR)/digital_dna $(OBJ_DIR)/script $(OBJ_DIR)/policy $(OBJ_DIR)/tools $(OBJ_DIR)/x402 $(OBJ_DIR)/zmq $(OBJ_DIR)/test
 	@echo "$(COLOR_BLUE)[CXX]$(COLOR_RESET)  $<"
-	@$(CXX) $(CXXFLAGS) $(INCLUDES) -c $< -o $@
+	@$(CXX) $(CXXFLAGS) $(CONSENSUS_CXXFLAGS) $(INCLUDES) -c $< -o $@
 
 # Compile chiavdf C++ wrapper (third-party, suppress warnings with -w)
-# Half-word Lehmer (32-bit approx) avoids signed overflow — no -fwrapv needed.
+# NOTE: this recipe hardcodes its flags and does NOT use $(CXXFLAGS), so it is the one
+# first-party-invoked C++ compile that does not inherit the project-wide -fwrapv (see the
+# CONSENSUS-CRITICAL block near the top of this file — the project DOES build with -fwrapv).
+# That is acceptable here and only here: the half-word Lehmer path (32-bit approx) does not
+# rely on signed overflow, so its result is well-defined either way. Do NOT extend this
+# hardcoded-flags pattern to any consensus-path translation unit.
 $(OBJ_DIR)/chiavdf/c_wrapper.o: depends/chiavdf/src/c_bindings/c_wrapper.cpp | $(OBJ_DIR)/chiavdf
 	@echo "$(COLOR_BLUE)[CXX]$(COLOR_RESET)  $< (chiavdf)"
 	@$(CXX) -std=c++17 -O2 -pipe -w $(CPPFLAGS) -I depends/chiavdf/src -I depends/chiavdf/src/c_bindings -c $< -o $@
@@ -1202,17 +1252,17 @@ $(OBJ_DIR)/chiavdf/c_wrapper.o: depends/chiavdf/src/c_bindings/c_wrapper.cpp | $
 # Compile chiavdf lzcnt utility (C file)
 $(OBJ_DIR)/chiavdf/lzcnt.o: depends/chiavdf/src/refcode/lzcnt.c | $(OBJ_DIR)/chiavdf
 	@echo "$(COLOR_BLUE)[CC]$(COLOR_RESET)   $< (chiavdf)"
-	@gcc $(CFLAGS) -w -c $< -o $@
+	@gcc $(CFLAGS) $(CONSENSUS_CXXFLAGS) -w -c $< -o $@
 
 # Compile utility C++ files from root directory
 $(OBJ_DIR)/%.o: %.cpp | $(OBJ_DIR)
 	@echo "$(COLOR_BLUE)[CXX]$(COLOR_RESET)  $<"
-	@$(CXX) $(CXXFLAGS) $(INCLUDES) -c $< -o $@
+	@$(CXX) $(CXXFLAGS) $(CONSENSUS_CXXFLAGS) $(INCLUDES) -c $< -o $@
 
 # Compile Dilithium C files
 $(DILITHIUM_DIR)/%.o: $(DILITHIUM_DIR)/%.c
 	@echo "$(COLOR_BLUE)[CC]$(COLOR_RESET)   $<"
-	@gcc $(CFLAGS) -DDILITHIUM_MODE=3 -I $(DILITHIUM_DIR) -c $< -o $@
+	@gcc $(CFLAGS) $(CONSENSUS_CXXFLAGS) -DDILITHIUM_MODE=3 -I $(DILITHIUM_DIR) -c $< -o $@
 
 # Fuzzer harness files (MUST compile with sanitizers for libFuzzer integration)
 $(OBJ_DIR)/test/fuzz/%.o: src/test/fuzz/%.cpp | $(OBJ_DIR)/test/fuzz
@@ -1222,7 +1272,7 @@ $(OBJ_DIR)/test/fuzz/%.o: src/test/fuzz/%.cpp | $(OBJ_DIR)/test/fuzz
 # Fuzz stubs: compiled WITHOUT sanitizers (dependency code, not harness)
 $(OBJ_DIR)/test/fuzz/fuzz_stubs.o: src/test/fuzz/fuzz_stubs.cpp | $(OBJ_DIR)/test/fuzz
 	@echo "$(COLOR_BLUE)[CXX]$(COLOR_RESET)  $< (fuzz stubs)"
-	@$(CXX) $(CXXFLAGS) $(INCLUDES) -c $< -o $@
+	@$(CXX) $(CXXFLAGS) $(CONSENSUS_CXXFLAGS) $(INCLUDES) -c $< -o $@
 
 # ============================================================================
 # Dependencies
@@ -1455,7 +1505,16 @@ quality: analyze
 # Fuzz test compiler (requires Clang with libFuzzer support)
 # Try clang++-14 first, fall back to clang++ (any version), or use environment variable
 FUZZ_CXX ?= $(shell command -v clang++-14 2>/dev/null || command -v clang++ 2>/dev/null || echo clang++)
-FUZZ_CXXFLAGS := -fsanitize=fuzzer,address,undefined -std=c++17 -O1 -g $(INCLUDES) -DDILITHIUM_MODE=3
+# -fwrapv is carried here too (see the CONSENSUS-CRITICAL block near the top).
+# FUZZ_CXXFLAGS is a standalone `:=` and does NOT inherit CXXFLAGS, so the flag must
+# be repeated or the fuzz build would exercise DIFFERENT arithmetic semantics than the
+# binaries we ship. Without it, `-fsanitize=undefined` aborts on the legacy DFMP heat
+# exponential the moment a corpus input reaches heat == effectiveFreeThreshold + 60 —
+# a false positive against the shipped semantics, which are defined by -fwrapv.
+# TRADE-OFF (accepted, K1): UBSan's signed-integer-overflow check is thereby vacuous
+# across the whole fuzz build, so genuinely-unintended signed overflow elsewhere must
+# be caught by review and by the C-3 saturating path's explicit tests, not by UBSan.
+FUZZ_CXXFLAGS := -fsanitize=fuzzer,address,undefined -fwrapv -std=c++17 -O1 -g $(INCLUDES) -DDILITHIUM_MODE=3
 
 # Fuzz test sources (Week 3 Phase 4 - 9 harnesses, 42+ targets)
 # Week 6 Phase 3 - Added tx_validation and utxo fuzzers (11 harnesses total)

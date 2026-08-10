@@ -416,10 +416,24 @@ uint256 CalculateEffectiveTarget(const uint256& baseTarget, int64_t multiplierFP
     // effective_target = baseTarget / multiplier
     // In fixed-point: effective_target = baseTarget × FP_SCALE / multiplierFP
 
-    // Ensure multiplier is at least 1× (shouldn't happen but be safe)
-    // C-3: with the saturating cap upstream (saturate=true at/above the gate), every
-    // multiplierFP reaching here is in [FP_SCALE, FP_HEAT_MULTIPLIER_MAX] and never
-    // negative/wrapped, so this floor is now a true safety floor rather than a wrap-catcher.
+    // Ensure multiplier is at least 1×.
+    //
+    // This floor has TWO distinct roles depending on which side of the C-3 gate we are on:
+    //
+    //  - AT/ABOVE the gate (saturate=true): with the saturating cap upstream, every
+    //    multiplierFP reaching here is in [FP_SCALE, FP_HEAT_MULTIPLIER_MAX] and never
+    //    negative/wrapped, so the floor is a true safety floor.
+    //
+    //  - BELOW the gate (saturate=false) — the LIVE rule today, since
+    //    dfmpOverflowFixActivationHeight is 999999999 on all three chains — it is STILL a
+    //    WRAP-CATCHER, and load-bearing consensus. The legacy heat exponential overflows
+    //    int64 at heat == effectiveFreeThreshold + 60, and this floor is what converts the
+    //    resulting negative multiplier into the documented "penalty silently OFF" (1.0x)
+    //    behaviour. That only holds because the build passes -fwrapv, which makes the
+    //    overflow a defined two's-complement wrap instead of undefined behaviour. Without
+    //    -fwrapv a compiler may prove `multiplierFP > 0` and delete this branch entirely,
+    //    diverging from the other platforms' binaries. See the CONSENSUS-CRITICAL block in
+    //    the Makefile. Do NOT "simplify" this check away.
     if (multiplierFP < FP_SCALE) {
         multiplierFP = FP_SCALE;
     }
