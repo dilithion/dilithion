@@ -2016,6 +2016,16 @@ std::optional<CBlockTemplate> BuildMiningTemplate(CBlockchainDB& blockchain, CWa
 }
 
 int main(int argc, char* argv[]) {
+    // FIRST local in main, so it is the LAST thing destroyed on the way out.
+    // This node starts RandomX FULL-mode init in a background thread on any host
+    // with >=8GB RAM (see the IBD-speedup branch below) whether or not it mines,
+    // and that thread lives in a namespace-scope std::thread. Left joinable, its
+    // destructor runs at static-destruction time and calls std::terminate() --
+    // after main has returned, so the process aborts (exit 3 on Windows, 134 on
+    // Linux) instead of exiting with the code the code below chose. The wallet
+    // guard's `return 1` was one of the casualties.
+    RandomXShutdownGuard randomx_shutdown_guard;
+
 #ifdef _WIN32
     // Register crash handler to log crash info before terminating
     SetUnhandledExceptionFilter(CrashHandler);
@@ -3179,6 +3189,27 @@ load_genesis_block:  // Bug #29: Label for automatic retry after blockchain wipe
             return 1;
         }
         std::cout << "  [OK] NodeContext initialized" << std::endl;
+
+        // g_node_context is a namespace-scope global that OWNS worker threads
+        // (CConnman's socket/message/open-connections/headers/blocks threads, the
+        // validation queue, the headers manager). NodeContext::Shutdown() is called
+        // exactly once, on the normal shutdown path at the bottom of main. Every
+        // early `return` after this point therefore left those threads to be torn
+        // down at STATIC-destruction time, after main had already returned — the
+        // same shape as the RandomX init threads, one level of indirection down.
+        //
+        // Declared HERE, not at the top of main, and that placement is the point:
+        // destruction is reverse of declaration, so this runs AFTER everything
+        // declared below it (the RPC/HTTP servers, the maintenance thread) and
+        // BEFORE the chain database and UTXO set declared above it — which is
+        // exactly the order the threads' references require. A guard at the top of
+        // main would shut the network down after its database had been closed.
+        //
+        // Shutdown() is idempotent (every step is null-guarded and resets its
+        // pointer), so the explicit call on the normal path leaves this a no-op.
+        struct NodeContextShutdownGuard {
+            ~NodeContextShutdownGuard() { g_node_context.Shutdown(); }
+        } node_context_shutdown_guard;
 
         // Phase 2: Initialize async block validation queue for IBD performance
         std::cout << "Initializing async block validation queue..." << std::endl;
@@ -6691,6 +6722,25 @@ load_genesis_block:  // Bug #29: Label for automatic retry after blockchain wipe
         // Phase 5: Updated to use CConnman instead of CConnectionManager
         std::cerr.flush();
         std::thread p2p_maint_thread;
+        // SAME DEFECT CLASS AS THE RANDOMX INIT THREADS, one scope down: this
+        // std::thread is joined exactly once, at the bottom of main on the normal
+        // shutdown path. Every `return` between here and there — the seed-attestation
+        // FATAL a few hundred lines below is a live example, and it fires on any
+        // relay whose seed key is plaintext — destroys it while still joinable, and
+        // a joinable std::thread destructor calls std::terminate(). Observed: exit 3
+        // and "terminate called without an active exception" in place of the
+        // intended exit 1. A joiner declared immediately after the thread runs on
+        // every path out of this scope; on the normal path the explicit join below
+        // has already run and this is a no-op.
+        struct MaintThreadJoiner {
+            std::thread& t;
+            ~MaintThreadJoiner() {
+                if (t.joinable()) {
+                    g_node_state.running = false;  // break the maintenance loop
+                    t.join();
+                }
+            }
+        } p2p_maint_joiner{p2p_maint_thread};
         try {
             p2p_maint_thread = std::thread([&feeler_manager]() {
             // Phase 1.1: Wrap thread entry point in try/catch to prevent silent crashes
@@ -7038,8 +7088,13 @@ load_genesis_block:  // Bug #29: Label for automatic retry after blockchain wipe
                     }
 #endif
 
-                    // Sleep for 30 seconds between maintenance cycles
-                    std::this_thread::sleep_for(std::chrono::seconds(30));
+                    // Sleep for 30 seconds between maintenance cycles, polled in
+                    // 1s steps. This thread is JOINED on the way out (see the
+                    // joiner where it is declared); an uninterruptible 30s sleep
+                    // would add up to 30s to every exit, error returns included.
+                    for (int maint_tick = 0; maint_tick < 30 && g_node_state.running; ++maint_tick) {
+                        std::this_thread::sleep_for(std::chrono::seconds(1));
+                    }
                 } catch (const std::system_error& e) {
                     std::cerr << "[P2P-Maint] System error in maintenance loop: " << e.what()
                               << " (code: " << e.code() << ")" << std::endl;

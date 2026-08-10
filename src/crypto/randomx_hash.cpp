@@ -4,9 +4,11 @@
 #include <crypto/randomx_hash.h>
 #include <randomx.h>
 
+#include <algorithm>
 #include <vector>
 #include <mutex>
 #include <stdexcept>
+#include <cstdlib>
 #include <cstring>
 #include <thread>
 #include <atomic>
@@ -50,6 +52,62 @@ namespace {
     std::atomic<bool> g_mining_initializing{false};
     std::thread g_mining_init_thread;
     std::vector<uint8_t> g_mining_key;
+
+    // ========================================================================
+    // Background-init thread lifecycle
+    // ========================================================================
+    // g_randomx_init_thread and g_mining_init_thread are namespace-scope
+    // std::thread objects. A std::thread that is still joinable when its
+    // destructor runs calls std::terminate() -- and for a namespace-scope
+    // object that destructor runs at static-destruction time, i.e. AFTER
+    // main() has returned its exit code. Every exit path that launched a
+    // background init but never joined it therefore ended in
+    // "terminate called without an active exception" and an abort exit code
+    // (3 under the MSVC runtime, 134 on Linux) in place of the intended one.
+    //
+    // That is not hypothetical: dilithion-node.cpp starts FULL-mode init
+    // unconditionally on any host with >=8GB RAM, including relay-only runs
+    // and runs that are about to refuse at wallet init. The wallet guard's
+    // "this is a deliberate stop, not a crash" message was printed by a
+    // process that then aborted, and its `return 1` never reached the shell.
+    //
+    // Fix: a single randomx_shutdown() that JOINS both threads, called from an
+    // RAII guard local to main() in both node binaries (so it runs on every
+    // return, early or not) and additionally registered with std::atexit as a
+    // backstop for any exit path that bypasses main's scope.
+    //
+    // JOIN, not detach: the init threads write g_mining_cache /
+    // g_mining_dataset / g_mining_vm / g_mining_key, which are objects in this
+    // TU with static storage duration. A detached thread still running while
+    // those are being destroyed is a use-after-free during teardown -- trading
+    // a deterministic abort for a nondeterministic one. Nothing is detached
+    // anywhere in this module.
+    //
+    // Joining is bounded because g_randomx_shutdown is a cancellation flag the
+    // dataset build polls between batches: without it, a shutdown one second
+    // into a 2GB dataset build would block the process for the remainder of
+    // that build (tens of seconds), which on the wallet-refusal path is a
+    // regression the user would experience as a hang.
+    std::atomic<bool> g_randomx_shutdown{false};
+
+    // Guards the two thread handles themselves (joinable()/join()/assignment).
+    // Deliberately NOT g_mining_mutex: the mining-init lambda holds that one for
+    // its whole run, so waiting on it here would make shutdown block on the very
+    // work it is trying to cancel. No code path takes this mutex and then
+    // g_mining_mutex, so the two cannot deadlock against each other.
+    std::mutex g_init_threads_mutex;
+
+    // Registered on first async launch, which is necessarily after this TU's
+    // statics are constructed -- and handlers registered later run earlier
+    // ([basic.start.term]), so this is guaranteed to run before the std::thread
+    // destructors it exists to protect.
+    std::once_flag g_atexit_once;
+
+    void RegisterShutdownAtExit() {
+        std::call_once(g_atexit_once, []() {
+            std::atexit([]() { randomx_shutdown(); });
+        });
+    }
 
     // ========================================================================
     // Large-page allocation (miner throughput)
@@ -392,17 +450,30 @@ extern "C" void randomx_init_async(const void* key, size_t key_len, int light_mo
         return;
     }
 
+    // Refuse to start new background work once shutdown has begun -- otherwise
+    // a late call could hand randomx_shutdown() a thread it has already joined
+    // past, and we would be back to terminating at static destruction.
+    if (g_randomx_shutdown.load(std::memory_order_acquire)) {
+        g_randomx_initializing = false;
+        return;
+    }
+
     // Start background initialization thread (we won the race)
     g_randomx_ready = false;
     g_randomx_progress = 0;
+
+    // Backstop for exit paths that never reach main's guard.
+    RegisterShutdownAtExit();
+
+    // Copy key data for thread safety
+    std::vector<uint8_t> key_copy((const uint8_t*)key, (const uint8_t*)key + key_len);
+
+    std::lock_guard<std::mutex> thread_lock(g_init_threads_mutex);
 
     // Join any existing thread
     if (g_randomx_init_thread.joinable()) {
         g_randomx_init_thread.join();
     }
-
-    // Copy key data for thread safety
-    std::vector<uint8_t> key_copy((const uint8_t*)key, (const uint8_t*)key + key_len);
 
     // Launch async initialization thread (move key_copy into lambda to avoid copy)
     g_randomx_init_thread = std::thread([key_copy = std::move(key_copy), light_mode]() {
@@ -441,6 +512,7 @@ extern "C" int randomx_is_ready() {
 
 // Wait for RandomX initialization to complete
 extern "C" void randomx_wait_for_init() {
+    std::lock_guard<std::mutex> thread_lock(g_init_threads_mutex);
     if (g_randomx_init_thread.joinable()) {
         std::cout << "  [WAIT] Waiting for RandomX initialization to complete..." << std::endl;
         g_randomx_init_thread.join();
@@ -602,13 +674,25 @@ extern "C" void randomx_init_mining_mode_async(const void* key, size_t key_len) 
         return;  // Already initialized
     }
 
+    // Refuse to start new background work once shutdown has begun. See the same
+    // guard in randomx_init_async().
+    if (g_randomx_shutdown.load(std::memory_order_acquire)) {
+        g_mining_initializing = false;
+        return;
+    }
+
+    // Backstop for exit paths that never reach main's guard.
+    RegisterShutdownAtExit();
+
+    // Copy key for thread safety
+    std::vector<uint8_t> key_copy((const uint8_t*)key, (const uint8_t*)key + key_len);
+
+    std::lock_guard<std::mutex> thread_lock(g_init_threads_mutex);
+
     // Join any existing thread
     if (g_mining_init_thread.joinable()) {
         g_mining_init_thread.join();
     }
-
-    // Copy key for thread safety
-    std::vector<uint8_t> key_copy((const uint8_t*)key, (const uint8_t*)key + key_len);
 
     // Launch async initialization thread (move key_copy into lambda to avoid copy)
     g_mining_init_thread = std::thread([key_copy = std::move(key_copy)]() {
@@ -616,6 +700,13 @@ extern "C" void randomx_init_mining_mode_async(const void* key, size_t key_len) 
             auto start_time = std::chrono::steady_clock::now();
 
             std::lock_guard<std::mutex> lock(g_mining_mutex);
+
+            // Cheapest cancellation point: shutdown may already have been
+            // requested between the launch above and this thread being scheduled.
+            if (g_randomx_shutdown.load(std::memory_order_acquire)) {
+                g_mining_initializing = false;
+                return;
+            }
 
             // Cleanup existing resources
             if (g_mining_vm != nullptr) {
@@ -686,12 +777,36 @@ extern "C" void randomx_init_mining_mode_async(const void* key, size_t key_len) 
                 }
 
                 init_threads.emplace_back([dataset_ptr, cache_ptr, start_item, count]() {
-                    randomx_init_dataset(dataset_ptr, cache_ptr, start_item, count);
+                    // Built in batches rather than one call so a shutdown request
+                    // is observed within a batch instead of after the whole 2GB
+                    // dataset. randomx_init_dataset() itself is uninterruptible,
+                    // and the enclosing thread is JOINED at shutdown, so an
+                    // unbatched call would make every exit wait out the full build.
+                    // 64Ki items is ~4MB of dataset -- microseconds of work.
+                    const unsigned long kBatchItems = 65536;
+                    for (unsigned long done = 0; done < count; done += kBatchItems) {
+                        if (g_randomx_shutdown.load(std::memory_order_acquire)) {
+                            return;  // partial dataset; the caller below discards it
+                        }
+                        const unsigned long n =
+                            std::min<unsigned long>(kBatchItems, count - done);
+                        randomx_init_dataset(dataset_ptr, cache_ptr, start_item + done, n);
+                    }
                 });
             }
 
             for (auto& thread : init_threads) {
                 thread.join();
+            }
+
+            // Cancelled: the dataset is partially initialized and must never be
+            // used for hashing. Leave the cache/dataset allocations to process
+            // teardown -- we are on the way out, and releasing a 2GB dataset buys
+            // nothing but latency on the exit path.
+            if (g_randomx_shutdown.load(std::memory_order_acquire)) {
+                g_mining_ready = false;
+                g_mining_initializing = false;
+                return;
             }
 
             std::atomic_thread_fence(std::memory_order_acquire);
@@ -726,10 +841,28 @@ extern "C" int randomx_is_mining_mode_ready() {
 }
 
 extern "C" void randomx_wait_for_mining_mode() {
+    std::lock_guard<std::mutex> thread_lock(g_init_threads_mutex);
     if (g_mining_init_thread.joinable()) {
         std::cout << "  [WAIT] Waiting for mining mode initialization..." << std::endl;
         g_mining_init_thread.join();
         std::cout << "  [WAIT] Mining mode initialization complete" << std::endl;
+    }
+}
+
+// See the contract in randomx_hash.h. Idempotent, and a no-op if nothing was
+// ever initialized.
+extern "C" void randomx_shutdown() {
+    // Publish the cancellation BEFORE taking the handle lock: an in-flight
+    // dataset build must be able to observe it while we are still waiting to
+    // acquire, otherwise we would serialise behind the very work we are cancelling.
+    g_randomx_shutdown.store(true, std::memory_order_release);
+
+    std::lock_guard<std::mutex> thread_lock(g_init_threads_mutex);
+    if (g_randomx_init_thread.joinable()) {
+        g_randomx_init_thread.join();
+    }
+    if (g_mining_init_thread.joinable()) {
+        g_mining_init_thread.join();
     }
 }
 
