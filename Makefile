@@ -521,6 +521,22 @@ TEST_SUITES_ALL  := $(shell bash scripts/run_test_suites.sh --list all)
 TEST_SUITES_FAST := $(shell bash scripts/run_test_suites.sh --list fast)
 TEST_SUITES_FULL := $(shell bash scripts/run_test_suites.sh --list full)
 
+# If run_test_suites.sh cannot be parsed (e.g. a stray apostrophe in a
+# quarantine reason closes the single-quoted ROSTER string), `--list` prints
+# NOTHING and $(shell ...) yields an empty list. `tests-build` would then have
+# no prerequisites and its recipe is only an echo, so it would report success
+# having built nothing at all — exactly the vacuous green this whole PR exists
+# to remove. `tests-fast`/`tests-full` happen to survive because their recipes
+# re-invoke the script and inherit its non-zero exit, but tests-build does not.
+# Fail loudly at parse time instead.
+ifeq ($(strip $(TEST_SUITES_ALL)),)
+$(error scripts/run_test_suites.sh --list all produced an empty roster. \
+Run 'bash scripts/run_test_suites.sh --list all' directly to see the error \
+(a lone apostrophe in a quarantine reason is the usual cause). Refusing to \
+continue with an empty test-suite list, which would build and run nothing \
+while reporting success.)
+endif
+
 # Every standalone suite links $(LIBS), which includes -lzmq, so each one needs
 # the vendored static libzmq the same way dilithion-node does. Declaring it here
 # (rather than per-target) keeps the dependency single-sourced off the roster.

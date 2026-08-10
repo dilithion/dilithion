@@ -26,6 +26,11 @@
 #     a reason instead — a quarantine is loud and auditable, a loosened
 #     assertion is silent.
 #   * A quarantine entry MUST carry a reason string. Empty reason = live.
+#   * NO APOSTROPHES IN A REASON. ROSTER is a single-quoted shell string, so a
+#     lone ' closes it and the script dies with a syntax error. Write "the X
+#     abort", not "X's abort". A syntax error here makes `--list` print
+#     nothing, which the Makefile turns into a hard error rather than an
+#     empty (vacuously green) build list.
 #   * Removing a quarantine requires the suite to actually pass.
 #
 # USAGE
@@ -102,9 +107,9 @@ fast|chain_case_2_5_equivalence_tests|180|UNTRIAGED: scenario_2 (connect-replace
 full|miner_tests|900|PRE-EXISTING, UNOWNED: 4 assertions fail -- "Failed to start mining", "No hashes computed", "No block found", "No hashes after mining". The mining controller does not start under the test harness. Flagged before F4; still unowned.
 full|wallet_tests|300|STALE TEST (likely): 4 assertions fail on coin selection / minimum relay fee / coinbase maturity -- e.g. builds a tx at 0.00001000 DIL against a 0.00010000 DIL minimum. Expectations predate the current fee and maturity rules.
 full|rpc_tests|300|STALE TEST: the harness calls CRPCServer::Start() without RPCAuth::InitializeAuth(), which the server now refuses by design. The test needs to initialise auth; the refusal itself is correct behaviour.
-full|integration_tests|600|REAL DEFECT (shutdown): every assertion passes, then the process aborts with "terminate called without an active exception" -- a thread destroyed while joinable at exit. Exit code 3. Fix the shutdown path, not the test.
+full|integration_tests|600|
 full|connman_tests|600|SUSPECTED REAL: high-load throughput test loses messages (pop_count != NUM_MESSAGES, connman_tests.cpp:552). Message loss under load in CConnman is not a stale expectation.
-full|tx_relay_tests|600|REAL HANG: all 6 tests print PASSED, then the process never exits -- killed at the 600s timeout. Hang is after the last test, i.e. in teardown. Observed on Windows/MSYS2; needs a Linux confirmation run.
+full|tx_relay_tests|600|REAL HANG, RE-CONFIRMED 2026-08-10 on the merged tree: all 6 tests print PASSED, then the process never exits -- killed at 600s (exit 124). Hang is after the last test, i.e. in teardown. NOT fixed by the J1/F6 shutdown PRs, which did fix the integration_tests abort, so this is a distinct teardown path. Also NOT the separately-tracked ~3600s runner freeze (testaccept_positive_path / fee_wiring_eviction_notifies) -- different signature, different binary. Do NOT lift by raising the timeout. Observed on Windows/MSYS2; still wants a Linux confirmation run.
 full|mining_integration_tests|900|MIXED, ONE SUSPECTED CONSENSUS GAP: (a) coinbase_transaction_creation expects 1 coinbase output and gets 3 -- stale, DFMP splits the coinbase; (b) block_validation_coinbase asserts CheckCoinbase REJECTS a coinbase paying 100 DIL at height 0 and it is ACCEPTED. (b) is a possible missing consensus check and must be triaged by a consensus owner before this quarantine is lifted.
 full|dfmp_mik_tests|600|
 full|net_tests|600|NOBUILD: source no longer compiles. References a removed global g_peer_manager and calls CNetMessageProcessor::CreateVersionMessage() with a signature that no longer exists. Needs a P2P owner to port the harness forward.
