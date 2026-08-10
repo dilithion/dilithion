@@ -187,9 +187,14 @@ public:
 // Both miner/controller.cpp AND the WF-1 differential test call THIS function, so
 // the test drives the real production assembly (no hand-copied mirror).
 //
-// `dst` MUST point to at least 80 writable bytes. `nonce32` is written at
-// MINING_HEADER_NONCE_OFFSET (the field the hot loop mutates each iteration);
-// h.nNonce is ignored.
+// `dst` MUST point to at least MINING_HEADER_SIZE (80) writable bytes. `nonce32` is
+// written at MINING_HEADER_NONCE_OFFSET (76) — the field the hot loop mutates each
+// iteration; h.nNonce is ignored.
+//
+// K1: every offset below is a named constant because the bare literals were hand-copied
+// into several unrelated files and only some of them got unified. Any new site that needs
+// the legacy 80-byte layout MUST call WriteMiningHeaderLE() / WriteMiningNonceLE() (or use
+// these constants), never re-type the numbers.
 
 /**
  * Byte offset of the nonce field inside the 80-byte legacy PoW preimage.
@@ -205,6 +210,13 @@ public:
  * wrong and it is covered by miner_nonce_write_tests.
  */
 static constexpr size_t MINING_HEADER_NONCE_OFFSET = 76;
+
+static constexpr size_t MINING_HEADER_VERSION_OFFSET = 0;
+static constexpr size_t MINING_HEADER_PREVHASH_OFFSET = 4;
+static constexpr size_t MINING_HEADER_MERKLE_OFFSET = 36;
+static constexpr size_t MINING_HEADER_TIME_OFFSET = 68;
+static constexpr size_t MINING_HEADER_BITS_OFFSET = 72;
+static constexpr size_t MINING_HEADER_SIZE = 80;
 
 /**
  * The remaining offsets of the legacy 80-byte PoW preimage, named for the same
