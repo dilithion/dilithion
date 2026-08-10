@@ -496,8 +496,60 @@ dilv-genesis-vdf: $(CORE_OBJECTS) $(OBJ_DIR)/tools/dilv_genesis_vdf.o $(DILITHIU
 # Test Binaries
 # ============================================================================
 
-tests: phase1_test miner_tests wallet_tests wallet_load_guard_tests rpc_tests rpc_auth_tests rpc_host_header_tests http_server_wallet_gate_tests ratelimiter_tests timestamp_tests crypter_tests seed_attestation_key_tests wallet_encryption_integration_tests wallet_persistence_tests integration_tests net_tests connman_tests tx_validation_tests tx_relay_tests mining_integration_tests bug_003_block_size_tests dfmp_mik_tests dfmp_heat_overflow_tests mik_registration_persistence_tests dna_propagation_tests test_passphrase_validator script_tests addrman_v2_tests peer_scorer_tests peer_scorer_banman_integration_tests header_proof_checker_tests chain_selector_tests getchaintips_equivalence_tests chain_case_2_5_equivalence_tests chain_work_smoke_tests reorg_wal_crash_injection_tests competing_sibling_below_checkpoint_tests headers_manager_to_chain_selector_wiring_tests fast_path_2_boundary_tests v4_1_checkpoint_enforcement_tests v4_1_chain_selector_suppression_tests auto_rebuild_marker_mode_symmetry_tests add_block_index_flag_merge_tests port_chain_selector_invariants_tests legacy_vs_port_differential_tests chainstate_integrity_tests magnet_canonical_health_tests
-	@echo "$(COLOR_GREEN)✓ All tests built successfully$(COLOR_RESET)"
+# ----------------------------------------------------------------------------
+# Standalone (non-Boost) test suites.
+#
+# HISTORY / WHY THIS LOOKS LIKE THIS
+# Until F4, `tests:` listed ~46 binaries and had exactly one recipe line:
+#     @echo "✓ All tests built successfully"
+# It BUILT them and RAN NONE. .github/workflows/ci.yml never invoked it either.
+# The whole standalone corpus had therefore never been executed by any
+# automated process; several suites had rotted to the point of not compiling
+# and nobody could tell.
+#
+# The roster (which suites exist, which tier, timeout, quarantine + reason) is
+# single-sourced in scripts/run_test_suites.sh. The build lists below are
+# DERIVED from it, so the set that gets built can never drift from the set that
+# gets run.
+#
+#   make tests        build every suite, then RUN every non-quarantined suite
+#   make tests-fast   the PR-gating tier (build + run)
+#   make tests-full   the scheduled tier (build + run)
+#   make tests-build  build only (no execution) — for memcheck/coverage plumbing
+# ----------------------------------------------------------------------------
+TEST_SUITES_ALL  := $(shell bash scripts/run_test_suites.sh --list all)
+TEST_SUITES_FAST := $(shell bash scripts/run_test_suites.sh --list fast)
+TEST_SUITES_FULL := $(shell bash scripts/run_test_suites.sh --list full)
+
+# Every standalone suite links $(LIBS), which includes -lzmq, so each one needs
+# the vendored static libzmq the same way dilithion-node does. Declaring it here
+# (rather than per-target) keeps the dependency single-sourced off the roster.
+#
+# This is an ORDER-ONLY prerequisite on each suite binary, not on the aggregate
+# tests-* targets: an order-only prereq of `tests-build` would only be ordered
+# against tests-build's own recipe, leaving the suite links free to race ahead
+# of it under -j. Attaching it to the binaries themselves is what actually
+# serialises correctly.
+#
+# Found by CI: the full-tier workflow's first make invocation is `make
+# tests-full`, so nothing had built libzmq first and every suite that links
+# CORE_OBJECTS died on "cannot find -lzmq". ci.yml only escaped it because
+# `make dilithion-node` runs earlier in that job and drags libzmq in.
+$(TEST_SUITES_ALL): | libzmq
+
+.PHONY: tests tests-build tests-fast tests-full
+
+tests-build: $(TEST_SUITES_ALL)
+	@echo "$(COLOR_GREEN)✓ All test suites built (NOT run — use 'make tests')$(COLOR_RESET)"
+
+tests: tests-build
+	@bash scripts/run_test_suites.sh all
+
+tests-fast: $(TEST_SUITES_FAST)
+	@bash scripts/run_test_suites.sh fast
+
+tests-full: $(TEST_SUITES_FULL)
+	@bash scripts/run_test_suites.sh full
 
 phase1_test: $(CORE_OBJECTS) $(OBJ_DIR)/test/phase1_simple_test.o $(DILITHIUM_OBJECTS) $(CHIAVDF_OBJECTS)
 	@echo "$(COLOR_BLUE)[LINK]$(COLOR_RESET) $@"
@@ -607,9 +659,13 @@ connman_tests: $(CORE_OBJECTS) $(OBJ_DIR)/test/connman_tests.o $(DILITHIUM_OBJEC
 	@echo "$(COLOR_BLUE)[LINK]$(COLOR_RESET) $@"
 	@$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS) $(LIBS)
 
-tx_validation_tests: $(CORE_OBJECTS) $(OBJ_DIR)/test/tx_validation_tests.o $(DILITHIUM_OBJECTS) $(CHIAVDF_OBJECTS)
-	@echo "$(COLOR_BLUE)[LINK]$(COLOR_RESET) $@"
-	@$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS) $(LIBS)
+# F4: the `tx_validation_tests` standalone target was DELETED. It compiled
+# src/test/tx_validation_tests.cpp — a BOOST_AUTO_TEST_SUITE file that is
+# already an entry in BOOST_TEST_OBJECTS and therefore already built and run
+# inside test_dilithion. Standalone it has no Boost main and no
+# unit_test_framework link, so it could never link at all: the target had been
+# permanently broken and nobody noticed because `make tests` only echoed.
+# The coverage is not lost — it runs as part of test_dilithion on every CI run.
 
 tx_relay_tests: $(CORE_OBJECTS) $(OBJ_DIR)/test/tx_relay_tests.o $(DILITHIUM_OBJECTS) $(CHIAVDF_OBJECTS)
 	@echo "$(COLOR_BLUE)[LINK]$(COLOR_RESET) $@"
@@ -934,7 +990,10 @@ v4_2_time_decay_cooldown_tests: $(OBJ_DIR)/test/v4_2_time_decay_cooldown_tests.o
 	@$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS)
 	@echo "$(COLOR_GREEN)✓ v4_2_time_decay_cooldown_tests built successfully$(COLOR_RESET)"
 
-test_passphrase_validator: $(OBJ_DIR)/wallet/passphrase_validator.o $(OBJ_DIR)/test_passphrase_validator.o
+# F4: passphrase_validator.o references RPCAuth::SecureCompare, which lives in
+# rpc/auth.o. The link had been broken since that reference was introduced —
+# invisible because nothing ever built this target (`make tests` only echoed).
+test_passphrase_validator: $(OBJ_DIR)/wallet/passphrase_validator.o $(OBJ_DIR)/rpc/auth.o $(OBJ_DIR)/crypto/sha3.o $(OBJ_DIR)/crypto/hmac_sha3.o $(OBJ_DIR)/crypto/pbkdf2_sha3.o $(OBJ_DIR)/util/logging.o $(OBJ_DIR)/test_passphrase_validator.o $(DILITHIUM_OBJECTS)
 	@echo "$(COLOR_BLUE)[LINK]$(COLOR_RESET) $@"
 	@$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS) $(LIBS)
 
@@ -1033,13 +1092,16 @@ difficulty_determinism_test: $(OBJ_DIR)/test/difficulty_determinism_test.o $(OBJ
 	@$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS) $(LIBS)
 	@echo "$(COLOR_GREEN)✓ Difficulty determinism test built successfully$(COLOR_RESET)"
 
-# Differential byte-equality proof for the single-source sighash preimage.
-# Links only the helper + sha3 + block (uint256) — no full-node dependency.
-# Exit 0 = the refactored builder is byte-equal to the legacy open-coded form.
-sighash_differential_tests: $(OBJ_DIR)/test/sighash_differential_tests.o $(OBJ_DIR)/consensus/sighash_preimage.o $(OBJ_DIR)/crypto/sha3.o $(OBJ_DIR)/crypto/randomx_hash.o $(OBJ_DIR)/primitives/block.o $(DILITHIUM_OBJECTS)
-	@echo "$(COLOR_BLUE)[LINK]$(COLOR_RESET) $@"
-	@$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS) $(LIBS)
-	@echo "$(COLOR_GREEN)✓ Sighash differential test built successfully$(COLOR_RESET)"
+# F4: the `sighash_differential_tests` standalone target and its source
+# (src/test/sighash_differential_tests.cpp) were DELETED as a duplicate.
+# src/test/sighash_preimage_tests.cpp is the same differential proof wired into
+# BOOST_TEST_OBJECTS, so it already runs in test_dilithion on every CI run. Each
+# file carried its OWN verbatim copy of the pre-refactor "legacy" byte layout —
+# the ground truth of the proof — and each only ever compared against its own
+# copy, so the two mirrors could silently drift apart without any test noticing.
+# Two independently-maintained copies of a ground truth is the hazard, not the
+# safeguard; the Boost copy is the one CI actually executes, so it is the one
+# that was kept.
 
 eda_test:
 	@echo "$(COLOR_BLUE)[CXX+LINK]$(COLOR_RESET) src/test/eda_test.cpp (standalone)"
@@ -1090,66 +1152,21 @@ batch_verifier_race_control: $(OBJ_DIR)/test/lp5_control/signature_batch_verifie
 # Run Tests
 # ============================================================================
 
+# `make test` = the full local gate: every standalone suite (build + RUN) plus
+# the Boost suite plus the wallet-preservation guard.
+#
+# F4: this recipe used to hand-maintain its own subset of ./binary invocations —
+# ~20 of the 46 suites — and swallowed failures with `|| true` on the Boost
+# suite, wallet_tests and rpc_tests. Both problems are gone: the roster is
+# single-sourced in scripts/run_test_suites.sh and nothing is `|| true`'d.
 test: tests test_dilithion asert_test wallet_load_guard_test
 	@echo "$(COLOR_YELLOW)========================================$(COLOR_RESET)"
 	@echo "$(COLOR_YELLOW)Running Boost Unit Test Suite$(COLOR_RESET)"
 	@echo "$(COLOR_YELLOW)========================================$(COLOR_RESET)"
-	@./test_dilithion --log_level=test_suite --report_level=short || true
-	@echo ""
-	@echo "$(COLOR_YELLOW)========================================$(COLOR_RESET)"
-	@echo "$(COLOR_YELLOW)Running Legacy Test Suite$(COLOR_RESET)"
-	@echo "$(COLOR_YELLOW)========================================$(COLOR_RESET)"
-	@echo ""
-	@echo "$(COLOR_YELLOW)Running Phase 1 tests...$(COLOR_RESET)"
-	@./phase1_test
-	@echo ""
-	@echo "$(COLOR_YELLOW)Running Phase 3 miner tests...$(COLOR_RESET)"
-	@./miner_tests
-	@echo ""
-	@echo "$(COLOR_YELLOW)Running Phase 4 wallet tests...$(COLOR_RESET)"
-	@timeout 10 ./wallet_tests || true
-	@echo ""
-	@echo "$(COLOR_YELLOW)Running Phase 4 RPC tests...$(COLOR_RESET)"
-	@timeout 10 ./rpc_tests || true
-	@echo ""
-	@echo "$(COLOR_YELLOW)Running RPC authentication tests...$(COLOR_RESET)"
-	@./rpc_auth_tests
-	@echo ""
-	@echo "$(COLOR_YELLOW)Running RPC Host-header allowlist + session-token tests...$(COLOR_RESET)"
-	@./rpc_host_header_tests
-	@echo ""
-	@echo "$(COLOR_YELLOW)Running LP-12 CHttpServer wallet-HTML gate tests...$(COLOR_RESET)"
-	@./http_server_wallet_gate_tests
-	@echo ""
-	@echo "$(COLOR_YELLOW)Running rate limiter regression tests...$(COLOR_RESET)"
-	@./ratelimiter_tests
-	@echo ""
-	@echo "$(COLOR_YELLOW)Running timestamp validation tests...$(COLOR_RESET)"
-	@./timestamp_tests
-	@echo ""
-	@echo "$(COLOR_YELLOW)Running wallet encryption tests...$(COLOR_RESET)"
-	@./crypter_tests
-	@echo ""
-	@echo "$(COLOR_YELLOW)Running wallet encryption integration tests...$(COLOR_RESET)"
-	@./wallet_encryption_integration_tests
-	@echo ""
-	@echo "$(COLOR_YELLOW)Running wallet persistence tests...$(COLOR_RESET)"
-	@./wallet_persistence_tests
-	@echo ""
-	@echo "$(COLOR_YELLOW)Running wallet load-guard tests...$(COLOR_RESET)"
-	@./wallet_load_guard_tests
-	@echo ""
-	@echo "$(COLOR_YELLOW)Running passphrase validator tests...$(COLOR_RESET)"
-	@./test_passphrase_validator
-	@echo ""
-	@echo "$(COLOR_YELLOW)Running integration tests...$(COLOR_RESET)"
-	@./integration_tests
+	@./test_dilithion --log_level=test_suite --report_level=short
 	@echo ""
 	@echo "$(COLOR_YELLOW)Running ASERT difficulty tests...$(COLOR_RESET)"
 	@./asert_test
-	@echo ""
-	@echo "$(COLOR_YELLOW)Running Phase 6 script system tests...$(COLOR_RESET)"
-	@./script_tests
 	@echo ""
 	@echo "$(COLOR_GREEN)✓ All test suites complete$(COLOR_RESET)"
 
@@ -1323,8 +1340,11 @@ help:
 	@echo "  genesis_gen      - Build the genesis block generator"
 	@echo ""
 	@echo "$(COLOR_BLUE)Test Targets:$(COLOR_RESET)"
-	@echo "  tests            - Build all test binaries"
-	@echo "  test             - Build and run all tests"
+	@echo "  tests            - Build AND RUN every standalone test suite"
+	@echo "  tests-fast       - Build+run the PR-gating tier only"
+	@echo "  tests-full       - Build+run the scheduled (slow) tier only"
+	@echo "  tests-build      - Build the suites WITHOUT running them"
+	@echo "  test             - tests + Boost suite + wallet-preservation guard"
 	@echo "  phase1_test      - Build Phase 1 core tests"
 	@echo "  miner_tests      - Build Phase 3 mining tests"
 	@echo "  wallet_tests     - Build Phase 4 wallet tests"
@@ -1349,7 +1369,7 @@ help:
 	@echo "$(COLOR_BLUE)Examples:$(COLOR_RESET)"
 	@echo "  make                    # Build main binaries"
 	@echo "  make -j8                # Build with 8 parallel jobs"
-	@echo "  make tests              # Build all tests"
+	@echo "  make tests              # Build and run all standalone suites"
 	@echo "  make test               # Build and run all tests"
 	@echo "  make clean all          # Clean rebuild"
 	@echo "  make depends all        # Build dependencies and main binaries"
@@ -1395,7 +1415,9 @@ lint:
 	fi
 
 # Memory leak detection
-memcheck: tests
+# F4: depends on tests-build, not tests — this target runs the binaries itself
+# under valgrind; `tests` would now run them all a second time natively first.
+memcheck: tests-build
 	@echo "$(COLOR_YELLOW)Running memory leak detection...$(COLOR_RESET)"
 	@if command -v valgrind >/dev/null 2>&1; then \
 		valgrind --leak-check=full --show-leak-kinds=all \
