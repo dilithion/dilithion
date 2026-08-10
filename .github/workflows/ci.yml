@@ -211,12 +211,22 @@ jobs:
         make test_dilithion -j$(nproc)
 
     - name: Run ASan Tests
+      env:
+        # exitcode=1 is the default, but pin it: the whole point of this step is
+        # that a finding changes the exit status.
+        ASAN_OPTIONS: 'detect_leaks=1:exitcode=1:print_stacktrace=1'
       run: |
-        # Phase 8: Run tests with ASan to detect memory errors
         # Skip HD wallet tests - BUG-77 (GetNewHDAddress hangs)
+        #
+        # This step used to end in `|| true`, so the AddressSanitizer job could
+        # not fail on a memory error — only on a build error or a timeout. A job
+        # whose entire purpose is catching memory-safety bugs was structurally
+        # incapable of reporting one, and had been for an unknown length of time.
+        # The suppression is gone. If this goes red, the finding is real: triage
+        # it, do not restore the `|| true`.
         echo "Running tests with AddressSanitizer..."
-        ./test_dilithion --log_level=test_suite --report_level=short --run_test='!wallet_hd_tests:!rpc_hd_wallet_tests:!hd_wallet_standalone_tests' || true
-        echo "✅ ASan tests completed (check output above for memory errors)"
+        ./test_dilithion --log_level=test_suite --report_level=short --run_test='!wallet_hd_tests:!rpc_hd_wallet_tests:!hd_wallet_standalone_tests'
+        echo "✅ ASan tests passed (no memory errors)"
 
   sanitizer-ubsan:
     name: UndefinedBehaviorSanitizer
@@ -285,12 +295,20 @@ jobs:
         make test_dilithion -j$(nproc)
 
     - name: Run UBSan Tests
+      env:
+        # CRITICAL: halt_on_error=1 is NOT optional here. UBSan's DEFAULT
+        # behaviour is to print a diagnostic and CARRY ON, leaving the exit
+        # status at 0. Deleting the `|| true` on its own would therefore have
+        # produced a gate that still could not fail — a quieter version of the
+        # same bug. With halt_on_error the first finding aborts and the job goes
+        # red.
+        UBSAN_OPTIONS: 'halt_on_error=1:print_stacktrace=1'
       run: |
-        # Phase 8: Run tests with UBSan to detect undefined behavior
         # Skip HD wallet tests - BUG-77 (GetNewHDAddress hangs)
+        # See the ASan step: this `|| true` had the same effect here.
         echo "Running tests with UndefinedBehaviorSanitizer..."
-        ./test_dilithion --log_level=test_suite --report_level=short --run_test='!wallet_hd_tests:!rpc_hd_wallet_tests:!hd_wallet_standalone_tests' || true
-        echo "✅ UBSan tests completed (check output above for undefined behavior)"
+        ./test_dilithion --log_level=test_suite --report_level=short --run_test='!wallet_hd_tests:!rpc_hd_wallet_tests:!hd_wallet_standalone_tests'
+        echo "✅ UBSan tests passed (no undefined behavior)"
 
   sanitizer-tsan:
     name: ThreadSanitizer (Data Races)
@@ -359,12 +377,16 @@ jobs:
         make test_dilithion -j$(nproc)
 
     - name: Run TSan Tests
+      env:
+        # TSan already exits 66 when it reports a race, but pin it explicitly so
+        # the gate does not depend on a default.
+        TSAN_OPTIONS: 'halt_on_error=1:exitcode=66'
       run: |
-        # Phase 8: Run tests with TSan to detect data races
         # Skip HD wallet tests - BUG-77 (GetNewHDAddress hangs)
+        # See the ASan step: this `|| true` had the same effect here.
         echo "Running tests with ThreadSanitizer..."
-        ./test_dilithion --log_level=test_suite --report_level=short --run_test='!wallet_hd_tests:!rpc_hd_wallet_tests:!hd_wallet_standalone_tests' || true
-        echo "✅ TSan tests completed (check output above for data races)"
+        ./test_dilithion --log_level=test_suite --report_level=short --run_test='!wallet_hd_tests:!rpc_hd_wallet_tests:!hd_wallet_standalone_tests'
+        echo "✅ TSan tests passed (no data races)"
 
   static-analysis:
     name: Static Analysis
@@ -499,6 +521,14 @@ jobs:
       run: |
         # Run Boost unit tests to generate coverage data
         # Skip HD wallet tests - BUG-77 (GetNewHDAddress hangs)
+        #
+        # The `|| true` here is DELIBERATELY KEPT and is not the same bug as the
+        # one removed from the ASan/UBSan/TSan steps. This job measures coverage;
+        # it is not a correctness gate, and the identical invocation is already
+        # gated (no suppression) in the gcc/Release leg of build-and-test, so a
+        # test failure still fails the run — just not in this job. Keeping it
+        # means a failing test yields partial coverage rather than no report.
+        # Do not cite this line as precedent for suppressing a gate.
         ./test_dilithion --log_level=test_suite --report_level=short --run_test='!wallet_hd_tests:!rpc_hd_wallet_tests:!hd_wallet_standalone_tests' || true
 
         # Verify .gcda files were generated
