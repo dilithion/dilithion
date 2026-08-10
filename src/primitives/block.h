@@ -211,12 +211,19 @@ public:
  */
 static constexpr size_t MINING_HEADER_NONCE_OFFSET = 76;
 
-static constexpr size_t MINING_HEADER_VERSION_OFFSET = 0;
+/**
+ * The remaining offsets of the legacy 80-byte PoW preimage, named for the same
+ * reason as MINING_HEADER_NONCE_OFFSET above: the bare literals were hand-copied
+ * into several unrelated files (net/blockencodings.cpp among them) and only some
+ * of the copies were ever unified. Any new site needing this layout MUST call
+ * WriteMiningHeaderLE() or use these constants — never re-type the numbers.
+ */
+static constexpr size_t MINING_HEADER_VERSION_OFFSET  = 0;
 static constexpr size_t MINING_HEADER_PREVHASH_OFFSET = 4;
-static constexpr size_t MINING_HEADER_MERKLE_OFFSET = 36;
-static constexpr size_t MINING_HEADER_TIME_OFFSET = 68;
-static constexpr size_t MINING_HEADER_BITS_OFFSET = 72;
-static constexpr size_t MINING_HEADER_SIZE = 80;
+static constexpr size_t MINING_HEADER_MERKLE_OFFSET   = 36;
+static constexpr size_t MINING_HEADER_TIME_OFFSET     = 68;
+static constexpr size_t MINING_HEADER_BITS_OFFSET     = 72;
+static constexpr size_t MINING_HEADER_SIZE            = 80;
 
 /**
  * Rewrite ONLY the nonce field of an already-assembled 80-byte mining header.

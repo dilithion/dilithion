@@ -425,6 +425,9 @@ bool CheckProofOfWorkDFMP(
     // block at the top of the Makefile) is what makes it a defined two's-complement wrap
     // and therefore identical across the GCC/Linux, GCC/MSYS2 and Clang/macOS binaries we
     // ship. Removing -fwrapv re-opens a consensus split on this exact path.
+    //
+    // The gate itself is single-sourced in DFMP::DfmpSaturatingMathActive (src/dfmp/dfmp.cpp)
+    // so miner and validator cannot drift at the activation boundary.
     bool dfmpSat = DFMP::DfmpSaturatingMathActive(height);
 
     int64_t multiplierFP;
