@@ -43,11 +43,22 @@
 // with a valid one, so the truncation is acceptable. Load cost is sub-ms over
 // any plausible mempool size.
 //
-// Atomicity: DumpMempool writes to <datadir>/mempool.dat.new, fsyncs, and
-// renames to mempool.dat. The rename is atomic on POSIX; on Windows it uses
-// std::filesystem::rename which is also atomic on NTFS for same-volume moves.
-// On torn write (power loss between fsync and rename), the prior mempool.dat
-// remains intact.
+// Atomicity: DumpMempool writes to <datadir>/mempool.dat.new, fsyncs it, and
+// then publishes it over mempool.dat via util::AtomicReplaceFile() --
+// rename(2) on POSIX, MoveFileExW(MOVEFILE_REPLACE_EXISTING |
+// MOVEFILE_WRITE_THROUGH) on Windows. Both are single filesystem operations,
+// so mempool.dat is at every instant either the complete previous file or the
+// complete new one: never torn, never absent. If the publish fails, the .new
+// file is removed and the prior mempool.dat is left intact.
+//
+// CORRECTION (M4): this comment previously claimed the publish used
+// std::filesystem::rename and that this "is also atomic on NTFS for same-volume
+// moves". That was wrong in a way that mattered. libstdc++ implements
+// std::filesystem::rename with _wrename(), which FAILS outright when the
+// destination already exists -- so on Windows the guarantee documented here was
+// not merely weaker than stated, the publish did not happen at all on any dump
+// after the first. Do not reintroduce std::filesystem::rename on this path; see
+// the rationale block in src/util/atomic_file.h.
 
 #include <atomic>
 #include <cstddef>

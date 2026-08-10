@@ -5,8 +5,10 @@
 
 #include <crypto/sha3.h>
 #include <dfmp/mik.h>
+#include <util/atomic_file.h>
 
 #include <cstdio>
+#include <string>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -84,13 +86,19 @@ bool SaveMIKRegistration(const std::string& datadir,
         out.flush();
     }
 
-    std::error_code ec;
-    std::filesystem::rename(tmpPath, finalPath, ec);
-    if (ec) {
-        // Fallback: remove then rename (Windows sometimes needs this)
-        std::filesystem::remove(finalPath, ec);
-        std::filesystem::rename(tmpPath, finalPath, ec);
-        if (ec) return false;
+    // Publish atomically. This file holds a MINED registration proof-of-work —
+    // it is not reconstructible from chain, so losing it costs the operator real
+    // work. The previous code here did fs::rename and, on failure, fell back to
+    // remove-then-rename; on Windows fs::rename ALWAYS fails when the
+    // destination exists, so the fallback was the normal path and every update
+    // ran through a window in which mik_registration.dat did not exist at all.
+    // durable=true: MOVEFILE_WRITE_THROUGH / parent-dir fsync.
+    // See src/util/atomic_file.h.
+    std::string moveErr;
+    if (!util::AtomicReplaceFile(tmpPath, finalPath, &moveErr, /*durable=*/true)) {
+        std::error_code rm_ec;
+        std::filesystem::remove(tmpPath, rm_ec);  // previous file left intact
+        return false;
     }
     return true;
 }

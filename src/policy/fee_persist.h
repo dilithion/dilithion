@@ -44,8 +44,18 @@
 // mempool.dat. AV-signature mitigation + integrity-detection at sub-ms
 // load cost. See node/mempool_persist.h for full rationale.
 //
-// Atomicity: write to <datadir>/fee_estimates.dat.new, fsync, rename,
-// fsync parent directory. On torn write, prior file remains intact.
+// Atomicity: write to <datadir>/fee_estimates.dat.new, fsync it, then publish
+// over fee_estimates.dat with util::AtomicReplaceFile() -- rename(2) on POSIX,
+// MoveFileExW(MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) on Windows,
+// which also covers the parent-directory fsync. The destination is at every
+// instant either the complete previous file or the complete new one: never
+// torn, never absent. On any failure the .new file is removed and the prior
+// fee_estimates.dat is left intact.
+//
+// CORRECTION (M4): the publish previously used std::filesystem::rename, which
+// on Windows is _wrename() and FAILS when the destination exists -- so this
+// "atomicity" paragraph described a save that, on Windows, simply did not
+// happen after the first one. Do not reintroduce it; see src/util/atomic_file.h.
 //
 // Cold-start semantics: any of (file missing, version mismatch, footer
 // mismatch, malformed body, bucket-ladder mismatch) yields LoadResult{
@@ -114,8 +124,10 @@ struct LoadResult {
 };
 
 /**
- * Atomic save: write to <datadir>/fee_estimates.dat.new, fsync, rename to
- * fee_estimates.dat. Caller must hold no estimator lock; this function
+ * Atomic save: write to <datadir>/fee_estimates.dat.new, fsync, then atomically
+ * replace fee_estimates.dat via util::AtomicReplaceFile() (NOT
+ * std::filesystem::rename -- see the header comment above and
+ * src/util/atomic_file.h). Caller must hold no estimator lock; this function
  * takes the estimator's internal mutex via snapshot().
  *
  * On disk-full or transient failure, returns success=false with an error

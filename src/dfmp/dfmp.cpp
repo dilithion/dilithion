@@ -5,6 +5,7 @@
 #include <dfmp/identity_db.h>
 #include <core/chainparams.h>
 #include <crypto/sha3.h>
+#include <util/deliberate_wrap.h>
 
 #include <cstring>
 #include <algorithm>
@@ -341,6 +342,13 @@ int64_t CalculatePendingPenaltyFP(int currentHeight, int firstSeenHeight) {
     return FP_PENDING_END;           // 1.0x (mature)
 }
 
+// UBSan opt-out (instrumentation only, zero codegen effect). The heat exponential below
+// deliberately overflows int64_t past heat == effectiveFreeThreshold + 60; the wrapped
+// negative is caught by the floor in CalculateEffectiveTarget() and that IS the live
+// consensus rule below the C-3 gate. -fwrapv makes it defined; this attribute stops
+// -fsanitize=undefined from aborting on it WITHOUT disabling signed-overflow detection
+// anywhere else. See src/util/deliberate_wrap.h.
+DILITHION_DELIBERATE_SIGNED_WRAP
 int64_t CalculateHeatMultiplierFP(int heat, int uniqueMiners, bool saturate) {
     // DFMP v3.0 Heat Penalty with Dynamic Scaling:
     // Free tier scales by active miner count:
@@ -373,6 +381,11 @@ int64_t CalculateHeatMultiplierFP(int heat, int uniqueMiners, bool saturate) {
     return penalty;
 }
 
+// UBSan opt-out (instrumentation only, zero codegen effect). The saturate=false branch
+// below is the exact legacy int64 expression and multiplies a possibly-wrapped heat
+// multiplier by maturity -- deliberate, made defined by -fwrapv, and the live rule
+// below the C-3 gate. See src/util/deliberate_wrap.h.
+DILITHION_DELIBERATE_SIGNED_WRAP
 int64_t CalculateTotalMultiplierFP(int currentHeight, int firstSeenHeight, int heat, int uniqueMiners, bool saturate) {
     int64_t pendingFP = CalculatePendingPenaltyFP(currentHeight, firstSeenHeight);
     int64_t heatFP = CalculateHeatMultiplierFP(heat, uniqueMiners, saturate);
@@ -564,6 +577,13 @@ int64_t CalculatePendingPenaltyFP_V31(int currentHeight, int firstSeenHeight) {
     return FP_PENDING_END;           // 1.0x (mature)
 }
 
+// UBSan opt-out (instrumentation only, zero codegen effect). The heat exponential below
+// deliberately overflows int64_t past heat == effectiveFreeThreshold + 60; the wrapped
+// negative is caught by the floor in CalculateEffectiveTarget() and that IS the live
+// consensus rule below the C-3 gate. -fwrapv makes it defined; this attribute stops
+// -fsanitize=undefined from aborting on it WITHOUT disabling signed-overflow detection
+// anywhere else. See src/util/deliberate_wrap.h.
+DILITHION_DELIBERATE_SIGNED_WRAP
 int64_t CalculateHeatMultiplierFP_V31(int heat, int uniqueMiners, bool saturate) {
     // DFMP v3.1: Softened heat penalty
     // Free tier: 36 blocks (or dynamic if higher)
@@ -595,6 +615,11 @@ int64_t CalculateHeatMultiplierFP_V31(int heat, int uniqueMiners, bool saturate)
     return penalty;
 }
 
+// UBSan opt-out (instrumentation only, zero codegen effect). The saturate=false branch
+// below is the exact legacy int64 expression and multiplies a possibly-wrapped heat
+// multiplier by maturity -- deliberate, made defined by -fwrapv, and the live rule
+// below the C-3 gate. See src/util/deliberate_wrap.h.
+DILITHION_DELIBERATE_SIGNED_WRAP
 int64_t CalculateTotalMultiplierFP_V31(int currentHeight, int firstSeenHeight, int heat, int uniqueMiners, bool saturate) {
     int64_t pendingFP = CalculatePendingPenaltyFP_V31(currentHeight, firstSeenHeight);
     int64_t heatFP = CalculateHeatMultiplierFP_V31(heat, uniqueMiners, saturate);
@@ -635,6 +660,13 @@ int64_t CalculatePendingPenaltyFP_V32(int currentHeight, int firstSeenHeight) {
     return FP_PENDING_END;           // 1.0x (mature)
 }
 
+// UBSan opt-out (instrumentation only, zero codegen effect). The heat exponential below
+// deliberately overflows int64_t past heat == effectiveFreeThreshold + 60; the wrapped
+// negative is caught by the floor in CalculateEffectiveTarget() and that IS the live
+// consensus rule below the C-3 gate. -fwrapv makes it defined; this attribute stops
+// -fsanitize=undefined from aborting on it WITHOUT disabling signed-overflow detection
+// anywhere else. See src/util/deliberate_wrap.h.
+DILITHION_DELIBERATE_SIGNED_WRAP
 int64_t CalculateHeatMultiplierFP_V32(int heat, int uniqueMiners, bool saturate) {
     // DFMP v3.2: Aggressive heat penalty (same formula as v3.0)
     // Free tier: 12 blocks (or dynamic if higher)
@@ -666,6 +698,11 @@ int64_t CalculateHeatMultiplierFP_V32(int heat, int uniqueMiners, bool saturate)
     return penalty;
 }
 
+// UBSan opt-out (instrumentation only, zero codegen effect). The saturate=false branch
+// below is the exact legacy int64 expression and multiplies a possibly-wrapped heat
+// multiplier by maturity -- deliberate, made defined by -fwrapv, and the live rule
+// below the C-3 gate. See src/util/deliberate_wrap.h.
+DILITHION_DELIBERATE_SIGNED_WRAP
 int64_t CalculateTotalMultiplierFP_V32(int currentHeight, int firstSeenHeight, int heat, int uniqueMiners, bool saturate) {
     int64_t pendingFP = CalculatePendingPenaltyFP_V32(currentHeight, firstSeenHeight);
     int64_t heatFP = CalculateHeatMultiplierFP_V32(heat, uniqueMiners, saturate);
@@ -693,6 +730,13 @@ int64_t CalculatePendingPenaltyFP_V33(int currentHeight, int firstSeenHeight) {
     return CalculatePendingPenaltyFP_V32(currentHeight, firstSeenHeight);
 }
 
+// UBSan opt-out (instrumentation only, zero codegen effect). The heat exponential below
+// deliberately overflows int64_t past heat == effectiveFreeThreshold + 60; the wrapped
+// negative is caught by the floor in CalculateEffectiveTarget() and that IS the live
+// consensus rule below the C-3 gate. -fwrapv makes it defined; this attribute stops
+// -fsanitize=undefined from aborting on it WITHOUT disabling signed-overflow detection
+// anywhere else. See src/util/deliberate_wrap.h.
+DILITHION_DELIBERATE_SIGNED_WRAP
 int64_t CalculateHeatMultiplierFP_V33(int heat, bool saturate) {
     // DFMP v3.3: Three-zone penalty, NO dynamic scaling
     //   Zone 1 (Free):        0-12 blocks  → 1.0x
@@ -726,6 +770,11 @@ int64_t CalculateHeatMultiplierFP_V33(int heat, bool saturate) {
     return penalty;
 }
 
+// UBSan opt-out (instrumentation only, zero codegen effect). The saturate=false branch
+// below is the exact legacy int64 expression and multiplies a possibly-wrapped heat
+// multiplier by maturity -- deliberate, made defined by -fwrapv, and the live rule
+// below the C-3 gate. See src/util/deliberate_wrap.h.
+DILITHION_DELIBERATE_SIGNED_WRAP
 int64_t CalculateTotalMultiplierFP_V33(int currentHeight, int firstSeenHeight, int heat, bool saturate) {
     int64_t pendingFP = CalculatePendingPenaltyFP_V33(currentHeight, firstSeenHeight);
     int64_t heatFP = CalculateHeatMultiplierFP_V33(heat, saturate);
@@ -753,6 +802,13 @@ int64_t CalculatePendingPenaltyFP_V34(int currentHeight, int firstSeenHeight) {
     return CalculatePendingPenaltyFP_V32(currentHeight, firstSeenHeight);
 }
 
+// UBSan opt-out (instrumentation only, zero codegen effect). The heat exponential below
+// deliberately overflows int64_t past heat == effectiveFreeThreshold + 60; the wrapped
+// negative is caught by the floor in CalculateEffectiveTarget() and that IS the live
+// consensus rule below the C-3 gate. -fwrapv makes it defined; this attribute stops
+// -fsanitize=undefined from aborting on it WITHOUT disabling signed-overflow detection
+// anywhere else. See src/util/deliberate_wrap.h.
+DILITHION_DELIBERATE_SIGNED_WRAP
 int64_t CalculateHeatMultiplierFP_V34(int heat, bool isVerified, bool saturate) {
     // DFMP v3.4: Same three-zone curve as v3.3, but free tier depends on
     // DNA verification status:
@@ -796,6 +852,11 @@ int64_t CalculateHeatMultiplierFP_V34(int heat, bool isVerified, bool saturate) 
     return penalty;
 }
 
+// UBSan opt-out (instrumentation only, zero codegen effect). The saturate=false branch
+// below is the exact legacy int64 expression and multiplies a possibly-wrapped heat
+// multiplier by maturity -- deliberate, made defined by -fwrapv, and the live rule
+// below the C-3 gate. See src/util/deliberate_wrap.h.
+DILITHION_DELIBERATE_SIGNED_WRAP
 int64_t CalculateTotalMultiplierFP_V34(int currentHeight, int firstSeenHeight, int heat, bool isVerified, bool saturate) {
     int64_t pendingFP = CalculatePendingPenaltyFP_V34(currentHeight, firstSeenHeight);
     int64_t heatFP = CalculateHeatMultiplierFP_V34(heat, isVerified, saturate);

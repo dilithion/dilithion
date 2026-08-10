@@ -1505,16 +1505,39 @@ quality: analyze
 # Fuzz test compiler (requires Clang with libFuzzer support)
 # Try clang++-14 first, fall back to clang++ (any version), or use environment variable
 FUZZ_CXX ?= $(shell command -v clang++-14 2>/dev/null || command -v clang++ 2>/dev/null || echo clang++)
-# -fwrapv is carried here too (see the CONSENSUS-CRITICAL block near the top).
-# FUZZ_CXXFLAGS is a standalone `:=` and does NOT inherit CXXFLAGS, so the flag must
-# be repeated or the fuzz build would exercise DIFFERENT arithmetic semantics than the
-# binaries we ship. Without it, `-fsanitize=undefined` aborts on the legacy DFMP heat
-# exponential the moment a corpus input reaches heat == effectiveFreeThreshold + 60 —
-# a false positive against the shipped semantics, which are defined by -fwrapv.
-# TRADE-OFF (accepted, K1): UBSan's signed-integer-overflow check is thereby vacuous
-# across the whole fuzz build, so genuinely-unintended signed overflow elsewhere must
-# be caught by review and by the C-3 saturating path's explicit tests, not by UBSan.
-FUZZ_CXXFLAGS := -fsanitize=fuzzer,address,undefined -fwrapv -std=c++17 -O1 -g $(INCLUDES) -DDILITHIUM_MODE=3
+# ---------------------------------------------------------------------------
+# DO NOT ADD -fwrapv TO FUZZ_CXXFLAGS. (M4; supersedes the K1 trade-off.)
+#
+# -fwrapv makes signed overflow well-defined, which means Clang emits NO
+# `signed-integer-overflow` check for the TU. Putting it in FUZZ_CXXFLAGS
+# therefore does not "silence a false positive" — it deletes an entire UBSan
+# bug class from every harness in the fuzz build, permanently and invisibly, to
+# quiet ONE known, deliberate site. A check that still runs and no longer checks
+# is worse than no check, because the green run is read as evidence.
+#
+# The exemption is scoped at the source instead, three ways:
+#
+#  1. The deliberate DFMP wrap sites carry DILITHION_DELIBERATE_SIGNED_WRAP
+#     (src/util/deliberate_wrap.h) on the individual functions. That is
+#     per-function, greppable, and documented at the site. It is
+#     instrumentation-only: zero codegen effect, consensus output unchanged.
+#
+#  2. Consensus/library objects linked into the fuzz binaries are built by the
+#     ordinary $(OBJ_DIR)/%.o recipe, which already carries
+#     $(CONSENSUS_CXXFLAGS) = -fwrapv. So the arithmetic SEMANTICS the fuzzers
+#     link against are identical to the shipped binaries regardless of this
+#     line — the semantics-parity argument for adding -fwrapv here does not
+#     apply, because this variable governs harness TUs only.
+#
+#  3. Harness TUs (src/test/fuzz/*.cpp) are test code and must never rely on
+#     signed wrapping. They keep full UBSan, signed-integer-overflow included.
+#
+# Verified with clang++-14: with -fwrapv the harness objects contain NO
+# __ubsan_handle_*_overflow relocation at all; without it the check is present
+# and fires, while the attributed DFMP functions stay silent even when the same
+# TU is compiled with -fsanitize=undefined.
+# ---------------------------------------------------------------------------
+FUZZ_CXXFLAGS := -fsanitize=fuzzer,address,undefined -std=c++17 -O1 -g $(INCLUDES) -DDILITHIUM_MODE=3
 
 # Fuzz test sources (Week 3 Phase 4 - 9 harnesses, 42+ targets)
 # Week 6 Phase 3 - Added tx_validation and utxo fuzzers (11 harnesses total)
