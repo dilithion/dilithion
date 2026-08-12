@@ -1148,6 +1148,7 @@ BOOST_TEST_OBJECTS := $(OBJ_DIR)/test/test_dilithion.o \
 	$(OBJ_DIR)/test/miner_nonce_write_tests.o \
 	$(OBJ_DIR)/test/chain_tips_cache_invalidation_tests.o \
 	$(OBJ_DIR)/test/reorg_depth_cap_tests.o \
+	$(OBJ_DIR)/test/reorg_belt_rebuild_flag_tests.o \
 	$(CRYPTO_PROPERTY_OBJECTS)
 
 # Link test objects + full library (CORE_OBJECTS) to avoid hand-picked object drift
