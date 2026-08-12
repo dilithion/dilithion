@@ -25,6 +25,7 @@
 #include <primitives/transaction.h>
 #include <primitives/block.h>
 #include <consensus/validation.h>
+#include <consensus/connect_checks.h>
 #include <amount.h>
 #include <uint256.h>
 #include <crypto/sha3.h>
@@ -561,6 +562,19 @@ BOOST_AUTO_TEST_CASE(utxo_reorg_handling) {
 
     std::vector<CTransactionRef> transactions = {coinbase, spending};
     CBlock block = CreateTestBlock(transactions, 2);
+
+    // C-R3 INVERSION: the low-level UTXO mutator ApplyBlock still ACCEPTS this
+    // garbage-signature spend (it only checks input existence / dup-txid); that
+    // is exactly the connect-path gap. The new unified connect-path validator
+    // ConnectBlockChecks — the gate ConnectTip now runs BEFORE ApplyBlock —
+    // REJECTS the same block for an invalid ML-DSA signature. (The spend is
+    // value-valid 100 -> 90, so the rejection is attributable to the signature.)
+    {
+        std::string ccError;
+        BOOST_CHECK_MESSAGE(
+            !ConnectBlockChecks(block, utxo, 2, /*fVerifyScripts=*/true, ccError),
+            "connect-path validator must reject the garbage-signature spend");
+    }
 
     BOOST_CHECK(utxo.ApplyBlock(block, 2, block.GetHash()));
 

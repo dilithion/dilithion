@@ -227,6 +227,7 @@ CONSENSUS_SOURCES := src/consensus/fees.cpp \
                      src/consensus/signature_batch_verifier.cpp \
                      src/consensus/sighash_preimage.cpp \
                      src/consensus/validation.cpp \
+                     src/consensus/connect_checks.cpp \
                      src/consensus/vdf_validation.cpp \
                      src/consensus/port/chain_selector_impl.cpp
 
@@ -1120,6 +1121,7 @@ BOOST_TEST_OBJECTS := $(OBJ_DIR)/test/test_dilithion.o \
 	$(OBJ_DIR)/test/validation_integration_tests.o \
 	$(OBJ_DIR)/test/consensus_validation_tests.o \
 	$(OBJ_DIR)/test/utxo_tests.o \
+	$(OBJ_DIR)/test/connect_checks_tests.o \
 	$(OBJ_DIR)/test/tx_validation_tests.o \
 	$(OBJ_DIR)/test/phase4_5_consensus_fixes_tests.o \
 	$(OBJ_DIR)/test/sighash_preimage_tests.o \

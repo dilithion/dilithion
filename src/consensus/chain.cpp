@@ -6,6 +6,7 @@
 #include <consensus/pow.h>
 #include <consensus/reorg_wal.h>  // P1-4: WAL for atomic reorgs
 #include <consensus/validation.h> // BUG #109 FIX: DeserializeBlockTransactions
+#include <consensus/connect_checks.h> // C-R3: unified connect-path block validator
 #include <consensus/vdf_validation.h> // CheckVDFCooldown, CheckConsecutiveMiner
 #include <vdf/cooldown_tracker.h>  // CCooldownTracker full definition
 #include <core/chainparams.h>     // MAINNET: Checkpoint validation
@@ -1713,6 +1714,47 @@ bool CChainState::ConnectTip(CBlockIndex* pindex, const CBlock& block, bool skip
                       << " REJECTED: registration rate limit exceeded" << std::endl;
             std::cerr << "[Chain] " << rateLimitError << std::endl;
 
+            pindex->nStatus |= CBlockIndex::BLOCK_FAILED_VALID;
+            if (pdb != nullptr) {
+                pdb->WriteBlockIndex(blockHash, *pindex);
+            }
+            return false;
+        }
+    }
+
+    // ========================================================================
+    // C-R3: UNIFIED CONNECT-PATH BLOCK VALIDATOR (last gate before ApplyBlock)
+    // ========================================================================
+    // A single READ-ONLY consensus gate that closes the class of checks the
+    // connect path historically skipped (they were enforced only on the mempool
+    // path, which a self-mined / never-relayed block bypasses): merkle-root
+    // commitment, spend-signature verification bound to the coin's committed
+    // scriptPubKey, per-tx value conservation, coinbase value <= subsidy + fees,
+    // in-block double-spend, and coinbase maturity. It runs for ALL connects,
+    // including reorg/skipValidation, so a bad fork block cannot be connected
+    // through ActivateBestChainStep either. It builds a per-block output overlay
+    // so an in-block-chained spend (child spends a same-block parent) is NOT
+    // falsely rejected. It is read-only: on failure ConnectTip returns before
+    // ApplyBlock mutates anything.
+    //
+    // fVerifyScripts: the expensive (~2 ms/input) ML-DSA signature step is gated
+    // on assumevalid — blocks at/below dfmpAssumeValidHeight are anchored by the
+    // shipped checkpoint hash commitment, so re-deriving their signatures adds no
+    // security (Bitcoin Core's assumevalid model). Value conservation, merkle,
+    // double-spend and maturity stay ALWAYS-ON regardless of assumevalid.
+    if (pUTXOSet != nullptr) {
+        std::string connectError;
+        const bool fVerifyScripts = !assumeValid;
+        if (!ConnectBlockChecks(block, *pUTXOSet, pindex->nHeight,
+                                fVerifyScripts, connectError)) {
+            std::cerr << "[Chain] ERROR: Block " << pindex->nHeight
+                      << " REJECTED by connect-path validator: " << connectError << std::endl;
+
+            // Genuine consensus failure — mark permanently failed (do not retry),
+            // mirroring the MIK/DNA/attestation reject blocks above. By the time
+            // ConnectTip runs, the parent is the tip and the UTXO set is current,
+            // so an input-not-found here is a genuine invalid spend, not transient
+            // corruption (which is handled separately at the ApplyBlock site below).
             pindex->nStatus |= CBlockIndex::BLOCK_FAILED_VALID;
             if (pdb != nullptr) {
                 pdb->WriteBlockIndex(blockHash, *pindex);
