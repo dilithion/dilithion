@@ -316,3 +316,23 @@ bool ConnectPathVerifyVDF(const Dilithion::ChainParams* params,
     return !ConnectPathMaySkipVDFVerify(nHeight, vdfAssumeValidHeight,
                                         fInitialBlockDownload);
 }
+
+bool ShouldRunVDFArrivalPreflight(bool isVDFBlock,
+                                  bool parentOnActiveChain,
+                                  bool alreadyHaveBlockData,
+                                  bool fInitialBlockDownload)
+{
+    // MEDIUM-2 (VDF_WIRING_REREVIEW3): the arrival-time preflight is a
+    // defense-in-depth filter, NOT the authoritative verify. Run it only for a
+    // FRESH v4 block on the authoritative-height path, outside IBD. The
+    // !alreadyHaveBlockData term is the load-bearing fix: a block we already hold
+    // must NOT re-run the expensive Wesolowski verify — that is redundant with
+    // ConnectTip and, on the honest-valid replay path, an unbannable
+    // CPU-exhaustion amplification. Excluding it does NOT weaken forgery
+    // rejection: a fresh forged block has no stored data, so it still runs the
+    // preflight and its peer is still scored.
+    return isVDFBlock
+        && parentOnActiveChain
+        && !alreadyHaveBlockData
+        && !fInitialBlockDownload;
+}

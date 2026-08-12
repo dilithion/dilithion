@@ -181,6 +181,58 @@ BOOST_FIXTURE_TEST_CASE(vdf_gate_dilv_params_default_verify_all_heights, DilVPar
 }
 
 // ============================================================================
+// MEDIUM-2 (VDF_WIRING_REREVIEW3) — the ARRIVAL-time preflight must NOT re-run
+// the expensive Wesolowski verify for a block we ALREADY have. Replaying a
+// known-valid v4 block (public tip) otherwise forces a full verify per message
+// with no peer penalty — an unbounded CPU-exhaustion amplification.
+//
+// ShouldRunVDFArrivalPreflight is the single decision point ProcessNewBlock uses
+// to gate the arrival preflight. Returning false == the expensive
+// ConnectPathCheckVDF is skipped. Pure fn => directly mutation-provable.
+//
+// Mutation target: deleting the `&& !alreadyHaveBlockData` term (the fix) flips
+// the "known block => skip" assertion from false to true => this test reddens.
+// ============================================================================
+
+BOOST_AUTO_TEST_CASE(vdf_medium2_known_block_skips_arrival_preflight) {
+    // FRESH unknown v4 block on the authoritative path, outside IBD => RUN.
+    // (Positive control: proves the guard is not "always skip" / always-false.)
+    BOOST_CHECK(ShouldRunVDFArrivalPreflight(/*isVDF=*/true, /*parentActive=*/true,
+                                             /*alreadyHave=*/false, /*IBD=*/false));
+
+    // THE FIX: the SAME block once we already hold its data => SKIP. This is the
+    // replayed-known-valid-tip case — no second expensive verify.
+    BOOST_CHECK(!ShouldRunVDFArrivalPreflight(/*isVDF=*/true, /*parentActive=*/true,
+                                              /*alreadyHave=*/true, /*IBD=*/false));
+
+    // A FRESH FORGED block is never "already have" (its data is never stored; the
+    // reject path only sets BLOCK_FAILED_VALID on an already-indexed entry), so it
+    // still RUNS the preflight => still rejected + peer scored. The dedup gate does
+    // NOT weaken forgery rejection.
+    BOOST_CHECK(ShouldRunVDFArrivalPreflight(/*isVDF=*/true, /*parentActive=*/true,
+                                             /*alreadyHave=*/false, /*IBD=*/false));
+
+    // IBD exemption preserved: never preflight while our own sync is behind.
+    BOOST_CHECK(!ShouldRunVDFArrivalPreflight(/*isVDF=*/true, /*parentActive=*/true,
+                                              /*alreadyHave=*/false, /*IBD=*/true));
+
+    // Orphan / competing-fork (parent NOT on active chain): never preflighted /
+    // scored — height was guessed (BUG #246 chain-mismatch discipline).
+    BOOST_CHECK(!ShouldRunVDFArrivalPreflight(/*isVDF=*/true, /*parentActive=*/false,
+                                              /*alreadyHave=*/false, /*IBD=*/false));
+
+    // Non-VDF (pre-v4 / DIL PoW) block: no VDF proof to verify => never preflight.
+    BOOST_CHECK(!ShouldRunVDFArrivalPreflight(/*isVDF=*/false, /*parentActive=*/true,
+                                              /*alreadyHave=*/false, /*IBD=*/false));
+
+    // Belt-and-braces: a known block is skipped regardless of IBD/orphan state —
+    // the dedup term dominates. Any of these turning true under the delete-the-term
+    // mutation reddens the test.
+    BOOST_CHECK(!ShouldRunVDFArrivalPreflight(/*isVDF=*/true, /*parentActive=*/true,
+                                              /*alreadyHave=*/true, /*IBD=*/true));
+}
+
+// ============================================================================
 // CONNECT-PATH SEAM — honest ACCEPT / forged REJECT (the security property)
 // ============================================================================
 

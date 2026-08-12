@@ -177,4 +177,51 @@ bool ConnectPathVerifyVDF(const Dilithion::ChainParams* params,
                           int nHeight,
                           bool fInitialBlockDownload);
 
+/**
+ * ShouldRunVDFArrivalPreflight — arrival-time (ProcessNewBlock) decision for the
+ * defense-in-depth VDF preflight (VDF_WIRING_REREVIEW3 MEDIUM-2 remediation).
+ *
+ * ProcessNewBlock runs an OPTIONAL arrival-time CheckVDFProof in front of the
+ * authoritative ConnectTip verify, so a FORGED v4 block is rejected + its sending
+ * peer scored BEFORE the block is stored/relayed. That preflight is the same
+ * ~tens-of-ms class-group Wesolowski verify. Round-3 review found it was placed
+ * AHEAD of the duplicate/already-have dedup: replaying a KNOWN-VALID v4 block
+ * (e.g. the public current tip) forced a full verify on every message with NO
+ * peer penalty (a valid proof is never Misbehaving) — an unbounded CPU-exhaustion
+ * amplification on the sole block-admission funnel. This predicate hoists the
+ * cheap dedup ahead of the expensive verify: an already-known block short-circuits.
+ *
+ * Runs the preflight ONLY when ALL hold:
+ *   1. isVDFBlock            — v4+ block (only these carry a VDF proof to verify).
+ *   2. parentOnActiveChain   — the block's parent is on the active chain, so the
+ *      height/challenge derivation is authoritative and a failing proof is
+ *      honest-impossible (safe to score the peer). An orphan/competing-fork block
+ *      whose height we guessed is NEVER preflighted/scored (BUG #246 discipline);
+ *      it defers to the authoritative ConnectTip verify.
+ *   3. !alreadyHaveBlockData — we do NOT already hold this block's data (in the DB
+ *      or a data-bearing index entry). A block we already have was verified at
+ *      ConnectTip (or will be when it activates), and a known-forged block is
+ *      culled by the Phase-3 IsInvalid() gate — re-running the verify buys nothing
+ *      and is the replay-DoS vector. A FRESH forged block has neither DB data nor a
+ *      data-bearing index (its data is never written; the reject path only sets
+ *      BLOCK_FAILED_VALID on an already-indexed entry), so this term does NOT let
+ *      forged blocks skip the preflight — they are still rejected + scored.
+ *   4. !fInitialBlockDownload — outside IBD only, so it never doubles the
+ *      from-genesis IBD VDF cost nor scores peers while our own sync is behind.
+ *
+ * Pure function of its arguments (no globals) so it is directly unit-testable and
+ * mutation-provable. Authoritative enforcement ALWAYS remains at ConnectTip; this
+ * gates only the redundant arrival-time filter in front of it.
+ *
+ * @param isVDFBlock             block.IsVDFBlock() — the block is v4+.
+ * @param parentOnActiveChain    The block's parent is on the active chain.
+ * @param alreadyHaveBlockData   We already hold this block's data (DB or index HaveData).
+ * @param fInitialBlockDownload  True iff the node is in initial block download.
+ * @return true iff the arrival-time VDF preflight should run for this block.
+ */
+bool ShouldRunVDFArrivalPreflight(bool isVDFBlock,
+                                  bool parentOnActiveChain,
+                                  bool alreadyHaveBlockData,
+                                  bool fInitialBlockDownload);
+
 #endif // DILITHION_CONSENSUS_CONNECT_CHECKS_H

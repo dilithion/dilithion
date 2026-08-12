@@ -5,6 +5,7 @@
 #include <node/blockchain_storage.h>
 #include <node/peer_mik_tracker.h>
 #include <consensus/vdf_validation.h>
+#include <consensus/connect_checks.h>  // ShouldRunVDFArrivalPreflight (MEDIUM-2 dedup gate)
 #include <node/block_index.h>
 #include <node/block_validation_queue.h>
 #include <node/fork_manager.h>
@@ -767,10 +768,31 @@ BlockProcessResult ProcessNewBlock(
         // miner cannot emit one) => genuine forgery => immediate-ban score
         // (INVALID_BLOCK_POW == 100), the ban-only-on-honest-impossible signal.
         if (!shouldSkipDFMP && block.IsVDFBlock()) {
+            // MEDIUM-2 (VDF_WIRING_REREVIEW3): hoist the CHEAP duplicate/
+            // already-have dedup AHEAD of the ~tens-of-ms Wesolowski verify. The
+            // same dedup runs downstream in Phase 3 (GetBlockIndex+HaveData at
+            // block_processing.cpp:977, db.BlockExists at :1054); consulting it
+            // here first stops a KNOWN-VALID v4 block (e.g. a replayed public tip)
+            // from forcing a full VDF verify on every message with no peer penalty
+            // — an unbounded CPU-exhaustion amplification on the sole admission
+            // funnel. A block we already hold is authoritatively verified at
+            // ConnectTip (or on activation), and a known-forged one is culled by
+            // the Phase-3 IsInvalid() gate, so the preflight buys nothing for it.
+            // A FRESH forged block has neither stored data nor a data-bearing index
+            // (data is never written on reject; only BLOCK_FAILED_VALID is set on an
+            // already-indexed entry), so it is NOT short-circuited here — it still
+            // runs the preflight and its peer is still scored.
+            CBlockIndex* pindexKnown = g_chainstate.GetBlockIndex(blockHash);
+            const bool alreadyHaveBlockData =
+                db.BlockExists(blockHash) ||
+                (pindexKnown != nullptr && pindexKnown->HaveData());
             const bool fInitialBlockDownloadVDF =
                 g_node_context.sync_coordinator &&
                 g_node_context.sync_coordinator->IsInitialBlockDownload();
-            if (!fInitialBlockDownloadVDF) {
+            if (ShouldRunVDFArrivalPreflight(/*isVDFBlock=*/block.IsVDFBlock(),
+                                             /*parentOnActiveChain=*/!shouldSkipDFMP,
+                                             alreadyHaveBlockData,
+                                             fInitialBlockDownloadVDF)) {
                 std::string vdfPreflightErr;
                 if (!ConnectPathCheckVDF(block, blockHeight, block.hashPrevBlock,
                                          /*fInitialBlockDownload=*/false,
