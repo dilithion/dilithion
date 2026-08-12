@@ -8309,7 +8309,11 @@ std::string CRPCServer::RPC_InvalidateBlock(const std::string& params) {
         std::cout << "[RPC] invalidateblock: disconnecting from height " << currentHeight
                   << " to " << disconnectTo << " (" << (currentHeight - disconnectTo) << " blocks)" << std::endl;
 
-        int disconnected = m_chainstate->DisconnectToHeight(disconnectTo, *m_blockchain);
+        // Operator carve-out (REORG_DEPTH_FINALITY_DESIGN §6.3): invalidateblock is
+        // an explicit operator action => allowDeep=true bypasses the automatic
+        // reorg-depth cap. Still bounded by the checkpoint floor in DisconnectToHeight.
+        int disconnected = m_chainstate->DisconnectToHeight(disconnectTo, *m_blockchain,
+                                                            /*batchSize=*/100, /*allowDeep=*/true);
         if (disconnected < 0) {
             throw std::runtime_error("DisconnectToHeight failed");
         }
@@ -8361,7 +8365,10 @@ std::string CRPCServer::RPC_InvalidateBlock(const std::string& params) {
     std::cout << "[RPC] invalidateblock: disconnecting from height " << currentHeight
               << " to " << disconnectTo << " (" << (currentHeight - disconnectTo) << " blocks)" << std::endl;
 
-    int disconnected = m_chainstate->DisconnectToHeight(disconnectTo, *m_blockchain);
+    // Operator carve-out (REORG_DEPTH_FINALITY_DESIGN §6.3): explicit operator
+    // invalidateblock => allowDeep=true. Still checkpoint-floor bounded.
+    int disconnected = m_chainstate->DisconnectToHeight(disconnectTo, *m_blockchain,
+                                                        /*batchSize=*/100, /*allowDeep=*/true);
     if (disconnected < 0) {
         throw std::runtime_error("DisconnectToHeight failed");
     }

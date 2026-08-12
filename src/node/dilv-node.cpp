@@ -5258,7 +5258,13 @@ load_genesis_block:  // Bug #29: Label for automatic retry after blockchain wipe
                     std::cout << "[REVALIDATION] Disconnecting chain to height " << (firstInvalidHeight - 1) << std::endl;
                     std::cout << "[REVALIDATION] ================================================\n" << std::endl;
 
-                    int disconnected = g_chainstate.DisconnectToHeight(firstInvalidHeight - 1, blockchain);
+                    // Operator carve-out (REORG_DEPTH_FINALITY_DESIGN §6.3): startup
+                    // revalidation is a self/operator action keyed off the node's OWN
+                    // consensus re-check of its OWN stored blocks (not attacker header
+                    // data), so it may roll back deeper than the automatic reorg cap =>
+                    // allowDeep=true. Still bounded by the checkpoint floor.
+                    int disconnected = g_chainstate.DisconnectToHeight(firstInvalidHeight - 1, blockchain,
+                                                                       /*batchSize=*/100, /*allowDeep=*/true);
                     if (disconnected < 0) {
                         std::cerr << "[REVALIDATION] CRITICAL: DisconnectToHeight failed!" << std::endl;
                         std::cerr << "[REVALIDATION] Try running with --reindex" << std::endl;

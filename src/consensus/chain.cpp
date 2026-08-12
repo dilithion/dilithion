@@ -2103,7 +2103,8 @@ bool CChainState::DisconnectTip(CBlockIndex* pindex, bool force_skip_utxo) {
     return true;
 }
 
-int CChainState::DisconnectToHeight(int targetHeight, CBlockchainDB& db, int batchSize) {
+int CChainState::DisconnectToHeight(int targetHeight, CBlockchainDB& db, int batchSize,
+                                    bool allowDeep) {
     std::unique_lock<std::recursive_mutex> lock(cs_main);
 
     // Perf fix 2026-07-12: this loop reassigns pindexTip directly (not via
@@ -2119,6 +2120,31 @@ int CChainState::DisconnectToHeight(int targetHeight, CBlockchainDB& db, int bat
         if (checkpoint && targetHeight < checkpoint->nHeight) {
             std::cerr << "[DisconnectToHeight] Cannot disconnect below checkpoint "
                       << checkpoint->nHeight << " (target=" << targetHeight << ")" << std::endl;
+            return -1;
+        }
+    }
+
+    // REORG-DEPTH FINALITY CAP (REORG_DEPTH_FINALITY_DESIGN §6.1, suspenders).
+    // Consensus::MAX_REORG_DEPTH is a HARD finality bound, but historically it was
+    // enforced ONLY on the in-band ActivateBestChain path (chain.cpp:881). The
+    // automatic IBD/fork-recovery callers reach THIS chokepoint directly and were
+    // bounded only by the checkpoint floor above — so a peer feeding forged
+    // low-difficulty headers (on VDF the header work is forgeable at ~zero cost)
+    // could drive a synced node to roll back to its last checkpoint, or all the way
+    // to genesis on a young/relaunch chain with only a genesis checkpoint. This
+    // guard makes the cap the standing finality bound on EVERY automatic disconnect.
+    // Default allowDeep=false closes the CLASS (both known recovery sites + any
+    // future automatic caller); only explicit operator actions (invalidateblock /
+    // startup revalidation) pass allowDeep=true, and they stay checkpoint-bounded by
+    // the floor above. The >cap case is routed by the callers to the operator-gated
+    // full-rebuild flow (re-IBD from genesis re-applies checkpoints; genesis-up
+    // activation is cap-exempt), which is the correct posture for a >60 divergence.
+    if (!allowDeep) {
+        const int depth = pindexTip->nHeight - targetHeight;  // > 0, guaranteed above
+        if (depth > Consensus::MAX_REORG_DEPTH) {
+            std::cerr << "[DisconnectToHeight] Refusing automatic disconnect of " << depth
+                      << " blocks (> MAX_REORG_DEPTH=" << Consensus::MAX_REORG_DEPTH
+                      << "); route to operator rebuild" << std::endl;
             return -1;
         }
     }
