@@ -5,6 +5,7 @@
 #define DILITHION_NET_SERIALIZE_H
 
 #include <primitives/block.h>
+#include <primitives/transaction.h>   // CompactSizeIsCanonical — shared minimality rule
 #include <net/protocol.h>
 #include <vector>
 #include <string>
@@ -199,18 +200,26 @@ public:
         return static_cast<int64_t>(ReadUint64());
     }
 
-    // Read variable-length integer
+    // Read variable-length integer.
+    // Malleability finding #5: enforce minimal (shortest-form) encoding so a
+    // single value has exactly one wire byte-string. Uses the same shared range
+    // check (CompactSizeIsCanonical) as the other two decoders — no drift.
     uint64_t ReadCompactSize() {
         uint8_t first = ReadUint8();
+        uint64_t value;
         if (first < 253) {
-            return first;
+            value = first;
         } else if (first == 253) {
-            return ReadUint16();
+            value = ReadUint16();
         } else if (first == 254) {
-            return ReadUint32();
+            value = ReadUint32();
         } else {
-            return ReadUint64();
+            value = ReadUint64();
         }
+        if (!CompactSizeIsCanonical(first, value)) {
+            throw std::runtime_error("Non-canonical CompactSize (non-minimal encoding)");
+        }
+        return value;
     }
 
     // Read string

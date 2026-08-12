@@ -3,6 +3,7 @@
 
 #include <consensus/validation.h>
 #include <consensus/tx_validation.h>
+#include <primitives/transaction.h>   // DeserializeCompactSize — single shared minimal decoder
 #include <consensus/pow.h>
 #include <consensus/vdf_validation.h>
 #include <consensus/params.h>
@@ -105,37 +106,22 @@ bool CBlockValidator::DeserializeBlockTransactions(
         return false;
     }
 
+    // Malleability finding #5: decode the block tx-count through the SINGLE
+    // shared CompactSize decoder (DeserializeCompactSize) instead of a third
+    // hand-rolled copy. This (a) enforces minimal encoding here too and (b)
+    // unifies the previously decoder-specific 255-prefix handling — the old
+    // inline copy special-rejected the 9-byte (255) prefix while the two other
+    // decoders accepted it, an inconsistency an attacker could probe. The
+    // absurd-count cap below (>100k) still rejects any genuinely large value.
     uint64_t txCount = 0;
-    uint8_t firstByte = data[offset++];
-
-    if (firstByte < 253) {
-        txCount = firstByte;
-    } else if (firstByte == 253) {
-        if (offset + 2 > dataSize) {
-            error = "Incomplete transaction count (253)";
+    {
+        const uint8_t* p = data + offset;
+        const uint8_t* endp = data + dataSize;
+        if (!DeserializeCompactSize(p, endp, txCount, &error)) {
+            // error string set by the shared decoder (truncation or non-minimal)
             return false;
         }
-        // CID 1675211 FIX: Cast to uint64_t before shifting to prevent sign extension
-        // When shifting uint8_t values, they are promoted to int (signed), which can cause
-        // sign extension if the high bit is set. Casting to uint64_t ensures unsigned behavior.
-        txCount = static_cast<uint64_t>(data[offset]) | (static_cast<uint64_t>(data[offset + 1]) << 8);
-        offset += 2;
-    } else if (firstByte == 254) {
-        if (offset + 4 > dataSize) {
-            error = "Incomplete transaction count (254)";
-            return false;
-        }
-        // CID 1675211 FIX: Cast to uint64_t before shifting to prevent sign extension
-        // When shifting uint8_t values, they are promoted to int (signed), which can cause
-        // sign extension if the high bit is set. Casting to uint64_t ensures unsigned behavior.
-        txCount = static_cast<uint64_t>(data[offset]) |
-                 (static_cast<uint64_t>(data[offset + 1]) << 8) |
-                 (static_cast<uint64_t>(data[offset + 2]) << 16) |
-                 (static_cast<uint64_t>(data[offset + 3]) << 24);
-        offset += 4;
-    } else {
-        error = "Unsupported transaction count encoding (255)";
-        return false;
+        offset = static_cast<size_t>(p - data);
     }
 
     if (txCount == 0) {

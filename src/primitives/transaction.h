@@ -15,6 +15,36 @@
  *  a duplicate — see FIX-1 HIGH-1. There must be exactly one CompactSize encoder. */
 void SerializeCompactSize(std::vector<uint8_t>& data, uint64_t size);
 
+/** Malleability closure (finding #5): the single-source minimality rule for
+ *  CompactSize decoders. A CompactSize MUST be encoded in its shortest form,
+ *  or the two byte-strings for one value become a wire-hygiene / relay-dedup
+ *  ambiguity. All three decoders (CDataStream::ReadCompactSize,
+ *  DeserializeCompactSize, and the block tx-count decoder in validation.cpp,
+ *  which now delegates here) share THIS one range check so they cannot drift.
+ *
+ *  @param prefix  the leading discriminator byte that was read
+ *  @param value   the value decoded from the bytes that followed it
+ *  @return true iff `prefix` is the shortest encoding that can represent `value`.
+ *
+ *  Soft-fork tightening: rejects a strict subset of previously-accepted
+ *  encodings; nothing previously-invalid becomes valid. Safe on a fresh
+ *  canonical genesis by construction (no honest producer emits non-minimal). */
+inline bool CompactSizeIsCanonical(uint8_t prefix, uint64_t value) {
+    if (prefix < 253)      return true;                    // 1-byte form: value == prefix, always minimal
+    if (prefix == 253)     return value >= 253;            // 3-byte form must carry >= 253
+    if (prefix == 254)     return value > 0xFFFFULL;       // 5-byte form must carry > 0xFFFF
+    /* prefix == 255 */    return value > 0xFFFFFFFFULL;   // 9-byte form must carry > 0xFFFFFFFF
+}
+
+/** Deserialize a compact size (Bitcoin-style varint) from a byte range, with
+ *  minimal-encoding enforcement (finding #5). Exported (non-static) so the
+ *  block tx-count decoder in validation.cpp reuses THIS one decoder instead of
+ *  hand-rolling a third copy that drifts. Advances `data` past the bytes read.
+ *  Returns false (setting *error, if provided) on truncation or non-minimal
+ *  encoding. */
+bool DeserializeCompactSize(const uint8_t*& data, const uint8_t* end,
+                            uint64_t& size, std::string* error);
+
 /**
  * An outpoint - a combination of a transaction hash and an index n into its vout
  */

@@ -31,6 +31,28 @@ static inline bool CastToBool(const std::vector<uint8_t>& vch) {
     return false;
 }
 
+// Malleability closure (finding #4, sub-vector B2): SCRIPT_VERIFY_MINIMALDATA.
+// A data push of `nSize` bytes must use its shortest possible opcode. Mirrors
+// Bitcoin Core's CheckMinimalPush(BIP-62 rule 3/4). Returns true iff `opcode`
+// is the minimal encoding for a push of `data[0..nSize)`.
+//   * empty push        -> OP_0
+//   * 1 byte, 1..16     -> OP_1..OP_16 (a raw push is non-minimal)
+//   * 1 byte == 0x81    -> OP_1NEGATE
+//   * <= 75 bytes       -> direct push (opcode == nSize)
+//   * <= 255 bytes      -> OP_PUSHDATA1
+//   * <= 65535 bytes    -> OP_PUSHDATA2
+//   * larger            -> OP_PUSHDATA4 (only option)
+// `firstByte` is data[0] for a 1-byte push and is ignored for other sizes.
+static inline bool CheckMinimalPush(size_t nSize, uint8_t firstByte, uint8_t opcode) {
+    if (nSize == 0)                                     return opcode == OP_0;
+    if (nSize == 1 && firstByte >= 1 && firstByte <= 16) return false;  // must use OP_1..OP_16
+    if (nSize == 1 && firstByte == 0x81)               return false;    // must use OP_1NEGATE
+    if (nSize <= 75)                                   return opcode == nSize;
+    if (nSize <= 255)                                  return opcode == OP_PUSHDATA1;
+    if (nSize <= 65535)                                return opcode == OP_PUSHDATA2;
+    return true;  // > 65535 can only be OP_PUSHDATA4
+}
+
 // ============================================================================
 // TransactionSignatureChecker
 // ============================================================================
@@ -188,6 +210,11 @@ bool EvalScript(std::vector<std::vector<uint8_t>>& stack,
                     error = "Push data size exceeds maximum element size";
                     return false;
                 }
+                if ((flags & SCRIPT_VERIFY_MINIMALDATA) &&
+                    !CheckMinimalPush(nSize, (nSize >= 1 ? *pc : uint8_t(0)), opcode)) {
+                    error = "Non-minimal data push (MINIMALDATA)";
+                    return false;
+                }
                 if (fExec) {
                     std::vector<uint8_t> data(pc, pc + nSize);
                     stack.push_back(std::move(data));
@@ -220,6 +247,11 @@ bool EvalScript(std::vector<std::vector<uint8_t>>& stack,
                 }
                 if (nSize > MAX_SCRIPT_ELEMENT_SIZE) {
                     error = "Push data size exceeds maximum element size";
+                    return false;
+                }
+                if ((flags & SCRIPT_VERIFY_MINIMALDATA) &&
+                    !CheckMinimalPush(nSize, (nSize >= 1 ? *pc : uint8_t(0)), opcode)) {
+                    error = "Non-minimal data push (MINIMALDATA)";
                     return false;
                 }
                 if (fExec) {
@@ -590,6 +622,16 @@ bool VerifyScript(const CScript& scriptSig,
 
     if (!CastToBool(stack.back())) {
         error = "Script evaluated to false";
+        return false;
+    }
+
+    // Malleability closure (finding #4, sub-vector B3): SCRIPT_VERIFY_CLEANSTACK.
+    // The scriptSig may prepend arbitrary extra pushes that land BELOW sig/pk;
+    // OP_CHECKSIG still leaves 1 on top so verification would pass while the
+    // extra bytes mutate the txid. Require the final stack to hold EXACTLY one
+    // element so no residue survives. Bitcoin BIP-62 rule 6.
+    if ((flags & SCRIPT_VERIFY_CLEANSTACK) && stack.size() != 1) {
+        error = "Stack not clean after evaluation (CLEANSTACK)";
         return false;
     }
 

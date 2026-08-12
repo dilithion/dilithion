@@ -1120,6 +1120,7 @@ BOOST_TEST_OBJECTS := $(OBJ_DIR)/test/test_dilithion.o \
 	$(OBJ_DIR)/test/difficulty_tests.o \
 	$(OBJ_DIR)/test/validation_integration_tests.o \
 	$(OBJ_DIR)/test/consensus_validation_tests.o \
+	$(OBJ_DIR)/test/malleability_tests.o \
 	$(OBJ_DIR)/test/utxo_tests.o \
 	$(OBJ_DIR)/test/connect_checks_tests.o \
 	$(OBJ_DIR)/test/vdf_connect_tests.o \
