@@ -1779,6 +1779,57 @@ bool CChainState::ConnectTip(CBlockIndex* pindex, const CBlock& block, bool skip
         }
     }
 
+    // ========================================================================
+    // VDF PROOF-OF-WORK ENFORCEMENT (v4+ Wesolowski proof) — reorg-safe.
+    // ========================================================================
+    // Closes ECOSYSTEM_HUNT_FINDINGS #3 (CRITICAL, live): CheckVDFProof existed
+    // but had only a dead-code caller, so EVERY live accept path skipped VDF
+    // verification and any MIK holder could forge DilV v4 blocks at zero
+    // sequential cost. This is the single live call that makes good on the
+    // "VDF proof validated in CheckVDFProof / at ConnectBlock" deferral comments
+    // scattered across the header/PoW/fork paths.
+    //
+    // Placement rationale:
+    //  - REORG-SAFE: sits OUTSIDE every `if (!skipValidation)` block, in the
+    //    same region as the sibling reorg-safe checks (CheckDNAHashEquality /
+    //    CheckMIKAttestations), so it runs for normal connects AND reorg /
+    //    fork-activation connects (skipValidation=true). A forged VDF block
+    //    arriving as a reorg candidate is exactly the attack, so it MUST run on
+    //    reorg connects too.
+    //  - DoS ORDERING: placed LAST — after the cheap PoW/MIK/DNA/attestation/
+    //    cooldown gates and after ConnectBlockChecks (merkle/value/signatures),
+    //    and immediately BEFORE ApplyBlock mutates the UTXO set — so a junk
+    //    block is culled by the µs/ms checks before the ~44 ms class-group
+    //    verify. CheckVDFProof itself also does its µs-cheap commitment/format
+    //    checks before the expensive create_discriminant + Wesolowski step.
+    //  - Context-independent: needs only block + height + prevHash + iterations,
+    //    so it is correct here regardless of identity-DB / tracker undo state.
+    //
+    // The IBD assume-valid skip is gated on the DEDICATED vdfAssumeValidHeight
+    // (default 0 => verify every block from height 1; a tip/reorg block is never
+    // skipped). ConnectPathCheckVDF encapsulates the gate + the verify.
+    {
+        const bool fInitialBlockDownloadVDF =
+            g_node_context.sync_coordinator &&
+            g_node_context.sync_coordinator->IsInitialBlockDownload();
+        std::string vdfError;
+        if (!ConnectPathCheckVDF(block, pindex->nHeight, block.hashPrevBlock,
+                                 fInitialBlockDownloadVDF, vdfError)) {
+            std::cerr << "[Chain] ERROR: Block " << pindex->nHeight
+                      << " REJECTED: VDF proof verification failed" << std::endl;
+            std::cerr << "[Chain] " << vdfError << std::endl;
+
+            // Forged/invalid VDF proof is a genuine consensus failure — mark
+            // permanently failed so it is never retried (mirrors the MIK/DNA/
+            // attestation/connect-validator reject blocks above).
+            pindex->nStatus |= CBlockIndex::BLOCK_FAILED_VALID;
+            if (pdb != nullptr) {
+                pdb->WriteBlockIndex(blockHash, *pindex);
+            }
+            return false;
+        }
+    }
+
     // Step 1: Update UTXO set (CS-004)
     if (pUTXOSet != nullptr) {
         if (!pUTXOSet->ApplyBlock(block, pindex->nHeight, blockHash)) {

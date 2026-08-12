@@ -114,6 +114,19 @@ public:
     // semantics); raising dfmpAssumeValidHeight must NEVER disable signatures.
     int scriptAssumeValidHeight = 0;
 
+    // VDF Assume-Valid Height (Wesolowski VDF-proof verification skip during IBD)
+    // DEDICATED knob, INDEPENDENT of both dfmpAssumeValidHeight and
+    // scriptAssumeValidHeight. Gates ONLY the ~44 ms/block CheckVDFProof call on
+    // the connect path (see ConnectPathVerifyVDF / ConnectPathMaySkipVDFVerify in
+    // consensus/connect_checks.h). Default 0 on EVERY network and EVERY relaunch
+    // => every v4 block's VDF proof (Wesolowski proof + coinbase commitment) is
+    // verified from height 1, closing the zero-cost DilV block-forgery hole
+    // (ECOSYSTEM_HUNT_FINDINGS #3). The skip fires only when this is > 0 AND the
+    // block is at/below it AND the node is still in IBD — a tip/reorg block is
+    // NEVER skipped. May ONLY be set > 0 alongside a hash-anchored checkpoint at
+    // that exact height (Bitcoin-Core assumevalid semantics).
+    int vdfAssumeValidHeight = 0;
+
     // DFMP v3.0 Activation Height
     // Before this height: DFMP v2.0 rules (20-block free tier, 3.0x maturity, no payout heat)
     // After this height: DFMP v3.0 rules (5-block free tier, 5.0x maturity, payout heat, dormancy, registration PoW)

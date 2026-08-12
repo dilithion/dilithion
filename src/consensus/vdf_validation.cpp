@@ -3,6 +3,7 @@
 
 #include <consensus/vdf_validation.h>
 #include <consensus/validation.h>
+#include <consensus/connect_checks.h>   // ConnectPathVerifyVDF (assume-valid gate)
 #include <vdf/vdf.h>
 #include <vdf/coinbase_vdf.h>
 #include <vdf/cooldown_tracker.h>
@@ -199,6 +200,40 @@ bool CheckVDFProof(
     }
 
     return true;
+}
+
+// ---------------------------------------------------------------------------
+// ConnectPathCheckVDF  (connect-path VDF enforcement seam)
+// ---------------------------------------------------------------------------
+
+bool ConnectPathCheckVDF(
+    const CBlock& block,
+    int nHeight,
+    const uint256& prevHash,
+    bool fInitialBlockDownload,
+    std::string& error)
+{
+    // Non-VDF (pre-v4) blocks carry no VDF proof — nothing to verify.
+    if (!block.IsVDFBlock())
+        return true;
+
+    // Genesis (height 0) is exempt: it is not a mined VDF block.
+    if (nHeight <= 0)
+        return true;
+
+    // Assume-valid IBD gate. Default vdfAssumeValidHeight == 0 => this never
+    // skips (verify every block from height 1). It skips ONLY a historical
+    // at/below-boundary block while still in IBD; a tip/reorg block is never
+    // skipped. See ConnectPathVerifyVDF / ConnectPathMaySkipVDFVerify.
+    if (!ConnectPathVerifyVDF(Dilithion::g_chainParams, nHeight, fInitialBlockDownload))
+        return true;
+
+    // Authoritative verification: single call covers BOTH the coinbase
+    // commitment (vdfProofHash == SHA3(proof)) and the class-group Wesolowski
+    // proof. Iteration count comes from chainparams (fail-safe: null => 0).
+    const uint64_t iters = Dilithion::g_chainParams
+        ? Dilithion::g_chainParams->vdfIterations : 0;
+    return CheckVDFProof(block, nHeight, prevHash, iters, error);
 }
 
 // ---------------------------------------------------------------------------

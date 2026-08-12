@@ -125,4 +125,56 @@ bool ConnectPathVerifyScripts(const Dilithion::ChainParams* params,
                               int nHeight,
                               bool fInitialBlockDownload);
 
+/**
+ * ConnectPathMaySkipVDFVerify — assume-valid gate for the Wesolowski VDF-proof
+ * verification step (ECOSYSTEM_HUNT_FINDINGS #3 remediation).
+ *
+ * EXACT structural mirror of ConnectPathMaySkipScriptVerify, applied to the
+ * ~44 ms/block CheckVDFProof call the connect path runs for v4+ blocks. The
+ * expensive class-group verify may be skipped ONLY when ALL of the following
+ * hold (Bitcoin-Core assumevalid semantics — never skips at the tip):
+ *
+ *   1. vdfAssumeValidHeight > 0  — the chain is CONFIGURED with a positive
+ *      VDF-assume-valid height. A relaunch/reset chain that leaves this at 0
+ *      (or negative) verifies EVERY v4 block from height 1 — no dormant window.
+ *   2. nHeight <= vdfAssumeValidHeight — the block is at/below that height, i.e.
+ *      its VDF proof is anchored by the shipped checkpoint hash chain.
+ *   3. fInitialBlockDownload — the node is still catching up. A freshly-mined or
+ *      reorg block being connected AT THE TIP (post-IBD) is NEVER skipped, even
+ *      below vdfAssumeValidHeight — closing the "forged low-height tip/reorg
+ *      block skips VDF verification" vector, which is the entire attack.
+ *
+ * When it returns false, the caller MUST verify the VDF proof. Pure function of
+ * its arguments (no globals) so it is directly unit-testable.
+ *
+ * @param nHeight                Height at which the block is being connected.
+ * @param vdfAssumeValidHeight   Configured VDF-assume-valid height (<=0 disables skipping).
+ * @param fInitialBlockDownload  True iff the node is in initial block download.
+ * @return true iff VDF-proof verification may be skipped for this block.
+ */
+bool ConnectPathMaySkipVDFVerify(int nHeight,
+                                 int vdfAssumeValidHeight,
+                                 bool fInitialBlockDownload);
+
+/**
+ * ConnectPathVerifyVDF — the SINGLE decision point for whether the connect path
+ * runs CheckVDFProof for a v4+ block at nHeight.
+ *
+ * Reads `params->vdfAssumeValidHeight` — a dedicated consensus parameter
+ * (default 0 on every network and every relaunch) DELIBERATELY SEPARATE from
+ * `params->scriptAssumeValidHeight` and `params->dfmpAssumeValidHeight`. With
+ * the default 0 this returns true for EVERY block => VDF proofs verified from
+ * height 1. Raising the DFMP or script knobs can NEVER silently disable VDF
+ * verification. Fail-safe: a null `params` yields vdfAssumeValidHeight = 0 =>
+ * verify.
+ *
+ * @param params                 Active chain params (may be null => verify).
+ * @param nHeight                Height at which the block is being connected.
+ * @param fInitialBlockDownload  True iff the node is in initial block download.
+ * @return true iff the caller MUST verify the VDF proof for this block.
+ */
+bool ConnectPathVerifyVDF(const Dilithion::ChainParams* params,
+                          int nHeight,
+                          bool fInitialBlockDownload);
+
 #endif // DILITHION_CONSENSUS_CONNECT_CHECKS_H

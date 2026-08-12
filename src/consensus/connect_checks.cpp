@@ -289,3 +289,30 @@ bool ConnectPathVerifyScripts(const Dilithion::ChainParams* params,
     return !ConnectPathMaySkipScriptVerify(nHeight, scriptAssumeValidHeight,
                                            fInitialBlockDownload);
 }
+
+bool ConnectPathMaySkipVDFVerify(int nHeight,
+                                 int vdfAssumeValidHeight,
+                                 bool fInitialBlockDownload)
+{
+    // Skip the ~44 ms Wesolowski verify ONLY for a historical block (at/below a
+    // POSITIVE assume-valid height) while still in IBD. A block at the tip, a
+    // height above the assume-valid height, or a chain configured with
+    // vdfAssumeValidHeight <= 0 always verifies. Exact mirror of the ML-DSA
+    // script gate — see the header for the full safety rationale.
+    return vdfAssumeValidHeight > 0
+        && nHeight <= vdfAssumeValidHeight
+        && fInitialBlockDownload;
+}
+
+bool ConnectPathVerifyVDF(const Dilithion::ChainParams* params,
+                          int nHeight,
+                          bool fInitialBlockDownload)
+{
+    // Read the DEDICATED VDF-assume-valid height — NOT scriptAssumeValidHeight
+    // and NOT dfmpAssumeValidHeight. Default 0 (the value on every network /
+    // relaunch, and the null-params fail-safe) => ConnectPathMaySkipVDFVerify is
+    // always false => verify every v4 block's VDF proof from height 1.
+    const int vdfAssumeValidHeight = params ? params->vdfAssumeValidHeight : 0;
+    return !ConnectPathMaySkipVDFVerify(nHeight, vdfAssumeValidHeight,
+                                        fInitialBlockDownload);
+}

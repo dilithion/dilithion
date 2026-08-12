@@ -77,6 +77,12 @@ ChainParams ChainParams::Mainnet() {
     // > 0 only alongside a hash-anchored checkpoint at that exact height.
     params.scriptAssumeValidHeight = 0;
 
+    // VDF Assume-Valid Height — dedicated knob, independent of both assume-valid
+    // heights above. Default 0 => verify every v4 block's VDF proof from height 1.
+    // (DIL mainnet is RandomX/PoW, not VDF, so this is a no-op here; set for
+    // uniformity and forward-safety.)
+    params.vdfAssumeValidHeight = 0;
+
     // DFMP v3.0 activation - payout heat tracking, reduced free tier, dormancy decay
     params.dfmpV3ActivationHeight = 7000;
     params.registrationPowBits = 28;  // DIL mainnet: original production value (unchanged)
@@ -307,6 +313,10 @@ ChainParams ChainParams::Testnet() {
     // > 0 only alongside a hash-anchored checkpoint at that exact height.
     params.scriptAssumeValidHeight = 0;
 
+    // VDF Assume-Valid Height — dedicated knob, independent of both assume-valid
+    // heights above. Default 0 => verify every v4 block's VDF proof from height 1.
+    params.vdfAssumeValidHeight = 0;
+
     // DFMP v3.0 activation - set above existing testnet chain height
     // Testnet tip was ~86,829 when v3.0 was implemented
     // Activation at 87,000 gives ~170 blocks buffer for upgrade
@@ -480,6 +490,14 @@ ChainParams ChainParams::DilV() {
     // can only be raised, never zeroed) therefore can NEVER disable signature
     // verification. Set > 0 only alongside a hash-anchored checkpoint at that height.
     params.scriptAssumeValidHeight = 0;
+
+    // VDF Assume-Valid Height — DilV is a VDF chain from genesis. Default 0 =>
+    // every DilV block's Wesolowski VDF proof is verified on the connect path
+    // from height 1 (closes the zero-cost forgery hole, ECOSYSTEM_HUNT #3). This
+    // knob is INDEPENDENT of the 44233 DFMP anchor and the 0 script-assumevalid
+    // above: raising either can never silently disable VDF verification. Set > 0
+    // only alongside a hash-anchored checkpoint at that exact height.
+    params.vdfAssumeValidHeight = 0;
 
     // All DFMP versions active from genesis — use modern rules from day one
     params.dfmpV3ActivationHeight = 0;
@@ -742,6 +760,11 @@ ChainParams ChainParams::Regtest() {
     // every ML-DSA spend signature from height 1 (HIGH-1 round-2 decoupling; kept
     // explicit even though the Testnet() baseline already sets 0).
     params.scriptAssumeValidHeight = 0;
+
+    // VDF Assume-Valid Height — 0: regtest (a VDF chain, see below) has no
+    // checkpoints, so it verifies every VDF proof from height 1. Kept explicit
+    // even though the Testnet() baseline already sets 0.
+    params.vdfAssumeValidHeight = 0;
 
     // Identifying coinbase message for regtest blocks.
     params.genesisCoinbaseMsg = "Dilithion Regtest";
