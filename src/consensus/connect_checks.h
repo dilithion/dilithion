@@ -8,6 +8,8 @@
 #include <node/utxo_set.h>
 #include <string>
 
+namespace Dilithion { class ChainParams; }
+
 /**
  * ConnectBlockChecks — unified connect-path block validator (C-R3 remediation).
  *
@@ -95,5 +97,32 @@ bool ConnectBlockChecks(const CBlock& block,
 bool ConnectPathMaySkipScriptVerify(int nHeight,
                                     int scriptAssumeValidHeight,
                                     bool fInitialBlockDownload);
+
+/**
+ * ConnectPathVerifyScripts — the SINGLE decision point for whether ConnectTip
+ * verifies ML-DSA spend signatures for a block at nHeight.
+ *
+ * HIGH-1 round-2 decoupling. Reads the connect-path assume-valid height from
+ * `params->scriptAssumeValidHeight` — a dedicated consensus parameter (default 0
+ * on every network and every relaunch) that is DELIBERATELY SEPARATE from
+ * `params->dfmpAssumeValidHeight` (which gates only the DFMP/MIK/cooldown/DNA
+ * skip). Because the signature gate no longer reads the DFMP knob:
+ *   - With the default scriptAssumeValidHeight == 0, this returns true for EVERY
+ *     block => signatures are verified from height 1 on every network and any
+ *     relaunch, closing BOTH the relaunch-IBD theft window AND the
+ *     synced-vs-IBD consensus partition the coupled knob created.
+ *   - Raising dfmpAssumeValidHeight (which can only ever be raised, never zeroed,
+ *     on the live chains) can NEVER silently disable signature verification.
+ *
+ * Fail-safe: a null `params` yields scriptAssumeValidHeight = 0 => verify.
+ *
+ * @param params                 Active chain params (may be null => verify).
+ * @param nHeight                Height at which the block is being connected.
+ * @param fInitialBlockDownload  True iff the node is in initial block download.
+ * @return true iff the caller MUST verify ML-DSA spend signatures for this block.
+ */
+bool ConnectPathVerifyScripts(const Dilithion::ChainParams* params,
+                              int nHeight,
+                              bool fInitialBlockDownload);
 
 #endif // DILITHION_CONSENSUS_CONNECT_CHECKS_H

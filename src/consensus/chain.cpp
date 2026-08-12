@@ -1738,27 +1738,29 @@ bool CChainState::ConnectTip(CBlockIndex* pindex, const CBlock& block, bool skip
     // ApplyBlock mutates anything.
     //
     // fVerifyScripts: the expensive (~2 ms/input) ML-DSA signature step is gated
-    // on assumevalid — blocks at/below dfmpAssumeValidHeight are anchored by the
-    // shipped checkpoint hash commitment, so re-deriving their signatures adds no
-    // security (Bitcoin Core's assumevalid model). Value conservation, merkle,
-    // double-spend and maturity stay ALWAYS-ON regardless of assumevalid.
+    // on a DEDICATED script-assume-valid height (chainParams->scriptAssumeValidHeight)
+    // — NOT on the DFMP knob (dfmpAssumeValidHeight / the `assumeValid` variable
+    // above, which gates only the DFMP/MIK/cooldown/DNA skip). Value conservation,
+    // merkle, double-spend and maturity stay ALWAYS-ON regardless of either knob.
     //
-    // HIGH-1: the signature skip is ADDITIONALLY gated on initial block download.
-    // A purely height-based skip (!assumeValid) disabled signatures for EVERY
-    // block below dfmpAssumeValidHeight — including a freshly-mined tip block at
-    // a low height on a relaunched-from-genesis chain, reopening the invalid-sig
-    // theft this gate exists to close. ConnectPathMaySkipScriptVerify skips ONLY
-    // for a historical block (at/below a POSITIVE assume-valid height) while the
-    // node is still catching up; at the tip every block verifies, and a chain
-    // with dfmpAssumeValidHeight<=0 verifies from height 1. Fail-safe: if the
-    // sync coordinator is unavailable, fInitialBlockDownload=false => verify.
+    // HIGH-1 (round-2 decoupling): reusing dfmpAssumeValidHeight (44000 DIL /
+    // 44233 DilV, raise-only on the live chains) for the signature gate meant a
+    // relaunch's IBD skipped ML-DSA verification for blocks 1..AVH (theft) AND
+    // partitioned IBD-vs-synced nodes. scriptAssumeValidHeight defaults to 0 on
+    // every network and every relaunch, so ConnectPathVerifyScripts returns true
+    // for every block => signatures verified from height 1, and a future raise of
+    // dfmpAssumeValidHeight can never silently disable them. The IBD guard inside
+    // ConnectPathMaySkipScriptVerify additionally ensures a tip block always
+    // verifies whenever a checkpoint-anchored scriptAssumeValidHeight is ever set
+    // > 0. Fail-safe: unavailable sync coordinator => fInitialBlockDownload=false,
+    // and a null chainParams => scriptAssumeValidHeight 0 => verify.
     if (pUTXOSet != nullptr) {
         std::string connectError;
         const bool fInitialBlockDownload =
             g_node_context.sync_coordinator &&
             g_node_context.sync_coordinator->IsInitialBlockDownload();
-        const bool fVerifyScripts = !ConnectPathMaySkipScriptVerify(
-            pindex->nHeight, assumeValidHeight, fInitialBlockDownload);
+        const bool fVerifyScripts = ConnectPathVerifyScripts(
+            Dilithion::g_chainParams, pindex->nHeight, fInitialBlockDownload);
         if (!ConnectBlockChecks(block, *pUTXOSet, pindex->nHeight,
                                 fVerifyScripts, connectError)) {
             std::cerr << "[Chain] ERROR: Block " << pindex->nHeight

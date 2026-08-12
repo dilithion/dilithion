@@ -99,6 +99,21 @@ public:
     // 0 = validate everything (no optimization)
     int dfmpAssumeValidHeight;
 
+    // Script Assume-Valid Height (ML-DSA spend-signature skip during IBD)
+    // DELIBERATELY SEPARATE from dfmpAssumeValidHeight (HIGH-1 round-2 decoupling).
+    // Gates ONLY the expensive ML-DSA signature step on the connect path (see
+    // ConnectPathVerifyScripts / ConnectPathMaySkipScriptVerify in
+    // consensus/connect_checks.h). dfmpAssumeValidHeight, by contrast, gates the
+    // DFMP/MIK/cooldown/DNA skip and can only be raised (never zeroed) on the live
+    // chains — so reusing it for the signature gate would make "verify signatures
+    // from block 1" and "skip MIK for bypassed history" unsatisfiable from one knob.
+    // Default 0 on EVERY network and EVERY relaunch => every block verifies ML-DSA
+    // signatures from height 1 (closes the relaunch-IBD theft window AND the
+    // synced-vs-IBD consensus partition). May ONLY ever be set > 0 together with a
+    // hash-anchored checkpoint at that exact height (Bitcoin-Core assumevalid
+    // semantics); raising dfmpAssumeValidHeight must NEVER disable signatures.
+    int scriptAssumeValidHeight = 0;
+
     // DFMP v3.0 Activation Height
     // Before this height: DFMP v2.0 rules (20-block free tier, 3.0x maturity, no payout heat)
     // After this height: DFMP v3.0 rules (5-block free tier, 5.0x maturity, payout heat, dormancy, registration PoW)

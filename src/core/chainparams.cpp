@@ -70,6 +70,13 @@ ChainParams ChainParams::Mainnet() {
     // NOTE: Chain built with MIK bypassed - cannot be removed, only raised
     params.dfmpAssumeValidHeight = 44000;  // v4.0.17: match new checkpoint at 44000 — skip cooldown/ban validation for checkpointed blocks during IBD
 
+    // Script Assume-Valid Height — decoupled from the DFMP knob above (HIGH-1
+    // round-2). Gates ONLY the ML-DSA signature skip on the connect path. Default
+    // 0 => DIL mainnet verifies spend signatures for EVERY block from height 1
+    // (raising dfmpAssumeValidHeight can never silently disable signatures). Set
+    // > 0 only alongside a hash-anchored checkpoint at that exact height.
+    params.scriptAssumeValidHeight = 0;
+
     // DFMP v3.0 activation - payout heat tracking, reduced free tier, dormancy decay
     params.dfmpV3ActivationHeight = 7000;
     params.registrationPowBits = 28;  // DIL mainnet: original production value (unchanged)
@@ -294,6 +301,12 @@ ChainParams ChainParams::Testnet() {
     // Must cover all pre-MIK blocks to allow fresh nodes to sync.
     params.dfmpAssumeValidHeight = 86850;
 
+    // Script Assume-Valid Height — decoupled from the DFMP knob above (HIGH-1
+    // round-2). Gates ONLY the ML-DSA signature skip on the connect path. Default
+    // 0 => testnet verifies spend signatures for EVERY block from height 1. Set
+    // > 0 only alongside a hash-anchored checkpoint at that exact height.
+    params.scriptAssumeValidHeight = 0;
+
     // DFMP v3.0 activation - set above existing testnet chain height
     // Testnet tip was ~86,829 when v3.0 was implemented
     // Activation at 87,000 gives ~170 blocks buffer for upgrade
@@ -459,6 +472,14 @@ ChainParams ChainParams::DilV() {
     // MIK required from block 1 onward
     params.dfmpActivationHeight = 0;
     params.dfmpAssumeValidHeight = 44233;  // v4.1 (was 44469): aligned with the new mandatory rollback checkpoint at 44233. Skips strict consensus checks (cooldown, MIK, DNA, attestation) only for blocks AT OR BELOW the canonical 44233 anchor. Above 44233, Patches A/C/E activate AND consensus checks are enforced — no bypass window. (v4.0.22 had this at 44469 with Patches at 44470, leaving 44234-44469 unprotected; that re-creates the v4.0.22 stop-gap failure mode. See cross-component audit finding HIGH-1.)
+
+    // Script Assume-Valid Height — decoupled from the DFMP knob above (HIGH-1
+    // round-2). Gates ONLY the ML-DSA signature skip on the connect path, NOT the
+    // DFMP/MIK/cooldown/DNA skip. Default 0 => DilV mainnet verifies spend
+    // signatures for EVERY block from height 1; the 44233 DFMP anchor above (which
+    // can only be raised, never zeroed) therefore can NEVER disable signature
+    // verification. Set > 0 only alongside a hash-anchored checkpoint at that height.
+    params.scriptAssumeValidHeight = 0;
 
     // All DFMP versions active from genesis — use modern rules from day one
     params.dfmpV3ActivationHeight = 0;
@@ -716,6 +737,11 @@ ChainParams ChainParams::Regtest() {
     // No checkpoints — regtest exists to test reorgs, including deep ones.
     params.checkpoints.clear();
     params.defaultAssumeValid = "";
+
+    // Script Assume-Valid Height — 0: with no checkpoints, regtest must verify
+    // every ML-DSA spend signature from height 1 (HIGH-1 round-2 decoupling; kept
+    // explicit even though the Testnet() baseline already sets 0).
+    params.scriptAssumeValidHeight = 0;
 
     // Identifying coinbase message for regtest blocks.
     params.genesisCoinbaseMsg = "Dilithion Regtest";

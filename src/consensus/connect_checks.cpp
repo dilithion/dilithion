@@ -275,3 +275,17 @@ bool ConnectPathMaySkipScriptVerify(int nHeight,
         && nHeight <= scriptAssumeValidHeight
         && fInitialBlockDownload;
 }
+
+bool ConnectPathVerifyScripts(const Dilithion::ChainParams* params,
+                              int nHeight,
+                              bool fInitialBlockDownload)
+{
+    // Read the DEDICATED script-assume-valid height — NOT dfmpAssumeValidHeight.
+    // This one line is the HIGH-1 round-2 decoupling: the signature gate and the
+    // DFMP/MIK skip now draw from independent knobs. Default 0 (fail-safe, and the
+    // value on every network / relaunch) => ConnectPathMaySkipScriptVerify is
+    // always false => verify from block 1. A null params likewise verifies.
+    const int scriptAssumeValidHeight = params ? params->scriptAssumeValidHeight : 0;
+    return !ConnectPathMaySkipScriptVerify(nHeight, scriptAssumeValidHeight,
+                                           fInitialBlockDownload);
+}

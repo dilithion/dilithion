@@ -657,6 +657,98 @@ BOOST_FIXTURE_TEST_CASE(cc_high1_tip_and_relaunch_verify_signatures, ChainParams
 }
 
 // ============================================================================
+// HIGH-1 round-2 — scriptAssumeValidHeight decoupled from dfmpAssumeValidHeight
+// ============================================================================
+// The connect-path signature gate now draws from a DEDICATED
+// scriptAssumeValidHeight (default 0), NOT dfmpAssumeValidHeight. Both tests go
+// end-to-end through ConnectPathVerifyScripts — the single decision point
+// ConnectTip calls — so a regression that re-couples the two knobs, or that
+// defaults scriptAssumeValidHeight to a nonzero DFMP-style value, reddens them.
+
+// (1) INVERSION of round-1 case (c). With the decoupled default
+// scriptAssumeValidHeight==0, a value-valid GARBAGE-signature spend at a low
+// height DURING IBD is REJECTED — where the round-1 coupled gate (reading
+// dfmpAssumeValidHeight=44000/44233) ACCEPTED the identical block.
+BOOST_FIXTURE_TEST_CASE(cc_high1_scriptavh_default0_rejects_garbage_sig_in_ibd, ChainParamsFixture) {
+    CUTXOSet utxo; std::string path = OpenTempUTXO(utxo);
+
+    // Decoupled by construction: the signature knob is 0 while the DFMP knob keeps
+    // its live (raise-only) value. If a regression copied the DFMP value into the
+    // script knob, this REQUIRE — and the reject below — would fire.
+    BOOST_REQUIRE_EQUAL(Dilithion::g_chainParams->scriptAssumeValidHeight, 0);
+    BOOST_REQUIRE(Dilithion::g_chainParams->dfmpAssumeValidHeight > 0);
+
+    Key owner = MakeKey();
+    COutPoint prev(MakeHash(0x98), 0);
+    BOOST_REQUIRE(utxo.AddUTXO(prev, CTxOut(100 * COIN, owner.spk), 1, false));
+    BOOST_REQUIRE(utxo.Flush());
+
+    const uint32_t H = 100;   // far below dfmpAssumeValidHeight — the round-1 skip window
+
+    // Derive fVerifyScripts EXACTLY as ConnectTip does (via the shared helper).
+    // Default scriptAVH=0 => ConnectPathMaySkipScriptVerify is false => verify.
+    const bool fVerify = ConnectPathVerifyScripts(Dilithion::g_chainParams, (int)H, /*IBD=*/true);
+    BOOST_CHECK_MESSAGE(fVerify,
+        "scriptAssumeValidHeight default 0 must verify signatures even at a low height during IBD");
+
+    std::vector<CTransactionRef> txs = {
+        Coinbase(Subsidy(H), H),
+        Spend(prev, 90 * COIN, DummyP2PKH(0x02), nullptr)   // garbage 0xAA sig, value-valid
+    };
+    CBlock b = MakeBlock(txs);
+    std::string err;
+    BOOST_CHECK_MESSAGE(!ConnectBlockChecks(b, utxo, (int)H, fVerify, err),
+        "garbage-sig spend at height 100 during IBD must be REJECTED under the decoupled default "
+        "(round-1's coupled knob accepted it)");
+    BOOST_CHECK_MESSAGE(err.find("signature") != std::string::npos ||
+                        err.find("script") != std::string::npos,
+        "rejection must be attributable to the signature gate, got: " << err);
+
+    utxo.Close(); CleanupUTXO(path);
+}
+
+// (2) DECOUPLING proof. Raising dfmpAssumeValidHeight to a large value must NOT
+// change fVerifyScripts. If the signature gate still read the DFMP knob, a raise
+// to 999999 would (height 100, IBD) skip signatures and ACCEPT the theft spend.
+BOOST_FIXTURE_TEST_CASE(cc_high1_dfmp_raise_does_not_disable_signatures, ChainParamsFixture) {
+    CUTXOSet utxo; std::string path = OpenTempUTXO(utxo);
+
+    Key owner = MakeKey();
+    COutPoint prev(MakeHash(0x99), 0);
+    BOOST_REQUIRE(utxo.AddUTXO(prev, CTxOut(100 * COIN, owner.spk), 1, false));
+    BOOST_REQUIRE(utxo.Flush());
+
+    const uint32_t H = 100;
+
+    // Baseline: with the DFMP knob at its shipped value, signatures verify.
+    BOOST_REQUIRE(ConnectPathVerifyScripts(Dilithion::g_chainParams, (int)H, /*IBD=*/true));
+
+    // Raise the DFMP knob far above H; leave scriptAssumeValidHeight at 0 (the
+    // fixture owns its ChainParams copy, restored on teardown). The signature gate
+    // reads the script knob, so it is UNAFFECTED — still verifies.
+    Dilithion::g_chainParams->dfmpAssumeValidHeight = 999999;
+    BOOST_REQUIRE_EQUAL(Dilithion::g_chainParams->scriptAssumeValidHeight, 0);
+    const bool fVerify = ConnectPathVerifyScripts(Dilithion::g_chainParams, (int)H, /*IBD=*/true);
+    BOOST_CHECK_MESSAGE(fVerify,
+        "raising dfmpAssumeValidHeight must NOT disable ML-DSA signature verification (decoupling)");
+
+    // End-to-end: the theft spend is still REJECTED after the DFMP-knob raise.
+    std::vector<CTransactionRef> txs = {
+        Coinbase(Subsidy(H), H),
+        Spend(prev, 90 * COIN, DummyP2PKH(0x02), nullptr)   // garbage sig
+    };
+    CBlock b = MakeBlock(txs);
+    std::string err;
+    BOOST_CHECK_MESSAGE(!ConnectBlockChecks(b, utxo, (int)H, fVerify, err),
+        "after raising dfmpAssumeValidHeight, a garbage-sig spend must still be REJECTED");
+    BOOST_CHECK_MESSAGE(err.find("signature") != std::string::npos ||
+                        err.find("script") != std::string::npos,
+        "rejection must be attributable to the signature gate, got: " << err);
+
+    utxo.Close(); CleanupUTXO(path);
+}
+
+// ============================================================================
 // MEDIUM-1 — overlay: multiple children of one same-block parent
 // ============================================================================
 // Two children spend DISTINCT outputs of a same-block parent (both real sigs):
