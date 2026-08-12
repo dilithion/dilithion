@@ -1742,9 +1742,23 @@ bool CChainState::ConnectTip(CBlockIndex* pindex, const CBlock& block, bool skip
     // shipped checkpoint hash commitment, so re-deriving their signatures adds no
     // security (Bitcoin Core's assumevalid model). Value conservation, merkle,
     // double-spend and maturity stay ALWAYS-ON regardless of assumevalid.
+    //
+    // HIGH-1: the signature skip is ADDITIONALLY gated on initial block download.
+    // A purely height-based skip (!assumeValid) disabled signatures for EVERY
+    // block below dfmpAssumeValidHeight — including a freshly-mined tip block at
+    // a low height on a relaunched-from-genesis chain, reopening the invalid-sig
+    // theft this gate exists to close. ConnectPathMaySkipScriptVerify skips ONLY
+    // for a historical block (at/below a POSITIVE assume-valid height) while the
+    // node is still catching up; at the tip every block verifies, and a chain
+    // with dfmpAssumeValidHeight<=0 verifies from height 1. Fail-safe: if the
+    // sync coordinator is unavailable, fInitialBlockDownload=false => verify.
     if (pUTXOSet != nullptr) {
         std::string connectError;
-        const bool fVerifyScripts = !assumeValid;
+        const bool fInitialBlockDownload =
+            g_node_context.sync_coordinator &&
+            g_node_context.sync_coordinator->IsInitialBlockDownload();
+        const bool fVerifyScripts = !ConnectPathMaySkipScriptVerify(
+            pindex->nHeight, assumeValidHeight, fInitialBlockDownload);
         if (!ConnectBlockChecks(block, *pUTXOSet, pindex->nHeight,
                                 fVerifyScripts, connectError)) {
             std::cerr << "[Chain] ERROR: Block " << pindex->nHeight

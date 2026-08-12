@@ -261,3 +261,17 @@ bool ConnectBlockChecks(const CBlock& block,
 
     return true;
 }
+
+bool ConnectPathMaySkipScriptVerify(int nHeight,
+                                    int scriptAssumeValidHeight,
+                                    bool fInitialBlockDownload)
+{
+    // Skip signatures ONLY for a historical block (at/below a POSITIVE
+    // assume-valid height) while still in IBD. A block at the tip, a height
+    // above the assume-valid height, or a chain configured with
+    // scriptAssumeValidHeight <= 0 always verifies. See the header for the
+    // full safety rationale (HIGH-1).
+    return scriptAssumeValidHeight > 0
+        && nHeight <= scriptAssumeValidHeight
+        && fInitialBlockDownload;
+}

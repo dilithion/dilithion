@@ -64,4 +64,36 @@ bool ConnectBlockChecks(const CBlock& block,
                         bool fVerifyScripts,
                         std::string& error);
 
+/**
+ * ConnectPathMaySkipScriptVerify — assume-valid gate for the ML-DSA signature step.
+ *
+ * HIGH-1 remediation. The connect path may skip the expensive (~2 ms/input)
+ * spend-signature verification ONLY when ALL of the following hold, mirroring
+ * Bitcoin Core's assumevalid (which never skips at the tip):
+ *
+ *   1. scriptAssumeValidHeight > 0  — the chain is CONFIGURED with a positive
+ *      script-assume-valid height. A relaunch/reset chain that leaves this at 0
+ *      (or negative) verifies EVERY block from height 1 — no dormant window.
+ *   2. nHeight <= scriptAssumeValidHeight — the block is at/below that height,
+ *      i.e. its signatures are anchored by the shipped checkpoint hash chain.
+ *   3. fInitialBlockDownload — the node is still catching up to the network.
+ *      A freshly-mined block being connected AT THE TIP (post-IBD) is NEVER
+ *      skipped, even if its height is below scriptAssumeValidHeight — closing
+ *      the "self-mined low-height tip block skips signatures" theft vector.
+ *
+ * When it returns false, the caller MUST verify signatures. The default is
+ * fail-safe: any caller that cannot determine IBD state passes
+ * fInitialBlockDownload=false, which verifies signatures unconditionally.
+ *
+ * Pure function of its arguments (no globals) so it is directly unit-testable.
+ *
+ * @param nHeight                  Height at which the block is being connected.
+ * @param scriptAssumeValidHeight  Configured script-assume-valid height (<=0 disables skipping).
+ * @param fInitialBlockDownload    True iff the node is in initial block download.
+ * @return true iff signature verification may be skipped for this block.
+ */
+bool ConnectPathMaySkipScriptVerify(int nHeight,
+                                    int scriptAssumeValidHeight,
+                                    bool fInitialBlockDownload);
+
 #endif // DILITHION_CONSENSUS_CONNECT_CHECKS_H

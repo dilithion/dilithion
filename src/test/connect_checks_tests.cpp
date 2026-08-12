@@ -28,6 +28,7 @@
 #include <primitives/block.h>
 #include <consensus/validation.h>
 #include <consensus/connect_checks.h>
+#include <consensus/tx_validation.h>   // TxValidation::MAX_MONEY (MoneyRange edge KATs)
 #include <consensus/sighash_preimage.h>
 #include <core/chainparams.h>
 #include <crypto/sha3.h>
@@ -195,6 +196,22 @@ CTransactionRef Spend(const COutPoint& prevout, uint64_t outVal,
     tx.nVersion = 1; tx.nLockTime = 0;
     tx.vin.push_back(CTxIn(prevout, std::vector<uint8_t>(100, 0xAA), CTxIn::SEQUENCE_FINAL));
     tx.vout.push_back(CTxOut(outVal, outSpk));
+    if (signer) {
+        tx.vin[0].scriptSig = SignInputLegacy(tx, 0, *signer);
+    }
+    return MakeTransactionRef(tx);
+}
+
+// Non-coinbase spend of `prevout` with MULTIPLE outputs, signed by `signer`
+// (input 0). Mirrors Spend() but lets a parent create several outputs so the
+// per-output overlay can be exercised by distinct children.
+CTransactionRef SpendTo(const COutPoint& prevout,
+                        const std::vector<CTxOut>& outs,
+                        const Key* signer) {
+    CTransaction tx;
+    tx.nVersion = 1; tx.nLockTime = 0;
+    tx.vin.push_back(CTxIn(prevout, std::vector<uint8_t>(100, 0xAA), CTxIn::SEQUENCE_FINAL));
+    for (const auto& o : outs) tx.vout.push_back(o);
     if (signer) {
         tx.vin[0].scriptSig = SignInputLegacy(tx, 0, *signer);
     }
@@ -538,6 +555,334 @@ BOOST_FIXTURE_TEST_CASE(cc_missing_input_rejected, ChainParamsFixture) {
     std::string err;
     BOOST_CHECK_MESSAGE(!ConnectBlockChecks(block, utxo, H, false, err),
                         "spend of non-existent output must be rejected");
+    BOOST_CHECK(err.find("not found") != std::string::npos);
+
+    utxo.Close(); CleanupUTXO(path);
+}
+
+// ============================================================================
+// HIGH-1 — assume-valid signature-skip gate (ConnectPathMaySkipScriptVerify)
+// ============================================================================
+// The connect path may skip the ML-DSA signature step ONLY for a historical
+// block (at/below a POSITIVE assume-valid height) while the node is in initial
+// block download. A block at the tip, a height above the assume-valid height,
+// or a chain with scriptAssumeValidHeight<=0 must ALWAYS verify. This unit test
+// pins each of the three AND-clauses (dropping any one reddens a specific case).
+BOOST_AUTO_TEST_CASE(cc_high1_script_assumevalid_predicate) {
+    // Relaunch/reset chain: scriptAssumeValidHeight<=0 => NEVER skip, ANY height,
+    // in or out of IBD. (Verifies every block from height 1 — no dormant window.)
+    BOOST_CHECK(!ConnectPathMaySkipScriptVerify(1,     0, /*IBD=*/true));
+    BOOST_CHECK(!ConnectPathMaySkipScriptVerify(1,     0, /*IBD=*/false));
+    BOOST_CHECK(!ConnectPathMaySkipScriptVerify(50000, 0, /*IBD=*/true));
+    BOOST_CHECK(!ConnectPathMaySkipScriptVerify(1,    -1, /*IBD=*/true));
+    // Pins the `scriptAssumeValidHeight > 0` clause: genesis height 0 with a
+    // 0 assume-valid height must NOT skip (drop the clause => 0<=0 && IBD => true).
+    BOOST_CHECK(!ConnectPathMaySkipScriptVerify(0,     0, /*IBD=*/true));
+
+    // Configured assume-valid height (mainnet dfmpAssumeValidHeight=44233), block
+    // at/below it: skip ONLY during IBD.
+    BOOST_CHECK( ConnectPathMaySkipScriptVerify(100,   44233, /*IBD=*/true));
+    BOOST_CHECK( ConnectPathMaySkipScriptVerify(44233, 44233, /*IBD=*/true));   // boundary
+    // Pins the IBD clause (the HIGH-1 core): the SAME historical height AT THE TIP
+    // (not IBD) must verify — closes the self-mined low-height tip-block vector.
+    BOOST_CHECK(!ConnectPathMaySkipScriptVerify(100,   44233, /*IBD=*/false));
+    BOOST_CHECK(!ConnectPathMaySkipScriptVerify(44233, 44233, /*IBD=*/false));
+    // Pins the `nHeight <= assumeValidHeight` clause: above the height => verify.
+    BOOST_CHECK(!ConnectPathMaySkipScriptVerify(44234, 44233, /*IBD=*/true));
+}
+
+// HIGH-1 end-to-end: derive fVerifyScripts exactly as ConnectTip does and confirm
+// a value-valid GARBAGE-signature spend (the theft primitive) is REJECTED at the
+// tip and on a relaunch chain, and legitimately skipped only for a historical IBD
+// block (proving the skip is real, not vacuous).
+BOOST_FIXTURE_TEST_CASE(cc_high1_tip_and_relaunch_verify_signatures, ChainParamsFixture) {
+    CUTXOSet utxo; std::string path = OpenTempUTXO(utxo);
+
+    Key owner = MakeKey();
+    COutPoint prev(MakeHash(0x90), 0);
+    BOOST_REQUIRE(utxo.AddUTXO(prev, CTxOut(100 * COIN, owner.spk), 1, false));
+    BOOST_REQUIRE(utxo.Flush());
+
+    auto garbageSigBlockAt = [&](uint32_t H) {
+        std::vector<CTransactionRef> txs = {
+            Coinbase(Subsidy(H), H),
+            Spend(prev, 90 * COIN, DummyP2PKH(0x02), nullptr)   // garbage 0xAA sig
+        };
+        return MakeBlock(txs);
+    };
+
+    const int relaunchAVH = 0;       // reset chain: assume-valid disabled
+    const int mainnetAVH  = 44233;   // shipped mainnet dfmpAssumeValidHeight
+
+    // (a) Relaunch chain, block 1, DURING IBD: assume-valid disabled => VERIFY =>
+    //     the garbage-sig spend is REJECTED (confirms a reset chain with
+    //     assumeValidHeight=0 verifies signatures from block 1).
+    {
+        const uint32_t H = 1;
+        const bool fVerify = !ConnectPathMaySkipScriptVerify((int)H, relaunchAVH, /*IBD=*/true);
+        BOOST_CHECK(fVerify);
+        CBlock b = garbageSigBlockAt(H);
+        std::string err;
+        BOOST_CHECK_MESSAGE(!ConnectBlockChecks(b, utxo, (int)H, fVerify, err),
+            "relaunch(assumeValidHeight=0) block 1 must verify signatures");
+    }
+
+    // (b) Mainnet params, low-height block AT THE TIP (not IBD): VERIFY => REJECT.
+    //     This is exactly the freshly-mined low-height tip-block theft HIGH-1 closes.
+    {
+        const uint32_t H = 100;   // far below 44233
+        const bool fVerify = !ConnectPathMaySkipScriptVerify((int)H, mainnetAVH, /*IBD=*/false);
+        BOOST_CHECK(fVerify);
+        CBlock b = garbageSigBlockAt(H);
+        std::string err;
+        BOOST_CHECK_MESSAGE(!ConnectBlockChecks(b, utxo, (int)H, fVerify, err),
+            "low-height TIP block must verify signatures (assume-valid must not skip at tip)");
+    }
+
+    // (c) Control: mainnet params, low-height block DURING IBD below assume-valid =>
+    //     skip is legitimate (Bitcoin Core assumevalid). fVerify=false and the
+    //     value-valid block is ACCEPTED — proving the skip actually happens (so the
+    //     rejects in (a)/(b) are attributable to the signature gate, not vacuous).
+    {
+        const uint32_t H = 100;
+        const bool fVerify = !ConnectPathMaySkipScriptVerify((int)H, mainnetAVH, /*IBD=*/true);
+        BOOST_CHECK(!fVerify);
+        CBlock b = garbageSigBlockAt(H);
+        std::string err;
+        BOOST_CHECK_MESSAGE(ConnectBlockChecks(b, utxo, (int)H, fVerify, err),
+            "historical IBD block below assume-valid may skip signatures: " << err);
+    }
+
+    utxo.Close(); CleanupUTXO(path);
+}
+
+// ============================================================================
+// MEDIUM-1 — overlay: multiple children of one same-block parent
+// ============================================================================
+// Two children spend DISTINCT outputs of a same-block parent (both real sigs):
+// both resolve from the per-block overlay -> ACCEPT. Load-bearing: without the
+// overlay both children fail "input not found".
+BOOST_FIXTURE_TEST_CASE(cc_overlay_multi_child_accepted, ChainParamsFixture) {
+    CUTXOSet utxo; std::string path = OpenTempUTXO(utxo);
+    const uint32_t H = 2;
+
+    Key k1 = MakeKey();  // owns the confirmed coin
+    Key k2 = MakeKey();  // owns txA output 0
+    Key k3 = MakeKey();  // owns txA output 1
+
+    COutPoint prev(MakeHash(0x91), 0);
+    BOOST_REQUIRE(utxo.AddUTXO(prev, CTxOut(100 * COIN, k1.spk), 1, false));
+    BOOST_REQUIRE(utxo.Flush());
+
+    // txA: spends prev (k1) -> out0 = 60 (k2), out1 = 39 (k3). fee = 1.
+    std::vector<CTxOut> aOuts = { CTxOut(60 * COIN, k2.spk), CTxOut(39 * COIN, k3.spk) };
+    CTransactionRef txA = SpendTo(prev, aOuts, &k1);
+    COutPoint a0(txA->GetHash(), 0);
+    COutPoint a1(txA->GetHash(), 1);
+
+    // txB spends a0 (k2) -> 59 (fee 1); txC spends a1 (k3) -> 38 (fee 1).
+    CTransactionRef txB = Spend(a0, 59 * COIN, DummyP2PKH(0x05), &k2);
+    CTransactionRef txC = Spend(a1, 38 * COIN, DummyP2PKH(0x06), &k3);
+
+    // total in-block fees = 3.
+    std::vector<CTransactionRef> txs = { Coinbase(Subsidy(H) + 3 * COIN, H), txA, txB, txC };
+    CBlock block = MakeBlock(txs);
+    std::string err;
+    BOOST_CHECK_MESSAGE(ConnectBlockChecks(block, utxo, H, /*fVerifyScripts=*/true, err),
+        "two children spending distinct outputs of a same-block parent must be accepted: " << err);
+
+    utxo.Close(); CleanupUTXO(path);
+}
+
+// Two children spend the SAME output of a same-block parent (overlay outpoint):
+// the second is a double-spend -> REJECT. Load-bearing on the spentInBlock guard
+// applied to an OVERLAY-resolved outpoint (both sigs are valid, so only the
+// double-spend check can reject).
+BOOST_FIXTURE_TEST_CASE(cc_overlay_double_spend_rejected, ChainParamsFixture) {
+    CUTXOSet utxo; std::string path = OpenTempUTXO(utxo);
+    const uint32_t H = 2;
+
+    Key k1 = MakeKey();
+    Key k2 = MakeKey();
+    COutPoint prev(MakeHash(0x92), 0);
+    BOOST_REQUIRE(utxo.AddUTXO(prev, CTxOut(100 * COIN, k1.spk), 1, false));
+    BOOST_REQUIRE(utxo.Flush());
+
+    // txA: spends prev (k1) -> out0 = 99 (k2).
+    std::vector<CTxOut> aOuts = { CTxOut(99 * COIN, k2.spk) };
+    CTransactionRef txA = SpendTo(prev, aOuts, &k1);
+    COutPoint a0(txA->GetHash(), 0);
+
+    // txB and txC BOTH spend a0, both signed by the real owner k2 (distinct
+    // output values => distinct txids, so seenTxids does NOT fire first).
+    CTransactionRef txB = Spend(a0, 98 * COIN, DummyP2PKH(0x05), &k2);
+    CTransactionRef txC = Spend(a0, 97 * COIN, DummyP2PKH(0x06), &k2);
+
+    std::vector<CTransactionRef> txs = { Coinbase(Subsidy(H) + 4 * COIN, H), txA, txB, txC };
+    CBlock block = MakeBlock(txs);
+    std::string err;
+    BOOST_CHECK_MESSAGE(!ConnectBlockChecks(block, utxo, H, /*fVerifyScripts=*/true, err),
+        "second spend of a same-block (overlay) output must be rejected");
+    BOOST_CHECK(err.find("double-spend") != std::string::npos);
+
+    utxo.Close(); CleanupUTXO(path);
+}
+
+// ============================================================================
+// MEDIUM-2 — MoneyRange guards (out-of-range input / output)
+// ============================================================================
+// Attribution: each assertion pins the SPECIFIC guard that must fire first. If
+// that guard is neutered the reject falls through to a different-message guard
+// (or the block is accepted), reddening the token check.
+BOOST_FIXTURE_TEST_CASE(cc_value_out_of_range_rejected, ChainParamsFixture) {
+    CUTXOSet utxo; std::string path = OpenTempUTXO(utxo);
+    const uint32_t H = 5;
+
+    // (a) SPENT-OUTPUT (input side) value out of range. The spent coin's value is
+    //     MAX_MONEY+1; the per-input MoneyRange guard must fire ("spent output
+    //     value out of range") BEFORE the totalIn/fee accumulators.
+    {
+        COutPoint big(MakeHash(0x93), 0);
+        BOOST_REQUIRE(utxo.AddUTXO(big, CTxOut((uint64_t)TxValidation::MAX_MONEY + 1, DummyP2PKH(0xAA)), 1, false));
+        BOOST_REQUIRE(utxo.Flush());
+        std::vector<CTransactionRef> txs = {
+            Coinbase(Subsidy(H), H),
+            Spend(big, 10 * COIN, DummyP2PKH(0x02), nullptr)   // small in-range output
+        };
+        CBlock block = MakeBlock(txs);
+        std::string err;
+        BOOST_CHECK_MESSAGE(!ConnectBlockChecks(block, utxo, H, /*fVerifyScripts=*/false, err),
+            "spend of an out-of-range coin must be rejected");
+        BOOST_CHECK_MESSAGE(err.find("spent output value out of range") != std::string::npos,
+            "expected the per-input MoneyRange guard to fire, got: " << err);
+    }
+
+    // (b) OUTPUT value out of range. In-range input (100), output = MAX_MONEY+1.
+    //     The per-output MoneyRange guard must fire ("output value out of range")
+    //     before the totalOut accumulator ("total output ...") or the mint check.
+    {
+        COutPoint ok(MakeHash(0x94), 0);
+        BOOST_REQUIRE(utxo.AddUTXO(ok, CTxOut(100 * COIN, DummyP2PKH(0xAA)), 1, false));
+        BOOST_REQUIRE(utxo.Flush());
+        std::vector<CTransactionRef> txs = {
+            Coinbase(Subsidy(H), H),
+            Spend(ok, (uint64_t)TxValidation::MAX_MONEY + 1, DummyP2PKH(0x02), nullptr)
+        };
+        CBlock block = MakeBlock(txs);
+        std::string err;
+        BOOST_CHECK_MESSAGE(!ConnectBlockChecks(block, utxo, H, /*fVerifyScripts=*/false, err),
+            "an out-of-range output value must be rejected");
+        // "output value out of range" must be present, but NOT the accumulator
+        // ("total output ...") nor the mint ("less than outputs") message — those
+        // are the fall-through guards a neutered per-output check would hit.
+        BOOST_CHECK_MESSAGE(err.find("output value out of range") != std::string::npos &&
+                            err.find("total") == std::string::npos &&
+                            err.find("less than outputs") == std::string::npos,
+            "expected the per-output MoneyRange guard to fire first, got: " << err);
+    }
+
+    utxo.Close(); CleanupUTXO(path);
+}
+
+// ============================================================================
+// MEDIUM-3 — coinbase maturity at the EXACT threshold (off-by-one pinning)
+// ============================================================================
+// Coinbase created at height 1, maturity M. Spending at height M (confs = M-1)
+// is immature -> REJECT; spending at height M+1 (confs = M) is mature -> ACCEPT.
+// Together these pin `<` (dropping to `<=` reddens the accept; loosening reddens
+// the reject).
+BOOST_FIXTURE_TEST_CASE(cc_coinbase_maturity_exact_threshold, ChainParamsFixture) {
+    CUTXOSet utxo; std::string path = OpenTempUTXO(utxo);
+
+    const unsigned int M = (unsigned int)Dilithion::g_chainParams->coinbaseMaturity;
+    BOOST_REQUIRE(M >= 1);
+
+    COutPoint cb(MakeHash(0x95), 0);
+    BOOST_REQUIRE(utxo.AddUTXO(cb, CTxOut(50 * COIN, DummyP2PKH(0xAA)), 1, /*coinbase=*/true));
+    BOOST_REQUIRE(utxo.Flush());
+
+    // confs = M-1 at H = M -> immature -> REJECT.
+    {
+        const uint32_t H = M;                 // confs = M - 1
+        std::vector<CTransactionRef> txs = {
+            Coinbase(Subsidy(H), H),
+            Spend(cb, 40 * COIN, DummyP2PKH(0x02), nullptr)
+        };
+        CBlock block = MakeBlock(txs);
+        std::string err;
+        BOOST_CHECK_MESSAGE(!ConnectBlockChecks(block, utxo, (int)H, /*fVerifyScripts=*/false, err),
+            "coinbase spend at exactly maturity-1 confirmations must be rejected");
+        BOOST_CHECK(err.find("immature") != std::string::npos);
+    }
+
+    // confs = M at H = M+1 -> mature -> ACCEPT.
+    {
+        const uint32_t H = M + 1;             // confs = M
+        std::vector<CTransactionRef> txs = {
+            Coinbase(Subsidy(H), H),
+            Spend(cb, 40 * COIN, DummyP2PKH(0x02), nullptr)
+        };
+        CBlock block = MakeBlock(txs);
+        std::string err;
+        BOOST_CHECK_MESSAGE(ConnectBlockChecks(block, utxo, (int)H, /*fVerifyScripts=*/false, err),
+            "coinbase spend at exactly maturity confirmations must be accepted: " << err);
+    }
+
+    utxo.Close(); CleanupUTXO(path);
+}
+
+// ============================================================================
+// LOW — duplicate txid and non-topological (child-before-parent) rejects
+// ============================================================================
+// Two identical non-coinbase txs (same txid) -> the seenTxids guard fires
+// ("duplicate transaction") BEFORE the double-spend guard. Load-bearing: with
+// seenTxids removed the second copy would instead reject as a double-spend
+// (different message), reddening the token check.
+BOOST_FIXTURE_TEST_CASE(cc_duplicate_txid_rejected, ChainParamsFixture) {
+    CUTXOSet utxo; std::string path = OpenTempUTXO(utxo);
+    const uint32_t H = 2;
+
+    COutPoint prev(MakeHash(0x96), 0);
+    BOOST_REQUIRE(utxo.AddUTXO(prev, CTxOut(100 * COIN, DummyP2PKH(0xAA)), 1, false));
+    BOOST_REQUIRE(utxo.Flush());
+
+    // Two byte-identical spends => identical txid.
+    CTransactionRef dup1 = Spend(prev, 90 * COIN, DummyP2PKH(0x02), nullptr);
+    CTransactionRef dup2 = Spend(prev, 90 * COIN, DummyP2PKH(0x02), nullptr);
+    BOOST_REQUIRE(dup1->GetHash() == dup2->GetHash());
+
+    std::vector<CTransactionRef> txs = { Coinbase(Subsidy(H), H), dup1, dup2 };
+    CBlock block = MakeBlock(txs);
+    std::string err;
+    BOOST_CHECK_MESSAGE(!ConnectBlockChecks(block, utxo, H, /*fVerifyScripts=*/false, err),
+        "a block containing a duplicate transaction must be rejected");
+    BOOST_CHECK_MESSAGE(err.find("duplicate") != std::string::npos,
+        "expected the duplicate-txid guard to fire first, got: " << err);
+}
+
+// Child-before-parent (non-topological) ordering: the child's input is not yet
+// in the overlay or the confirmed set -> "input not found" REJECT. Pins that the
+// connect path requires topological order (matches ApplyBlock).
+BOOST_FIXTURE_TEST_CASE(cc_child_before_parent_rejected, ChainParamsFixture) {
+    CUTXOSet utxo; std::string path = OpenTempUTXO(utxo);
+    const uint32_t H = 2;
+
+    Key k1 = MakeKey();
+    Key k2 = MakeKey();
+    COutPoint prev(MakeHash(0x97), 0);
+    BOOST_REQUIRE(utxo.AddUTXO(prev, CTxOut(100 * COIN, k1.spk), 1, false));
+    BOOST_REQUIRE(utxo.Flush());
+
+    CTransactionRef txA = SpendTo(prev, { CTxOut(99 * COIN, k2.spk) }, &k1);
+    COutPoint a0(txA->GetHash(), 0);
+    CTransactionRef txB = Spend(a0, 98 * COIN, DummyP2PKH(0x05), &k2);
+
+    // Child (txB) placed BEFORE parent (txA).
+    std::vector<CTransactionRef> txs = { Coinbase(Subsidy(H) + 2 * COIN, H), txB, txA };
+    CBlock block = MakeBlock(txs);
+    std::string err;
+    BOOST_CHECK_MESSAGE(!ConnectBlockChecks(block, utxo, H, /*fVerifyScripts=*/true, err),
+        "child-before-parent (non-topological) block must be rejected");
     BOOST_CHECK(err.find("not found") != std::string::npos);
 
     utxo.Close(); CleanupUTXO(path);
