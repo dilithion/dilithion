@@ -38,6 +38,15 @@ namespace Dilithion { class ChainParams; }
  *   4. In-block double-spend — an outpoint may be spent at most once per block.
  *   5. Coinbase maturity     — no spend of a coinbase output younger than
  *                             COINBASE_MATURITY (per-chain).
+ *   6. Canonical scriptSig   — every non-coinbase P2PKH input's scriptSig is the
+ *                             single canonical layout (IsCanonicalP2PKHScriptSig,
+ *                             the SAME single-source predicate the mempool path
+ *                             uses). Closes txid malleability on blocks (finding
+ *                             #4). UNCONDITIONAL — enforced regardless of
+ *                             fVerifyScripts, matching the mempool path so the two
+ *                             surfaces never diverge. The interpreter's
+ *                             MINIMALDATA+CLEANSTACK flags (general/scriptV2
+ *                             defense-in-depth) ride inside check 2's VerifyScript.
  *
  * Load-bearing correctness detail: a per-block output overlay resolves an input
  * that spends a parent transaction EARLIER IN THE SAME BLOCK. Without it a valid
@@ -54,8 +63,8 @@ namespace Dilithion { class ChainParams; }
  * @param fVerifyScripts When true, verify ML-DSA spend signatures. Set false only
  *                       for blocks at/below the script-assumevalid height (their
  *                       signatures are anchored by a checkpoint hash commitment).
- *                       Value conservation, merkle, double-spend and maturity are
- *                       enforced REGARDLESS of this flag.
+ *                       Value conservation, merkle, double-spend, maturity and the
+ *                       canonical-scriptSig gate are enforced REGARDLESS of this flag.
  * @param error          Human-readable rejection reason on failure.
  * @return true if the block passes every enforced check; false (with error set)
  *         otherwise. A false return must abort the connect BEFORE ApplyBlock.

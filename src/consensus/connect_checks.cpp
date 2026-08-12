@@ -4,9 +4,10 @@
 #include <consensus/connect_checks.h>
 
 #include <consensus/validation.h>       // CBlockValidator (deserialize, merkle, subsidy)
-#include <consensus/tx_validation.h>    // CTransactionValidator::VerifyScript, TxValidation::*
+#include <consensus/tx_validation.h>    // CTransactionValidator::VerifyScript, IsCanonicalP2PKHScriptSig, TxValidation::*
 #include <core/chainparams.h>           // Dilithion::g_chainParams
 #include <primitives/transaction.h>
+#include <script/script.h>              // CScript::IsPayToPublicKeyHash (malleability gate predicate)
 #include <amount.h>
 
 #include <cstdint>
@@ -144,6 +145,43 @@ bool ConnectBlockChecks(const CBlock& block,
                     spentOut      = entry.out;
                     spentHeight   = entry.nHeight;
                     spentCoinbase = entry.fCoinBase;
+                }
+
+                // ---- CHECK 6: canonical P2PKH scriptSig (malleability closure) ----
+                // A malleated (non-canonical) scriptSig re-encodes the SAME spend to
+                // a DIFFERENT txid without invalidating the ML-DSA signature (which
+                // commits to no scriptSig bytes) — the classic pre-segwit txid-
+                // malleability vector (finding #4). The mempool/relay path already
+                // rejects it in CheckTransactionInputs; enforcing the SAME single-
+                // source predicate here (IsCanonicalP2PKHScriptSig, exported from
+                // tx_validation) closes it on the block-connect path. Every block-
+                // acceptance path (normal sync, self-mined, reorg) funnels through
+                // ConnectTip -> ConnectBlockChecks, so a malleated scriptSig mined
+                // into a block is REJECTED by every node identically — the C-R3
+                // connect-path gap the mempool gate could not cover.
+                //
+                // UNCONDITIONAL (independent of fVerifyScripts): the mempool path
+                // enforces it unconditionally, so gating it behind assume-valid here
+                // would let the connect surface accept byte-strings the mempool
+                // surface rejects — the very mempool/connect split this closure is
+                // meant to avoid. It is an O(1) structural check (a length plus two
+                // uint16 field compares), so unlike the ~2 ms ML-DSA verify there is
+                // no cost reason to skip it; running it BEFORE CHECK 2 also rejects a
+                // non-canonical scriptSig before the expensive signature step (DoS
+                // ordering). The interpreter's MINIMALDATA + CLEANSTACK flags
+                // (defense-in-depth for the general/scriptV2 surface) ride inside
+                // CHECK 2's VerifyScript. Keyed on the SPENT output type (P2PKH),
+                // resolved above from {overlay U utxoSet}; coinbase never reaches
+                // this loop (isCoinbase skip).
+                {
+                    CScript spk(spentOut.scriptPubKey.begin(),
+                                spentOut.scriptPubKey.end());
+                    if (spk.IsPayToPublicKeyHash() &&
+                        !IsCanonicalP2PKHScriptSig(txin.scriptSig)) {
+                        error = "ConnectBlockChecks: non-canonical scriptSig for "
+                                "P2PKH input " + std::to_string(i) + " (malleability)";
+                        return false;
+                    }
                 }
 
                 // ---- CHECK 5: coinbase maturity ----

@@ -172,6 +172,26 @@ std::vector<uint8_t> SignInputLegacy(const CTransaction& tx, size_t idx, const K
     return ss;
 }
 
+// A canonical-LAYOUT garbage scriptSig: the exact 5265-byte P2PKH shape
+// (LE16(3309) | 3309*fill | LE16(1952) | 1952*fill) with junk sig/pk content.
+// It PASSES the connect-path canonical-scriptSig gate (CHECK 6) on LAYOUT — so a
+// spend that isolates a NON-signature check with fVerifyScripts=false reaches
+// that check instead of being culled by the malleability gate — while its junk
+// content still FAILS the ML-DSA signature step when fVerifyScripts=true. (The
+// placeholder was a 100-byte 0xAA blob before the malleability gate landed; this
+// mirrors dd983607's canonicalisation of tx_validation_tests. Malleated-LAYOUT
+// scriptSigs — the thing the gate rejects — are constructed explicitly per test.)
+std::vector<uint8_t> CanonicalLayoutSig(uint8_t fill = 0xAA) {
+    const size_t SIG = 3309, PK = 1952;
+    std::vector<uint8_t> s;
+    s.reserve(2 + SIG + 2 + PK);
+    s.push_back((uint8_t)(SIG & 0xFF)); s.push_back((uint8_t)((SIG >> 8) & 0xFF));
+    s.insert(s.end(), SIG, fill);
+    s.push_back((uint8_t)(PK & 0xFF));  s.push_back((uint8_t)((PK >> 8) & 0xFF));
+    s.insert(s.end(), PK, fill);
+    return s;
+}
+
 // Coinbase paying `value` (single output). scriptSig carries `data` for uniqueness.
 CTransactionRef Coinbase(uint64_t value, uint32_t data) {
     CTransaction tx;
@@ -194,7 +214,7 @@ CTransactionRef Spend(const COutPoint& prevout, uint64_t outVal,
                       const Key* signer) {
     CTransaction tx;
     tx.nVersion = 1; tx.nLockTime = 0;
-    tx.vin.push_back(CTxIn(prevout, std::vector<uint8_t>(100, 0xAA), CTxIn::SEQUENCE_FINAL));
+    tx.vin.push_back(CTxIn(prevout, CanonicalLayoutSig(0xAA), CTxIn::SEQUENCE_FINAL));
     tx.vout.push_back(CTxOut(outVal, outSpk));
     if (signer) {
         tx.vin[0].scriptSig = SignInputLegacy(tx, 0, *signer);
@@ -210,11 +230,23 @@ CTransactionRef SpendTo(const COutPoint& prevout,
                         const Key* signer) {
     CTransaction tx;
     tx.nVersion = 1; tx.nLockTime = 0;
-    tx.vin.push_back(CTxIn(prevout, std::vector<uint8_t>(100, 0xAA), CTxIn::SEQUENCE_FINAL));
+    tx.vin.push_back(CTxIn(prevout, CanonicalLayoutSig(0xAA), CTxIn::SEQUENCE_FINAL));
     for (const auto& o : outs) tx.vout.push_back(o);
     if (signer) {
         tx.vin[0].scriptSig = SignInputLegacy(tx, 0, *signer);
     }
+    return MakeTransactionRef(tx);
+}
+
+// Non-coinbase spend of `prevout` carrying an EXPLICIT raw scriptSig (no signing),
+// so a test can inject a malleated-LAYOUT scriptSig the canonical gate must reject.
+CTransactionRef SpendRaw(const COutPoint& prevout, uint64_t outVal,
+                         const std::vector<uint8_t>& outSpk,
+                         const std::vector<uint8_t>& rawScriptSig) {
+    CTransaction tx;
+    tx.nVersion = 1; tx.nLockTime = 0;
+    tx.vin.push_back(CTxIn(prevout, rawScriptSig, CTxIn::SEQUENCE_FINAL));
+    tx.vout.push_back(CTxOut(outVal, outSpk));
     return MakeTransactionRef(tx);
 }
 
@@ -226,6 +258,21 @@ std::vector<uint8_t> DummyP2PKH(uint8_t fill) {
 }
 
 uint64_t Subsidy(uint32_t h) { return CBlockValidator::CalculateBlockSubsidy(h); }
+
+// A block whose non-coinbase tx is fully valid EXCEPT for the scriptSig LAYOUT it
+// carries: coinbase(subsidy) + a value-valid (in 100 -> out 90, fee 10), mature,
+// existent, single-spend of the confirmed P2PKH coin `prev`, with scriptSig `ss`.
+// Merkle is recomputed over the actual (possibly malleated) tx. With
+// fVerifyScripts=false the ONLY connect-path check that can reject is the
+// canonical-scriptSig gate (CHECK 6), so acceptance/rejection is attributable to
+// the scriptSig layout alone.
+CBlock MallBlock(const COutPoint& prev, const std::vector<uint8_t>& ss, uint32_t H) {
+    std::vector<CTransactionRef> txs = {
+        Coinbase(Subsidy(H), H),
+        SpendRaw(prev, 90 * COIN, DummyP2PKH(0x02), ss)
+    };
+    return MakeBlock(txs);
+}
 
 } // namespace
 
@@ -976,6 +1023,168 @@ BOOST_FIXTURE_TEST_CASE(cc_child_before_parent_rejected, ChainParamsFixture) {
     BOOST_CHECK_MESSAGE(!ConnectBlockChecks(block, utxo, H, /*fVerifyScripts=*/true, err),
         "child-before-parent (non-topological) block must be rejected");
     BOOST_CHECK(err.find("not found") != std::string::npos);
+
+    utxo.Close(); CleanupUTXO(path);
+}
+
+// ============================================================================
+// MALLEABILITY (finding #4) — canonical P2PKH scriptSig ON THE CONNECT PATH
+// ============================================================================
+// MALLEABILITY_REREVIEW HIGH: the canonical-scriptSig gate lived only on the
+// mempool/relay path (CheckTransactionInputs) and a DEAD block validator, so a
+// malleated scriptSig MINED INTO A BLOCK was accepted by every node on connect.
+// CHECK 6 closes that: ConnectBlockChecks now enforces the SAME single-source
+// predicate (IsCanonicalP2PKHScriptSig) that the mempool path uses.
+//
+// Every rejection below runs with fVerifyScripts=FALSE so ONLY the UNCONDITIONAL
+// canonical gate can reject — the ML-DSA step is off, and each spend is otherwise
+// value-valid, mature, existent, single-spend, correct-merkle. So a reject is
+// attributable to CHECK 6 alone, and neutering CHECK 6 flips every reject to
+// ACCEPT (the mutation proof; see MALLEABILITY_INTEGRATION.md for the run).
+
+// Positive control: the honest canonical layout is ACCEPTED on the connect path,
+// both with signatures OFF (proves the gate passes the canonical LAYOUT) and with
+// signatures ON over a real ML-DSA signature (proves the gate does not reject the
+// honest producer's byte-string). The coinbase in each block carries a NON-
+// canonical scriptSig ({0x04,...}) yet the block is accepted — proving CHECK 6 is
+// correctly exempt for the coinbase input.
+BOOST_FIXTURE_TEST_CASE(cc_mall_canonical_scriptsig_accepted, ChainParamsFixture) {
+    CUTXOSet utxo; std::string path = OpenTempUTXO(utxo);
+    const uint32_t H = 2;
+
+    Key k = MakeKey();
+    COutPoint prev(MakeHash(0xC0), 0);
+    BOOST_REQUIRE(utxo.AddUTXO(prev, CTxOut(100 * COIN, k.spk), 1, false));  // committed to k
+    BOOST_REQUIRE(utxo.Flush());
+
+    // Real ML-DSA signature => the exact 5265-byte canonical layout.
+    std::vector<CTransactionRef> txs = {
+        Coinbase(Subsidy(H), H),
+        Spend(prev, 90 * COIN, DummyP2PKH(0x02), &k)
+    };
+    CBlock block = MakeBlock(txs);
+
+    std::string errOn;
+    BOOST_CHECK_MESSAGE(ConnectBlockChecks(block, utxo, H, /*fVerifyScripts=*/true, errOn),
+        "honest canonical spend must be accepted with signatures ON: " << errOn);
+    std::string errOff;
+    BOOST_CHECK_MESSAGE(ConnectBlockChecks(block, utxo, H, /*fVerifyScripts=*/false, errOff),
+        "honest canonical layout must pass CHECK 6 with signatures OFF: " << errOff);
+
+    utxo.Close(); CleanupUTXO(path);
+}
+
+// Rejection matrix: each malleated LAYOUT (the txid-malleability vectors B1..B4)
+// mined into a block is REJECTED on the connect path. Anti-vacuity: the SAME
+// harness first accepts the base canonical layout, so every reject is caused by
+// the layout mutation, not incidental structural failure.
+BOOST_FIXTURE_TEST_CASE(cc_mall_malleated_scriptsig_rejected_on_connect, ChainParamsFixture) {
+    CUTXOSet utxo; std::string path = OpenTempUTXO(utxo);
+    const uint32_t H = 2;
+
+    // Confirmed P2PKH coin. Signatures are OFF for this whole case, so the pubkey<->
+    // hash binding is not checked and a Dummy P2PKH scriptPubKey suffices; the coin
+    // only needs to BE P2PKH so CHECK 6 keys on it.
+    COutPoint prev(MakeHash(0xC0), 0);
+    BOOST_REQUIRE(utxo.AddUTXO(prev, CTxOut(100 * COIN, DummyP2PKH(0xC1)), 1, false));
+    BOOST_REQUIRE(utxo.Flush());
+
+    const std::vector<uint8_t> canonical = CanonicalLayoutSig(0xAA);  // 5265 bytes, valid layout
+    BOOST_REQUIRE_EQUAL(canonical.size(), (size_t)5265);
+
+    // --- Anti-vacuity: the base canonical layout is ACCEPTED (scripts off) --------
+    {
+        CBlock ok = MallBlock(prev, canonical, H);
+        std::string err;
+        BOOST_CHECK_MESSAGE(ConnectBlockChecks(ok, utxo, H, /*fVerifyScripts=*/false, err),
+            "base canonical layout must be accepted so rejects are attributable: " << err);
+    }
+
+    auto expectReject = [&](const std::vector<uint8_t>& ss, const char* label) {
+        CBlock b = MallBlock(prev, ss, H);
+        std::string err;
+        BOOST_CHECK_MESSAGE(!ConnectBlockChecks(b, utxo, H, /*fVerifyScripts=*/false, err),
+            label << ": malleated scriptSig must be REJECTED on the connect path");
+        BOOST_CHECK_MESSAGE(err.find("malleability") != std::string::npos ||
+                            err.find("canonical") != std::string::npos,
+            label << ": reject must be attributable to CHECK 6, got: " << err);
+    };
+
+    // B3 — prepend junk: size 5266 != 5265 (size branch).
+    {
+        std::vector<uint8_t> s = canonical;
+        s.insert(s.begin(), 0x00);
+        expectReject(s, "junk-prepended");
+    }
+    // B3 — stack residue: an extra pushed element appended (size 5267, size branch).
+    {
+        std::vector<uint8_t> s = canonical;
+        s.push_back(0x01); s.push_back(0xFF);   // trailing residue
+        expectReject(s, "stack-residue-appended");
+    }
+    // B4 — wrong pk_len FIELD: total size stays 5265, but the pk_len field is 1951
+    // (not 1952). This is the sub-vector IsLegacyScriptSig misses (pk_len branch).
+    {
+        std::vector<uint8_t> s = canonical;
+        const size_t off = 2 + 3309;            // pk_len field offset
+        s[off] = (uint8_t)(1951 & 0xFF); s[off + 1] = (uint8_t)((1951 >> 8) & 0xFF);
+        expectReject(s, "wrong-pk_len");
+    }
+    // wrong sig_len FIELD: size stays 5265, sig_len field is 3308 (sig_len branch).
+    {
+        std::vector<uint8_t> s = canonical;
+        s[0] = (uint8_t)(3308 & 0xFF); s[1] = (uint8_t)((3308 >> 8) & 0xFF);
+        expectReject(s, "wrong-sig_len");
+    }
+    // B1/B2 — push-opcode / non-minimal-push framing: encode sig & pk via a
+    // 4-byte-length PUSHDATA4-style prefix instead of the canonical 2-byte length.
+    // Size = 5 + 3309 + 5 + 1952 = 5271 != 5265 (size branch); no push opcodes are
+    // part of the canonical layout at all.
+    {
+        std::vector<uint8_t> s;
+        auto pushData4 = [&](size_t n) {
+            s.push_back(0x4e);                                   // OP_PUSHDATA4
+            for (int i = 0; i < 4; ++i) s.push_back((uint8_t)((n >> (i * 8)) & 0xFF));
+            s.insert(s.end(), n, 0xAA);
+        };
+        pushData4(3309);   // sig
+        pushData4(1952);   // pk
+        BOOST_REQUIRE_EQUAL(s.size(), (size_t)5271);
+        expectReject(s, "push-opcode-nonminimal");
+    }
+
+    utxo.Close(); CleanupUTXO(path);
+}
+
+// The gate is UNCONDITIONAL: a malleated scriptSig is rejected on the connect path
+// EVEN when signatures are assume-valid-skipped (fVerifyScripts=false). This is the
+// property that makes the closure a real consensus rule rather than a signature-
+// path artifact, and that keeps the connect surface identical to the mempool
+// surface (which enforces it unconditionally). Contrast: the SAME junk-prepended
+// layout with signatures ON is ALSO rejected (via CHECK 6 before the sig step).
+BOOST_FIXTURE_TEST_CASE(cc_mall_gate_unconditional_wrt_assumevalid, ChainParamsFixture) {
+    CUTXOSet utxo; std::string path = OpenTempUTXO(utxo);
+    const uint32_t H = 2;
+
+    COutPoint prev(MakeHash(0xC2), 0);
+    BOOST_REQUIRE(utxo.AddUTXO(prev, CTxOut(100 * COIN, DummyP2PKH(0xC3)), 1, false));
+    BOOST_REQUIRE(utxo.Flush());
+
+    std::vector<uint8_t> malleated = CanonicalLayoutSig(0xAA);
+    malleated.insert(malleated.begin(), 0x00);   // junk-prepended -> non-canonical
+
+    CBlock b = MallBlock(prev, malleated, H);
+
+    std::string errOff;
+    BOOST_CHECK_MESSAGE(!ConnectBlockChecks(b, utxo, H, /*fVerifyScripts=*/false, errOff),
+        "malleated scriptSig must be rejected even with signatures assume-valid-skipped");
+    BOOST_CHECK_MESSAGE(errOff.find("malleability") != std::string::npos ||
+                        errOff.find("canonical") != std::string::npos,
+        "scripts-off reject must be the canonical gate, got: " << errOff);
+
+    std::string errOn;
+    BOOST_CHECK_MESSAGE(!ConnectBlockChecks(b, utxo, H, /*fVerifyScripts=*/true, errOn),
+        "malleated scriptSig must also be rejected with signatures ON");
 
     utxo.Close(); CleanupUTXO(path);
 }

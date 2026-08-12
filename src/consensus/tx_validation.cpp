@@ -16,11 +16,15 @@
 #include <cstring>
 #include <iostream>
 
-namespace {
-
 // ============================================================================
 // Malleability closure (finding #4): the ONE canonical P2PKH scriptSig layout.
 // ============================================================================
+//
+// Exported (declared in tx_validation.h) so BOTH the mempool/relay path
+// (CheckTransactionInputs, below) AND the block-connect path (ConnectBlockChecks
+// in consensus/connect_checks.cpp) enforce THIS one predicate. A second, drifting
+// copy on the connect path would be a latent consensus split; single-sourcing it
+// makes the mempool and connect surfaces reject the identical byte-string set.
 //
 // Pre-scriptV2 the only spend type is P2PKH, and the signature commits to NO
 // scriptSig bytes (GetSigningHash replaces every scriptSig with empty) while the
@@ -60,8 +64,6 @@ bool IsCanonicalP2PKHScriptSig(const std::vector<uint8_t>& s) {
     if (pk_len != PK) return false;
     return true;
 }
-
-}  // namespace
 
 // ============================================================================
 // Basic Structural Validation
