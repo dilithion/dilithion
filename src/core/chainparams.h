@@ -625,6 +625,60 @@ public:
         }
         return highest;
     }
+
+    /**
+     * True iff a hash-anchored checkpoint exists at EXACTLY this height.
+     *
+     * Distinct from GetLastCheckpoint (at-or-before) and CheckpointCheck
+     * (hash match at height) — this asks only "is this exact height pinned?".
+     */
+    bool HasCheckpointAtHeight(int height) const {
+        for (const auto& cp : checkpoints) {
+            if (cp.nHeight == height) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * LOW-1 (VDF connect-path re-review) — config-hazard guard.
+     *
+     * An assume-valid height > 0 that is NOT pinned by a hash-anchored
+     * checkpoint at that EXACT height is a theft window: at/below the boundary,
+     * a node still in IBD skips the corresponding verify (ML-DSA signatures for
+     * scriptAssumeValidHeight, the Wesolowski VDF proof for vdfAssumeValidHeight),
+     * so a forged historical block below an unpinned boundary would be accepted.
+     * Bitcoin-Core assume-valid semantics require the boundary to sit under a
+     * checkpoint the attacker cannot rewrite. Both knobs default to 0 on every
+     * network and relaunch (skip unreachable), so this guard is inert today; it
+     * fails loud the moment someone raises a boundary without pairing a
+     * checkpoint. (dfmpAssumeValidHeight is deliberately excluded — it gates a
+     * penalty-multiplier skip, not a signature/proof skip, and is anchored by the
+     * separate raise-only live-chain discipline.)
+     *
+     * @param error set to a human-readable reason when the config is unsafe
+     * @return true if the assume-valid configuration is safe
+     */
+    bool ValidateAssumeValidCheckpoints(std::string& error) const {
+        if (scriptAssumeValidHeight > 0 &&
+            !HasCheckpointAtHeight(scriptAssumeValidHeight)) {
+            error = "scriptAssumeValidHeight=" +
+                    std::to_string(scriptAssumeValidHeight) +
+                    " has no hash-anchored checkpoint at that exact height "
+                    "(unpinned assume-valid boundary is a signature-skip theft window)";
+            return false;
+        }
+        if (vdfAssumeValidHeight > 0 &&
+            !HasCheckpointAtHeight(vdfAssumeValidHeight)) {
+            error = "vdfAssumeValidHeight=" +
+                    std::to_string(vdfAssumeValidHeight) +
+                    " has no hash-anchored checkpoint at that exact height "
+                    "(unpinned assume-valid boundary is a VDF-proof-skip theft window)";
+            return false;
+        }
+        return true;
+    }
 };
 
 // Global chain parameters (initialized at startup)

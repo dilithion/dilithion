@@ -2256,6 +2256,19 @@ int main(int argc, char* argv[]) {
         std::cout << "Network: MAINNET" << std::endl;
     }
 
+    // LOW-1 (VDF connect-path re-review): fail loud at startup if any
+    // assume-valid boundary (script or VDF) is set > 0 without a hash-anchored
+    // checkpoint at that exact height — an unpinned boundary is an IBD theft
+    // window. Inert at the shipped defaults (all boundaries 0); a tripwire for
+    // any future misconfiguration.
+    {
+        std::string assumeValidErr;
+        if (!Dilithion::g_chainParams->ValidateAssumeValidCheckpoints(assumeValidErr)) {
+            std::cerr << "FATAL: unsafe assume-valid configuration: " << assumeValidErr << std::endl;
+            return 1;
+        }
+    }
+
     // Phase 10: Set default datadir, ports from chain params if not specified
     // (Config file values already applied above, now apply chain params as final fallback)
     if (config.datadir.empty()) {

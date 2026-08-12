@@ -34,6 +34,9 @@
 #include <consensus/connect_checks.h>
 #include <consensus/vdf_validation.h>
 #include <consensus/validation.h>   // CBlockValidator (BuildMerkleRoot)
+#include <consensus/chain.h>        // CChainState / ConnectTip (integration test)
+#include <node/block_index.h>       // CBlockIndex (integration test)
+#include <core/node_context.h>      // g_node_context (integration test)
 #include <vdf/vdf.h>
 #include <vdf/coinbase_vdf.h>
 #include <primitives/block.h>
@@ -41,6 +44,8 @@
 #include <core/chainparams.h>
 #include <crypto/sha3.h>
 #include <uint256.h>
+
+#include <memory>
 
 #include <array>
 #include <vector>
@@ -307,6 +312,123 @@ BOOST_FIXTURE_TEST_CASE(vdf_connect_non_vdf_and_genesis_exempt, DilVParamsFixtur
     // Genesis (height 0) is exempt even for a v4 block.
     CBlock v4 = MakeVDFBlock(prev, minerAddr, junk, MakePrev(0x01), MakePrev(0x02));
     BOOST_CHECK(ConnectPathCheckVDF(v4, /*height=*/0, prev, /*IBD=*/false, err));
+}
+
+// ============================================================================
+// LOW-1 — assume-valid boundary MUST be pinned by a checkpoint at that exact
+// height. Mutation target: dropping either clause of
+// ValidateAssumeValidCheckpoints reddens the "unpinned => unsafe" assertions.
+// ============================================================================
+
+BOOST_AUTO_TEST_CASE(vdf_low1_assumevalid_requires_checkpoint_at_height) {
+    Dilithion::ChainParams p = Dilithion::ChainParams::DilV();
+    std::string err;
+
+    // Shipped default: both boundaries 0 => the skip is unreachable => SAFE.
+    BOOST_REQUIRE_EQUAL(p.vdfAssumeValidHeight, 0);
+    BOOST_REQUIRE_EQUAL(p.scriptAssumeValidHeight, 0);
+    BOOST_CHECK(p.ValidateAssumeValidCheckpoints(err));
+
+    // vdfAssumeValidHeight > 0 with NO checkpoint at that height => UNSAFE.
+    p.vdfAssumeValidHeight = 50000;
+    BOOST_CHECK_MESSAGE(!p.ValidateAssumeValidCheckpoints(err),
+                        "unpinned vdfAssumeValidHeight must be rejected");
+    BOOST_CHECK(err.find("vdfAssumeValidHeight") != std::string::npos);
+
+    // Pin it with a hash-anchored checkpoint at exactly that height => SAFE.
+    p.checkpoints.emplace_back(50000, MakePrev(0x7A));
+    BOOST_CHECK_MESSAGE(p.ValidateAssumeValidCheckpoints(err),
+                        "a checkpoint at the exact boundary makes it safe; err=" << err);
+
+    // A checkpoint at a DIFFERENT height does not pin the boundary => UNSAFE.
+    p.vdfAssumeValidHeight = 60000;   // no checkpoint at 60000
+    BOOST_CHECK(!p.ValidateAssumeValidCheckpoints(err));
+
+    // The same rule holds for the script signature-skip boundary.
+    Dilithion::ChainParams s = Dilithion::ChainParams::DilV();
+    s.scriptAssumeValidHeight = 12345;
+    BOOST_CHECK(!s.ValidateAssumeValidCheckpoints(err));
+    BOOST_CHECK(err.find("scriptAssumeValidHeight") != std::string::npos);
+    s.checkpoints.emplace_back(12345, MakePrev(0x3B));
+    BOOST_CHECK(s.ValidateAssumeValidCheckpoints(err));
+
+    // HasCheckpointAtHeight is exact-match only (not at-or-before).
+    BOOST_CHECK(s.HasCheckpointAtHeight(12345));
+    BOOST_CHECK(!s.HasCheckpointAtHeight(12344));
+}
+
+// ============================================================================
+// REGRESSION LOCK — full ConnectTip on the reorg / fork-activation connect path
+// (skipValidation=true) MUST still reject a forged v4 block. This is the gap the
+// implementer flagged: placement (the VDF call sits OUTSIDE every
+// `if (!skipValidation)`) is correct now, but only an end-to-end skipValidation
+// connect proves the call actually fires there. If a future refactor slides the
+// VDF check back inside a `!skipValidation` guard, this test flips from
+// REJECT(false + BLOCK_FAILED_VALID) to ACCEPT(true + BLOCK_VALID_CHAIN).
+// ============================================================================
+
+namespace {
+// Restore the g_node_context consensus deps this test neutralises.
+struct NodeContextGuard {
+    CCooldownTracker* tracker;
+    std::unique_ptr<digital_dna::DNARegistryDB> dna;
+    std::unique_ptr<dilithion::net::port::ISyncCoordinator> sync;
+    NodeContextGuard() {
+        tracker = g_node_context.cooldown_tracker;
+        dna = std::move(g_node_context.dna_registry);
+        sync = std::move(g_node_context.sync_coordinator);
+        g_node_context.cooldown_tracker = nullptr;      // skip cooldown/consec/cap
+        // dna_registry / sync_coordinator are now null (moved out) => DNA check
+        // skipped and fInitialBlockDownload=false.
+    }
+    ~NodeContextGuard() {
+        g_node_context.cooldown_tracker = tracker;
+        g_node_context.dna_registry = std::move(dna);
+        g_node_context.sync_coordinator = std::move(sync);
+    }
+};
+}  // namespace
+
+BOOST_FIXTURE_TEST_CASE(vdf_connecttip_forged_rejected_on_skipvalidation_reorg, DilVParamsFixture) {
+    NodeContextGuard ncGuard;  // neutralise DNA/cooldown/sync deps; auto-restore
+
+    const uint256 prev = MakePrev(0xAB);
+    const int height = 100;   // <= DilV dfmpAssumeValidHeight => reorg-safe MIK/
+                              // attestation checks are assume-valid-skipped, leaving
+                              // the VDF gate as the decisive check.
+    std::array<uint8_t, 20> minerAddr; minerAddr.fill(0x11);
+
+    // FORGE-A forged block: both commitments recomputed so it clears every cheap
+    // check and reaches the class-group Wesolowski verify.
+    vdf::VDFResult r = ComputeHonest(prev, height, minerAddr);
+    BOOST_REQUIRE(!r.proof.empty());
+    const size_t proofLen = r.proof.size();
+    const size_t formSize = proofLen / 2;
+    std::vector<uint8_t> fproof(proofLen);
+    for (size_t i = 0; i < proofLen; ++i) fproof[i] = (uint8_t)((i * 7u + 1u) & 0xFF);
+    uint256 fph = CoinbaseVDF::ComputeProofHash(fproof);
+    uint256 fout; SHA3_256(fproof.data(), formSize, fout.data);
+    CBlock forged = MakeVDFBlock(prev, minerAddr, fproof, fout, fph);
+
+    // Minimal chainstate: no DB, no UTXO set, no mempool. With those null, the
+    // ONLY consensus gate between ConnectTip entry and `return true` is the VDF
+    // check — so a pass here would connect the block (non-vacuous: removing/moving
+    // the VDF check flips this test green→accept).
+    CChainState cs;
+    CBlockIndex idx;              // default ctor: pprev=null, nStatus=0
+    idx.nHeight = height;
+    idx.nVersion = forged.nVersion;
+    idx.phashBlock = MakePrev(0x5A);   // GetBlockHash() returns this (non-null)
+
+    // skipValidation=true => the reorg / fork-activation connect path.
+    const bool connected = cs.ConnectTip(&idx, forged, /*skipValidation=*/true);
+
+    BOOST_CHECK_MESSAGE(!connected,
+        "forged v4 block MUST be rejected on the skipValidation=true reorg-connect path");
+    BOOST_CHECK_MESSAGE((idx.nStatus & CBlockIndex::BLOCK_FAILED_VALID) != 0,
+        "rejected forged block must be marked BLOCK_FAILED_VALID");
+    BOOST_CHECK_MESSAGE((idx.nStatus & CBlockIndex::BLOCK_VALID_CHAIN) == 0,
+        "forged block must NOT be marked connected");
 }
 
 BOOST_AUTO_TEST_SUITE_END()
