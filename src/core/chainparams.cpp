@@ -75,13 +75,21 @@ ChainParams ChainParams::Mainnet() {
     // 0 => DIL mainnet verifies spend signatures for EVERY block from height 1
     // (raising dfmpAssumeValidHeight can never silently disable signatures). Set
     // > 0 only alongside a hash-anchored checkpoint at that exact height.
-    params.scriptAssumeValidHeight = 0;
+    // PHASE-1 STOPGAP DEPLOY (2026-08-14): raised from 0 to the live tip so a
+    // fixed node GRANDFATHERS the existing chain (incl. the h84,229-84,391 drain
+    // blocks, which are invalid-sig and would be REJECTED under =0, forking the
+    // node off mainnet) and enforces spend-signature validity for every block
+    // ABOVE 84,931. Paired with the hash-anchored checkpoint at 84,931 below
+    // (required by ValidateAssumeValidCheckpoints). The fresh-genesis relaunch
+    // (phase-3) uses =0; this value is ONLY for the in-place deploy onto the
+    // existing chain. Re-pin to the actual cutover tip at deploy time.
+    params.scriptAssumeValidHeight = 84931;
 
     // VDF Assume-Valid Height — dedicated knob, independent of both assume-valid
     // heights above. Default 0 => verify every v4 block's VDF proof from height 1.
-    // (DIL mainnet is RandomX/PoW, not VDF, so this is a no-op here; set for
-    // uniformity and forward-safety.)
-    params.vdfAssumeValidHeight = 0;
+    // (DIL mainnet is RandomX/PoW, not VDF, so this is a no-op here; set to match
+    // scriptAssumeValidHeight for uniformity in the phase-1 stopgap build.)
+    params.vdfAssumeValidHeight = 84931;
 
     // DFMP v3.0 activation - payout heat tracking, reduced free tier, dormancy decay
     params.dfmpV3ActivationHeight = 7000;
@@ -240,6 +248,13 @@ ChainParams ChainParams::Mainnet() {
     // seeds (NYC/LDN/SGP/SYD) via getblockhash{height:54000} on 2026-05-19;
     // fleet was in full consensus at tip 54793.
     params.checkpoints.emplace_back(54000, uint256S("0000000bb44c964b4e3c6fec8c15941738cd74b434bafbfe4aadce898140b993"));
+    // PHASE-1 STOPGAP checkpoint at the live tip (2026-08-14, height 84,931).
+    // Verified unanimous across all 4 DIL mainnet seeds (NYC/LDN/SGP/SYD) at
+    // bestblockhash 0000007b8388…81d29 on 2026-08-14. Anchors scriptAssumeValidHeight
+    // =84931 above: the fixed node accepts the existing (theft-containing) history
+    // to here and enforces signature validity from 84,932 forward. Re-pin to the
+    // actual cutover tip at deploy time.
+    params.checkpoints.emplace_back(84931, uint256S("0000007b838884c41a6821918ec0cb5a1237ddd7af21cf9be2209db867a81d29"));
 
     // ASSUME-VALID: Skip DFMP penalty validation below this block
     // Empty = validate everything (populate after mainnet has established blocks)
