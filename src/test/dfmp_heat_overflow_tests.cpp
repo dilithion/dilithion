@@ -33,6 +33,9 @@
  *  - G3     the four consensus-critical sites (consensus/pow.cpp, miner/controller.cpp,
  *           node/dilithion-node.cpp, node/dilv-node.cpp) all route through that ONE
  *           predicate and no file outside chainparams re-derives the comparison.
+ *  - G4     -fwrapv (which makes this file's whole subject — signed wrap — DEFINED
+ *           behavior) is machine-enforced: the Makefile's CONSENSUS_CXXFLAGS override
+ *           exists and every first-party compile recipe includes it.
  */
 
 #include <dfmp/dfmp.h>
@@ -563,6 +566,54 @@ TEST(g3_four_call_sites_single_sourced) {
     std::cout << "    single source verified (>= + null guard)" << std::endl;
 }
 
+// =======================================================================
+// G4: -fwrapv is machine-enforced, not comment-enforced.
+//
+// The heat arithmetic this suite hardens is DEFINED behavior only under
+// -fwrapv (signed overflow wraps); without it the compiler may legally
+// assume no overflow and emit a consensus-divergent binary. The Makefile
+// carries the full rationale for the delivery mechanism (`override
+// CONSENSUS_CXXFLAGS := -fwrapv`, injected per-recipe because `override
+// CXXFLAGS +=` silently breaks every later plain `+=`). Until now that
+// mechanism was enforced only by a comment saying recipes MUST include
+// it. This test pins both halves, so dropping the variable or writing a
+// compile recipe without it fails a suite instead of shipping UB.
+// =======================================================================
+TEST(g4_consensus_fwrapv_machine_enforced) {
+    const std::filesystem::path root = findSrcDir().parent_path();
+    const std::string mk = readWholeFile((root / "Makefile").string());
+
+    // 1) The override variable exists, exactly once, with the flag.
+    ASSERT(countOccurrences(mk, "override CONSENSUS_CXXFLAGS := -fwrapv") == 1,
+        "Makefile must define `override CONSENSUS_CXXFLAGS := -fwrapv` exactly once");
+
+    // 2) Every first-party compile recipe includes $(CONSENSUS_CXXFLAGS).
+    //    A compile recipe = a tab-indented recipe line invoking $(CXX) with -c.
+    std::vector<std::string> naked;
+    std::istringstream lines(mk);
+    std::string line;
+    size_t lineno = 0, recipes = 0;
+    while (std::getline(lines, line)) {
+        lineno++;
+        if (line.empty() || line[0] != '\t') continue;          // recipe lines only
+        if (line.find("$(CXX)") == std::string::npos) continue;
+        if (line.find(" -c ") == std::string::npos) continue;   // compile, not link
+        recipes++;
+        if (line.find("$(CONSENSUS_CXXFLAGS)") == std::string::npos) {
+            naked.push_back("Makefile:" + std::to_string(lineno));
+        }
+    }
+    ASSERT(recipes >= 10,
+        "expected >=10 compile recipes ($(CXX) ... -c) in the Makefile — matcher broke?");
+    if (!naked.empty()) {
+        std::string msg = "compile recipes missing $(CONSENSUS_CXXFLAGS) (CONSENSUS-UB RISK):";
+        for (const auto& n : naked) msg += " " + n;
+        throw std::runtime_error(msg);
+    }
+    std::cout << "    " << recipes << " compile recipes checked, all carry $(CONSENSUS_CXXFLAGS)"
+              << std::endl;
+}
+
 int main() {
     std::cout << YELLOW << "========================================" << RESET << std::endl;
     std::cout << YELLOW << "C-3 DFMP Heat Overflow Tests" << RESET << std::endl;
@@ -577,6 +628,7 @@ int main() {
     test_g1_activation_predicate_boundary_wrapper();
     test_g2_shipped_params_gate_is_off_wrapper();
     test_g3_four_call_sites_single_sourced_wrapper();
+    test_g4_consensus_fwrapv_machine_enforced_wrapper();
 
     std::cout << std::endl;
     std::cout << YELLOW << "========================================" << RESET << std::endl;
