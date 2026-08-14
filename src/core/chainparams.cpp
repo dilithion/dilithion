@@ -500,19 +500,29 @@ ChainParams ChainParams::DilV() {
 
     // Script Assume-Valid Height — decoupled from the DFMP knob above (HIGH-1
     // round-2). Gates ONLY the ML-DSA signature skip on the connect path, NOT the
-    // DFMP/MIK/cooldown/DNA skip. Default 0 => DilV mainnet verifies spend
-    // signatures for EVERY block from height 1; the 44233 DFMP anchor above (which
-    // can only be raised, never zeroed) therefore can NEVER disable signature
-    // verification. Set > 0 only alongside a hash-anchored checkpoint at that height.
-    params.scriptAssumeValidHeight = 0;
+    // DFMP/MIK/cooldown/DNA skip. The 44233 DFMP anchor above (which can only be
+    // raised, never zeroed) can NEVER disable signature verification.
+    // v4.5.2 (2026-08-15): raised from 0 to 218,800 alongside the hash-anchored
+    // checkpoint at that exact height (below) — see that checkpoint's comment for
+    // the full rationale (fresh-IBD halt at 53,870 under v4.5.1's live connect-path
+    // verification). Buried history ≤218,800 is grandfathered; spend signatures
+    // are enforced for every block above.
+    params.scriptAssumeValidHeight = 218800;
 
-    // VDF Assume-Valid Height — DilV is a VDF chain from genesis. Default 0 =>
-    // every DilV block's Wesolowski VDF proof is verified on the connect path
-    // from height 1 (closes the zero-cost forgery hole, ECOSYSTEM_HUNT #3). This
-    // knob is INDEPENDENT of the 44233 DFMP anchor and the 0 script-assumevalid
-    // above: raising either can never silently disable VDF verification. Set > 0
-    // only alongside a hash-anchored checkpoint at that exact height.
-    params.vdfAssumeValidHeight = 0;
+    // VDF Assume-Valid Height — DilV is a VDF chain from genesis. Wesolowski VDF
+    // proofs are live-verified on the connect path (closes the zero-cost forgery
+    // hole, ECOSYSTEM_HUNT #3). This knob is INDEPENDENT of the 44233 DFMP anchor
+    // and the script-assumevalid above: raising either can never silently disable
+    // VDF verification.
+    // v4.5.2 (2026-08-15): raised from 0 to 218,800 alongside the hash-anchored
+    // checkpoint at that exact height (below). Canonical block 53,870 carries a
+    // proof that FAILS live verification (accepted ~March under the pre-fix
+    // non-verifying path, ~165k blocks deep), so =0 makes every fresh v4.5.1 DilV
+    // sync halt there — reproduced end-to-end on the released Linux asset (LDN
+    // assurance node, 2026-08-14/15). History ≤218,800 is grandfathered behind the
+    // checkpoint; VDF proofs are live-verified for every block above. The forgery
+    // hole stays closed tip-forward, which is where it matters.
+    params.vdfAssumeValidHeight = 218800;
 
     // All DFMP versions active from genesis — use modern rules from day one
     params.dfmpV3ActivationHeight = 0;
@@ -691,6 +701,19 @@ ChainParams ChainParams::DilV() {
     // window (highest_checkpoint+1 .. tip). Verified unanimous across all 4 DilV
     // mainnet seeds 2026-05-06. See v4_4_chainstate_integrity_contract.md decision (a).
     params.checkpoints.emplace_back(47500, uint256S("1094f7ca0197845a120a5440ce01c88e65b72f84f42a456f29e43c81b0cddbce"));
+
+    // v4.5.2 VDF/script assume-valid anchor (2026-08-15). v4.5.1 turned on LIVE
+    // Wesolowski verification on the DilV connect path with vdfAssumeValidHeight=0;
+    // a fresh IBD then re-verifies every historical proof — and canonical block
+    // 53,870 (accepted ~March under the pre-fix non-verifying path, ~165k deep)
+    // FAILS live verification, so every fresh v4.5.1 DilV sync halts there
+    // (reproduced end-to-end on the released Linux asset, LDN assurance node,
+    // 2026-08-14/15). Same medicine as DIL's phase-1 84,931 anchor: grandfather
+    // buried history below this hash-anchored height, enforce live VDF + script
+    // validity for every block above it. Verified against the live DilV chain at
+    // height 218,892 on 2026-08-15; anchor is 92 blocks below that tip (past
+    // MAX_REORG_DEPTH finality).
+    params.checkpoints.emplace_back(218800, uint256S("2bc897c2fed6f920b8ea6312717a9645c6578e2bb5da1fc7fe59e98c9fbe7ee5"));
 
     // v4.4 release-time anchor (resolved decision (j) — two checkpoints per v4.x
     // release for rolling-checkpoint discipline). Verified unanimous across all
