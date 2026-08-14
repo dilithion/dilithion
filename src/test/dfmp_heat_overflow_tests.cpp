@@ -494,6 +494,26 @@ static size_t countOccurrences(const std::string& hay, const std::string& needle
     return n;
 }
 
+// G3/G4 assert about CODE, not prose: a rationale comment naming the parameter
+// (e.g. the k1 -fwrapv comment at pow.cpp:418) must not trip the single-source
+// sweep. Strips //-to-EOL only — the dominant style here; a block comment naming
+// the param would still count, which fails safe (a human looks, then rewords).
+static std::string stripLineComments(const std::string& body) {
+    std::string out;
+    out.reserve(body.size());
+    size_t pos = 0;
+    while (pos < body.size()) {
+        size_t eol = body.find('\n', pos);
+        if (eol == std::string::npos) eol = body.size();
+        size_t slashes = body.find("//", pos);
+        size_t end = (slashes != std::string::npos && slashes < eol) ? slashes : eol;
+        out.append(body, pos, end - pos);
+        out.push_back('\n');
+        pos = eol + 1;
+    }
+    return out;
+}
+
 // =======================================================================
 // G3: the four consensus-critical call sites route through the ONE
 // predicate, and NOTHING outside chainparams/dfmp.cpp re-derives it.
@@ -521,7 +541,7 @@ TEST(g3_four_call_sites_single_sourced) {
         "node/dilv-node.cpp",
     };
     for (const char* rel : sites) {
-        const std::string body = readWholeFile((src / rel).string());
+        const std::string body = stripLineComments(readWholeFile((src / rel).string()));
         ASSERT(countOccurrences(body, kCall) >= 1,
             std::string(rel) + " must call DFMP::DfmpSaturatingMathActive()");
         ASSERT(countOccurrences(body, kParam) == 0,
@@ -539,7 +559,7 @@ TEST(g3_four_call_sites_single_sourced) {
         const std::string ext = e.path().extension().string();
         if (ext != ".cpp" && ext != ".h" && ext != ".hpp") continue;
         const std::string rel = std::filesystem::relative(e.path(), src).generic_string();
-        const std::string body = readWholeFile(e.path().string());
+        const std::string body = stripLineComments(readWholeFile(e.path().string()));
         if (countOccurrences(body, kParam) == 0) continue;
         if (rel == "core/chainparams.h" || rel == "core/chainparams.cpp") continue;
         if (rel == "dfmp/dfmp.cpp") { predicateFileHits++; continue; }
@@ -580,7 +600,8 @@ TEST(g3_four_call_sites_single_sourced) {
 // compile recipe without it fails a suite instead of shipping UB.
 // =======================================================================
 TEST(g4_consensus_fwrapv_machine_enforced) {
-    const std::filesystem::path root = findSrcDir().parent_path();
+    const std::filesystem::path srcPath = findSrcDir();
+    const std::filesystem::path root = srcPath.parent_path();
     const std::string mk = readWholeFile((root / "Makefile").string());
 
     // 1) The override variable exists, exactly once, with the flag.
@@ -589,6 +610,10 @@ TEST(g4_consensus_fwrapv_machine_enforced) {
 
     // 2) Every first-party compile recipe includes $(CONSENSUS_CXXFLAGS).
     //    A compile recipe = a tab-indented recipe line invoking $(CXX) with -c.
+    //    Scoped to recipes that use $(CXXFLAGS): the consensus-flag contract
+    //    rides with first-party flag sets. Hardcoded-flag third-party recipes
+    //    (chiavdf c_wrapper) are a separately-documented exemption — see the
+    //    "Do NOT extend this hardcoded-flags pattern" comment above that rule.
     std::vector<std::string> naked;
     std::istringstream lines(mk);
     std::string line;
@@ -598,13 +623,14 @@ TEST(g4_consensus_fwrapv_machine_enforced) {
         if (line.empty() || line[0] != '\t') continue;          // recipe lines only
         if (line.find("$(CXX)") == std::string::npos) continue;
         if (line.find(" -c ") == std::string::npos) continue;   // compile, not link
+        if (line.find("$(CXXFLAGS)") == std::string::npos) continue;  // third-party exemption
         recipes++;
         if (line.find("$(CONSENSUS_CXXFLAGS)") == std::string::npos) {
             naked.push_back("Makefile:" + std::to_string(lineno));
         }
     }
-    ASSERT(recipes >= 10,
-        "expected >=10 compile recipes ($(CXX) ... -c) in the Makefile — matcher broke?");
+    ASSERT(recipes >= 3,
+        "expected >=3 first-party compile recipes ($(CXX) $(CXXFLAGS) ... -c) — matcher broke?");
     if (!naked.empty()) {
         std::string msg = "compile recipes missing $(CONSENSUS_CXXFLAGS) (CONSENSUS-UB RISK):";
         for (const auto& n : naked) msg += " " + n;

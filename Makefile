@@ -757,6 +757,12 @@ dfmp_heat_overflow_tests: $(CORE_OBJECTS) $(OBJ_DIR)/test/dfmp_heat_overflow_tes
 	@echo "$(COLOR_BLUE)[LINK]$(COLOR_RESET) $@"
 	@$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS) $(LIBS)
 
+# Structural pin only — reads source files, links nothing from the node.
+shutdown_disarm_ownership_tests: $(OBJ_DIR)/test/shutdown_disarm_ownership_tests.o
+	@echo "$(COLOR_BLUE)[LINK]$(COLOR_RESET) $@"
+	@$(CXX) $(CXXFLAGS) -o $@ $^
+	@echo "$(COLOR_GREEN)✓ shutdown_disarm_ownership_tests built successfully$(COLOR_RESET)"
+
 mik_registration_persistence_tests: $(CORE_OBJECTS) $(OBJ_DIR)/test/mik_registration_persistence_tests.o $(DILITHIUM_OBJECTS) $(CHIAVDF_OBJECTS)
 	@echo "$(COLOR_BLUE)[LINK]$(COLOR_RESET) $@"
 	@$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS) $(LIBS)
@@ -922,7 +928,7 @@ auto_rebuild_marker_mode_symmetry_tests: $(CORE_OBJECTS) $(OBJ_DIR)/test/auto_re
 INTEGRITY_TEST_FAULT_OBJ := $(OBJ_DIR)/test/utxo_set_faultinject.o
 $(INTEGRITY_TEST_FAULT_OBJ): src/node/utxo_set.cpp | $(OBJ_DIR)/test
 	@echo "$(COLOR_BLUE)[CXX]$(COLOR_RESET)  $< (fault-injection enabled, test-only)"
-	@$(CXX) $(CXXFLAGS) -DDILITHION_ENABLE_FAULT_INJECTION $(INCLUDES) -c $< -o $@
+	@$(CXX) $(CXXFLAGS) $(CONSENSUS_CXXFLAGS) -DDILITHION_ENABLE_FAULT_INJECTION $(INCLUDES) -c $< -o $@
 
 # The test driver references g_undo_fetch_fault_injector, so its own object must
 # also see DILITHION_ENABLE_FAULT_INJECTION. Built via a target-specific recompile
@@ -930,7 +936,7 @@ $(INTEGRITY_TEST_FAULT_OBJ): src/node/utxo_set.cpp | $(OBJ_DIR)/test
 INTEGRITY_TEST_DRIVER_OBJ := $(OBJ_DIR)/test/chainstate_integrity_tests_faultinject.o
 $(INTEGRITY_TEST_DRIVER_OBJ): src/test/chainstate_integrity_tests.cpp | $(OBJ_DIR)/test
 	@echo "$(COLOR_BLUE)[CXX]$(COLOR_RESET)  $< (fault-injection enabled, test-only)"
-	@$(CXX) $(CXXFLAGS) -DDILITHION_ENABLE_FAULT_INJECTION $(INCLUDES) -c $< -o $@
+	@$(CXX) $(CXXFLAGS) $(CONSENSUS_CXXFLAGS) -DDILITHION_ENABLE_FAULT_INJECTION $(INCLUDES) -c $< -o $@
 
 CHAINSTATE_INTEGRITY_CORE_OBJECTS := \
 	$(filter-out $(OBJ_DIR)/node/utxo_set.o,$(CORE_OBJECTS)) \
@@ -1206,11 +1212,11 @@ $(OBJ_DIR)/test/lp5_control:
 
 $(OBJ_DIR)/test/lp5_control/signature_batch_verifier_prefix.o: src/test/lp5_control/signature_batch_verifier_prefix.cpp | $(OBJ_DIR)/test/lp5_control
 	@echo "$(COLOR_BLUE)[CXX]$(COLOR_RESET)  $< (LP-5 control, frozen pre-fix)"
-	@$(CXX) $(CXXFLAGS) $(INCLUDES) -I src/test/lp5_control -c $< -o $@
+	@$(CXX) $(CXXFLAGS) $(CONSENSUS_CXXFLAGS) $(INCLUDES) -I src/test/lp5_control -c $< -o $@
 
 $(OBJ_DIR)/test/lp5_control/batch_verifier_race_tests.o: src/test/batch_verifier_race_tests.cpp | $(OBJ_DIR)/test/lp5_control
 	@echo "$(COLOR_BLUE)[CXX]$(COLOR_RESET)  $< (-DPREFIX_API control variant)"
-	@$(CXX) $(CXXFLAGS) $(INCLUDES) -I src/test/lp5_control -DPREFIX_API -c $< -o $@
+	@$(CXX) $(CXXFLAGS) $(CONSENSUS_CXXFLAGS) $(INCLUDES) -I src/test/lp5_control -DPREFIX_API -c $< -o $@
 
 batch_verifier_race_control: $(OBJ_DIR)/test/lp5_control/signature_batch_verifier_prefix.o $(OBJ_DIR)/test/lp5_control/batch_verifier_race_tests.o $(DILITHIUM_OBJECTS)
 	@echo "$(COLOR_BLUE)[LINK]$(COLOR_RESET) $@"
