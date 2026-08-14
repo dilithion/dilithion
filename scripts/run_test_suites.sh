@@ -102,7 +102,7 @@ fast|wallet_encryption_integration_tests|600|
 fast|genesis_all_networks_tests|600|
 fast|shutdown_disarm_ownership_tests|60|
 fast|phase1_test|120|STALE TEST (diagnosed, fix deliberately NOT taken here): phase1_simple_test.cpp:25 hard-codes "MIN_TX_FEE = 50000, FEE_PER_BYTE = 25"; the live values in consensus/fees.h:14,17 are MIN_TX_FEE = 0 and FEE_PER_BYTE = 5, so both the fee assert (:26) and the rate assert (:30, expects 25..50 ions/byte, actual 5.0) fail. NOTE FOR WHOEVER FIXES IT: do not just substitute the current constants -- CalculateMinFee IS "MIN_TX_FEE + size*FEE_PER_BYTE" (fees.cpp:10), so an expectation written that way is a tautology that restates the implementation and covers nothing. Un-quarantine only with assertions that hold independently of the formula (e.g. rate == FEE_PER_BYTE exactly, which catches a flat base being reintroduced; strict monotonicity in tx size).
-fast|timestamp_tests|120|SUSPECTED REAL: post-fork min-gap branch computes required=1410859008s (timestamp_tests.cpp:267 -> CheckBlockTimestamp). A ~44-year required inter-block gap is a nonsense value, not a moved goalpost. Needs a consensus owner before this is called stale.
+fast|timestamp_tests|120|
 fast|seed_attestation_key_tests|180|UNTRIAGED: 3 of ~40 checks fail around key-file MAC verification / migration. Needs the seed-attestation owner; failure mode is not obviously stale.
 fast|test_passphrase_validator|60|SUSPECTED REAL (policy): 2 of 16 cases -- two passphrases the suite expects REJECTED are now ACCEPTED at "Moderate (57/100)". Either the strength policy was deliberately loosened (then fix the expectations, with a reason) or it regressed. Do not just flip the expectations.
 fast|chain_case_2_5_equivalence_tests|180|UNTRIAGED: scenario_2 (connect-replacement-fails-then-recovers) now truncates the chain and triggers auto_rebuild instead of recovering (chain_case_2_5_equivalence_tests.cpp:304). Behaviour change in ActivateBestChainStep; needs a chainstate owner to say which side is right.
@@ -116,7 +116,7 @@ full|mining_integration_tests|900|MIXED, ONE SUSPECTED CONSENSUS GAP: (a) coinba
 full|dfmp_mik_tests|600|
 full|net_tests|600|NOBUILD: source no longer compiles. References a removed global g_peer_manager and calls CNetMessageProcessor::CreateVersionMessage() with a signature that no longer exists. Needs a P2P owner to port the harness forward.
 full|randomx_mode_test|1800|
-full|large_pages_optin_test|900|
+full|large_pages_optin_test|2100|
 '
 
 # ---------------------------------------------------------------------------

@@ -4,14 +4,17 @@
 /**
  * Shutdown final-Disarm ownership — structural pins.
  *
- * The invariant (red-team @ eac44a4e, MED-3 fold): the shutdown watchdog's
- * deadline must cover EVERY teardown step, and the last teardown actor on every
- * exit path is RandomXShutdownGuard's destructor (first local of main =>
- * destructs last; it joins the RandomX threads). Therefore that destructor —
- * and ONLY it — calls ShutdownProgress::Disarm(). Any Disarm() reachable
- * earlier re-opens an unbounded-hang window at exactly the step the
+ * The invariant (red-team @ eac44a4e, MED-3 fold): once the shutdown watchdog
+ * is ARMED, its deadline must cover every remaining teardown step, and the
+ * last teardown actor is RandomXShutdownGuard's destructor (first local of
+ * main => destructs last; it joins the RandomX threads). Therefore that
+ * destructor — and ONLY it — calls ShutdownProgress::Disarm(). Any Disarm()
+ * reachable earlier re-opens an unbounded-hang window at exactly the step the
  * J1/K2 shutdown work exists to bound (the pre-fold defect: both mains
  * disarmed at their tail, then the guard joined with no deadline).
+ * Scope, honestly: early returns BEFORE anything arms (config refusals,
+ * init failures) never had a deadline and still don't — that is a separate,
+ * pre-existing property, not what these pins assert.
  *
  * Destruction order is a comment-enforced property of main()'s declaration
  * order, and comment-enforced orderings rot (see G4 in

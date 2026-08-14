@@ -614,8 +614,19 @@ TEST(g4_consensus_fwrapv_machine_enforced) {
     //    rides with first-party flag sets. Hardcoded-flag third-party recipes
     //    (chiavdf c_wrapper) are a separately-documented exemption — see the
     //    "Do NOT extend this hardcoded-flags pattern" comment above that rule.
+    // Join backslash-continuations FIRST — a recipe split across lines would
+    // otherwise evade every substring check (fold: red-team M-3; the two
+    // Dilithium-primitive recipes were invisible to the first version).
+    std::string mkJoined;
+    mkJoined.reserve(mk.size());
+    for (size_t i = 0; i < mk.size(); ++i) {
+        if (mk[i] == '\\' && i + 1 < mk.size() && mk[i + 1] == '\n') { mkJoined += ' '; ++i; continue; }
+        if (mk[i] == '\\' && i + 2 < mk.size() && mk[i + 1] == '\r' && mk[i + 2] == '\n') { mkJoined += ' '; i += 2; continue; }
+        mkJoined += mk[i];
+    }
+
     std::vector<std::string> naked;
-    std::istringstream lines(mk);
+    std::istringstream lines(mkJoined);
     std::string line;
     size_t lineno = 0, recipes = 0;
     while (std::getline(lines, line)) {
@@ -626,11 +637,15 @@ TEST(g4_consensus_fwrapv_machine_enforced) {
         if (line.find("$(CXXFLAGS)") == std::string::npos) continue;  // third-party exemption
         recipes++;
         if (line.find("$(CONSENSUS_CXXFLAGS)") == std::string::npos) {
-            naked.push_back("Makefile:" + std::to_string(lineno));
+            naked.push_back("Makefile(joined-line):" + std::to_string(lineno));
         }
     }
-    ASSERT(recipes >= 3,
-        "expected >=3 first-party compile recipes ($(CXX) $(CXXFLAGS) ... -c) — matcher broke?");
+    // 7 first-party compile recipes exist today (incl. the two Dilithium
+    // primitive recipes only visible after continuation-joining). A DROP below
+    // that is a recipe escaping the sweep, not legitimate shrinkage.
+    ASSERT(recipes >= 7,
+        "first-party compile recipe count dropped below 7 — a recipe is evading the sweep "
+        "(continuation trick or variable rename); fix the matcher, don't relax this");
     if (!naked.empty()) {
         std::string msg = "compile recipes missing $(CONSENSUS_CXXFLAGS) (CONSENSUS-UB RISK):";
         for (const auto& n : naked) msg += " " + n;

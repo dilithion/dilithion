@@ -9010,6 +9010,10 @@ load_genesis_block:  // Bug #29: Label for automatic retry after blockchain wipe
         // main, destructs last) joins the RandomX threads AFTER this line and
         // owns the final Disarm, so the shutdown deadline covers those joins.
         // Disarming here re-opens the unbounded-hang window at the last step.
+        // Name the newly-covered region so a hang in the try-scope local
+        // destructors is reported against the right stage, not the last
+        // database stage (fold: red-team M-1).
+        Dilithion::ShutdownProgress::Stage("main-scope teardown (locals)");
         std::cout << "Dilithion node stopped cleanly" << std::endl;
 
     } catch (const std::exception& e) {

@@ -760,7 +760,7 @@ dfmp_heat_overflow_tests: $(CORE_OBJECTS) $(OBJ_DIR)/test/dfmp_heat_overflow_tes
 # Structural pin only — reads source files, links nothing from the node.
 shutdown_disarm_ownership_tests: $(OBJ_DIR)/test/shutdown_disarm_ownership_tests.o
 	@echo "$(COLOR_BLUE)[LINK]$(COLOR_RESET) $@"
-	@$(CXX) $(CXXFLAGS) -o $@ $^
+	@$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS)
 	@echo "$(COLOR_GREEN)✓ shutdown_disarm_ownership_tests built successfully$(COLOR_RESET)"
 
 mik_registration_persistence_tests: $(CORE_OBJECTS) $(OBJ_DIR)/test/mik_registration_persistence_tests.o $(DILITHIUM_OBJECTS) $(CHIAVDF_OBJECTS)

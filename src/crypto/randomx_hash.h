@@ -173,8 +173,11 @@ struct RandomXShutdownGuard {
         // disarm: anything disarming earlier leaves the
         // joins below to hang with the watchdog already stood down -- the exact
         // step the shutdown-deadline work exists to bound. Gated on an armed,
-        // not-yet-disarmed watchdog so trivial exits (--version, config
-        // refusals, pre-shutdown failures) behave exactly as before.
+        // not-yet-disarmed watchdog. SCOPE (honest): only paths that ARMED get
+        // a deadline -- the normal shutdown sequence and the unwind guard's
+        // path. Early returns BEFORE the unwind guard exists (config refusals,
+        // FULL-mode init failures) join with no deadline, as they always did,
+        // bounded by the join's cancellation-poll batches.
         const bool covered =
             Dilithion::ShutdownProgress::Armed().load(std::memory_order_acquire) &&
             !Dilithion::ShutdownProgress::Disarmed().load(std::memory_order_acquire);
