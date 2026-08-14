@@ -144,6 +144,7 @@ jobs:
       if: startsWith(github.ref, 'refs/tags/')
       uses: softprops/action-gh-release@v3
       with:
+        draft: true
         files: releases/dilithion-${{ steps.get_version.outputs.version }}-mainnet-macos-${{ matrix.arch }}.tar.gz
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
