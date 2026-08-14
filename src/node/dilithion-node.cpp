@@ -6790,7 +6790,12 @@ load_genesis_block:  // Bug #29: Label for automatic retry after blockchain wipe
 
         // Initiate outbound connections for --connect nodes (manual=true for auto-reconnect)
         if (!config.connect_nodes.empty()) {
-            std::cout << "Initiating outbound connections..." << std::endl;
+            // --connect mode: ONLY connect to specified peers — skip hardcoded seeds + AddrMan.
+            // Ported from dilv-node d690e7db (2026-03-25); the shared connman guard existed but
+            // dilithion-node never SET the flag, so --connect nodes still reached mainnet seeds
+            // (surfaced 2026-08-14 when an isolated test node connected to live seeds in ~20s).
+            g_node_context.connman->m_connect_only = true;
+            std::cout << "Initiating outbound connections (connect-only mode)..." << std::endl;
             for (const auto& node_addr : config.connect_nodes) {
                 std::cout << "  Connecting to " << node_addr << "..." << std::endl;
 
