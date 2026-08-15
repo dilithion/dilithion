@@ -428,33 +428,40 @@ TEST(g1_activation_predicate_boundary) {
 // KILLS: an accidental/silent change of dfmpOverflowFixActivationHeight.
 // =======================================================================
 TEST(g2_shipped_params_gate_is_off) {
-    const int kOff = 999999999;
-    struct { const char* name; Dilithion::ChainParams params; } chains[] = {
-        { "Mainnet", Dilithion::ChainParams::Mainnet() },
-        { "Testnet", Dilithion::ChainParams::Testnet() },
-        { "DilV",    Dilithion::ChainParams::DilV()    },
-        { "Regtest", Dilithion::ChainParams::Regtest() },
+    // v4.6.0 ACTIVATION (Will, 2026-08-15): the gate is no longer frozen OFF —
+    // it activates at a per-chain height (~3wk adoption window from the live
+    // tips at decision time; RE-PIN at release cut). This test's job flips
+    // with it: pin the DECIDED heights so an accidental/silent change — in
+    // EITHER direction — still goes RED, and prove the predicate is exact at
+    // each chain's boundary.
+    struct { const char* name; Dilithion::ChainParams params; int activation; } chains[] = {
+        { "Mainnet", Dilithion::ChainParams::Mainnet(), 93000  },
+        { "Testnet", Dilithion::ChainParams::Testnet(), 0      },
+        { "DilV",    Dilithion::ChainParams::DilV(),    255000 },
+        { "Regtest", Dilithion::ChainParams::Regtest(), 0      },  // derives from Testnet
     };
     for (auto& c : chains) {
-        ASSERT(c.params.dfmpOverflowFixActivationHeight == kOff,
+        ASSERT(c.params.dfmpOverflowFixActivationHeight == c.activation,
             std::string("dfmpOverflowFixActivationHeight changed on ")
                 .append(c.name)
                 .append(" — that is a CONSENSUS decision, not a refactor").c_str());
 
         Dilithion::ChainParams local = c.params;
         ScopedChainParams guard(&local);
-        // Every realistic live height stays on the legacy path.
-        const int heights[] = { 0, 1, 1000, 100000, 10000000, kOff - 1 };
-        for (int h : heights) {
-            ASSERT(DfmpSaturatingMathActive(h) == false,
-                std::string("gate must be OFF on ").append(c.name)
-                    .append(" at a live height").c_str());
+        // Exact boundary: legacy math strictly below, saturating at and above.
+        if (c.activation > 0) {
+            ASSERT(DfmpSaturatingMathActive(0) == false,
+                std::string("gate must be OFF at genesis on ").append(c.name).c_str());
+            ASSERT(DfmpSaturatingMathActive(c.activation - 1) == false,
+                std::string("gate must be OFF just below activation on ").append(c.name).c_str());
         }
-        // ...and the predicate still flips exactly at the (unreachable) height.
-        ASSERT(DfmpSaturatingMathActive(kOff) == true,
-            "predicate must still flip at the configured activation height");
+        ASSERT(DfmpSaturatingMathActive(c.activation) == true,
+            std::string("gate must flip exactly at activation on ").append(c.name).c_str());
+        ASSERT(DfmpSaturatingMathActive(c.activation + 1) == true,
+            std::string("gate must stay ON above activation on ").append(c.name).c_str());
     }
-    std::cout << "    gate OFF (999999999) on Mainnet/Testnet/DilV/Regtest" << std::endl;
+    std::cout << "    activation pinned: Mainnet 93000, Testnet 0, DilV 255000, Regtest 0"
+              << std::endl;
 }
 
 // -----------------------------------------------------------------------
