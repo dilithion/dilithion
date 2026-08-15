@@ -881,6 +881,17 @@ bool CChainState::ActivateBestChain(CBlockIndex* pindexNew, const CBlock& block,
         std::cerr << "[Chain] ERROR: Reorganization too deep: " << reorg_depth << " blocks" << std::endl;
         std::cerr << "  Maximum allowed: " << reorg_cap << " blocks" << std::endl;
         std::cerr << "  This may indicate a long-range attack or network partition" << std::endl;
+        // v4.6 fold (A/HIGH-2): the node now knows a strictly-better chain
+        // exists beyond the reorg cap and cannot switch — the canonical
+        // off-canonical transition, on the LEGACY (default) path. Latch +
+        // one structured ERROR line; OffCanonicalReason() reads the latch, so
+        // getblockchaininfo's on_canonical goes false for real. OBSERVABILITY
+        // ONLY — deliberately NO FlagChainRebuild here: giving the legacy
+        // path the new path's auto-recovery (wipe+resync via the wrapper) is
+        // a behavior decision tracked separately, not smuggled in with a
+        // signal fix.
+        LogOffCanonicalTransition("depth-rejection",
+                                  static_cast<int64_t>(pindexNew->nHeight));
         return false;
     }
 
@@ -2264,6 +2275,18 @@ std::string CChainState::OffCanonicalReason() const {
     // rejected leaf to m_setBlockIndexCandidates, so the old predicate fired on
     // a healthy on-canonical node → cry-wolf monitor.py alerts. Genuine drift
     // detection (distinct from depth-rejection) is a v2 item (F7 anchored-root).
+    // v4.6 fold (A/HIGH-2, Will's call 2026-08-15: wire it for real): the
+    // off-canonical LATCH also drives the signal. The legacy activation path
+    // rejects a too-deep reorg WITHOUT flagging a rebuild (no auto-recovery
+    // there — that behavioral parity is a separate decision), so before this
+    // the signal could only ever fire behind the default-OFF useNewPath gate:
+    // green-by-construction, and monitoring read it as health. The latch is
+    // set by LogOffCanonicalTransition at BOTH paths' depth-rejection sites
+    // and cleared by ClearChainRebuildFlag on recovery, so it IS the
+    // episode marker.
+    if (m_off_canonical_logged.load(std::memory_order_acquire)) {
+        return "depth-rejection";
+    }
     if (m_chain_needs_rebuild.load(std::memory_order_acquire) &&
         m_chain_rebuild_reason.load(std::memory_order_acquire) ==
             ChainRebuildReason::DepthRejection) {
