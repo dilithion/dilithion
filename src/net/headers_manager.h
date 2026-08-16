@@ -52,6 +52,11 @@ namespace NetProtocol {
  * Memory efficient: Headers are ~80 bytes each, so 1M headers = ~80MB
  */
 class CHeadersManager {
+    // TEST-ONLY (F-2 fold): lets reorg_belt_rebuild_flag_tests seed the height
+    // index directly (AddToHeightIndex is private) so FindForkPoint yields a
+    // deeper-than-cap fork. No production code names this struct.
+    friend struct IbdReorgBeltTestAccess;
+
 public:
     CHeadersManager();
     ~CHeadersManager();  // Explicit destructor for proper cleanup order

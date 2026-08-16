@@ -227,6 +227,7 @@ CONSENSUS_SOURCES := src/consensus/fees.cpp \
                      src/consensus/signature_batch_verifier.cpp \
                      src/consensus/sighash_preimage.cpp \
                      src/consensus/validation.cpp \
+                     src/consensus/connect_checks.cpp \
                      src/consensus/vdf_validation.cpp \
                      src/consensus/port/chain_selector_impl.cpp
 
@@ -1119,7 +1120,10 @@ BOOST_TEST_OBJECTS := $(OBJ_DIR)/test/test_dilithion.o \
 	$(OBJ_DIR)/test/difficulty_tests.o \
 	$(OBJ_DIR)/test/validation_integration_tests.o \
 	$(OBJ_DIR)/test/consensus_validation_tests.o \
+	$(OBJ_DIR)/test/malleability_tests.o \
 	$(OBJ_DIR)/test/utxo_tests.o \
+	$(OBJ_DIR)/test/connect_checks_tests.o \
+	$(OBJ_DIR)/test/vdf_connect_tests.o \
 	$(OBJ_DIR)/test/tx_validation_tests.o \
 	$(OBJ_DIR)/test/phase4_5_consensus_fixes_tests.o \
 	$(OBJ_DIR)/test/sighash_preimage_tests.o \
@@ -1143,6 +1147,8 @@ BOOST_TEST_OBJECTS := $(OBJ_DIR)/test/test_dilithion.o \
 	$(OBJ_DIR)/test/wf1_host_endian_differential_test.o \
 	$(OBJ_DIR)/test/miner_nonce_write_tests.o \
 	$(OBJ_DIR)/test/chain_tips_cache_invalidation_tests.o \
+	$(OBJ_DIR)/test/reorg_depth_cap_tests.o \
+	$(OBJ_DIR)/test/reorg_belt_rebuild_flag_tests.o \
 	$(CRYPTO_PROPERTY_OBJECTS)
 
 # Link test objects + full library (CORE_OBJECTS) to avoid hand-picked object drift

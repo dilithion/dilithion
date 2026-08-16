@@ -20,6 +20,9 @@ enum ScriptVerifyFlags : unsigned int {
     SCRIPT_VERIFY_CHECKLOCKTIMEVERIFY   = (1U << 1),  // BIP-65
     SCRIPT_VERIFY_CHECKSEQUENCEVERIFY   = (1U << 2),  // BIP-112
     SCRIPT_VERIFY_NULLDUMMY             = (1U << 3),  // Require empty dummy for CHECKMULTISIG
+    // Malleability closure (finding #4), general-script / scriptV2 surface:
+    SCRIPT_VERIFY_MINIMALDATA           = (1U << 4),  // Every push must use its shortest opcode (kills B2)
+    SCRIPT_VERIFY_CLEANSTACK            = (1U << 5),  // Final stack must hold exactly one element (kills B3)
 };
 
 // ============================================================================

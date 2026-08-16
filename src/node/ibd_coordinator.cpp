@@ -1738,6 +1738,32 @@ bool CIbdCoordinator::FetchBlocks() {
                         }
                     }
 
+                    // BELT (REORG_DEPTH_FINALITY_DESIGN §6.2, symmetric with the
+                    // deep-fork handler): refuse a stuck-fork escalation deeper than
+                    // the consensus reorg cap; route it to the operator-gated
+                    // full-rebuild flow instead of rolling validated history back
+                    // below finality. The DisconnectToHeight chokepoint
+                    // (allowDeep=false) is the suspenders if this belt is bypassed.
+                    if (should_disconnect &&
+                        (chain_height - fork_point) > Consensus::MAX_REORG_DEPTH) {
+                        LogPrintf(IBD, WARN,
+                            "[IBD] BUG#273: escalation depth %d exceeds MAX_REORG_DEPTH=%d — "
+                            "refusing automatic deep disconnect, flagging full rebuild\n",
+                            chain_height - fork_point, Consensus::MAX_REORG_DEPTH);
+                        // F-2 fold: flag the CONSUMED rebuild path. The old
+                        // coordinator-local m_requires_reindex had ZERO readers,
+                        // so the "route to rebuild" was a phantom. FlagChainRebuild
+                        // sets CChainState::m_chain_needs_rebuild, polled by the
+                        // node main loop via Dilithion::MaybeTriggerChainRebuild.
+                        // DepthRejection = a legitimate deeper-than-cap fork (not a
+                        // corruption). m_chainstate IS g_chainstate in production.
+                        m_chainstate.FlagChainRebuild(
+                            CChainState::ChainRebuildReason::DepthRejection);
+                        forkMgr.CancelFork("BUG#273: depth exceeds reorg cap - flagging rebuild");
+                        forkMgr.ClearInFlightState(m_node_context, fork_point);
+                        should_disconnect = false;
+                    }
+
                     if (should_disconnect) {
                         // Cancel active fork candidate first
                         forkMgr.CancelFork("BUG#273: escalating to DisconnectToHeight");
@@ -1747,7 +1773,11 @@ bool CIbdCoordinator::FetchBlocks() {
                         int disconnected = m_chainstate.DisconnectToHeight(fork_point, *m_node_context.blockchain_db);
                         if (disconnected < 0) {
                             std::cerr << "[IBD] BUG#273: DisconnectToHeight failed - requires --reindex" << std::endl;
-                            m_requires_reindex = true;
+                            // F-2 fold: was a write-only phantom flag. Route the
+                            // genuine mid-disconnect failure to the consumed rebuild
+                            // path (DisconnectTipFailure cause class).
+                            m_chainstate.FlagChainRebuild(
+                                CChainState::ChainRebuildReason::DisconnectTipFailure);
                         } else {
                             if (g_verbose.load(std::memory_order_relaxed))
                                 std::cout << "[IBD] BUG#273: Disconnected " << disconnected
@@ -2449,6 +2479,36 @@ bool CIbdCoordinator::AttemptForkRecovery(int chain_height, int header_height, F
     // Deep fork handling: fork exceeds MAX_AUTO_REORG_DEPTH
     // Disconnect blocks back to fork point, then re-download correct chain via normal IBD
     if (fork_depth > MAX_AUTO_REORG_DEPTH) {
+        // BELT (REORG_DEPTH_FINALITY_DESIGN §6.2): a fork deeper than the consensus
+        // reorg cap must NOT be auto-disconnected. On VDF the header-work gate below
+        // is forgeable at ~zero cost, so trusting it to authorise a deep disconnect
+        // lets a single malicious peer roll a synced node back to its last
+        // checkpoint (or to genesis on a young/relaunch chain with only a genesis
+        // checkpoint). Route the >cap case to the operator-gated full-rebuild flow
+        // (FlagChainRebuild → DepthRejection, consumed by the node main loop's
+        // MaybeTriggerChainRebuild): re-IBD from genesis re-applies checkpoints and
+        // genesis-up activation is cap-exempt, so the correct chain is derived
+        // WITHOUT a destructive deep reorg. Refuse BEFORE the header-work gate and
+        // BEFORE clearing the mempool. The DisconnectToHeight chokepoint
+        // (allowDeep=false) is the suspenders that also refuses if this belt is ever
+        // bypassed or MAX_AUTO_REORG_DEPTH is ever raised above the consensus cap.
+        if (fork_depth > Consensus::MAX_REORG_DEPTH) {
+            LogPrintf(IBD, WARN,
+                "[FORK-RECOVERY] Fork depth %d exceeds MAX_REORG_DEPTH=%d — refusing "
+                "automatic deep disconnect, flagging full rebuild\n",
+                fork_depth, Consensus::MAX_REORG_DEPTH);
+            // F-2 fold: flag the CONSUMED rebuild path. The old coordinator-local
+            // m_requires_reindex had ZERO readers — the belt's "flag full rebuild"
+            // was a phantom. FlagChainRebuild sets CChainState::m_chain_needs_rebuild,
+            // polled by the node main loop via Dilithion::MaybeTriggerChainRebuild.
+            // DepthRejection = a legitimate deeper-than-cap fork (not a corruption);
+            // matches the in-band ActivateBestChain depth-cap site (chain.cpp).
+            m_chainstate.FlagChainRebuild(
+                CChainState::ChainRebuildReason::DepthRejection);
+            m_fork_stall_cycles.store(0);
+            return false;  // do NOT clear mempool, do NOT DisconnectToHeight
+        }
+
         if (g_verbose.load(std::memory_order_relaxed))
             std::cout << "[FORK-RECOVERY] Deep fork detected (" << fork_depth
                       << " blocks, fork_point=" << fork_point << ")" << std::endl;
@@ -2495,13 +2555,19 @@ bool CIbdCoordinator::AttemptForkRecovery(int chain_height, int header_height, F
         // Disconnect to fork point using proper per-block UTXO/identity/mempool undo
         if (!m_node_context.blockchain_db) {
             std::cerr << "[FORK-RECOVERY] No blockchain DB - cannot disconnect" << std::endl;
-            m_requires_reindex = true;
+            // F-2 fold: was a write-only phantom flag. Cannot perform the
+            // disconnect → route to the consumed rebuild path.
+            m_chainstate.FlagChainRebuild(
+                CChainState::ChainRebuildReason::DisconnectTipFailure);
             return false;
         }
         int disconnected = m_chainstate.DisconnectToHeight(fork_point, *m_node_context.blockchain_db);
         if (disconnected < 0) {
             std::cerr << "[FORK-RECOVERY] Failed to disconnect - requires --reindex" << std::endl;
-            m_requires_reindex = true;
+            // F-2 fold: was a write-only phantom flag. Route the genuine
+            // mid-disconnect failure to the consumed rebuild path.
+            m_chainstate.FlagChainRebuild(
+                CChainState::ChainRebuildReason::DisconnectTipFailure);
             return false;
         }
         if (g_verbose.load(std::memory_order_relaxed))

@@ -70,6 +70,27 @@ ChainParams ChainParams::Mainnet() {
     // NOTE: Chain built with MIK bypassed - cannot be removed, only raised
     params.dfmpAssumeValidHeight = 44000;  // v4.0.17: match new checkpoint at 44000 — skip cooldown/ban validation for checkpointed blocks during IBD
 
+    // Script Assume-Valid Height — decoupled from the DFMP knob above (HIGH-1
+    // round-2). Gates ONLY the ML-DSA signature skip on the connect path. Default
+    // 0 => DIL mainnet verifies spend signatures for EVERY block from height 1
+    // (raising dfmpAssumeValidHeight can never silently disable signatures). Set
+    // > 0 only alongside a hash-anchored checkpoint at that exact height.
+    // PHASE-1 STOPGAP DEPLOY (2026-08-14): raised from 0 to the live tip so a
+    // fixed node GRANDFATHERS the existing chain (incl. the h84,229-84,391 drain
+    // blocks, which are invalid-sig and would be REJECTED under =0, forking the
+    // node off mainnet) and enforces spend-signature validity for every block
+    // ABOVE 84,931. Paired with the hash-anchored checkpoint at 84,931 below
+    // (required by ValidateAssumeValidCheckpoints). The fresh-genesis relaunch
+    // (phase-3) uses =0; this value is ONLY for the in-place deploy onto the
+    // existing chain. Re-pin to the actual cutover tip at deploy time.
+    params.scriptAssumeValidHeight = 84931;
+
+    // VDF Assume-Valid Height — dedicated knob, independent of both assume-valid
+    // heights above. Default 0 => verify every v4 block's VDF proof from height 1.
+    // (DIL mainnet is RandomX/PoW, not VDF, so this is a no-op here; set to match
+    // scriptAssumeValidHeight for uniformity in the phase-1 stopgap build.)
+    params.vdfAssumeValidHeight = 84931;
+
     // DFMP v3.0 activation - payout heat tracking, reduced free tier, dormancy decay
     params.dfmpV3ActivationHeight = 7000;
     params.registrationPowBits = 28;  // DIL mainnet: original production value (unchanged)
@@ -227,6 +248,13 @@ ChainParams ChainParams::Mainnet() {
     // seeds (NYC/LDN/SGP/SYD) via getblockhash{height:54000} on 2026-05-19;
     // fleet was in full consensus at tip 54793.
     params.checkpoints.emplace_back(54000, uint256S("0000000bb44c964b4e3c6fec8c15941738cd74b434bafbfe4aadce898140b993"));
+    // PHASE-1 STOPGAP checkpoint at the live tip (2026-08-14, height 84,931).
+    // Verified unanimous across all 4 DIL mainnet seeds (NYC/LDN/SGP/SYD) at
+    // bestblockhash 0000007b8388…81d29 on 2026-08-14. Anchors scriptAssumeValidHeight
+    // =84931 above: the fixed node accepts the existing (theft-containing) history
+    // to here and enforces signature validity from 84,932 forward. Re-pin to the
+    // actual cutover tip at deploy time.
+    params.checkpoints.emplace_back(84931, uint256S("0000007b838884c41a6821918ec0cb5a1237ddd7af21cf9be2209db867a81d29"));
 
     // ASSUME-VALID: Skip DFMP penalty validation below this block
     // Empty = validate everything (populate after mainnet has established blocks)
@@ -293,6 +321,16 @@ ChainParams ChainParams::Testnet() {
     // Early testnet blocks were mined before MIK was added to coinbase.
     // Must cover all pre-MIK blocks to allow fresh nodes to sync.
     params.dfmpAssumeValidHeight = 86850;
+
+    // Script Assume-Valid Height — decoupled from the DFMP knob above (HIGH-1
+    // round-2). Gates ONLY the ML-DSA signature skip on the connect path. Default
+    // 0 => testnet verifies spend signatures for EVERY block from height 1. Set
+    // > 0 only alongside a hash-anchored checkpoint at that exact height.
+    params.scriptAssumeValidHeight = 0;
+
+    // VDF Assume-Valid Height — dedicated knob, independent of both assume-valid
+    // heights above. Default 0 => verify every v4 block's VDF proof from height 1.
+    params.vdfAssumeValidHeight = 0;
 
     // DFMP v3.0 activation - set above existing testnet chain height
     // Testnet tip was ~86,829 when v3.0 was implemented
@@ -459,6 +497,32 @@ ChainParams ChainParams::DilV() {
     // MIK required from block 1 onward
     params.dfmpActivationHeight = 0;
     params.dfmpAssumeValidHeight = 44233;  // v4.1 (was 44469): aligned with the new mandatory rollback checkpoint at 44233. Skips strict consensus checks (cooldown, MIK, DNA, attestation) only for blocks AT OR BELOW the canonical 44233 anchor. Above 44233, Patches A/C/E activate AND consensus checks are enforced — no bypass window. (v4.0.22 had this at 44469 with Patches at 44470, leaving 44234-44469 unprotected; that re-creates the v4.0.22 stop-gap failure mode. See cross-component audit finding HIGH-1.)
+
+    // Script Assume-Valid Height — decoupled from the DFMP knob above (HIGH-1
+    // round-2). Gates ONLY the ML-DSA signature skip on the connect path, NOT the
+    // DFMP/MIK/cooldown/DNA skip. The 44233 DFMP anchor above (which can only be
+    // raised, never zeroed) can NEVER disable signature verification.
+    // v4.5.2 (2026-08-15): raised from 0 to 218,800 alongside the hash-anchored
+    // checkpoint at that exact height (below) — see that checkpoint's comment for
+    // the full rationale (fresh-IBD halt at 53,870 under v4.5.1's live connect-path
+    // verification). Buried history ≤218,800 is grandfathered; spend signatures
+    // are enforced for every block above.
+    params.scriptAssumeValidHeight = 218800;
+
+    // VDF Assume-Valid Height — DilV is a VDF chain from genesis. Wesolowski VDF
+    // proofs are live-verified on the connect path (closes the zero-cost forgery
+    // hole, ECOSYSTEM_HUNT #3). This knob is INDEPENDENT of the 44233 DFMP anchor
+    // and the script-assumevalid above: raising either can never silently disable
+    // VDF verification.
+    // v4.5.2 (2026-08-15): raised from 0 to 218,800 alongside the hash-anchored
+    // checkpoint at that exact height (below). Canonical block 53,870 carries a
+    // proof that FAILS live verification (accepted ~March under the pre-fix
+    // non-verifying path, ~165k blocks deep), so =0 makes every fresh v4.5.1 DilV
+    // sync halt there — reproduced end-to-end on the released Linux asset (LDN
+    // assurance node, 2026-08-14/15). History ≤218,800 is grandfathered behind the
+    // checkpoint; VDF proofs are live-verified for every block above. The forgery
+    // hole stays closed tip-forward, which is where it matters.
+    params.vdfAssumeValidHeight = 218800;
 
     // All DFMP versions active from genesis — use modern rules from day one
     params.dfmpV3ActivationHeight = 0;
@@ -638,6 +702,19 @@ ChainParams ChainParams::DilV() {
     // mainnet seeds 2026-05-06. See v4_4_chainstate_integrity_contract.md decision (a).
     params.checkpoints.emplace_back(47500, uint256S("1094f7ca0197845a120a5440ce01c88e65b72f84f42a456f29e43c81b0cddbce"));
 
+    // v4.5.2 VDF/script assume-valid anchor (2026-08-15). v4.5.1 turned on LIVE
+    // Wesolowski verification on the DilV connect path with vdfAssumeValidHeight=0;
+    // a fresh IBD then re-verifies every historical proof — and canonical block
+    // 53,870 (accepted ~March under the pre-fix non-verifying path, ~165k deep)
+    // FAILS live verification, so every fresh v4.5.1 DilV sync halts there
+    // (reproduced end-to-end on the released Linux asset, LDN assurance node,
+    // 2026-08-14/15). Same medicine as DIL's phase-1 84,931 anchor: grandfather
+    // buried history below this hash-anchored height, enforce live VDF + script
+    // validity for every block above it. Verified against the live DilV chain at
+    // height 218,892 on 2026-08-15; anchor is 92 blocks below that tip (past
+    // MAX_REORG_DEPTH finality).
+    params.checkpoints.emplace_back(218800, uint256S("2bc897c2fed6f920b8ea6312717a9645c6578e2bb5da1fc7fe59e98c9fbe7ee5"));
+
     // v4.4 release-time anchor (resolved decision (j) — two checkpoints per v4.x
     // release for rolling-checkpoint discipline). Verified unanimous across all
     // 4 DilV mainnet seeds 2026-05-08 at canary cut time (LDN, NYC, SGP, SYD via
@@ -716,6 +793,16 @@ ChainParams ChainParams::Regtest() {
     // No checkpoints — regtest exists to test reorgs, including deep ones.
     params.checkpoints.clear();
     params.defaultAssumeValid = "";
+
+    // Script Assume-Valid Height — 0: with no checkpoints, regtest must verify
+    // every ML-DSA spend signature from height 1 (HIGH-1 round-2 decoupling; kept
+    // explicit even though the Testnet() baseline already sets 0).
+    params.scriptAssumeValidHeight = 0;
+
+    // VDF Assume-Valid Height — 0: regtest (a VDF chain, see below) has no
+    // checkpoints, so it verifies every VDF proof from height 1. Kept explicit
+    // even though the Testnet() baseline already sets 0.
+    params.vdfAssumeValidHeight = 0;
 
     // Identifying coinbase message for regtest blocks.
     params.genesisCoinbaseMsg = "Dilithion Regtest";

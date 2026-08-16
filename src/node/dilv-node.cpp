@@ -2183,6 +2183,19 @@ int main(int argc, char* argv[]) {
         std::cout << "Network: DILV (VDF distribution, ~45s blocks)" << std::endl;
     }
 
+    // LOW-1 (VDF connect-path re-review): fail loud at startup if any
+    // assume-valid boundary (script or VDF) is set > 0 without a hash-anchored
+    // checkpoint at that exact height — an unpinned boundary is an IBD theft
+    // window. Inert at the shipped defaults (all boundaries 0); a tripwire for
+    // any future misconfiguration.
+    {
+        std::string assumeValidErr;
+        if (!Dilithion::g_chainParams->ValidateAssumeValidCheckpoints(assumeValidErr)) {
+            std::cerr << "FATAL: unsafe assume-valid configuration: " << assumeValidErr << std::endl;
+            return 1;
+        }
+    }
+
     // Phase 10: Set default datadir, ports from chain params if not specified
     // (Config file values already applied above, now apply chain params as final fallback)
     if (config.datadir.empty()) {
@@ -5245,7 +5258,13 @@ load_genesis_block:  // Bug #29: Label for automatic retry after blockchain wipe
                     std::cout << "[REVALIDATION] Disconnecting chain to height " << (firstInvalidHeight - 1) << std::endl;
                     std::cout << "[REVALIDATION] ================================================\n" << std::endl;
 
-                    int disconnected = g_chainstate.DisconnectToHeight(firstInvalidHeight - 1, blockchain);
+                    // Operator carve-out (REORG_DEPTH_FINALITY_DESIGN §6.3): startup
+                    // revalidation is a self/operator action keyed off the node's OWN
+                    // consensus re-check of its OWN stored blocks (not attacker header
+                    // data), so it may roll back deeper than the automatic reorg cap =>
+                    // allowDeep=true. Still bounded by the checkpoint floor.
+                    int disconnected = g_chainstate.DisconnectToHeight(firstInvalidHeight - 1, blockchain,
+                                                                       /*batchSize=*/100, /*allowDeep=*/true);
                     if (disconnected < 0) {
                         std::cerr << "[REVALIDATION] CRITICAL: DisconnectToHeight failed!" << std::endl;
                         std::cerr << "[REVALIDATION] Try running with --reindex" << std::endl;

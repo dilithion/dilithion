@@ -5,6 +5,7 @@
 #include <node/blockchain_storage.h>
 #include <node/peer_mik_tracker.h>
 #include <consensus/vdf_validation.h>
+#include <consensus/connect_checks.h>  // ShouldRunVDFArrivalPreflight (MEDIUM-2 dedup gate)
 #include <node/block_index.h>
 #include <node/block_validation_queue.h>
 #include <node/fork_manager.h>
@@ -732,6 +733,110 @@ BlockProcessResult ProcessNewBlock(
             }
 
             return BlockProcessResult::INVALID_POW;
+        }
+
+        // =====================================================================
+        // MEDIUM-1 (VDF connect-path re-review): ARRIVAL-TIME VDF PREFLIGHT +
+        // PEER-MISBEHAVIOR SCORING (defense-in-depth cost filter).
+        // =====================================================================
+        // A DilV v4 block has NO cheap proof-of-work gate at arrival — the
+        // hash-under-target check is skipped for VDF blocks and
+        // CheckProofOfWorkDFMP short-circuits to `true` for them. So a junk v4
+        // block (correct nBits copied, junk ~200-byte proof, both header
+        // commitments recomputed so every µs-cheap check passes) would otherwise
+        // sail through arrival, get STORED + RELAYED, become a best-chain
+        // candidate, and only be culled by the ~44 ms class-group Wesolowski
+        // verify at ConnectTip — which scores NO peer (it has no peer context).
+        // An attacker could then mint unlimited distinct junk blocks (vary
+        // nonce/coinbase), each forcing a fresh 44 ms verify + disk write, a
+        // CPU-exhaustion amplification. This preflight runs the SAME
+        // CheckVDFProof at acceptance (design VDF_VERIFICATION_DESIGN.md
+        // §DoS-2/3) so a forged block is rejected BEFORE storage/relay and its
+        // sending peer is scored. Authoritative enforcement STILL lives at
+        // ConnectTip; this is a filter in front of it, never a replacement.
+        //
+        // Guarded so it can never false-ban an honest peer or slow IBD:
+        //  - only when the parent is on the active chain (!shouldSkipDFMP), so
+        //    blockHeight is authoritative and the VDF challenge is derived
+        //    correctly — an orphan/fork block whose height we guessed must NOT
+        //    be scored (mirrors the BUG #246 "no misbehavior for chain-mismatch"
+        //    discipline);
+        //  - only OUTSIDE IBD, so it does not double the from-genesis IBD VDF
+        //    cost and does not score peers while our own sync state is behind.
+        //    During IBD the authoritative ConnectTip verify still rejects it.
+        // A failing proof under those conditions is honest-impossible (a real
+        // miner cannot emit one) => genuine forgery => immediate-ban score
+        // (INVALID_BLOCK_POW == 100), the ban-only-on-honest-impossible signal.
+        if (!shouldSkipDFMP && block.IsVDFBlock()) {
+            // MEDIUM-2 (VDF_WIRING_REREVIEW3): hoist the CHEAP duplicate/
+            // already-have dedup AHEAD of the ~tens-of-ms Wesolowski verify. The
+            // same dedup runs downstream in Phase 3 (GetBlockIndex+HaveData at
+            // block_processing.cpp:977, db.BlockExists at :1054); consulting it
+            // here first stops a KNOWN-VALID v4 block (e.g. a replayed public tip)
+            // from forcing a full VDF verify on every message with no peer penalty
+            // — an unbounded CPU-exhaustion amplification on the sole admission
+            // funnel. A block we already hold is authoritatively verified at
+            // ConnectTip (or on activation), and a known-forged one is culled by
+            // the Phase-3 IsInvalid() gate, so the preflight buys nothing for it.
+            // A FRESH forged block has neither stored data nor a data-bearing index
+            // (data is never written on reject; only BLOCK_FAILED_VALID is set on an
+            // already-indexed entry), so it is NOT short-circuited here — it still
+            // runs the preflight and its peer is still scored.
+            CBlockIndex* pindexKnown = g_chainstate.GetBlockIndex(blockHash);
+            const bool alreadyHaveBlockData =
+                db.BlockExists(blockHash) ||
+                (pindexKnown != nullptr && pindexKnown->HaveData());
+            const bool fInitialBlockDownloadVDF =
+                g_node_context.sync_coordinator &&
+                g_node_context.sync_coordinator->IsInitialBlockDownload();
+            if (ShouldRunVDFArrivalPreflight(/*isVDFBlock=*/block.IsVDFBlock(),
+                                             /*parentOnActiveChain=*/!shouldSkipDFMP,
+                                             alreadyHaveBlockData,
+                                             fInitialBlockDownloadVDF)) {
+                std::string vdfPreflightErr;
+                if (!ConnectPathCheckVDF(block, blockHeight, block.hashPrevBlock,
+                                         /*fInitialBlockDownload=*/false,
+                                         vdfPreflightErr)) {
+                    std::cerr << "[ProcessNewBlock] ERROR: VDF proof preflight failed at height "
+                              << blockHeight << ": " << vdfPreflightErr << std::endl;
+                    g_metrics.RecordInvalidBlock();
+
+                    SendRejectMessage(peer_id, "block", "Invalid VDF proof: " + vdfPreflightErr);
+
+                    // Prevent re-requesting this block from any peer.
+                    if (ctx.headers_manager) {
+                        ctx.headers_manager->InvalidateHeader(blockHash);
+                    }
+
+                    // Height is authoritative and we are synced, so a failing VDF
+                    // proof is a genuine forgery, never a chain-mismatch artefact —
+                    // score the sender for immediate ban.
+                    if (ctx.peer_manager && peer_id >= 0) {
+                        ctx.peer_manager->Misbehaving(peer_id, 100,
+                                                      MisbehaviorType::INVALID_BLOCK_POW);
+                    }
+
+                    // Mark permanently failed if already indexed so it is never
+                    // retried (mirrors the DFMP reject path above).
+                    CBlockIndex* pindexVdf = g_chainstate.GetBlockIndex(blockHash);
+                    if (pindexVdf) {
+                        pindexVdf->nStatus |= CBlockIndex::BLOCK_FAILED_VALID;
+                        g_chainstate.InvalidateChainTipsCache();
+                        if (ctx.blockchain_db) {
+                            ctx.blockchain_db->WriteBlockIndex(blockHash, *pindexVdf);
+                        }
+                    }
+
+                    // Release in-flight tracking so new blocks can be requested.
+                    tracker_guard.released = true;
+                    if (ctx.block_fetcher) {
+                        ctx.block_fetcher->MarkBlockReceived(peer_id, blockHash);
+                        ctx.block_fetcher->OnBlockReceived(peer_id, blockHeight, blockHash);
+                    }
+
+                    return BlockProcessResult::INVALID_POW;
+                }
+            }
         }
     } else if (forkPreValidated) {
         if (g_verbose.load(std::memory_order_relaxed))

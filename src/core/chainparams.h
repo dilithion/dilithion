@@ -99,6 +99,34 @@ public:
     // 0 = validate everything (no optimization)
     int dfmpAssumeValidHeight;
 
+    // Script Assume-Valid Height (ML-DSA spend-signature skip during IBD)
+    // DELIBERATELY SEPARATE from dfmpAssumeValidHeight (HIGH-1 round-2 decoupling).
+    // Gates ONLY the expensive ML-DSA signature step on the connect path (see
+    // ConnectPathVerifyScripts / ConnectPathMaySkipScriptVerify in
+    // consensus/connect_checks.h). dfmpAssumeValidHeight, by contrast, gates the
+    // DFMP/MIK/cooldown/DNA skip and can only be raised (never zeroed) on the live
+    // chains — so reusing it for the signature gate would make "verify signatures
+    // from block 1" and "skip MIK for bypassed history" unsatisfiable from one knob.
+    // Default 0 on EVERY network and EVERY relaunch => every block verifies ML-DSA
+    // signatures from height 1 (closes the relaunch-IBD theft window AND the
+    // synced-vs-IBD consensus partition). May ONLY ever be set > 0 together with a
+    // hash-anchored checkpoint at that exact height (Bitcoin-Core assumevalid
+    // semantics); raising dfmpAssumeValidHeight must NEVER disable signatures.
+    int scriptAssumeValidHeight = 0;
+
+    // VDF Assume-Valid Height (Wesolowski VDF-proof verification skip during IBD)
+    // DEDICATED knob, INDEPENDENT of both dfmpAssumeValidHeight and
+    // scriptAssumeValidHeight. Gates ONLY the ~44 ms/block CheckVDFProof call on
+    // the connect path (see ConnectPathVerifyVDF / ConnectPathMaySkipVDFVerify in
+    // consensus/connect_checks.h). Default 0 on EVERY network and EVERY relaunch
+    // => every v4 block's VDF proof (Wesolowski proof + coinbase commitment) is
+    // verified from height 1, closing the zero-cost DilV block-forgery hole
+    // (ECOSYSTEM_HUNT_FINDINGS #3). The skip fires only when this is > 0 AND the
+    // block is at/below it AND the node is still in IBD — a tip/reorg block is
+    // NEVER skipped. May ONLY be set > 0 alongside a hash-anchored checkpoint at
+    // that exact height (Bitcoin-Core assumevalid semantics).
+    int vdfAssumeValidHeight = 0;
+
     // DFMP v3.0 Activation Height
     // Before this height: DFMP v2.0 rules (20-block free tier, 3.0x maturity, no payout heat)
     // After this height: DFMP v3.0 rules (5-block free tier, 5.0x maturity, payout heat, dormancy, registration PoW)
@@ -596,6 +624,60 @@ public:
             }
         }
         return highest;
+    }
+
+    /**
+     * True iff a hash-anchored checkpoint exists at EXACTLY this height.
+     *
+     * Distinct from GetLastCheckpoint (at-or-before) and CheckpointCheck
+     * (hash match at height) — this asks only "is this exact height pinned?".
+     */
+    bool HasCheckpointAtHeight(int height) const {
+        for (const auto& cp : checkpoints) {
+            if (cp.nHeight == height) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * LOW-1 (VDF connect-path re-review) — config-hazard guard.
+     *
+     * An assume-valid height > 0 that is NOT pinned by a hash-anchored
+     * checkpoint at that EXACT height is a theft window: at/below the boundary,
+     * a node still in IBD skips the corresponding verify (ML-DSA signatures for
+     * scriptAssumeValidHeight, the Wesolowski VDF proof for vdfAssumeValidHeight),
+     * so a forged historical block below an unpinned boundary would be accepted.
+     * Bitcoin-Core assume-valid semantics require the boundary to sit under a
+     * checkpoint the attacker cannot rewrite. Both knobs default to 0 on every
+     * network and relaunch (skip unreachable), so this guard is inert today; it
+     * fails loud the moment someone raises a boundary without pairing a
+     * checkpoint. (dfmpAssumeValidHeight is deliberately excluded — it gates a
+     * penalty-multiplier skip, not a signature/proof skip, and is anchored by the
+     * separate raise-only live-chain discipline.)
+     *
+     * @param error set to a human-readable reason when the config is unsafe
+     * @return true if the assume-valid configuration is safe
+     */
+    bool ValidateAssumeValidCheckpoints(std::string& error) const {
+        if (scriptAssumeValidHeight > 0 &&
+            !HasCheckpointAtHeight(scriptAssumeValidHeight)) {
+            error = "scriptAssumeValidHeight=" +
+                    std::to_string(scriptAssumeValidHeight) +
+                    " has no hash-anchored checkpoint at that exact height "
+                    "(unpinned assume-valid boundary is a signature-skip theft window)";
+            return false;
+        }
+        if (vdfAssumeValidHeight > 0 &&
+            !HasCheckpointAtHeight(vdfAssumeValidHeight)) {
+            error = "vdfAssumeValidHeight=" +
+                    std::to_string(vdfAssumeValidHeight) +
+                    " has no hash-anchored checkpoint at that exact height "
+                    "(unpinned assume-valid boundary is a VDF-proof-skip theft window)";
+            return false;
+        }
+        return true;
     }
 };
 

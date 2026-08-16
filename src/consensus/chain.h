@@ -698,9 +698,16 @@ public:
      * @param targetHeight Height to disconnect down to (this block stays)
      * @param db Database reference for persisting progress
      * @param batchSize Blocks per batch before releasing cs_main (0 = no batching)
+     * @param allowDeep When false (default), REFUSE to disconnect more than
+     *        Consensus::MAX_REORG_DEPTH blocks (returns -1, tip untouched) — the
+     *        finality-cap chokepoint that binds every AUTOMATIC caller
+     *        (REORG_DEPTH_FINALITY_DESIGN, suspenders). Only explicit operator
+     *        actions (invalidateblock / startup revalidation) pass true; they
+     *        remain bounded by the checkpoint floor.
      * @return Number of blocks disconnected, or -1 on failure
      */
-    int DisconnectToHeight(int targetHeight, CBlockchainDB& db, int batchSize = 100);
+    int DisconnectToHeight(int targetHeight, CBlockchainDB& db, int batchSize = 100,
+                           bool allowDeep = false);
 
     /**
      * Get blockchain height (height of current tip)

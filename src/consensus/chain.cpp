@@ -6,6 +6,7 @@
 #include <consensus/pow.h>
 #include <consensus/reorg_wal.h>  // P1-4: WAL for atomic reorgs
 #include <consensus/validation.h> // BUG #109 FIX: DeserializeBlockTransactions
+#include <consensus/connect_checks.h> // C-R3: unified connect-path block validator
 #include <consensus/vdf_validation.h> // CheckVDFCooldown, CheckConsecutiveMiner
 #include <vdf/cooldown_tracker.h>  // CCooldownTracker full definition
 #include <core/chainparams.h>     // MAINNET: Checkpoint validation
@@ -1721,6 +1722,114 @@ bool CChainState::ConnectTip(CBlockIndex* pindex, const CBlock& block, bool skip
         }
     }
 
+    // ========================================================================
+    // C-R3: UNIFIED CONNECT-PATH BLOCK VALIDATOR (last gate before ApplyBlock)
+    // ========================================================================
+    // A single READ-ONLY consensus gate that closes the class of checks the
+    // connect path historically skipped (they were enforced only on the mempool
+    // path, which a self-mined / never-relayed block bypasses): merkle-root
+    // commitment, spend-signature verification bound to the coin's committed
+    // scriptPubKey, per-tx value conservation, coinbase value <= subsidy + fees,
+    // in-block double-spend, and coinbase maturity. It runs for ALL connects,
+    // including reorg/skipValidation, so a bad fork block cannot be connected
+    // through ActivateBestChainStep either. It builds a per-block output overlay
+    // so an in-block-chained spend (child spends a same-block parent) is NOT
+    // falsely rejected. It is read-only: on failure ConnectTip returns before
+    // ApplyBlock mutates anything.
+    //
+    // fVerifyScripts: the expensive (~2 ms/input) ML-DSA signature step is gated
+    // on a DEDICATED script-assume-valid height (chainParams->scriptAssumeValidHeight)
+    // — NOT on the DFMP knob (dfmpAssumeValidHeight / the `assumeValid` variable
+    // above, which gates only the DFMP/MIK/cooldown/DNA skip). Value conservation,
+    // merkle, double-spend and maturity stay ALWAYS-ON regardless of either knob.
+    //
+    // HIGH-1 (round-2 decoupling): reusing dfmpAssumeValidHeight (44000 DIL /
+    // 44233 DilV, raise-only on the live chains) for the signature gate meant a
+    // relaunch's IBD skipped ML-DSA verification for blocks 1..AVH (theft) AND
+    // partitioned IBD-vs-synced nodes. scriptAssumeValidHeight defaults to 0 on
+    // every network and every relaunch, so ConnectPathVerifyScripts returns true
+    // for every block => signatures verified from height 1, and a future raise of
+    // dfmpAssumeValidHeight can never silently disable them. The IBD guard inside
+    // ConnectPathMaySkipScriptVerify additionally ensures a tip block always
+    // verifies whenever a checkpoint-anchored scriptAssumeValidHeight is ever set
+    // > 0. Fail-safe: unavailable sync coordinator => fInitialBlockDownload=false,
+    // and a null chainParams => scriptAssumeValidHeight 0 => verify.
+    if (pUTXOSet != nullptr) {
+        std::string connectError;
+        const bool fInitialBlockDownload =
+            g_node_context.sync_coordinator &&
+            g_node_context.sync_coordinator->IsInitialBlockDownload();
+        const bool fVerifyScripts = ConnectPathVerifyScripts(
+            Dilithion::g_chainParams, pindex->nHeight, fInitialBlockDownload);
+        if (!ConnectBlockChecks(block, *pUTXOSet, pindex->nHeight,
+                                fVerifyScripts, connectError)) {
+            std::cerr << "[Chain] ERROR: Block " << pindex->nHeight
+                      << " REJECTED by connect-path validator: " << connectError << std::endl;
+
+            // Genuine consensus failure — mark permanently failed (do not retry),
+            // mirroring the MIK/DNA/attestation reject blocks above. By the time
+            // ConnectTip runs, the parent is the tip and the UTXO set is current,
+            // so an input-not-found here is a genuine invalid spend, not transient
+            // corruption (which is handled separately at the ApplyBlock site below).
+            pindex->nStatus |= CBlockIndex::BLOCK_FAILED_VALID;
+            if (pdb != nullptr) {
+                pdb->WriteBlockIndex(blockHash, *pindex);
+            }
+            return false;
+        }
+    }
+
+    // ========================================================================
+    // VDF PROOF-OF-WORK ENFORCEMENT (v4+ Wesolowski proof) — reorg-safe.
+    // ========================================================================
+    // Closes ECOSYSTEM_HUNT_FINDINGS #3 (CRITICAL, live): CheckVDFProof existed
+    // but had only a dead-code caller, so EVERY live accept path skipped VDF
+    // verification and any MIK holder could forge DilV v4 blocks at zero
+    // sequential cost. This is the single live call that makes good on the
+    // "VDF proof validated in CheckVDFProof / at ConnectBlock" deferral comments
+    // scattered across the header/PoW/fork paths.
+    //
+    // Placement rationale:
+    //  - REORG-SAFE: sits OUTSIDE every `if (!skipValidation)` block, in the
+    //    same region as the sibling reorg-safe checks (CheckDNAHashEquality /
+    //    CheckMIKAttestations), so it runs for normal connects AND reorg /
+    //    fork-activation connects (skipValidation=true). A forged VDF block
+    //    arriving as a reorg candidate is exactly the attack, so it MUST run on
+    //    reorg connects too.
+    //  - DoS ORDERING: placed LAST — after the cheap PoW/MIK/DNA/attestation/
+    //    cooldown gates and after ConnectBlockChecks (merkle/value/signatures),
+    //    and immediately BEFORE ApplyBlock mutates the UTXO set — so a junk
+    //    block is culled by the µs/ms checks before the ~44 ms class-group
+    //    verify. CheckVDFProof itself also does its µs-cheap commitment/format
+    //    checks before the expensive create_discriminant + Wesolowski step.
+    //  - Context-independent: needs only block + height + prevHash + iterations,
+    //    so it is correct here regardless of identity-DB / tracker undo state.
+    //
+    // The IBD assume-valid skip is gated on the DEDICATED vdfAssumeValidHeight
+    // (default 0 => verify every block from height 1; a tip/reorg block is never
+    // skipped). ConnectPathCheckVDF encapsulates the gate + the verify.
+    {
+        const bool fInitialBlockDownloadVDF =
+            g_node_context.sync_coordinator &&
+            g_node_context.sync_coordinator->IsInitialBlockDownload();
+        std::string vdfError;
+        if (!ConnectPathCheckVDF(block, pindex->nHeight, block.hashPrevBlock,
+                                 fInitialBlockDownloadVDF, vdfError)) {
+            std::cerr << "[Chain] ERROR: Block " << pindex->nHeight
+                      << " REJECTED: VDF proof verification failed" << std::endl;
+            std::cerr << "[Chain] " << vdfError << std::endl;
+
+            // Forged/invalid VDF proof is a genuine consensus failure — mark
+            // permanently failed so it is never retried (mirrors the MIK/DNA/
+            // attestation/connect-validator reject blocks above).
+            pindex->nStatus |= CBlockIndex::BLOCK_FAILED_VALID;
+            if (pdb != nullptr) {
+                pdb->WriteBlockIndex(blockHash, *pindex);
+            }
+            return false;
+        }
+    }
+
     // Step 1: Update UTXO set (CS-004)
     if (pUTXOSet != nullptr) {
         if (!pUTXOSet->ApplyBlock(block, pindex->nHeight, blockHash)) {
@@ -1994,7 +2103,8 @@ bool CChainState::DisconnectTip(CBlockIndex* pindex, bool force_skip_utxo) {
     return true;
 }
 
-int CChainState::DisconnectToHeight(int targetHeight, CBlockchainDB& db, int batchSize) {
+int CChainState::DisconnectToHeight(int targetHeight, CBlockchainDB& db, int batchSize,
+                                    bool allowDeep) {
     std::unique_lock<std::recursive_mutex> lock(cs_main);
 
     // Perf fix 2026-07-12: this loop reassigns pindexTip directly (not via
@@ -2010,6 +2120,31 @@ int CChainState::DisconnectToHeight(int targetHeight, CBlockchainDB& db, int bat
         if (checkpoint && targetHeight < checkpoint->nHeight) {
             std::cerr << "[DisconnectToHeight] Cannot disconnect below checkpoint "
                       << checkpoint->nHeight << " (target=" << targetHeight << ")" << std::endl;
+            return -1;
+        }
+    }
+
+    // REORG-DEPTH FINALITY CAP (REORG_DEPTH_FINALITY_DESIGN §6.1, suspenders).
+    // Consensus::MAX_REORG_DEPTH is a HARD finality bound, but historically it was
+    // enforced ONLY on the in-band ActivateBestChain path (chain.cpp:881). The
+    // automatic IBD/fork-recovery callers reach THIS chokepoint directly and were
+    // bounded only by the checkpoint floor above — so a peer feeding forged
+    // low-difficulty headers (on VDF the header work is forgeable at ~zero cost)
+    // could drive a synced node to roll back to its last checkpoint, or all the way
+    // to genesis on a young/relaunch chain with only a genesis checkpoint. This
+    // guard makes the cap the standing finality bound on EVERY automatic disconnect.
+    // Default allowDeep=false closes the CLASS (both known recovery sites + any
+    // future automatic caller); only explicit operator actions (invalidateblock /
+    // startup revalidation) pass allowDeep=true, and they stay checkpoint-bounded by
+    // the floor above. The >cap case is routed by the callers to the operator-gated
+    // full-rebuild flow (re-IBD from genesis re-applies checkpoints; genesis-up
+    // activation is cap-exempt), which is the correct posture for a >60 divergence.
+    if (!allowDeep) {
+        const int depth = pindexTip->nHeight - targetHeight;  // > 0, guaranteed above
+        if (depth > Consensus::MAX_REORG_DEPTH) {
+            std::cerr << "[DisconnectToHeight] Refusing automatic disconnect of " << depth
+                      << " blocks (> MAX_REORG_DEPTH=" << Consensus::MAX_REORG_DEPTH
+                      << "); route to operator rebuild" << std::endl;
             return -1;
         }
     }

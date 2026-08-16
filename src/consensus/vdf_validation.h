@@ -38,6 +38,41 @@ bool CheckVDFProof(
 );
 
 /**
+ * Connect-path VDF enforcement seam (ECOSYSTEM_HUNT_FINDINGS #3 remediation).
+ *
+ * The SINGLE decision the connect path (CChainState::ConnectTip) makes about a
+ * block's VDF proof, composed in one testable place:
+ *   - Non-VDF (pre-v4) blocks and genesis (height 0) are exempt (return true).
+ *   - The ~44 ms Wesolowski verify is skipped only when the assume-valid gate
+ *     (ConnectPathVerifyVDF, reading vdfAssumeValidHeight) says so — i.e. a
+ *     historical at/below-boundary block during IBD. Default vdfAssumeValidHeight
+ *     == 0 => verify EVERY block from height 1; a tip/reorg block is never skipped.
+ *   - Otherwise CheckVDFProof runs, covering BOTH the coinbase commitment
+ *     (vdfProofHash == SHA3(proof)) and the class-group Wesolowski proof.
+ *
+ * Iteration count and the assume-valid height are read from Dilithion::g_chainParams
+ * (fail-safe: null params => iterations 0 and vdfAssumeValidHeight 0 => verify).
+ * Called from the reorg-safe section of ConnectTip so it runs for normal AND
+ * reorg/fork-activation connects — a forged VDF block arriving as a reorg
+ * candidate is the attack this closes.
+ *
+ * @param block                  The candidate block (block.vtx carries the coinbase).
+ * @param nHeight                Height at which the block is being connected.
+ * @param prevHash               Hash of the previous block (for challenge derivation).
+ * @param fInitialBlockDownload  True iff the node is in initial block download.
+ * @param error                  Human-readable rejection reason on failure.
+ * @return true if the block's VDF proof is valid (or verification is exempt/skipped);
+ *         false (with error set) if the VDF proof is invalid — abort the connect.
+ */
+bool ConnectPathCheckVDF(
+    const CBlock& block,
+    int nHeight,
+    const uint256& prevHash,
+    bool fInitialBlockDownload,
+    std::string& error
+);
+
+/**
  * Compute the per-miner VDF challenge.
  *
  * challenge = SHA3-256( prevHash || height_le32 || minerAddress )

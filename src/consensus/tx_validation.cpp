@@ -17,6 +17,55 @@
 #include <iostream>
 
 // ============================================================================
+// Malleability closure (finding #4): the ONE canonical P2PKH scriptSig layout.
+// ============================================================================
+//
+// Exported (declared in tx_validation.h) so BOTH the mempool/relay path
+// (CheckTransactionInputs, below) AND the block-connect path (ConnectBlockChecks
+// in consensus/connect_checks.cpp) enforce THIS one predicate. A second, drifting
+// copy on the connect path would be a latent consensus split; single-sourcing it
+// makes the mempool and connect surfaces reject the identical byte-string set.
+//
+// Pre-scriptV2 the only spend type is P2PKH, and the signature commits to NO
+// scriptSig bytes (GetSigningHash replaces every scriptSig with empty) while the
+// txid commits to ALL of them. So any scriptSig re-encoding that still verifies
+// mutates the txid without invalidating the signature (classic pre-segwit
+// malleability). We close it by accepting EXACTLY one byte-string per (sig, pk):
+//
+//     [sig_len == 3309 (2 LE)] [sig (3309)] [pk_len == 1952 (2 LE)] [pk (1952)]  = 5265 bytes
+//
+// This is precisely what WalletCrypto::CreateScriptSig already emits and what the
+// whole chain already uses (zero wallet/genesis change — the lowest-divergence
+// option). It kills all four sub-vectors for P2PKH inputs:
+//   B1 legacy<->push-opcode  (only this one format accepted; no push opcodes)
+//   B2 PUSHDATA2<->PUSHDATA4  (no push opcodes at all)
+//   B3 prepend junk / stack residue (exact length -> no room for extra pushes)
+//   B4 format mixing          (no push encodings)
+//
+// It is STRICTER than IsLegacyScriptSig(), which only checks size + sig_len and
+// leaves the inner pk_len field unvalidated: the sequential verify path ignores
+// that field (uses the constant) while the batch path (PrepareSignatureData)
+// requires pk_len == 1952 — so a bare IsLegacyScriptSig gate would still admit a
+// malleated pk_len byte-pair on the sequential path AND split the two paths.
+// Nailing pk_len == 1952 here removes both.
+//
+// NOTE: coinbase inputs are exempt (arbitrary MIK/DFMP data, no signature,
+// committed via merkle->header->PoW). This gate lives on the non-coinbase input
+// path only (CheckTransactionInputs returns early for coinbase).
+bool IsCanonicalP2PKHScriptSig(const std::vector<uint8_t>& s) {
+    const size_t SIG = DILITHIUM3_SIG_SIZE;   // 3309
+    const size_t PK  = DILITHIUM3_PK_SIZE;    // 1952
+    if (s.size() != 2 + SIG + 2 + PK) return false;                 // exactly 5265
+    uint16_t sig_len = static_cast<uint16_t>(s[0]) |
+                       (static_cast<uint16_t>(s[1]) << 8);
+    if (sig_len != SIG) return false;
+    uint16_t pk_len = static_cast<uint16_t>(s[2 + SIG]) |
+                      (static_cast<uint16_t>(s[2 + SIG + 1]) << 8);
+    if (pk_len != PK) return false;
+    return true;
+}
+
+// ============================================================================
 // Basic Structural Validation
 // ============================================================================
 
@@ -232,6 +281,43 @@ bool CTransactionValidator::CheckTransactionInputs(const CTransaction& tx, CUTXO
         }
     }
 
+    // ========================================================================
+    // Malleability closure (finding #4): canonical scriptSig gate.
+    // ========================================================================
+    // For every non-coinbase input spending a P2PKH output, the scriptSig MUST
+    // be the single canonical layout (see IsCanonicalP2PKHScriptSig above).
+    //
+    // Placement is load-bearing: this sits in CheckTransactionInputs, which runs
+    //   (a) as step 2 of CheckTransaction — i.e. BEFORE step 3's batch-vs-
+    //       sequential verify branch, so BOTH verify paths inherit an identical
+    //       already-canonical scriptSig (no consensus split), and
+    //   (b) directly on the block-validation path (CBlockValidator::ValidateBlock
+    //       and ProcessNewBlock both call CheckTransactionInputs), so a malleated
+    //       scriptSig mined into a block is rejected on the same rule.
+    // Coinbase never reaches here (early return above).
+    //
+    // Keyed on the SPENT output type (P2PKH) rather than height, so it stays
+    // correct across the scriptV2 boundary: non-P2PKH spends (post-activation)
+    // are governed by the interpreter's MINIMALDATA + CLEANSTACK flags instead.
+    for (size_t i = 0; i < tx.vin.size(); ++i) {
+        CUTXOEntry entry;
+        if (!utxoSet.GetUTXO(tx.vin[i].prevout, entry)) {
+            // Existence was just verified above; be defensive and let the
+            // downstream script/fee steps surface any genuine miss.
+            continue;
+        }
+        CScript spk(entry.out.scriptPubKey.begin(), entry.out.scriptPubKey.end());
+        if (spk.IsPayToPublicKeyHash()) {
+            if (!IsCanonicalP2PKHScriptSig(tx.vin[i].scriptSig)) {
+                char buf[128];
+                snprintf(buf, sizeof(buf),
+                         "Non-canonical scriptSig for P2PKH input %zu (malleability)", i);
+                error = buf;
+                return false;
+            }
+        }
+    }
+
     // BIP-68: Relative locktime enforcement (requires tx version >= 2)
     // Each input's nSequence can encode a relative lock:
     //   Bit 31 (disable): If set, no relative lock enforced for this input
@@ -396,9 +482,18 @@ bool CTransactionValidator::VerifyScript(const CTransaction& tx,
     uint32_t chain_id = Dilithion::g_chainParams ? Dilithion::g_chainParams->chainID : 1;
     TransactionSignatureChecker checker(tx, static_cast<unsigned int>(inputIdx), chain_id);
 
-    // Verification flags
+    // Verification flags.
+    // MINIMALDATA + CLEANSTACK are enabled here as defense-in-depth on the
+    // sequential interpreter path (malleability finding #4). For P2PKH the
+    // canonical-scriptSig gate in CheckTransactionInputs already rejects every
+    // non-canonical form before this runs, so these never fire differently on
+    // the P2PKH path (the canonical converted form uses minimal PUSHDATA2 pushes
+    // and leaves exactly one stack element) — but they harden the general
+    // scriptV2 path and cost nothing on the honest path.
     unsigned int flags = SCRIPT_VERIFY_CHECKLOCKTIMEVERIFY
-                       | SCRIPT_VERIFY_CHECKSEQUENCEVERIFY;
+                       | SCRIPT_VERIFY_CHECKSEQUENCEVERIFY
+                       | SCRIPT_VERIFY_MINIMALDATA
+                       | SCRIPT_VERIFY_CLEANSTACK;
 
     // Evaluate scripts through the interpreter
     return ::VerifyScript(sig, pubkey, flags, checker, error);

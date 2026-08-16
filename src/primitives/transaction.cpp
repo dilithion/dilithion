@@ -329,8 +329,11 @@ static bool DeserializeUint64(const uint8_t*& data, const uint8_t* end, uint64_t
     return true;
 }
 
-/** Helper function to deserialize a compact size (Bitcoin-style varint) */
-static bool DeserializeCompactSize(const uint8_t*& data, const uint8_t* end, uint64_t& size, std::string* error = nullptr) {
+/** Deserialize a compact size (Bitcoin-style varint) with minimal-encoding
+ *  enforcement (malleability finding #5). Declared in primitives/transaction.h
+ *  and exported (non-static) so validation.cpp's block tx-count decoder reuses
+ *  THIS one decoder rather than keeping a third hand-rolled copy that drifts. */
+bool DeserializeCompactSize(const uint8_t*& data, const uint8_t* end, uint64_t& size, std::string* error) {
     if (data >= end) {
         if (error) *error = "Insufficient data for CompactSize";
         return false;
@@ -341,6 +344,7 @@ static bool DeserializeCompactSize(const uint8_t*& data, const uint8_t* end, uin
 
     if (first < 253) {
         size = first;
+        // 1-byte form is always minimal; no range check needed.
         return true;
     } else if (first == 253) {
         // 2-byte size
@@ -351,7 +355,6 @@ static bool DeserializeCompactSize(const uint8_t*& data, const uint8_t* end, uin
         size = static_cast<uint64_t>(data[0]) |
                (static_cast<uint64_t>(data[1]) << 8);
         data += 2;
-        return true;
     } else if (first == 254) {
         // 4-byte size
         uint32_t size32;
@@ -359,11 +362,21 @@ static bool DeserializeCompactSize(const uint8_t*& data, const uint8_t* end, uin
             return false;
         }
         size = size32;
-        return true;
     } else {  // first == 255
         // 8-byte size
-        return DeserializeUint64(data, end, size, error);
+        if (!DeserializeUint64(data, end, size, error)) {
+            return false;
+        }
     }
+
+    // Malleability finding #5: reject non-minimal (non-shortest) encodings so a
+    // single value has exactly one wire byte-string. Shared range check keeps
+    // all three decoders in lockstep.
+    if (!CompactSizeIsCanonical(first, size)) {
+        if (error) *error = "Non-canonical CompactSize (non-minimal encoding)";
+        return false;
+    }
+    return true;
 }
 
 // ============================================================================

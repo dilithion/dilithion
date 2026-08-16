@@ -54,6 +54,30 @@ namespace TxValidation {
 }
 
 /**
+ * IsCanonicalP2PKHScriptSig — the SINGLE canonical P2PKH scriptSig layout
+ * (transaction-malleability closure, finding #4).
+ *
+ * Pre-scriptV2 the only spend type is P2PKH, and the ML-DSA signature commits to
+ * NO scriptSig bytes (GetSigningHash blanks every scriptSig) while the txid commits
+ * to ALL of them. Any scriptSig re-encoding that still verifies therefore mutates
+ * the txid without invalidating the signature (classic pre-segwit malleability).
+ * Exactly one byte-string is accepted per (sig, pk):
+ *
+ *   [sig_len == 3309 (2 LE)] [sig (3309)] [pk_len == 1952 (2 LE)] [pk (1952)] = 5265 bytes
+ *
+ * This is byte-for-byte what WalletCrypto::CreateScriptSig already emits, so no
+ * honest spend is rejected. Exported (single-source) so both the mempool/relay
+ * path (CTransactionValidator::CheckTransactionInputs) and the block-connect path
+ * (ConnectBlockChecks) enforce the identical predicate — no drift, no consensus
+ * split between the two surfaces. Coinbase inputs are exempt (both call sites skip
+ * them).
+ *
+ * @param scriptSig The unlocking script bytes of a non-coinbase P2PKH input.
+ * @return true iff scriptSig is the single canonical layout above.
+ */
+bool IsCanonicalP2PKHScriptSig(const std::vector<uint8_t>& scriptSig);
+
+/**
  * CTransactionValidator
  *
  * Comprehensive transaction validation system for Dilithion cryptocurrency.

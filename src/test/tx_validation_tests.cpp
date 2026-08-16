@@ -62,6 +62,19 @@ namespace {
         return script;
     }
 
+    // Canonical P2PKH scriptSig — the ONE layout the malleability rule accepts:
+    // [sig_len==3309 (2 LE)][sig(3309)][pk_len==1952 (2 LE)][pk(1952)] = 5265 bytes.
+    // CheckTransactionInputs does not verify the signature, so arbitrary sig/pk
+    // content of the correct lengths is sufficient to exercise the input path.
+    std::vector<uint8_t> CanonicalP2PKHSig() {
+        std::vector<uint8_t> s;
+        s.push_back(3309 & 0xff); s.push_back((3309 >> 8) & 0xff);
+        s.insert(s.end(), 3309, 0xAB);
+        s.push_back(1952 & 0xff); s.push_back((1952 >> 8) & 0xff);
+        s.insert(s.end(), 1952, 0xCD);
+        return s;   // 5265 bytes
+    }
+
     // Helper to create a simple transaction
     CTransaction CreateSimpleTx(bool includeInput = true, CAmount outputValue = 50 * COIN) {
         CTransaction tx;
@@ -333,7 +346,7 @@ BOOST_AUTO_TEST_CASE(check_inputs_value_mismatch) {
     // Try to spend more than available (100 coins output)
     CTransaction tx;
     tx.nVersion = 1;
-    tx.vin.push_back(CTxIn(outpoint, {0x01, 0x02}));
+    tx.vin.push_back(CTxIn(outpoint, CanonicalP2PKHSig()));
     tx.vout.push_back(CTxOut(100 * COIN, CreateP2PKHScript())); // More than input!
 
     BOOST_CHECK(!validator.CheckTransactionInputs(tx, utxoSet, 100, fee, error));
@@ -360,7 +373,7 @@ BOOST_AUTO_TEST_CASE(check_inputs_negative_fee) {
     // Output more than input (negative fee)
     CTransaction tx;
     tx.nVersion = 1;
-    tx.vin.push_back(CTxIn(outpoint, {0x01, 0x02}));
+    tx.vin.push_back(CTxIn(outpoint, CanonicalP2PKHSig()));
     tx.vout.push_back(CTxOut(51 * COIN, CreateP2PKHScript()));
 
     BOOST_CHECK(!validator.CheckTransactionInputs(tx, utxoSet, 100, fee, error));
@@ -448,7 +461,7 @@ BOOST_AUTO_TEST_CASE(calculate_fee_zero) {
     // Create transaction with 50 coins output (0 fee)
     CTransaction tx;
     tx.nVersion = 1;
-    tx.vin.push_back(CTxIn(outpoint, {0x01, 0x02}));
+    tx.vin.push_back(CTxIn(outpoint, CanonicalP2PKHSig()));
     tx.vout.push_back(CTxOut(50 * COIN, CreateP2PKHScript()));
 
     // Should fail due to insufficient fee
@@ -506,7 +519,7 @@ BOOST_AUTO_TEST_CASE(calculate_fee_dust) {
     // Try to create tiny output (dust threshold)
     CTransaction tx;
     tx.nVersion = 1;
-    tx.vin.push_back(CTxIn(outpoint, {0x01, 0x02}));
+    tx.vin.push_back(CTxIn(outpoint, CanonicalP2PKHSig()));
     tx.vout.push_back(CTxOut(500, CreateP2PKHScript())); // Very small
 
     // CheckTransactionInputs validates fees and coinbase maturity, not dust.
@@ -539,7 +552,7 @@ BOOST_AUTO_TEST_CASE(check_coinbase_immature) {
     // Try to spend at height 150 (only 50 confirmations, need 100)
     CTransaction tx;
     tx.nVersion = 1;
-    tx.vin.push_back(CTxIn(outpoint, {0x01, 0x02}));
+    tx.vin.push_back(CTxIn(outpoint, CanonicalP2PKHSig()));
     tx.vout.push_back(CTxOut(49 * COIN, CreateP2PKHScript()));
 
     BOOST_CHECK(!validator.CheckTransactionInputs(tx, utxoSet, 150, fee, error));
@@ -566,7 +579,7 @@ BOOST_AUTO_TEST_CASE(check_coinbase_mature) {
     // Spend at height 200 (100 confirmations - exactly mature)
     CTransaction tx;
     tx.nVersion = 1;
-    tx.vin.push_back(CTxIn(outpoint, {0x01, 0x02}));
+    tx.vin.push_back(CTxIn(outpoint, CanonicalP2PKHSig()));
     tx.vout.push_back(CTxOut((50 * COIN) - 100000, CreateP2PKHScript())); // Leave fee
 
     bool result = validator.CheckTransactionInputs(tx, utxoSet, 200, fee, error);
@@ -592,7 +605,7 @@ BOOST_AUTO_TEST_CASE(check_coinbase_maturity_boundary) {
     // Try at height 199 (99 confirmations - not quite mature)
     CTransaction tx;
     tx.nVersion = 1;
-    tx.vin.push_back(CTxIn(outpoint, {0x01, 0x02}));
+    tx.vin.push_back(CTxIn(outpoint, CanonicalP2PKHSig()));
     tx.vout.push_back(CTxOut((50 * COIN) - 100000, CreateP2PKHScript()));
 
     BOOST_CHECK(!validator.CheckTransactionInputs(tx, utxoSet, 199, fee, error));
@@ -622,7 +635,7 @@ BOOST_AUTO_TEST_CASE(validate_transaction_full_flow) {
     // Create valid transaction
     CTransaction tx;
     tx.nVersion = 1;
-    tx.vin.push_back(CTxIn(outpoint, {0x01, 0x02}));
+    tx.vin.push_back(CTxIn(outpoint, CanonicalP2PKHSig()));
     tx.vout.push_back(CTxOut((100 * COIN) - 100000, CreateP2PKHScript())); // 0.001 coin fee
 
     // Step 1: Basic validation
@@ -660,9 +673,9 @@ BOOST_AUTO_TEST_CASE(validate_transaction_multiple_inputs) {
     // Create transaction spending all three (100 coins total)
     CTransaction tx;
     tx.nVersion = 1;
-    tx.vin.push_back(CTxIn(out1, {0x01}));
-    tx.vin.push_back(CTxIn(out2, {0x02}));
-    tx.vin.push_back(CTxIn(out3, {0x03}));
+    tx.vin.push_back(CTxIn(out1, CanonicalP2PKHSig()));
+    tx.vin.push_back(CTxIn(out2, CanonicalP2PKHSig()));
+    tx.vin.push_back(CTxIn(out3, CanonicalP2PKHSig()));
     tx.vout.push_back(CTxOut((100 * COIN) - 100000, CreateP2PKHScript()));
 
     bool result = validator.CheckTransactionInputs(tx, utxoSet, 100, fee, error);
@@ -692,7 +705,7 @@ BOOST_AUTO_TEST_CASE(validate_transaction_multiple_outputs) {
     // Create transaction with multiple outputs
     CTransaction tx;
     tx.nVersion = 1;
-    tx.vin.push_back(CTxIn(outpoint, {0x01, 0x02}));
+    tx.vin.push_back(CTxIn(outpoint, CanonicalP2PKHSig()));
     tx.vout.push_back(CTxOut(30 * COIN, CreateP2PKHScript()));
     tx.vout.push_back(CTxOut(40 * COIN, CreateP2PKHScript()));
     tx.vout.push_back(CTxOut((30 * COIN) - 100000, CreateP2PKHScript()));

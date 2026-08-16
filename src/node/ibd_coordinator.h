@@ -59,6 +59,11 @@ inline const char* ForkRecoveryReasonToString(ForkRecoveryReason reason) {
  * structure used by Bitcoin Core's net_processing loop.
  */
 class CIbdCoordinator {
+    // TEST-ONLY (F-2 fold): lets reorg_belt_rebuild_flag_tests drive the private
+    // AttemptForkRecovery deep-fork belt end-to-end and assert the CONSUMED
+    // rebuild flag is set. No production code names this struct.
+    friend struct IbdReorgBeltTestAccess;
+
 public:
     /**
      * @brief Constructor using NodeContext (Phase 5.1)
@@ -145,11 +150,6 @@ public:
         m_last_block_connected_ticks.store(
             std::chrono::steady_clock::now().time_since_epoch().count());
     }
-
-    /**
-     * @brief Check if reindex is required due to deep fork
-     */
-    bool RequiresReindex() const { return m_requires_reindex; }
 
 private:
     void UpdateState();
@@ -286,8 +286,11 @@ private:
     // Uses atomic<int64_t> (steady_clock ticks) to avoid data race between
     // block-processing threads (write) and IBD thread (read).
     std::atomic<int64_t> m_last_block_connected_ticks;
-    // Layer 3: Deep fork handling - requires manual reindex for security
-    bool m_requires_reindex{false};
+    // Layer 3: Deep fork handling. A fork deeper than the consensus reorg cap is
+    // refused here and routed to the CONSUMED rebuild path via
+    // m_chainstate.FlagChainRebuild(DepthRejection) — polled by the node main loop
+    // (Dilithion::MaybeTriggerChainRebuild). (F-2 fold: the former coordinator-local
+    // m_requires_reindex flag had zero readers and was removed as a phantom.)
     // Max blocks to auto-reorg in place. Tracks the consensus reorg cap
     // (Consensus::MAX_REORG_DEPTH, currently 60) so the cheap in-place
     // DisconnectToHeight recovery branch fires for EVERY fork the consensus
