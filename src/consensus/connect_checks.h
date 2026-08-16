@@ -187,6 +187,40 @@ bool ConnectPathVerifyVDF(const Dilithion::ChainParams* params,
                           bool fInitialBlockDownload);
 
 /**
+ * ConnectPathMaySkipDFMPChecks — assume-valid gate for the DFMP/MIK family of
+ * connect-time checks (MIK expiration, seed attestation, consensus cooldown,
+ * consecutive-miner, per-MIK window cap, registration rate limit).
+ *
+ * External round-2 (3/4 reviewers): ConnectTip's `assumeValid` was HEIGHT-ONLY
+ * (`dfmpAssumeValidHeight > 0 && nHeight <= dfmpAssumeValidHeight`) with no IBD
+ * guard, unlike the script and VDF gates. A SYNCED node connecting a block
+ * at/below the DFMP assume-valid height (a low-height fork candidate delivered
+ * post-IBD) skipped every DFMP rule. This predicate mirrors the script gate:
+ * the skip needs (1) a POSITIVE configured height, (2) nHeight <= that height,
+ * and (3) EITHER the node is still in IBD, OR the block is CHECKPOINT-ANCHORED
+ * (proven to be an ancestor of a shipped checkpoint hash — the caller resolves
+ * that against the block index and passes it in). The anchored arm keeps a
+ * synced node that legitimately (re)connects a canonical historical block from
+ * running identity-DB / tracker-state-dependent checks that the network never
+ * enforced on that block (dfmpAssumeValidHeight exists precisely because those
+ * checks fail on canonical incident-range history) — so the guard tightens the
+ * unanchored case only and cannot reject canonical history.
+ *
+ * Pure function of its arguments (no globals) so it is directly unit-testable.
+ *
+ * @param nHeight                 Height at which the block is being connected.
+ * @param dfmpAssumeValidHeight   Configured DFMP assume-valid height (<=0 disables skipping).
+ * @param fInitialBlockDownload   True iff the node is in initial block download.
+ * @param fCheckpointAnchored     True iff the block is a proven ancestor of a
+ *                                shipped checkpoint at height >= nHeight.
+ * @return true iff the DFMP-family checks may be skipped for this block.
+ */
+bool ConnectPathMaySkipDFMPChecks(int nHeight,
+                                  int dfmpAssumeValidHeight,
+                                  bool fInitialBlockDownload,
+                                  bool fCheckpointAnchored);
+
+/**
  * ShouldRunVDFArrivalPreflight — arrival-time (ProcessNewBlock) decision for the
  * defense-in-depth VDF preflight (VDF_WIRING_REREVIEW3 MEDIUM-2 remediation).
  *

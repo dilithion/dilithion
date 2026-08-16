@@ -817,9 +817,21 @@ bool CheckMIKExpiration(
     int threshold = Dilithion::g_chainParams ?
         Dilithion::g_chainParams->mikExpirationThreshold : 5760;
 
-    // Deserialize coinbase
+    // ------------------------------------------------------------------------
+    // FAIL CLOSED on anything that prevents the rule from being evaluated
+    // (external round-2, Grok + DeepSeek). Pre-fold every parse failure below
+    // returned true ("let other checks handle") — but this is a post-activation
+    // ACCEPT-SET rule: a block whose coinbase cannot be parsed, has no input, or
+    // carries no MIK data has NOT proven its identity is unexpired, so it must
+    // be REJECTED here, not deferred to a check that may itself be skipped.
+    // Every canonical post-activation VDF block carries a parseable MIK (the
+    // arrival/connect DFMP paths require it), so this rejects nothing valid.
+    // Activation: mikExpirationActivationHeight is 999,999,999 (disabled) on
+    // every network today, so this tightening cannot touch live history.
+    // ------------------------------------------------------------------------
     if (block.vtx.empty()) {
-        return true;  // No coinbase to check
+        error = "CheckMIKExpiration: block has no transactions";
+        return false;
     }
 
     const uint8_t* data = block.vtx.data();
@@ -832,23 +844,28 @@ bool CheckMIKExpiration(
     } else if (data[0] == 253 && dataSize >= 3) {
         txCountSize = 3;
     } else {
-        return true;  // Can't parse — let other checks handle
+        error = "CheckMIKExpiration: cannot parse tx-count varint";
+        return false;
     }
 
     CTransaction coinbase;
     size_t consumed = 0;
     if (!coinbase.Deserialize(data + txCountSize, dataSize - txCountSize, nullptr, &consumed)) {
-        return true;  // Can't parse — let other checks handle
+        error = "CheckMIKExpiration: cannot deserialize coinbase";
+        return false;
     }
 
-    if (coinbase.vin.empty()) {
-        return true;
+    if (!coinbase.IsCoinBase()) {
+        error = "CheckMIKExpiration: first transaction is not coinbase-form";
+        return false;
     }
 
     // Parse MIK data
     DFMP::CMIKScriptData mikData;
     if (!DFMP::ParseMIKFromScriptSig(coinbase.vin[0].scriptSig, mikData)) {
-        return true;  // No MIK data — let other checks handle
+        error = "CheckMIKExpiration: no parseable MIK data in coinbase at height " +
+                std::to_string(height);
+        return false;
     }
 
     // Registration blocks always pass (re-registering is the cure for expiration)
@@ -858,7 +875,8 @@ bool CheckMIKExpiration(
 
     // Reference block: check if MIK is expired
     if (!DFMP::g_identityDb) {
-        return true;  // No identity DB — can't check
+        error = "CheckMIKExpiration: identity database unavailable — cannot prove MIK unexpired";
+        return false;
     }
 
     int lastMined = DFMP::g_identityDb->GetLastMined(mikData.identity);

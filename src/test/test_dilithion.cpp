@@ -11,6 +11,7 @@
 #define BOOST_TEST_MODULE Dilithion Test Suite
 #include <boost/test/included/unit_test.hpp>
 
+#include <consensus/chain.h>   // CChainState::SetTestAllowConnectWithoutUTXOSet
 #include <iostream>
 #include <cstring>
 
@@ -33,6 +34,15 @@ struct DilithionTestSetup {
         const char* rx_key = "Dilithion-RandomX-Test";
         randomx_init_for_hashing(rx_key, strlen(rx_key), 1 /* light_mode=true */);
         std::cout << "✓ RandomX initialized (light mode)" << std::endl;
+
+        // TEST-ONLY opt-in: many chain-selection / reorg suites drive
+        // ActivateBestChain on header-only CChainState instances with no UTXO
+        // set attached. Production ConnectTip FAILS CLOSED on a null UTXO set
+        // (external round-2 HIGH); this switch is the explicit, process-wide
+        // test exemption. Suites that assert the fail-closed behaviour itself
+        // (connect_checks_tests cc_r2_null_utxoset_fails_closed) flip it off
+        // locally and restore it.
+        CChainState::SetTestAllowConnectWithoutUTXOSet(true);
     }
 
     ~DilithionTestSetup() {

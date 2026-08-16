@@ -6,6 +6,7 @@
 #include <consensus/validation.h>       // CBlockValidator (deserialize, merkle, subsidy)
 #include <consensus/tx_validation.h>    // CTransactionValidator::VerifyScript, IsCanonicalP2PKHScriptSig, TxValidation::*
 #include <core/chainparams.h>           // Dilithion::g_chainParams
+#include <consensus/params.h>            // Consensus::COINBASE_SCRIPTSIG_{MIN,MAX}_SIZE
 #include <primitives/transaction.h>
 #include <script/script.h>              // CScript::IsPayToPublicKeyHash (malleability gate predicate)
 #include <amount.h>
@@ -73,6 +74,44 @@ bool ConnectBlockChecks(const CBlock& block,
         }
     }
 
+    // =========================================================================
+    // CHECK 0 — coinbase STRUCTURE by FORM, not by POSITION (external round-2
+    // BLOCKER). The loop below (and CUTXOSet::ApplyBlock) treats txs[0] as "the
+    // coinbase" — i.e. it skips input resolution / value conservation for it.
+    // If txs[0] is NOT actually coinbase-form, a normal spend placed at index 0
+    // would have its inputs neither resolved nor value-checked: it could mint
+    // arbitrary value (the coinbase value cap below only bounds it against
+    // subsidy+fees) or, in ApplyBlock, "spend" nothing while creating outputs.
+    // So: txs[0] MUST satisfy IsCoinBase() (exactly one input, null prevout),
+    // and its scriptSig MUST be within the consensus size bounds BEFORE any of
+    // the downstream parsers (MIK / attestation / VDF-proof extraction) touch it
+    // — that is the connect-seam size cap (round-2 #8; the wire deserializer
+    // independently bounds every scriptSig at 20000 bytes and the VDF-proof
+    // extractor at MAX_PROOF_SIZE, so this makes the coinbase bound explicit
+    // and pre-parse rather than incidental). Structural, height-free,
+    // context-free => reorg-safe. Runs BEFORE the per-tx loop so a malformed
+    // block is culled before any signature work.
+    // =========================================================================
+    {
+        const CTransaction& cb = *txs[0];
+        if (!cb.IsCoinBase()) {
+            error = "ConnectBlockChecks: first transaction is not coinbase-form "
+                    "(must have exactly one input with null prevout)";
+            return false;
+        }
+        const size_t ssLen = cb.vin[0].scriptSig.size();
+        if (ssLen < Consensus::COINBASE_SCRIPTSIG_MIN_SIZE ||
+            ssLen > Consensus::COINBASE_SCRIPTSIG_MAX_SIZE) {
+            error = "ConnectBlockChecks: coinbase scriptSig size out of bounds ("
+                    + std::to_string(ssLen) + " bytes)";
+            return false;
+        }
+        if (cb.vout.empty()) {
+            error = "ConnectBlockChecks: coinbase has no outputs";
+            return false;
+        }
+    }
+
     const unsigned int coinbaseMaturity = Dilithion::g_chainParams
         ? static_cast<unsigned int>(Dilithion::g_chainParams->coinbaseMaturity)
         : TxValidation::COINBASE_MATURITY;
@@ -102,6 +141,18 @@ bool ConnectBlockChecks(const CBlock& block,
         }
 
         if (!isCoinbase) {
+            // CHECK 0 (continued): only txs[0] may be coinbase-form. A second
+            // coinbase-form tx at idx>0 would resolve its null prevout against
+            // the UTXO set (input-not-found => rejected below anyway), but make
+            // it explicit and structural (Bitcoin Core CheckBlock "bad-cb-multiple")
+            // so the position/form invariant ApplyBlock relies on is asserted
+            // here, not incidentally.
+            if (tx->IsCoinBase()) {
+                error = "ConnectBlockChecks: coinbase-form transaction at index "
+                        + std::to_string(txIdx) + " (only index 0 may be coinbase)";
+                return false;
+            }
+
             // DoS cap on signature-verification work (mirrors CheckTransaction).
             if (tx->vin.size() > TxValidation::MAX_INPUT_COUNT_PER_TX) {
                 error = "ConnectBlockChecks: transaction has too many inputs (DoS limit)";
@@ -262,37 +313,35 @@ bool ConnectBlockChecks(const CBlock& block,
     }
 
     // =========================================================================
-    // CHECK 3 (coinbase value) — Sigma(out)(coinbase) <= subsidy + Sigma(fees).
-    // Unconditional (independent of fVerifyScripts and of any relay-fee flag);
-    // this is the anti-inflation invariant. Genesis (height 0) excepted, matching
-    // CBlockValidator::CheckCoinbase's height-0 skip for pre-funded genesis.
+    // CHECK 3 (coinbase value + structure + tax) — the SINGLE-SOURCE coinbase
+    // rule, CBlockValidator::CheckCoinbase, run at connect:
+    //   * coinbase FORM (IsCoinBase, one input, null prevout), scriptSig bounds,
+    //     at least one output                       (structure)
+    //   * Sigma(out)(coinbase) <= subsidy + Sigma(fees)   (anti-inflation)
+    //   * mainnet/DilV Dev-Fund + Dev-Reward outputs present and sufficient
+    //     (the 2% mining development contribution)   (tax)
+    // Genesis (height 0) keeps CheckCoinbase's structure-only treatment (pre-
+    // funded genesis coinbase).
+    //
+    // External round-2 HIGH: before this fold the structure + tax rules were
+    // ARRIVAL-ONLY (block_processing.cpp coinbase-tax section), skipped for
+    // forkPreValidated / skipPoWCheck blocks and downgraded to structure-only
+    // when feeCalcReliable=false; the connect seam enforced ONLY the value cap.
+    // A miner could therefore connect a block whose coinbase omits the tax
+    // outputs (self-mined, or delivered through the fork path). Running the
+    // same predicate here makes it unconditional on EVERY connect, including
+    // reorg/skipValidation connects. It is context-free (block + height +
+    // chainparams only) => reorg-safe. Verified non-history-rejecting against
+    // the local DIL (0..55,819) and DilV (0..83,769) block DBs: 0 canonical
+    // coinbases fail CheckCoinbase(structure+tax); the arrival gate has run the
+    // same predicate on every non-fork block since both chains' genesis.
+    // Unconditional (independent of fVerifyScripts and of any relay-fee flag).
     // =========================================================================
-    if (nHeight != 0) {
-        const CTransactionRef& coinbase = txs[0];
-
-        const uint64_t subsidy =
-            CBlockValidator::CalculateBlockSubsidy(static_cast<uint32_t>(nHeight));
-        uint64_t maxValue = subsidy;
-        if (totalFees > 0) {
-            const uint64_t feesU = static_cast<uint64_t>(totalFees);
-            if (maxValue + feesU < maxValue) {
-                error = "ConnectBlockChecks: coinbase max-value overflow (subsidy + fees)";
-                return false;
-            }
-            maxValue += feesU;
-        }
-
-        uint64_t coinbaseOut = 0;
-        for (const auto& txout : coinbase->vout) {
-            if (coinbaseOut + txout.nValue < coinbaseOut) {
-                error = "ConnectBlockChecks: coinbase output value overflow";
-                return false;
-            }
-            coinbaseOut += txout.nValue;
-        }
-
-        if (coinbaseOut > maxValue) {
-            error = "ConnectBlockChecks: coinbase value exceeds subsidy + fees";
+    {
+        std::string cbErr;
+        if (!blockValidator.CheckCoinbase(*txs[0], static_cast<uint32_t>(nHeight),
+                                          totalFees, cbErr)) {
+            error = "ConnectBlockChecks: coinbase check failed: " + cbErr;
             return false;
         }
     }
@@ -353,6 +402,21 @@ bool ConnectPathVerifyVDF(const Dilithion::ChainParams* params,
     const int vdfAssumeValidHeight = params ? params->vdfAssumeValidHeight : 0;
     return !ConnectPathMaySkipVDFVerify(nHeight, vdfAssumeValidHeight,
                                         fInitialBlockDownload);
+}
+
+bool ConnectPathMaySkipDFMPChecks(int nHeight,
+                                  int dfmpAssumeValidHeight,
+                                  bool fInitialBlockDownload,
+                                  bool fCheckpointAnchored)
+{
+    // Skip the DFMP-family checks ONLY for a historical block (at/below a
+    // POSITIVE assume-valid height) AND (still in IBD OR proven checkpoint-
+    // anchored). A block at the tip / above the height / on a chain configured
+    // with dfmpAssumeValidHeight <= 0 is always checked. Same shape as the
+    // script/VDF gates plus the anchored arm — see the header.
+    return dfmpAssumeValidHeight > 0
+        && nHeight <= dfmpAssumeValidHeight
+        && (fInitialBlockDownload || fCheckpointAnchored);
 }
 
 bool ShouldRunVDFArrivalPreflight(bool isVDFBlock,

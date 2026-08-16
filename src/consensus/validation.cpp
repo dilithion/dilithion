@@ -225,8 +225,10 @@ bool CBlockValidator::CheckCoinbase(
         return false;
     }
 
-    // Coinbase scriptSig must be 2-20000 bytes (raised for Dilithium MIK + 3-4 attestation sigs)
-    if (coinbase.vin[0].scriptSig.size() < 2 || coinbase.vin[0].scriptSig.size() > 20000) {
+    // Coinbase scriptSig must be 2-20000 bytes (raised for Dilithium MIK + 3-4 attestation sigs).
+    // Bounds are Consensus::COINBASE_SCRIPTSIG_{MIN,MAX}_SIZE — shared with ConnectBlockChecks.
+    if (coinbase.vin[0].scriptSig.size() < Consensus::COINBASE_SCRIPTSIG_MIN_SIZE ||
+        coinbase.vin[0].scriptSig.size() > Consensus::COINBASE_SCRIPTSIG_MAX_SIZE) {
         error = "Coinbase scriptSig size invalid";
         return false;
     }

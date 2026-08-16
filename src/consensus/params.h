@@ -91,6 +91,18 @@ static const size_t MAX_REQUEST_SIZE = 1024 * 1024;
 static const size_t MAX_BLOCK_SIZE = 4 * 1024 * 1024;
 
 /**
+ * Coinbase scriptSig size bounds (bytes). Single source of truth for
+ * CBlockValidator::CheckCoinbase (arrival) AND ConnectBlockChecks (connect):
+ * the connect seam must cap the coinbase scriptSig BEFORE the MIK /
+ * attestation / VDF-proof parsers and the Wesolowski verify touch it, so a
+ * peer cannot drive unbounded parse/verify CPU with an oversize coinbase.
+ * 20000 accommodates ML-DSA MIK + 3-4 attestation signatures + VDF proof
+ * (largest canonical coinbase scriptSig observed: 15,488 bytes, DilV h=83,550).
+ */
+static const size_t COINBASE_SCRIPTSIG_MIN_SIZE = 2;
+static const size_t COINBASE_SCRIPTSIG_MAX_SIZE = 20000;
+
+/**
  * Safety margin (16 KB) subtracted from MAX_BLOCK_SIZE when building mining
  * templates. Size estimates during transaction selection have small jitter;
  * budgeting against MAX_BLOCK_SIZE - BLOCK_SIZE_SAFETY_MARGIN guarantees the

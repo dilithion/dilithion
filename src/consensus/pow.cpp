@@ -128,15 +128,12 @@ uint32_t FixCompactEncoding(uint32_t nCompact) {
     return (nSize << 24) | nMantissa;
 }
 
-bool CheckProofOfWork(uint256 hash, uint32_t nBits) {
-    // Bug #47 Fix: Match Bitcoin Core approach
-    // Don't reject based on arbitrary MIN/MAX_DIFFICULTY_BITS
-    // Instead, validate target expansion and check against powLimit
+bool IsValidPoWTarget(uint32_t nBits, uint256& target) {
+    // Expand the compact target. CompactToBig already folds Bitcoin Core's
+    // SetCompact edge cases into a ZERO target: nCompact == 0, mantissa == 0,
+    // size == 0, and size > 32 (overflow). A zero target is rejected below.
+    target = CompactToBig(nBits);
 
-    // Convert compact difficulty to full target
-    uint256 target = CompactToBig(nBits);
-
-    // Check for zero target (invalid)
     bool isZero = true;
     for (int i = 0; i < 32; i++) {
         if (target.data[i] != 0) {
@@ -145,6 +142,45 @@ bool CheckProofOfWork(uint256 hash, uint32_t nBits) {
         }
     }
     if (isZero) {
+        return false;
+    }
+
+    // powLimit (external round-2, GPT-5.5 unique): a compact nBits that expands
+    // to a target EASIER than the network's easiest allowed target must be
+    // rejected — Bitcoin Core's `bnTarget > UintToArith256(params.powLimit)`
+    // term. Without it, a header carrying an over-easy nBits (e.g. 0x2000ffff,
+    // or 0x20ffffff whose 32-byte mantissa expands to a near-all-ones target)
+    // passes hash < target trivially. This is the same bound the retarget code
+    // clamps to (MAX_DIFFICULTY_BITS, pow.h), so a rule-conformant chain can
+    // never produce a target above it; nBits == GetNextWorkRequired is enforced
+    // separately at arrival/fork-staging, this closes the header/orphan/basic-
+    // PoW seams that only ran hash < target.
+    //
+    // NOT ported: Core's fNegative rejection. Dilithion's CompactToBig masks
+    // the mantissa with 0x007fffff (bit 23 stripped) instead of flagging it, and
+    // 1,667 canonical DIL mainnet blocks (heights ~18,4xx, pre-
+    // compactEncodingFixHeight=18500) carry nBits with bit 23 set. Rejecting
+    // "negative" nBits would reject history => chain split. The masked
+    // interpretation is deterministic and STRICTER (smaller target), so it is
+    // kept as-is. Verified against the local DIL block DB (heights 0..55,819:
+    // 0 blocks with target > powLimit, 1,667 with bit 23 set) and by
+    // construction above (ASERT/EDA/retarget all clamp to MAX_DIFFICULTY_BITS).
+    static const uint256 powLimit = CompactToBig(MAX_DIFFICULTY_BITS);
+    if (HashLessThan(powLimit, target)) {   // target > powLimit
+        return false;
+    }
+    return true;
+}
+
+bool CheckProofOfWork(uint256 hash, uint32_t nBits) {
+    // Bug #47 Fix: Match Bitcoin Core approach
+    // Don't reject based on arbitrary MIN/MAX_DIFFICULTY_BITS
+    // Instead, validate target expansion and check against powLimit
+
+    // Convert compact difficulty to full target; reject zero / overflow /
+    // over-easy (target > powLimit) encodings — see IsValidPoWTarget.
+    uint256 target;
+    if (!IsValidPoWTarget(nBits, target)) {
         return false;
     }
 
@@ -176,18 +212,11 @@ bool CheckProofOfWorkDFMP(
         return false;  // Legacy RandomX blocks rejected after exclusive height
     }
 
-    // Convert compact difficulty to full target
-    uint256 baseTarget = CompactToBig(nBits);
-
-    // Check for zero target (invalid)
-    bool isZero = true;
-    for (int i = 0; i < 32; i++) {
-        if (baseTarget.data[i] != 0) {
-            isZero = false;
-            break;
-        }
-    }
-    if (isZero) {
+    // Convert compact difficulty to full target; reject zero / overflow /
+    // over-easy (target > powLimit) encodings — same predicate as the legacy
+    // CheckProofOfWork path so both seams agree (see IsValidPoWTarget).
+    uint256 baseTarget;
+    if (!IsValidPoWTarget(nBits, baseTarget)) {
         return false;
     }
 
@@ -232,6 +261,18 @@ bool CheckProofOfWorkDFMP(
 
     // Get coinbase transaction (first transaction in block)
     const CTransaction& coinbaseTx = *transactions[0];
+
+    // External round-2 (GPT-5.5): coinbaseTx.vin[0] below was indexed without
+    // proving vin is non-empty — a malformed block whose first tx has no inputs
+    // crashed the validator (remote DoS). Require coinbase FORM (exactly one
+    // input, null prevout) here; a first tx that is not coinbase-form is
+    // invalid regardless, and ConnectBlockChecks/ApplyBlock reject it too.
+    if (!coinbaseTx.IsCoinBase()) {
+        std::cerr << "[DFMP] Block " << height
+                  << ": first transaction is not coinbase-form (vin.size()="
+                  << coinbaseTx.vin.size() << ")" << std::endl;
+        return false;
+    }
 
     // ========================================================================
     // DFMP v2.0: Mining Identity Key (MIK) Validation

@@ -29,6 +29,11 @@
 #include <consensus/validation.h>
 #include <consensus/connect_checks.h>
 #include <consensus/tx_validation.h>   // TxValidation::MAX_MONEY (MoneyRange edge KATs)
+#include <consensus/params.h>          // Consensus::DEV_FUND_PUBKEY_HASH / MINING_TAX_PERCENT / COINBASE_SCRIPTSIG_MAX_SIZE
+#include <consensus/chain.h>           // CChainState (null-UTXO fail-closed KAT)
+#include <consensus/pow.h>             // CheckProofOfWork / IsValidPoWTarget / MAX_DIFFICULTY_BITS
+#include <consensus/vdf_validation.h>  // CheckMIKExpiration (fail-closed KATs)
+#include <node/block_index.h>          // CBlockIndex (null-UTXO fail-closed KAT)
 #include <consensus/sighash_preimage.h>
 #include <core/chainparams.h>
 #include <crypto/sha3.h>
@@ -192,7 +197,26 @@ std::vector<uint8_t> CanonicalLayoutSig(uint8_t fill = 0xAA) {
     return s;
 }
 
-// Coinbase paying `value` (single output). scriptSig carries `data` for uniqueness.
+// The mainnet Dev-Fund / Dev-Reward P2PKH outputs CheckCoinbase requires at
+// height H (2% of subsidy, split 50/50). Exposed so tests can build a coinbase
+// that omits / underpays one of them (round-2 HIGH: tax enforced at connect).
+uint64_t RequiredDevFund(uint32_t H) {
+    uint64_t tax = (CBlockValidator::CalculateBlockSubsidy(H) * Consensus::MINING_TAX_PERCENT) / 100;
+    return (tax * Consensus::DEV_FUND_SHARE) / 100;
+}
+uint64_t RequiredDevReward(uint32_t H) {
+    uint64_t tax = (CBlockValidator::CalculateBlockSubsidy(H) * Consensus::MINING_TAX_PERCENT) / 100;
+    return tax - RequiredDevFund(H);
+}
+std::vector<uint8_t> DevFundSpk()   { return P2PKH(Consensus::DEV_FUND_PUBKEY_HASH); }
+std::vector<uint8_t> DevRewardSpk() { return P2PKH(Consensus::DEV_REWARD_PUBKEY_HASH); }
+
+// Coinbase paying `value` in TOTAL across the mainnet-required layout
+// (miner + Dev Fund + Dev Reward, tax computed for height `H`); the miner
+// output absorbs value - tax. scriptSig carries `data` for uniqueness. Since
+// the round-2 fold, ConnectBlockChecks runs the full CheckCoinbase (structure
+// + tax + value cap) at connect, so a positive-control coinbase must carry the
+// tax outputs. All existing callers pass H as `data`, so tax is sized for H.
 CTransactionRef Coinbase(uint64_t value, uint32_t data) {
     CTransaction tx;
     tx.nVersion = 1; tx.nLockTime = 0;
@@ -203,7 +227,23 @@ CTransactionRef Coinbase(uint64_t value, uint32_t data) {
     std::vector<uint8_t> spk = {0x76, 0xa9, 0x14};
     spk.insert(spk.end(), 20, 0x01);
     spk.push_back(0x88); spk.push_back(0xac);
-    tx.vout.push_back(CTxOut(value, spk));
+    const uint64_t df = RequiredDevFund(data), dr = RequiredDevReward(data);
+    const uint64_t miner = (value >= df + dr) ? (value - df - dr) : 0;
+    tx.vout.push_back(CTxOut(miner, spk));
+    tx.vout.push_back(CTxOut(df, DevFundSpk()));
+    tx.vout.push_back(CTxOut(dr, DevRewardSpk()));
+    return MakeTransactionRef(tx);
+}
+
+// A coinbase with an EXPLICIT output list and scriptSig (no tax layout applied):
+// the raw builder the round-2 structural KATs use to construct malformed
+// coinbases (missing tax output, oversize scriptSig, wrong form, ...).
+CTransactionRef CoinbaseRaw(const std::vector<CTxOut>& outs,
+                            const std::vector<uint8_t>& scriptSig) {
+    CTransaction tx;
+    tx.nVersion = 1; tx.nLockTime = 0;
+    tx.vin.push_back(CTxIn(COutPoint(), scriptSig));
+    for (const auto& o : outs) tx.vout.push_back(o);
     return MakeTransactionRef(tx);
 }
 
@@ -1187,6 +1227,409 @@ BOOST_FIXTURE_TEST_CASE(cc_mall_gate_unconditional_wrt_assumevalid, ChainParamsF
         "malleated scriptSig must also be rejected with signatures ON");
 
     utxo.Close(); CleanupUTXO(path);
+}
+
+// ============================================================================
+// EXTERNAL ROUND-2 FOLD — BLOCKER/HIGH KATs
+// (branch fold/external-round2-blockers). Each rejection is paired with a
+// positive control so it is attributable to the specific rule under test, and
+// each rule was mutation-verified: reverting the corresponding fix in the
+// validator turns the named assertion RED (see the fold commit message).
+// ============================================================================
+
+// ---- helpers local to the round-2 KATs -------------------------------------
+
+// A "fake coinbase": a NORMAL-form transaction (single NON-null input) placed at
+// index 0, paying `value` to a miner-style P2PKH. Pre-fold, ConnectBlockChecks
+// and ApplyBlock trusted POSITION (txIdx == 0 => coinbase) so this tx's input
+// was never resolved and its value never conserved.
+CTransactionRef FakeCoinbaseAtIdx0(uint64_t value, uint8_t seed) {
+    CTransaction tx;
+    tx.nVersion = 1; tx.nLockTime = 0;
+    tx.vin.push_back(CTxIn(COutPoint(MakeHash(seed), 0), CanonicalLayoutSig(0xAA), CTxIn::SEQUENCE_FINAL));
+    tx.vout.push_back(CTxOut(value, DummyP2PKH(0x33)));
+    return MakeTransactionRef(tx);
+}
+
+// A block whose only tx is a coinbase built by CoinbaseRaw with an explicit
+// output list — used by the tax / scriptSig-cap KATs.
+CBlock TaxBlock(uint32_t H, const std::vector<CTxOut>& outs, uint32_t data = 0x51) {
+    std::vector<uint8_t> ss = {0x04, (uint8_t)data, (uint8_t)H, 0, 0};
+    return MakeBlock({ CoinbaseRaw(outs, ss) });
+}
+
+// ---- #1 BLOCKER: coinbase by FORM, not POSITION -----------------------------
+
+// A normal-form spend at index 0 (the "fake coinbase") is REJECTED by the
+// connect-path validator on FORM — even when its value is within the coinbase
+// cap (subsidy) so the value cap alone could NOT have caught it — and ApplyBlock
+// independently refuses to mutate on it. Positive control: a real coinbase at
+// index 0 is accepted. Mutation: revert CHECK 0 (position-only) => the
+// value==subsidy variant is ACCEPTED by ConnectBlockChecks => RED.
+BOOST_FIXTURE_TEST_CASE(cc_r2_fake_coinbase_at_idx0_rejected_by_form, ChainParamsFixture) {
+    CUTXOSet utxo; std::string path = OpenTempUTXO(utxo);
+    const uint32_t H = 7;
+
+    // (a) 1e6 DIL "mint" at index 0 — the supply-inflation shape.
+    {
+        CBlock blk = MakeBlock({ FakeCoinbaseAtIdx0(1000000ULL * COIN, 0x71) });
+        std::string err;
+        BOOST_CHECK_MESSAGE(!ConnectBlockChecks(blk, utxo, H, false, err),
+                            "fake coinbase (1e6 DIL) at index 0 must be rejected");
+        BOOST_CHECK_MESSAGE(err.find("not coinbase-form") != std::string::npos,
+                            "rejection must be attributable to the FORM check, got: " << err);
+        // ApplyBlock (the mutator) refuses independently.
+        BOOST_CHECK_MESSAGE(!utxo.ApplyBlock(blk, H, blk.GetHash()),
+                            "ApplyBlock must refuse a non-coinbase-form first tx");
+    }
+    // (b) value == subsidy at index 0 — passes the value cap; ONLY the form
+    //     check can reject it. This is the load-bearing mutation target.
+    {
+        CBlock blk = MakeBlock({ FakeCoinbaseAtIdx0(Subsidy(H), 0x72) });
+        std::string err;
+        BOOST_CHECK_MESSAGE(!ConnectBlockChecks(blk, utxo, H, false, err),
+                            "fake coinbase (== subsidy) at index 0 must be rejected on FORM");
+        BOOST_CHECK(err.find("not coinbase-form") != std::string::npos);
+        BOOST_CHECK(!utxo.ApplyBlock(blk, H, blk.GetHash()));
+        // Refused before any batch write: none of its outputs were created.
+        BOOST_CHECK(!utxo.HaveUTXO(COutPoint(blk.GetHash(), 0)));
+    }
+    // (c) positive control: real coinbase at index 0 accepted + applied.
+    {
+        CBlock ok = MakeBlock({ Coinbase(Subsidy(H), H) });
+        std::string err;
+        BOOST_CHECK_MESSAGE(ConnectBlockChecks(ok, utxo, H, false, err),
+                            "real coinbase must be accepted: " << err);
+        BOOST_CHECK(utxo.ApplyBlock(ok, H, ok.GetHash()));
+    }
+    utxo.Close(); CleanupUTXO(path);
+}
+
+// A coinbase-FORM tx at index > 0 is REJECTED structurally (not merely by the
+// incidental input-not-found on its null prevout), and ApplyBlock refuses.
+// Positive control: the same block with a real spend at index 1 is accepted.
+// Mutation: delete the idx>0 IsCoinBase() reject in ConnectBlockChecks => the
+// error string is no longer the structural one => RED.
+BOOST_FIXTURE_TEST_CASE(cc_r2_coinbase_form_at_idx1_rejected, ChainParamsFixture) {
+    CUTXOSet utxo; std::string path = OpenTempUTXO(utxo);
+    const uint32_t H = 3;
+
+    CBlock bad = MakeBlock({ Coinbase(Subsidy(H), H), Coinbase(Subsidy(H), H + 100) });
+    std::string err;
+    BOOST_CHECK(!ConnectBlockChecks(bad, utxo, H, false, err));
+    BOOST_CHECK_MESSAGE(err.find("coinbase-form transaction at index 1") != std::string::npos,
+                        "must be the structural reject, got: " << err);
+    BOOST_CHECK(!utxo.ApplyBlock(bad, H, bad.GetHash()));
+
+    // Positive control: real spend at index 1.
+    Key k = MakeKey();
+    COutPoint prev(MakeHash(0x90), 0);
+    BOOST_REQUIRE(utxo.AddUTXO(prev, CTxOut(100 * COIN, k.spk), 1, false));
+    BOOST_REQUIRE(utxo.Flush());
+    CBlock ok = MakeBlock({ Coinbase(Subsidy(H) + 10 * COIN, H),
+                            Spend(prev, 90 * COIN, DummyP2PKH(0x02), &k) });
+    std::string err2;
+    BOOST_CHECK_MESSAGE(ConnectBlockChecks(ok, utxo, H, true, err2), "control: " << err2);
+    utxo.Close(); CleanupUTXO(path);
+}
+
+// ---- #2 HIGH: coinbase structure + Dev-Fund/Dev-Reward tax enforced at CONNECT
+
+// A coinbase that OMITS the Dev Fund output (value otherwise <= subsidy) is
+// REJECTED by ConnectBlockChecks — with fVerifyScripts=false, i.e. exactly the
+// connect that arrival could have skipped (forkPreValidated / skipPoWCheck /
+// feeCalcReliable=false). Underpaid Dev Reward likewise. Positive control: the
+// full tax layout at the same height is accepted. Mutation: revert CHECK 3 to
+// the value-cap-only form => both bad blocks ACCEPTED => RED.
+BOOST_FIXTURE_TEST_CASE(cc_r2_dev_tax_enforced_at_connect, ChainParamsFixture) {
+    CUTXOSet utxo; std::string path = OpenTempUTXO(utxo);
+    const uint32_t H = 11;
+    const uint64_t S = Subsidy(H);
+    const uint64_t df = RequiredDevFund(H), dr = RequiredDevReward(H);
+    BOOST_REQUIRE(df > 0 && dr > 0);
+
+    // (a) Dev Fund output missing (miner takes it).
+    {
+        CBlock blk = TaxBlock(H, { CTxOut(S - dr, DummyP2PKH(0x01)), CTxOut(dr, DevRewardSpk()),
+                                   CTxOut(0, DummyP2PKH(0x05)) /* pad to 3 outputs */ });
+        std::string err;
+        BOOST_CHECK(!ConnectBlockChecks(blk, utxo, H, false, err));
+        BOOST_CHECK_MESSAGE(err.find("Dev Fund") != std::string::npos, "got: " << err);
+    }
+    // (b) Dev Reward underpaid by 1.
+    {
+        CBlock blk = TaxBlock(H, { CTxOut(S - df - dr + 1, DummyP2PKH(0x01)),
+                                   CTxOut(df, DevFundSpk()), CTxOut(dr - 1, DevRewardSpk()) });
+        std::string err;
+        BOOST_CHECK(!ConnectBlockChecks(blk, utxo, H, false, err));
+        BOOST_CHECK_MESSAGE(err.find("Dev Reward") != std::string::npos, "got: " << err);
+    }
+    // (c) positive control: exact layout accepted.
+    {
+        CBlock blk = TaxBlock(H, { CTxOut(S - df - dr, DummyP2PKH(0x01)),
+                                   CTxOut(df, DevFundSpk()), CTxOut(dr, DevRewardSpk()) });
+        std::string err;
+        BOOST_CHECK_MESSAGE(ConnectBlockChecks(blk, utxo, H, false, err), "control: " << err);
+    }
+    // (d) genesis keeps CheckCoinbase's structure-only treatment: at height 0
+    //     no tax and any value is accepted (pre-funded genesis).
+    {
+        CBlock blk = TaxBlock(0, { CTxOut(123456789ULL * COIN, DummyP2PKH(0x01)) });
+        std::string err;
+        BOOST_CHECK_MESSAGE(ConnectBlockChecks(blk, utxo, 0, false, err), "genesis: " << err);
+    }
+    utxo.Close(); CleanupUTXO(path);
+}
+
+// ---- #8: coinbase scriptSig size cap at the connect seam ---------------------
+
+// An oversize (MAX+1) or undersize (MIN-1) coinbase scriptSig is REJECTED by
+// ConnectBlockChecks BEFORE any parser touches it; exactly MAX bytes is
+// accepted (positive control at the boundary). The MIN-1 assertion pins the
+// CHECK 0 error string so the cap's PRE-PARSE position is what is tested
+// (CheckCoinbase at the end of the validator would also reject, with a
+// different message). Mutation: delete the CHECK 0 size bounds => the MIN-1
+// message changes to CheckCoinbase's => RED.
+BOOST_FIXTURE_TEST_CASE(cc_r2_coinbase_scriptsig_cap_at_connect, ChainParamsFixture) {
+    CUTXOSet utxo; std::string path = OpenTempUTXO(utxo);
+    const uint32_t H = 4;
+    const uint64_t S = Subsidy(H);
+    const uint64_t df = RequiredDevFund(H), dr = RequiredDevReward(H);
+    std::vector<CTxOut> outs = { CTxOut(S - df - dr, DummyP2PKH(0x01)),
+                                 CTxOut(df, DevFundSpk()), CTxOut(dr, DevRewardSpk()) };
+
+    auto blockWithSs = [&](size_t n) {
+        std::vector<uint8_t> ss(n, 0x42);
+        if (n >= 4) { ss[0] = 0x04; ss[1] = (uint8_t)H; }
+        return MakeBlock({ CoinbaseRaw(outs, ss) });
+    };
+    {
+        // MAX+1: the wire deserializer (CTransaction::Deserialize, 20000-byte
+        // scriptSig bound) already culls this before CHECK 0 can — so the
+        // oversize case is DOUBLY bounded on the connect seam; either message
+        // is a rejection BEFORE any coinbase parser runs.
+        CBlock blk = blockWithSs(Consensus::COINBASE_SCRIPTSIG_MAX_SIZE + 1);
+        std::string err;
+        BOOST_CHECK(!ConnectBlockChecks(blk, utxo, H, false, err));
+        BOOST_CHECK_MESSAGE(err.find("coinbase scriptSig size out of bounds") != std::string::npos ||
+                            err.find("scriptSig too large") != std::string::npos,
+                            "must be a size-bound rejection, got: " << err);
+    }
+    {
+        // MIN-1: only CHECK 0 rejects this before the parsers — pins the cap's
+        // pre-parse position (mutation target).
+        CBlock blk = blockWithSs(Consensus::COINBASE_SCRIPTSIG_MIN_SIZE - 1);
+        std::string err;
+        BOOST_CHECK(!ConnectBlockChecks(blk, utxo, H, false, err));
+        BOOST_CHECK_MESSAGE(err.find("coinbase scriptSig size out of bounds") != std::string::npos,
+                            "must be the pre-parse CHECK 0 cap, got: " << err);
+    }
+    {
+        CBlock blk = blockWithSs(Consensus::COINBASE_SCRIPTSIG_MAX_SIZE);
+        std::string err;
+        BOOST_CHECK_MESSAGE(ConnectBlockChecks(blk, utxo, H, false, err), "boundary control: " << err);
+    }
+    utxo.Close(); CleanupUTXO(path);
+}
+
+// ---- #3 HIGH: null pUTXOSet FAILS CLOSED in ConnectTip -----------------------
+
+// With NO UTXO set attached and the test opt-in OFF, ConnectTip must return
+// false and must NOT mark the block BLOCK_VALID_CHAIN. Positive control: with
+// the (test-only) opt-in ON the very same call proceeds and marks the block —
+// which is precisely the pre-fold fail-open behaviour, now reachable only via
+// the explicit switch. Mutation: delete the null-UTXO guard => opt-in-OFF arm
+// returns true / marks valid => RED. Uses a height-0 legacy block so no
+// other gate (DFMP/attestation/VDF) can be the cause of the result.
+BOOST_FIXTURE_TEST_CASE(cc_r2_null_utxoset_fails_closed, ChainParamsFixture) {
+    const bool savedAllow = CChainState::TestAllowConnectWithoutUTXOSet();
+    struct Restore { bool v; ~Restore() { CChainState::SetTestAllowConnectWithoutUTXOSet(v); } } restore{savedAllow};
+
+    CBlock blk;                       // legacy, empty body — height-0 shape
+    blk.nVersion = 1; blk.nTime = 1700000000u; blk.nBits = 0x1d00ffff;
+
+    auto makeIdx = [&]() {
+        auto idx = std::make_unique<CBlockIndex>();
+        idx->nHeight = 0;
+        idx->nStatus = 0;
+        idx->phashBlock = blk.GetHash();
+        return idx;
+    };
+
+    // (a) opt-in OFF => fail closed.
+    {
+        CChainState cs;               // pUTXOSet == nullptr
+        CChainState::SetTestAllowConnectWithoutUTXOSet(false);
+        auto idx = makeIdx();
+        CBlockIndex* p = idx.get();
+        BOOST_REQUIRE(cs.AddBlockIndex(p->GetBlockHash(), std::move(idx)));
+        BOOST_CHECK_MESSAGE(!cs.ConnectTip(p, blk, false),
+                            "ConnectTip must FAIL CLOSED with no UTXO set");
+        BOOST_CHECK_MESSAGE((p->nStatus & CBlockIndex::BLOCK_VALID_CHAIN) == 0,
+                            "block must NOT be marked BLOCK_VALID_CHAIN");
+        BOOST_CHECK_MESSAGE((p->nStatus & CBlockIndex::BLOCK_FAILED_VALID) == 0,
+                            "misconfiguration must not brand the block invalid");
+    }
+    // (b) opt-in ON (test exemption) => proceeds and marks valid.
+    {
+        CChainState cs;
+        CChainState::SetTestAllowConnectWithoutUTXOSet(true);
+        auto idx = makeIdx();
+        CBlockIndex* p = idx.get();
+        BOOST_REQUIRE(cs.AddBlockIndex(p->GetBlockHash(), std::move(idx)));
+        BOOST_CHECK(cs.ConnectTip(p, blk, false));
+        BOOST_CHECK((p->nStatus & CBlockIndex::BLOCK_VALID_CHAIN) != 0);
+    }
+}
+
+// ---- #4: PoW target validity — zero / overflow / over-easy nBits -------------
+
+// CheckProofOfWork and CheckProofOfWorkDFMP reject a compact nBits whose target
+// is ZERO (mantissa 0 / size 0), OVERFLOWS (size > 32) or is EASIER than
+// powLimit (target > CompactToBig(MAX_DIFFICULTY_BITS)) — even for the
+// all-zero hash that trivially satisfies hash < target. Canonical-range nBits
+// (genesis 0x1e01fffe, hardest 0x1d00ffff, powLimit 0x1f0fffff itself, and a
+// bit-23 "negative" mantissa as carried by 1,667 canonical DIL blocks around
+// h=18,4xx) are ACCEPTED as targets. Mutation: delete the powLimit compare in
+// IsValidPoWTarget => 0x2000ffff / 0x20ffffff accepted => RED.
+BOOST_FIXTURE_TEST_CASE(cc_r2_pow_rejects_over_easy_nbits, ChainParamsFixture) {
+    uint256 zeroHash; std::memset(zeroHash.data, 0, 32);   // < any non-zero target
+
+    // Over-easy encodings.
+    BOOST_CHECK(!CheckProofOfWork(zeroHash, 0x2000ffff));  // size 32, target > powLimit
+    BOOST_CHECK(!CheckProofOfWork(zeroHash, 0x20ffffff));  // size 32, ~all-ones target
+    BOOST_CHECK(!CheckProofOfWork(zeroHash, 0x1f10ffff));  // just above powLimit
+    BOOST_CHECK(!CheckProofOfWork(zeroHash, 0x21000001));  // size 33 => overflow => zero
+    BOOST_CHECK(!CheckProofOfWork(zeroHash, 0x1d000000));  // zero mantissa
+    BOOST_CHECK(!CheckProofOfWork(zeroHash, 0x00ffffff));  // size 0
+    BOOST_CHECK(!CheckProofOfWork(zeroHash, 0));
+
+    // Canonical-range encodings accepted (zero hash satisfies hash < target).
+    BOOST_CHECK(CheckProofOfWork(zeroHash, 0x1f0fffff));   // == powLimit (MAX_DIFFICULTY_BITS)
+    BOOST_CHECK(CheckProofOfWork(zeroHash, 0x1e01fffe));   // DIL genesis
+    BOOST_CHECK(CheckProofOfWork(zeroHash, 0x1d00ffff));   // MIN_DIFFICULTY_BITS / DilV
+    BOOST_CHECK(CheckProofOfWork(zeroHash, 0x1dac1449));   // bit-23 set: canonical DIL h=18,496 — NOT rejected
+
+    // IsValidPoWTarget agrees.
+    uint256 t;
+    BOOST_CHECK(IsValidPoWTarget(0x1dac1449, t));
+    BOOST_CHECK(!IsValidPoWTarget(0x2000ffff, t));
+    BOOST_CHECK(!IsValidPoWTarget(0x21000001, t));
+
+    // DFMP path agrees: over-easy nBits rejected before any MIK work; canonical
+    // nBits proceeds (legacy block, assume-valid range => HashLessThan(hash, target)).
+    CBlock blk = MakeBlock({ Coinbase(Subsidy(5), 5) });
+    blk.nVersion = 1;
+    BOOST_CHECK(!CheckProofOfWorkDFMP(blk, zeroHash, 0x2000ffff, 5, /*activationHeight=*/0));
+    BOOST_CHECK(!CheckProofOfWorkDFMP(blk, zeroHash, 0x21000001, 5, 0));
+    BOOST_CHECK(CheckProofOfWorkDFMP(blk, zeroHash, 0x1f0fffff, 5, 0));
+}
+
+// ---- #5: CheckProofOfWorkDFMP must not index vin[0] of an input-less first tx
+
+// A legacy block whose first tx has NO inputs reaches the MIK-parse step
+// (deserialises fine); pre-fold `coinbaseTx.vin[0]` was undefined behaviour
+// (crash) there. Now it is REJECTED (not coinbase-form). Positive control: a
+// real coinbase with the same hash/nBits proceeds. Mutation: delete the
+// IsCoinBase() guard => UB / crash on the input-less block => RED.
+BOOST_FIXTURE_TEST_CASE(cc_r2_dfmp_pow_rejects_inputless_first_tx, ChainParamsFixture) {
+    uint256 zeroHash; std::memset(zeroHash.data, 0, 32);
+    CTransaction noIn; noIn.nVersion = 1; noIn.nLockTime = 0;
+    noIn.vout.push_back(CTxOut(1 * COIN, DummyP2PKH(0x01)));
+    CBlock bad = MakeBlock({ MakeTransactionRef(noIn) });
+    bad.nVersion = 1;
+    BOOST_CHECK(!CheckProofOfWorkDFMP(bad, zeroHash, 0x1f0fffff, 5, 0));
+
+    // Two-input first tx (also not coinbase-form) rejected as well.
+    CTransaction twoIn; twoIn.nVersion = 1; twoIn.nLockTime = 0;
+    twoIn.vin.push_back(CTxIn(COutPoint(), {0x04,1,2,3,4}));
+    twoIn.vin.push_back(CTxIn(COutPoint(MakeHash(0x11), 0), {0x04,1,2,3,4}, CTxIn::SEQUENCE_FINAL));
+    twoIn.vout.push_back(CTxOut(1 * COIN, DummyP2PKH(0x01)));
+    CBlock bad2 = MakeBlock({ MakeTransactionRef(twoIn) });
+    bad2.nVersion = 1;
+    BOOST_CHECK(!CheckProofOfWorkDFMP(bad2, zeroHash, 0x1f0fffff, 5, 0));
+
+    CBlock ok = MakeBlock({ Coinbase(Subsidy(5), 5) });
+    ok.nVersion = 1;
+    BOOST_CHECK(CheckProofOfWorkDFMP(ok, zeroHash, 0x1f0fffff, 5, 0));
+}
+
+// ---- #6: CheckMIKExpiration FAILS CLOSED on parse failure --------------------
+
+// Post-activation, a block with an empty vtx / unparseable coinbase / no MIK
+// data is REJECTED (was: returned true, "let other checks handle"). Pre-
+// activation the same blocks pass (rule not in force). Mutation: restore the
+// `return true` on the empty-vtx / no-MIK arms => RED.
+BOOST_FIXTURE_TEST_CASE(cc_r2_mik_expiration_fails_closed, ChainParamsFixture) {
+    // ACTIVATE the rule on the fixture's private params copy (live chains: disabled).
+    owned->mikExpirationActivationHeight = 1;
+    owned->mikExpirationThreshold = 100;
+
+    std::string err;
+    // (a) empty vtx.
+    {
+        CBlock blk; blk.nVersion = CBlockHeader::VDF_VERSION;
+        BOOST_CHECK_MESSAGE(!CheckMIKExpiration(blk, 10, err), "empty vtx must fail closed");
+        BOOST_CHECK(err.find("no transactions") != std::string::npos);
+    }
+    // (b) coinbase with no MIK data (plain height-push scriptSig).
+    {
+        CBlock blk = MakeBlock({ Coinbase(Subsidy(10), 10) });
+        blk.nVersion = CBlockHeader::VDF_VERSION;
+        err.clear();
+        BOOST_CHECK_MESSAGE(!CheckMIKExpiration(blk, 10, err), "no MIK data must fail closed");
+        BOOST_CHECK(err.find("no parseable MIK") != std::string::npos);
+    }
+    // (c) first tx not coinbase-form.
+    {
+        CBlock blk = MakeBlock({ FakeCoinbaseAtIdx0(1 * COIN, 0x77) });
+        blk.nVersion = CBlockHeader::VDF_VERSION;
+        err.clear();
+        BOOST_CHECK(!CheckMIKExpiration(blk, 10, err));
+        BOOST_CHECK(err.find("not coinbase-form") != std::string::npos);
+    }
+    // (d) garbage vtx (unparseable varint / coinbase).
+    {
+        CBlock blk; blk.nVersion = CBlockHeader::VDF_VERSION;
+        blk.vtx = {0xfe, 0x00};                    // 0xfe varint prefix, truncated
+        err.clear();
+        BOOST_CHECK(!CheckMIKExpiration(blk, 10, err));
+        blk.vtx = {0x01, 0xff, 0xff};              // 1 tx, junk body
+        err.clear();
+        BOOST_CHECK(!CheckMIKExpiration(blk, 10, err));
+    }
+    // (e) pre-activation positive control: the same empty block passes.
+    {
+        owned->mikExpirationActivationHeight = 999999999;
+        CBlock blk; blk.nVersion = CBlockHeader::VDF_VERSION;
+        err.clear();
+        BOOST_CHECK(CheckMIKExpiration(blk, 10, err));
+    }
+}
+
+// ---- #7: DFMP assume-valid gate — IBD guard + checkpoint anchor -------------
+
+// The DFMP-family skip needs a POSITIVE configured height, nHeight <= it, and
+// (IBD OR checkpoint-anchored). Mirrors cc_high1_script_assumevalid_predicate.
+// Mutation: drop the (fIBD || anchored) term => the synced-unanchored row
+// returns true => RED.
+BOOST_AUTO_TEST_CASE(cc_r2_dfmp_assumevalid_predicate) {
+    const int AVH = 44000;
+    // In IBD, at/below AVH => skip (regardless of anchor).
+    BOOST_CHECK( ConnectPathMaySkipDFMPChecks(1,     AVH, true,  false));
+    BOOST_CHECK( ConnectPathMaySkipDFMPChecks(AVH,   AVH, true,  false));
+    // Synced, at/below AVH, NOT anchored => must check (the round-2 gap).
+    BOOST_CHECK(!ConnectPathMaySkipDFMPChecks(1,     AVH, false, false));
+    BOOST_CHECK(!ConnectPathMaySkipDFMPChecks(AVH,   AVH, false, false));
+    // Synced but proven checkpoint-anchored => skip (canonical history is safe).
+    BOOST_CHECK( ConnectPathMaySkipDFMPChecks(1,     AVH, false, true));
+    BOOST_CHECK( ConnectPathMaySkipDFMPChecks(AVH,   AVH, false, true));
+    // Above AVH => never skip, whatever the flags.
+    BOOST_CHECK(!ConnectPathMaySkipDFMPChecks(AVH+1, AVH, true,  true));
+    BOOST_CHECK(!ConnectPathMaySkipDFMPChecks(AVH+1, AVH, false, false));
+    // Non-positive configured height => never skip.
+    BOOST_CHECK(!ConnectPathMaySkipDFMPChecks(1, 0,  true, true));
+    BOOST_CHECK(!ConnectPathMaySkipDFMPChecks(1, -1, true, true));
 }
 
 BOOST_AUTO_TEST_SUITE_END()

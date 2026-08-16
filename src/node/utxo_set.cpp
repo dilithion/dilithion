@@ -577,6 +577,29 @@ bool CUTXOSet::ApplyBlock(const CBlock& block, uint32_t height, const uint256& b
         return false;
     }
 
+    // Defense in depth (external round-2 BLOCKER, coinbase-by-position): this
+    // mutator treats tx_idx==0 as the coinbase (skips input spending, marks its
+    // outputs fCoinBase). If the first tx is NOT coinbase-form, that trust would
+    // let a normal spend at index 0 create outputs without spending its inputs
+    // (a mint that also leaves the "spent" coins in the set), and a coinbase-form
+    // tx at idx>0 would try to spend the null outpoint. ConnectBlockChecks is
+    // the authoritative validator for this and REJECTS such blocks before
+    // ApplyBlock runs; this refusal is the belt to that brace so ApplyBlock can
+    // never mutate on a position/form mismatch even if called on its own.
+    if (!transactions[0]->IsCoinBase()) {
+        std::cerr << "[ERROR] CUTXOSet::ApplyBlock: first transaction is not coinbase-form "
+                  << "(refusing to apply block at height " << height << ")" << std::endl;
+        return false;
+    }
+    for (size_t tx_idx = 1; tx_idx < transactions.size(); ++tx_idx) {
+        if (transactions[tx_idx]->IsCoinBase()) {
+            std::cerr << "[ERROR] CUTXOSet::ApplyBlock: coinbase-form transaction at index "
+                      << tx_idx << " (refusing to apply block at height " << height << ")"
+                      << std::endl;
+            return false;
+        }
+    }
+
     // Step 2: Prepare undo data (spent UTXOs) for potential rollback
     // Format: count (4 bytes) + for each UTXO: hash (32) + n (4) + CUTXOEntry
     std::vector<uint8_t> undoData;

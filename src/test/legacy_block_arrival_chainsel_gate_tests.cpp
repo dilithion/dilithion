@@ -205,6 +205,10 @@ void test_legacy_block_arrival_routes_to_chain_selector_without_port_pm()
 
 int main()
 {
+    // TEST-ONLY opt-in: this harness drives ConnectTip on a CChainState with
+    // no UTXO set attached (header/selector-level test). Production ConnectTip
+    // FAILS CLOSED on a null UTXO set (external round-2 HIGH); opt in explicitly.
+    CChainState::SetTestAllowConnectWithoutUTXOSet(true);
     std::cout << "v4.3.4 cut Block 3 — legacy block-arrival chain-selector gate\n\n";
     try {
         test_legacy_block_arrival_routes_to_chain_selector_without_port_pm();

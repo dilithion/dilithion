@@ -526,6 +526,10 @@ void test_port_missing_pindex_short_circuits_before_staging()
 // ============================================================================
 int main()
 {
+    // TEST-ONLY opt-in: this harness drives ConnectTip on a CChainState with
+    // no UTXO set attached (header/selector-level test). Production ConnectTip
+    // FAILS CLOSED on a null UTXO set (external round-2 HIGH); opt in explicitly.
+    CChainState::SetTestAllowConnectWithoutUTXOSet(true);
     std::cout << "Phase 11 A1 — port-path fork-staging dispatch tests\n";
     std::cout << "  (state-machine-level; TriggerChainSwitch + ActivateBestChain\n";
     std::cout << "   end-to-end exercised by Phase 8+ bash harness)\n\n";

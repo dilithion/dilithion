@@ -44,6 +44,17 @@ const int EDA_REDUCTION_DENOMINATOR = 4;
 /** Maximum number of reduction steps (cap at ~97% reduction) */
 const int EDA_MAX_STEPS = 20;
 
+/**
+ * Expand a compact nBits and decide whether it is an ACCEPTABLE PoW target:
+ * rejects a zero/overflow expansion and a target EASIER than powLimit
+ * (CompactToBig(MAX_DIFFICULTY_BITS)). Shared by CheckProofOfWork and
+ * CheckProofOfWorkDFMP so every seam agrees. On success `target` holds the
+ * expanded value. Bit-23 ("negative") mantissas are NOT rejected — see the
+ * definition for why (canonical DIL history carries them; CompactToBig masks
+ * them deterministically).
+ */
+bool IsValidPoWTarget(uint32_t nBits, uint256& target);
+
 /** Check whether a block hash satisfies the proof-of-work requirement */
 bool CheckProofOfWork(uint256 hash, uint32_t nBits);
 

@@ -260,6 +260,12 @@ bool CheckMIKAttestations(
  * rejected. The MIK must re-register with a full registration block (0x01).
  *
  * Registration blocks always pass. Depends on identity DB (GetLastMined).
+ *
+ * FAILS CLOSED post-activation: an empty vtx, unparseable tx-count/coinbase,
+ * non-coinbase-form first tx, missing MIK data, or unavailable identity DB
+ * returns false (with error set) — the block has not proven its identity is
+ * unexpired. Pre-activation always returns true. NOT reorg-safe (identity-DB
+ * dependent) — callers keep it inside the !skipValidation gate.
  */
 bool CheckMIKExpiration(
     const CBlock& block,

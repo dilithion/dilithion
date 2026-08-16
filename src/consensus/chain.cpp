@@ -26,6 +26,10 @@
 #include <thread>
 #include <chrono>
 
+// TEST-ONLY opt-in for UTXO-less ConnectTip (see chain.h). Default false =>
+// ConnectTip fails closed when pUTXOSet == nullptr.
+bool CChainState::s_testAllowConnectWithoutUTXOSet = false;
+
 CChainState::CChainState() : pindexTip(nullptr), pdb(nullptr), pUTXOSet(nullptr) {
 }
 
@@ -1306,6 +1310,32 @@ bool CChainState::ConnectTip(CBlockIndex* pindex, const CBlock& block, bool skip
         return m_testConnectTipOverride(pindex, block);
     }
 
+    // ========================================================================
+    // FAIL CLOSED on a missing UTXO set (external round-2 HIGH).
+    // ========================================================================
+    // Pre-fold, a null pUTXOSet skipped BOTH the connect-path validator
+    // (ConnectBlockChecks) AND ApplyBlock — guarded by `if (pUTXOSet != nullptr)`
+    // — yet still fell through to `nStatus |= BLOCK_VALID_CHAIN | BLOCK_HAVE_DATA`:
+    // an unvalidated accept. Refuse HERE, before any side effect (cooldown-tracker
+    // OnBlockConnected, BLOCK_FAILED_VALID writes, pnext wiring, callbacks).
+    // No production path connects without a UTXO set: both node binaries call
+    // SetUTXOSet() before the genesis ActivateBestChain (dilithion-node.cpp /
+    // dilv-node.cpp "Initializing chain state..."), and every other
+    // ConnectTip/ActivateBestChain caller (ForkManager, chain selector, IBD,
+    // RPC) goes through g_chainstate after that point. The only UTXO-less
+    // callers are header-only chain-selection / fork-staging unit tests, which
+    // opt in EXPLICITLY, process-wide, via
+    // CChainState::SetTestAllowConnectWithoutUTXOSet(true).
+    // Not marked BLOCK_FAILED_VALID: the block was not judged, the node is
+    // misconfigured — refuse, log, and leave the block retryable.
+    if (pUTXOSet == nullptr && !s_testAllowConnectWithoutUTXOSet) {
+        std::cerr << "[Chain] ERROR: Block " << pindex->nHeight
+                  << " REFUSED: no UTXO set attached to chain state "
+                  << "(connect-path validator and ApplyBlock cannot run; failing closed)"
+                  << std::endl;
+        return false;
+    }
+
     // ============================================================================
     // CS-005: Chain Reorganization Rollback - ConnectTip Implementation
     // ============================================================================
@@ -1348,9 +1378,46 @@ bool CChainState::ConnectTip(CBlockIndex* pindex, const CBlock& block, bool skip
     // chain. Computed before !skipValidation so it's available for both
     // identity-dependent checks (inside) and tracker-based checks (outside).
     // ====================================================================
+    // External round-2 (3/4 reviewers): the skip was HEIGHT-ONLY — no IBD guard,
+    // unlike the script/VDF gates — so a SYNCED node connecting a low-height
+    // block skipped every DFMP rule. Now: skip iff height <= AVH AND (in IBD OR
+    // the block is a proven ancestor of a shipped checkpoint). The anchored arm
+    // keeps a synced node's legitimate (re)connect of canonical history from
+    // running tracker/identity-DB-dependent checks the network never enforced
+    // on those blocks. Predicate: ConnectPathMaySkipDFMPChecks (pure, tested).
     int assumeValidHeight = Dilithion::g_chainParams ?
         Dilithion::g_chainParams->dfmpAssumeValidHeight : 0;
-    bool assumeValid = (assumeValidHeight > 0 && pindex->nHeight <= assumeValidHeight);
+    bool assumeValid = false;
+    if (assumeValidHeight > 0 && pindex->nHeight <= assumeValidHeight) {
+        const bool fIBD_dfmp =
+            g_node_context.sync_coordinator &&
+            g_node_context.sync_coordinator->IsInitialBlockDownload();
+        bool fAnchored = false;
+        if (!fIBD_dfmp && Dilithion::g_chainParams) {
+            // Cheap anchor proof (only evaluated when NOT in IBD, i.e. never on
+            // the tip hot path once the chain is past AVH): find the LOWEST
+            // shipped checkpoint at height >= this block, look up its block
+            // index, and require this block to be its ancestor at nHeight
+            // (O(log n) via pskip). No index for the checkpoint yet => not
+            // proven => checks run.
+            const Dilithion::CCheckpoint* cpAbove = nullptr;
+            for (const auto& cp : Dilithion::g_chainParams->checkpoints) {
+                if (cp.nHeight >= pindex->nHeight &&
+                    (!cpAbove || cp.nHeight < cpAbove->nHeight)) {
+                    cpAbove = &cp;
+                }
+            }
+            if (cpAbove) {
+                const CBlockIndex* pcp = GetBlockIndex(cpAbove->hashBlock);
+                if (pcp && pcp->nHeight == cpAbove->nHeight) {
+                    const CBlockIndex* anc = pcp->GetAncestor(pindex->nHeight);
+                    fAnchored = (anc == pindex);
+                }
+            }
+        }
+        assumeValid = ConnectPathMaySkipDFMPChecks(pindex->nHeight, assumeValidHeight,
+                                                   fIBD_dfmp, fAnchored);
+    }
 
     if (!skipValidation) {
         int dfmpActivationHeight = Dilithion::g_chainParams ?
@@ -1381,6 +1448,16 @@ bool CChainState::ConnectTip(CBlockIndex* pindex, const CBlock& block, bool skip
         // After activation, reference blocks from expired MIK identities are
         // rejected. Depends on identity DB (GetLastMined), so must be inside
         // !skipValidation gate. IBD blocks below assumeValid are exempt.
+        //
+        // External round-2 (Grok + DeepSeek): CheckMIKExpiration now FAILS
+        // CLOSED on every parse failure (empty vtx / bad varint / coinbase
+        // deser / non-coinbase-form / no MIK data / no identity DB) instead of
+        // returning true. It stays INSIDE !skipValidation deliberately: it is
+        // NOT reorg-safe — GetLastMined/GetFirstSeen read the identity DB,
+        // whose undo is incomplete across a multi-block reorg (same reason
+        // CheckProofOfWorkDFMP stays here), so running it on a reorg connect
+        // could FALSELY reject a canonical block. Reorg-connected blocks are
+        // still covered by the reorg-safe tracker/attestation checks below.
         if (block.IsVDFBlock() && !assumeValid && pindex->nHeight > 0) {
             std::string expirationError;
             if (!CheckMIKExpiration(block, pindex->nHeight, expirationError)) {

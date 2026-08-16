@@ -249,7 +249,25 @@ public:
     void SetTestDisconnectTipOverride(DisconnectTipOverride h) { m_testDisconnectTipOverride = std::move(h); }
     void SetTestWriteBestBlockOverride(WriteBestBlockOverride h) { m_testWriteBestBlockOverride = std::move(h); }
     void SetTestReadBlockOverride(ReadBlockOverride h) { m_testReadBlockOverride = std::move(h); }
+
+    // ============================================================
+    // TEST-ONLY: UTXO-less ConnectTip opt-in (external round-2 HIGH).
+    // ============================================================
+    // ConnectTip FAILS CLOSED when no UTXO set is attached (pUTXOSet ==
+    // nullptr): with no UTXO set, neither the connect-path validator
+    // (ConnectBlockChecks: merkle / signatures / value / coinbase) nor
+    // ApplyBlock can run, so marking such a block BLOCK_VALID_CHAIN would be
+    // an unvalidated accept. Both node binaries call SetUTXOSet() before the
+    // first ActivateBestChain (genesis) — no production path connects without
+    // one — so the only legitimate UTXO-less callers are chain-selection /
+    // fork-staging unit tests that drive header-only CChainState instances.
+    // Those opt in EXPLICITLY, process-wide, via this switch (set in the Boost
+    // global fixture and at the top of the standalone test mains). Production
+    // never calls it; the default is false => fail closed.
+    static void SetTestAllowConnectWithoutUTXOSet(bool allow) { s_testAllowConnectWithoutUTXOSet = allow; }
+    static bool TestAllowConnectWithoutUTXOSet() { return s_testAllowConnectWithoutUTXOSet; }
 private:
+    static bool s_testAllowConnectWithoutUTXOSet;
     ConnectTipOverride m_testConnectTipOverride;
     DisconnectTipOverride m_testDisconnectTipOverride;
     WriteBestBlockOverride m_testWriteBestBlockOverride;
