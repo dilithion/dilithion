@@ -507,6 +507,8 @@ src/digital_dna/fingerprint_run*.json
 /fuzz_subsidy.exe
 /test_passphrase_validator
 /test_passphrase_validator.exe
+/test_dilithion
+/test_dilithion.exe
 
 # DLLs at repo root (copied from MSYS2 mingw64/bin during Windows packaging;
 # the authoritative copies live in MSYS2, not in this repo)
