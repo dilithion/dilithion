@@ -1322,7 +1322,18 @@ $(OBJ_DIR)/test/fuzz/fuzz_stubs.o: src/test/fuzz/fuzz_stubs.cpp | $(OBJ_DIR)/tes
 depends:
 	@echo "$(COLOR_YELLOW)Building dependencies...$(COLOR_RESET)"
 	@echo "$(COLOR_BLUE)[RandomX]$(COLOR_RESET) Building RandomX library..."
-	@cd depends/randomx && mkdir -p build-windows && cd build-windows && cmake -DCMAKE_SYSTEM_PROCESSOR=x86_64 -G "MSYS Makefiles" .. && make
+	@if [ ! -f $(RANDOMX_BUILD_DIR)/librandomx.a ]; then \
+		case "$(UNAME_S)" in \
+			MINGW*|MSYS*|Windows) \
+				cd depends/randomx && mkdir -p build-windows && cd build-windows && \
+				cmake -DCMAKE_SYSTEM_PROCESSOR=x86_64 -G "MSYS Makefiles" .. && $(MAKE) ;; \
+			*) \
+				cd depends/randomx && mkdir -p build && cd build && \
+				cmake -DCMAKE_BUILD_TYPE=Release .. && $(MAKE) ;; \
+		esac; \
+	else \
+		echo "  $(RANDOMX_BUILD_DIR)/librandomx.a already built"; \
+	fi
 	@echo "$(COLOR_BLUE)[Dilithium]$(COLOR_RESET) Building Dilithium reference C objects..."
 	@$(MAKE) --no-print-directory $(DILITHIUM_OBJECTS)
 	@echo "$(COLOR_BLUE)[libzmq]$(COLOR_RESET) Building libzmq static library..."
