@@ -15,11 +15,15 @@ const COLLAPSE_THRESHOLD = 5; // Show expand button when inputs/outputs exceed t
 let activeChain = localStorage.getItem('explorerChain') || 'dil';
 let UNIT = activeChain === 'dilv' ? 'DilV' : 'DIL';
 let BLOCK_REWARD_FALLBACK = activeChain === 'dilv' ? 100 : 50;
+// Source of truth: src/core/chainparams.cpp — DIL mainnet halvingInterval = 210000 (:42),
+// DilV halvingInterval = 1050000 (:440). DilV's ~45s blocks give it a 5x longer interval.
+let HALVING_INTERVAL = activeChain === 'dilv' ? 1050000 : 210000;
 
 function switchExplorerChain(chain) {
     activeChain = chain;
     UNIT = chain === 'dilv' ? 'DilV' : 'DIL';
     BLOCK_REWARD_FALLBACK = chain === 'dilv' ? 100 : 50;
+    HALVING_INTERVAL = chain === 'dilv' ? 1050000 : 210000;
     localStorage.setItem('explorerChain', chain);
     // Update toggle buttons
     const dilBtn = document.getElementById('chainBtnDil');
@@ -431,7 +435,6 @@ function detectTxType(tx) {
 
 // --- Dashboard helpers ---
 
-const HALVING_INTERVAL = 210000;
 const FLAG_EMOJI = { US: '\u{1F1FA}\u{1F1F8}', GB: '\u{1F1EC}\u{1F1E7}', SG: '\u{1F1F8}\u{1F1EC}', AU: '\u{1F1E6}\u{1F1FA}' };
 
 function getBlockReward(height) {
