@@ -8,14 +8,14 @@ Loaded by the generic close-session skill when present. Holds Dilithion's concre
 
 The three canonical clone roots (always include these, even if "I didn't touch them" — verify-before-assert):
 - `c:/Users/will/dilithion`
-- `c:/Users/will/dilithion-private`
+- `c:/Users/will/agent-comms`  *(was `c:/Users/will/dilithion-private` — that path NO LONGER EXISTS; the hub moved 2026-08-21, corrected 2026-08-31 when a close-session run fetched it and found nothing there)*
 - `c:/Users/will/dilithion-strategy`
 
 Plus a fourth repo (worktree under `c:/tmp/`, a separate `agent-comms` clone, anything else) if it is in the worktree-list output but not in the canonical three — INCLUDE it.
 
 Generic-skill placeholder mapping for this project:
 - `<working-repo>` → `c:/Users/will/dilithion`
-- `<agent-comms-hub>` → `c:/Users/will/dilithion-private`
+- `<agent-comms-hub>` → `c:/Users/will/agent-comms`  *(corrected 2026-08-31; the old `dilithion-private` path does not exist)*
 - `<strategy/state-repo>` → `c:/Users/will/dilithion-strategy`
 
 ### Strategy-repo pull (Step 1.3)
