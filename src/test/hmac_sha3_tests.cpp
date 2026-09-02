@@ -556,4 +556,80 @@ BOOST_AUTO_TEST_CASE(hmac_sha3_512_bip32_test_vector) {
     BOOST_CHECK(!all_zeros);
 }
 
+/**
+ * Known-answer tests for the empty-input edge cases (UBSan nonnull-attribute
+ * finding, PR #165 / CI-1). Every case below passes a NULL pointer with length
+ * 0, which the API explicitly accepts and which used to reach
+ * memcpy(dst, nullptr, 0) -- undefined behaviour under memcpy's nonnull
+ * attribute. The guards must not change a single output byte, so each case is
+ * pinned to a vector computed INDEPENDENTLY of this code with Python 3:
+ *
+ *   hmac.new(key, data, hashlib.sha3_256).hexdigest()
+ *   hmac.new(key, data, hashlib.sha3_512).hexdigest()
+ *
+ * (Python's hmac module + OpenSSL SHA3; nothing here is derived from the
+ * implementation under test.)
+ */
+BOOST_AUTO_TEST_CASE(hmac_sha3_256_empty_key_empty_data_kat) {
+    uint8_t output[32];
+    HMAC_SHA3_256(nullptr, 0, nullptr, 0, output);
+    const std::vector<uint8_t> expected = hex_to_bytes(
+        "e841c164e5b4f10c9f3985587962af72fd607a951196fc92fb3a5251941784ea");
+    BOOST_CHECK_EQUAL_COLLECTIONS(output, output + 32, expected.begin(), expected.end());
+}
+
+BOOST_AUTO_TEST_CASE(hmac_sha3_256_empty_data_with_key_kat) {
+    const uint8_t key[] = "test key";
+    uint8_t output[32];
+    HMAC_SHA3_256(key, sizeof(key) - 1, nullptr, 0, output);
+    const std::vector<uint8_t> expected = hex_to_bytes(
+        "1d7343d01fecaa36ec7d18bc273c3c9a10913ae17632945c3d5f725b656a00d5");
+    BOOST_CHECK_EQUAL_COLLECTIONS(output, output + 32, expected.begin(), expected.end());
+}
+
+BOOST_AUTO_TEST_CASE(hmac_sha3_256_empty_key_with_data_kat) {
+    const uint8_t data[] = "test data";
+    uint8_t output[32];
+    HMAC_SHA3_256(nullptr, 0, data, sizeof(data) - 1, output);
+    const std::vector<uint8_t> expected = hex_to_bytes(
+        "e38348ba4de2ed057991ea12cca70598cac9706a35609ee47fb12c9985cb507d");
+    BOOST_CHECK_EQUAL_COLLECTIONS(output, output + 32, expected.begin(), expected.end());
+}
+
+BOOST_AUTO_TEST_CASE(hmac_sha3_512_empty_key_empty_data_kat) {
+    uint8_t output[64];
+    HMAC_SHA3_512(nullptr, 0, nullptr, 0, output);
+    const std::vector<uint8_t> expected = hex_to_bytes(
+        "cbcf45540782d4bc7387fbbf7d30b3681d6d66cc435cafd82546b0fce96b367e"
+        "a79662918436fba442e81a01d0f9592dfcd30f7a7a8f1475693d30be4150ca84");
+    BOOST_CHECK_EQUAL_COLLECTIONS(output, output + 64, expected.begin(), expected.end());
+
+    // The std::vector overload must agree (an empty vector's data() may or may
+    // not be null -- both must take the same guarded path to the same digest).
+    std::vector<uint8_t> empty;
+    uint8_t output_vec[64];
+    HMAC_SHA3_512(empty, empty, output_vec);
+    BOOST_CHECK_EQUAL_COLLECTIONS(output_vec, output_vec + 64, expected.begin(), expected.end());
+}
+
+BOOST_AUTO_TEST_CASE(hmac_sha3_512_empty_data_with_key_kat) {
+    const uint8_t key[] = "test key";
+    uint8_t output[64];
+    HMAC_SHA3_512(key, sizeof(key) - 1, nullptr, 0, output);
+    const std::vector<uint8_t> expected = hex_to_bytes(
+        "356e327b42c4ba1243dd477332c9816612eef9389f62743418d97b94224d6f10"
+        "ac75384c26a1e46bd5c052789fed888f226c773a5e668ea0d374777699afd695");
+    BOOST_CHECK_EQUAL_COLLECTIONS(output, output + 64, expected.begin(), expected.end());
+}
+
+BOOST_AUTO_TEST_CASE(hmac_sha3_512_empty_key_with_data_kat) {
+    const uint8_t data[] = "test data";
+    uint8_t output[64];
+    HMAC_SHA3_512(nullptr, 0, data, sizeof(data) - 1, output);
+    const std::vector<uint8_t> expected = hex_to_bytes(
+        "324f39ef0d3352636e0a19bb6ed6c6b483c3aad057a518d43a330b507bf608d5"
+        "1934d01a3baa239b2422437877218f7ffc3163545bb966a2504eaf6895715263");
+    BOOST_CHECK_EQUAL_COLLECTIONS(output, output + 64, expected.begin(), expected.end());
+}
+
 BOOST_AUTO_TEST_SUITE_END() // hmac_sha3_tests
