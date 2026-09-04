@@ -7,6 +7,7 @@
 #include <net/serialize.h>
 #include <crypto/sha3.h>
 #include <uint256.h>
+#include <util/atomic_file.h>
 
 #include <cerrno>
 #include <cmath>
@@ -135,27 +136,8 @@ void XorScramble(uint8_t* data, size_t length,
     }
 }
 
-std::string FsyncParentDir(const std::filesystem::path& file_path) {
-#ifdef _WIN32
-    (void)file_path;
-    return std::string();
-#else
-    const std::filesystem::path parent = file_path.parent_path();
-    if (parent.empty()) return std::string();
-    int dir_fd = ::open(parent.c_str(), O_RDONLY);
-    if (dir_fd < 0) {
-        return "open parent dir for fsync failed: " +
-               std::string(std::strerror(errno));
-    }
-    if (::fsync(dir_fd) != 0) {
-        const std::string err = std::strerror(errno);
-        ::close(dir_fd);
-        return "fsync parent dir failed: " + err;
-    }
-    ::close(dir_fd);
-    return std::string();
-#endif
-}
+// (FsyncParentDir removed: the parent-directory fsync now lives in
+//  util::AtomicReplaceFile(durable=true), so there is one implementation.)
 
 std::string AtomicWrite(const std::filesystem::path& target,
                         const std::vector<uint8_t>& bytes) {
@@ -207,17 +189,20 @@ std::string AtomicWrite(const std::filesystem::path& target,
     }
     std::fclose(f);
 
-    std::error_code ec;
-    std::filesystem::rename(tmp, target, ec);
-    if (ec) {
-        const std::string err = ec.message();
+    // Publish atomically. Same change as src/node/mempool_persist.cpp (these
+    // two writers are line-for-line clones): the publish no longer depends on
+    // std::filesystem::rename's Windows behaviour, which is a libstdc++
+    // implementation detail rather than a guarantee. util::AtomicReplaceFile
+    // uses MoveFileExW(MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) on
+    // Windows and rename(2) + parent-dir fsync on POSIX; durable=true subsumes
+    // the FsyncParentDir call that used to follow. See src/util/atomic_file.h.
+    std::string move_err;
+    if (!util::AtomicReplaceFile(tmp, target, &move_err, /*durable=*/true)) {
+        // No-op if the replace succeeded and only the durability step failed;
+        // `target` is never removed.
         cleanup_tmp();
-        return "rename(" + tmp.string() + " -> " + target.string() +
-               ") failed: " + err;
+        return move_err;
     }
-
-    const std::string dir_err = FsyncParentDir(target);
-    if (!dir_err.empty()) return dir_err;
     return std::string();
 }
 

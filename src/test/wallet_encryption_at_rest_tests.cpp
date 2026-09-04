@@ -3141,6 +3141,252 @@ static void Test_F1R4_DeferredExportGatedByValidate() {
     std::remove(path.c_str());
 }
 
+// ---------------------------------------------------------------------------
+// Test — REGRESSION (LP-7 follow-up, ecosystem-sweep C-1): per-address keys
+// MINTED AFTER encryption must carry a v7 MAC. The three at-rest store sites —
+// GetNewHDAddress (DeriveAndCacheHDAddress), GetNewAddress (encrypted new-keypair
+// path), and ImportKey — stored the encrypted per-address key with an EMPTY
+// vchMAC. SaveUnlocked then wrote a macLen=0 v7 record, and the LP-7 loader
+// (Load: version>=v7 && encKey.vchMAC.empty() -> return false) refused the WHOLE
+// wallet on the next start, bricking it (total funds-access loss). This pins all
+// three paths: encrypt -> mint/import an address -> save -> a FRESH load must
+// SUCCEED and the key must be spendable from the on-disk v7 record. On the
+// unfixed binary every "wallet reloads" assertion below FAILS (Load returns
+// false). The fix mirrors EncryptWallet's per-address ComputeRecordMAC.
+// ---------------------------------------------------------------------------
+static void Test_V7PerAddressKeyMACRoundTrip() {
+    std::cout << COLOR_BLUE "\n[Regression C-1] Per-address keys minted post-encryption carry a v7 MAC (no brick)\n" COLOR_RESET;
+
+    const std::string pass = "P3r@ddr!MAC#R0undtr1p2026";
+
+    // --- (A) GetNewHDAddress -> DeriveAndCacheHDAddress store site ---
+    {
+        const std::string path = "lp7_reg_hdaddr_wallet.dat";
+        std::remove(path.c_str());
+        CDilithiumAddress newAddr;
+        {
+            CWallet w;
+            w.SetWalletFile(path);
+            std::string mnemonic;
+            CHECK(w.GenerateHDWallet(mnemonic), "(HD) generated HD wallet");
+            CHECK(w.EncryptWallet(pass), "(HD) encrypted wallet (stays unlocked)");
+            newAddr = w.GetNewHDAddress();   // buggy store site
+            CHECK(!newAddr.GetData().empty(), "(HD) minted a new HD address post-encryption");
+        }
+        CWallet w2;
+        w2.SetWalletFile(path);
+        bool loaded = w2.Load(path);
+        CHECK(loaded, "(HD) LOAD-BEARING: wallet reloads after minting an HD address (NOT bricked)");
+        CHECK(loaded && FileVersion(path) == WALLET_FILE_VERSION_7, "(HD) on-disk file is v7");
+        CKey rec;
+        bool spendable = loaded && w2.Unlock(pass) && w2.GetKey(newAddr, rec);
+        CHECK(spendable, "(HD) minted address is spendable from the on-disk v7 record");
+        std::remove(path.c_str());
+    }
+
+    // --- (B) GenerateNewKey -> encrypted new-keypair store site (3rd site) ---
+    {
+        const std::string path = "lp7_reg_newaddr_wallet.dat";
+        std::remove(path.c_str());
+        CDilithiumAddress newAddr;
+        {
+            CWallet w;
+            w.SetWalletFile(path);
+            std::string mnemonic;
+            CHECK(w.GenerateHDWallet(mnemonic), "(NewKey) generated HD wallet");
+            CHECK(w.EncryptWallet(pass), "(NewKey) encrypted wallet");
+            CHECK(w.GenerateNewKey(), "(NewKey) minted a non-HD key post-encryption (GenerateNewKey)");
+            newAddr = w.GetAddresses().back();   // GenerateNewKey appends → hits the line 257 store
+            CHECK(!newAddr.GetData().empty(), "(NewKey) captured the minted address");
+        }
+        CWallet w2;
+        w2.SetWalletFile(path);
+        bool loaded = w2.Load(path);
+        CHECK(loaded, "(NewKey) LOAD-BEARING: wallet reloads after GenerateNewKey (NOT bricked)");
+        CKey rec;
+        bool spendable = loaded && w2.Unlock(pass) && w2.GetKey(newAddr, rec);
+        CHECK(spendable, "(NewKey) minted address is spendable from the on-disk v7 record");
+        std::remove(path.c_str());
+    }
+
+    // --- (C) ImportKey -> importprivkey store site ---
+    {
+        const std::string path = "lp7_reg_import_wallet.dat";
+        std::remove(path.c_str());
+        CKey imported;
+        CHECK(WalletCrypto::GenerateKeyPair(imported), "(Import) generated a keypair to import");
+        CDilithiumAddress impAddr(imported.vchPubKey);
+        {
+            CWallet w;
+            w.SetWalletFile(path);
+            std::string mnemonic;
+            CHECK(w.GenerateHDWallet(mnemonic), "(Import) generated HD wallet");
+            CHECK(w.EncryptWallet(pass), "(Import) encrypted wallet");
+            CHECK(w.ImportKey(imported, impAddr), "(Import) imported a key into the encrypted wallet");
+        }
+        CWallet w2;
+        w2.SetWalletFile(path);
+        bool loaded = w2.Load(path);
+        CHECK(loaded, "(Import) LOAD-BEARING: wallet reloads after importprivkey (NOT bricked)");
+        CKey rec;
+        bool spendable = loaded && w2.Unlock(pass) && w2.GetKey(impAddr, rec);
+        CHECK(spendable &&
+              std::vector<uint8_t>(rec.vchPrivKey.begin(), rec.vchPrivKey.end()) ==
+              std::vector<uint8_t>(imported.vchPrivKey.begin(), imported.vchPrivKey.end()),
+              "(Import) imported private key round-trips from the on-disk v7 record");
+        std::remove(path.c_str());
+    }
+
+    // --- (D) KEYING-MATCH on a LOADED LEGACY v6 wallet (red-team CRITICAL-1):
+    //         a non-HD v6 wallet NEVER migrates, so minting must write a LEGACY-
+    //         keyed MAC (matching VerifyRecordMAC's legacy keying for v<7), not a
+    //         v7-keyed MAC. With the v7-only keying, the minted key loads but is
+    //         silently UNSPENDABLE after reload (MAC verify mismatch). ---
+    {
+        const std::string path = "lp7_reg_v6mint_wallet.dat";
+        std::remove(path.c_str());
+        LegacyV6NonHDResult v6;
+        bool built = BuildLegacyV6NonHDWalletWithKey(path, pass, v6);
+        CHECK(built, "(v6-mint) built legacy v6 non-HD wallet");
+        if (built) {
+            CDilithiumAddress mintedAddr;
+            {
+                CWallet w;
+                w.SetWalletFile(path);            // autosave on
+                CHECK(w.Load(path), "(v6-mint) loaded legacy v6 wallet");
+                CHECK(w.Unlock(pass), "(v6-mint) unlocked (non-HD v6 -> NO migration)");
+                CHECK(FileVersion(path) == WALLET_FILE_VERSION_6,
+                      "(v6-mint) wallet stays v6 after unlock (no migration)");
+                CHECK(w.GenerateNewKey(), "(v6-mint) minted a non-HD key on the v6 wallet (GenerateNewKey)");
+                mintedAddr = w.GetAddresses().back();   // hits the line 257 store at v6
+                CHECK(!mintedAddr.GetData().empty(), "(v6-mint) captured the minted address");
+                CHECK(FileVersion(path) == WALLET_FILE_VERSION_6,
+                      "(v6-mint) file STILL v6 after minting (no v7 promotion)");
+            }
+            CWallet w2;
+            w2.SetWalletFile(path);
+            bool loaded = w2.Load(path);
+            CHECK(loaded, "(v6-mint) wallet reloads after minting on a v6 wallet");
+            CKey rec;
+            bool spendable = loaded && w2.Unlock(pass) && w2.GetKey(mintedAddr, rec);
+            CHECK(spendable,
+                  "(v6-mint) LOAD-BEARING (CRITICAL-1): key minted on a v6 wallet is SPENDABLE after reload (keying matches verify side)");
+        }
+        std::remove(path.c_str());
+    }
+
+    // --- (E) KEYING-MATCH for ImportKey on a LOADED LEGACY v6 wallet (Cursor/GLM
+    //         GO-WITH-REVISIONS fold). Sibling of cell (D) but exercises the
+    //         ImportKey@511-513 mint site instead of GenerateNewKey. A NON-HD v6
+    //         wallet NEVER migrates (migration arms only inside the HD branch), so
+    //         m_loadedFileVersion stays 6 on BOTH the mint and the reload → verify
+    //         uses legacy keying on both. WITH the fix the legacy-keyed MAC written
+    //         here matches (spendable); WITHOUT the fix a v7-keyed MAC mismatches and
+    //         the imported key is silently UNSPENDABLE. This is the CLEAN, fully
+    //         non-vacuous arm: no migration re-MAC can mask it. ---
+    {
+        const std::string path = "lp7_reg_v6import_wallet.dat";
+        std::remove(path.c_str());
+        LegacyV6NonHDResult v6;
+        bool built = BuildLegacyV6NonHDWalletWithKey(path, pass, v6);
+        CHECK(built, "(v6-import) built legacy v6 non-HD wallet");
+        if (built) {
+            // Fresh keypair to import (cell C's pattern).
+            CKey imported;
+            CHECK(WalletCrypto::GenerateKeyPair(imported), "(v6-import) generated a keypair to import");
+            CDilithiumAddress impAddr(imported.vchPubKey);
+            {
+                CWallet w;
+                w.SetWalletFile(path);            // autosave on (non-HD → no migration to mask)
+                CHECK(w.Load(path), "(v6-import) loaded legacy v6 wallet");
+                CHECK(w.Unlock(pass), "(v6-import) unlocked (non-HD v6 -> NO migration)");
+                CHECK(FileVersion(path) == WALLET_FILE_VERSION_6,
+                      "(v6-import) wallet stays v6 after unlock (no migration)");
+                // ImportKey precondition: !mapCryptedKeys.empty() — the builder seeded
+                // one legacy-MAC'd per-address key, so this holds on the unlocked v6 wallet.
+                CHECK(w.ImportKey(imported, impAddr),
+                      "(v6-import) imported a key on the v6 wallet (ImportKey, autosaves)");
+                CHECK(FileVersion(path) == WALLET_FILE_VERSION_6,
+                      "(v6-import) file STILL v6 after importing (no v7 promotion)");
+            }
+            CWallet w2;
+            w2.SetWalletFile(path);
+            bool loaded = w2.Load(path);
+            CHECK(loaded, "(v6-import) wallet reloads after importing on a v6 wallet");
+            CKey rec;
+            bool spendable = loaded && w2.Unlock(pass) && w2.GetKey(impAddr, rec);
+            CHECK(spendable &&
+                  std::vector<uint8_t>(rec.vchPrivKey.begin(), rec.vchPrivKey.end()) ==
+                  std::vector<uint8_t>(imported.vchPrivKey.begin(), imported.vchPrivKey.end()),
+                  "(v6-import) LOAD-BEARING: key imported on a v6 wallet is SPENDABLE after reload and the private key round-trips (keying matches verify side)");
+        }
+        std::remove(path.c_str());
+    }
+
+    // --- (F) KEYING-MATCH for GetNewHDAddress -> DeriveAndCacheHDAddress@5741-5743
+    //         on a LOADED LEGACY v6 HD wallet (the path Cursor named). This arm is
+    //         ENTANGLED with seed migration and is made genuinely NON-VACUOUS by
+    //         exploiting the migration-FAILED-TO-PERSIST window.
+    //
+    //         EMPIRICAL basis (verified against wallet.cpp):
+    //           • MigrateToEncryptedSeedV7Unlocked early-returns false with NO
+    //             in-memory mutation when (!m_autoSave || m_walletFile.empty())
+    //             (wallet.cpp ~5818-5820). The per-record re-MAC loop that re-keys
+    //             every key to v7 (Step 2c, ~6047-6074) lives AFTER that guard, so
+    //             an autosave-OFF unlock does NOT run it: in-memory MACs stay legacy
+    //             and m_loadedFileVersion STAYS 6 (same pattern proven by
+    //             Test_M1_FlagTracksOnDiskNotInMemory ~line 1399).
+    //         So: load autosave-OFF, Unlock (stays v6, migration deferred), mint via
+    //         GetNewHDAddress (DeriveAndCacheHDAddress mints at v6 → legacy-keyed MAC),
+    //         then persist with the public Save(path) — which, at m_loadedFileVersion==6,
+    //         writes the v6 layout. Reload ALSO autosave-OFF so the reload's Unlock
+    //         again defers migration (stays v6) and GetKey verifies the minted key with
+    //         legacy keying against the on-disk legacy-keyed MAC. WITH the fix this
+    //         matches (spendable); WITHOUT it (v7-keyed mint MAC) it mismatches. ---
+    {
+        const std::string path = "lp7_reg_v6hdmint_wallet.dat";
+        std::remove(path.c_str());
+        LegacyV6Result legacy;
+        bool built = BuildLegacyV6Wallet(path, pass, legacy);
+        CHECK(built, "(v6-hdmint) built legacy v6 plaintext-seed HD wallet");
+        if (built) {
+            CDilithiumAddress mintedAddr;
+            {
+                // Autosave OFF (no SetWalletFile) → Unlock's migration early-returns
+                // before the in-memory re-MAC loop; the wallet stays v6 in memory.
+                CWallet w;
+                CHECK(w.Load(path), "(v6-hdmint) loaded legacy v6 HD wallet (autosave OFF)");
+                CHECK(w.NeedsSeedMigration(), "(v6-hdmint) pre-unlock: migration armed");
+                CHECK(w.Unlock(pass), "(v6-hdmint) unlocked (migration cannot persist → deferred)");
+                // Migration deferred: in-memory keying stays v6 (no re-MAC loop ran).
+                CHECK(w.NeedsSeedMigration(),
+                      "(v6-hdmint) migration STAYS armed after autosave-off unlock (stays v6 in memory)");
+                CHECK(FileVersion(path) == WALLET_FILE_VERSION_6,
+                      "(v6-hdmint) on-disk file STILL v6 after autosave-off unlock");
+                mintedAddr = w.GetNewHDAddress();   // mints at v6 → DeriveAndCacheHDAddress@5743
+                CHECK(!mintedAddr.GetData().empty(), "(v6-hdmint) minted an HD address on the v6 wallet");
+                // Persist explicitly via the public writer. At m_loadedFileVersion==6 the
+                // version-aware writer emits the v6 layout, so the file stays v6.
+                CHECK(w.Save(path), "(v6-hdmint) persisted the minted key via Save(path)");
+                CHECK(FileVersion(path) == WALLET_FILE_VERSION_6,
+                      "(v6-hdmint) file STILL v6 after Save (no v7 promotion)");
+            }
+            // Reload autosave-OFF too, so the reload's Unlock again defers migration and
+            // GetKey verifies at m_loadedFileVersion==6 against the on-disk legacy MAC.
+            CWallet w2;
+            bool loaded = w2.Load(path);
+            CHECK(loaded, "(v6-hdmint) wallet reloads after minting an HD address on a v6 wallet");
+            CHECK(loaded && FileVersion(path) == WALLET_FILE_VERSION_6,
+                  "(v6-hdmint) reloaded file is still v6 (verify reads at v6)");
+            CKey rec;
+            bool spendable = loaded && w2.Unlock(pass) && w2.GetKey(mintedAddr, rec);
+            CHECK(spendable,
+                  "(v6-hdmint) LOAD-BEARING: HD address minted on a v6 wallet is SPENDABLE after reload (DeriveAndCacheHDAddress keying matches verify side)");
+        }
+        std::remove(path.c_str());
+    }
+}
+
 int main() {
     std::cout << COLOR_BLUE "==== LP-7 wallet encryption-at-rest tests ====" COLOR_RESET "\n";
 
@@ -3158,6 +3404,7 @@ int main() {
     Test_PerRecordMACIsolation();
     Test_AtomicRenameCrashWindow();
     Test_LegacyPerAddressKey();
+    Test_V7PerAddressKeyMACRoundTrip();   // ecosystem-sweep C-1 regression
     Test_ChangePassphraseLegacyNonHD();
     Test_ChangePassphraseLegacyV6WithMIK();
     Test_EncryptWalletRollback();

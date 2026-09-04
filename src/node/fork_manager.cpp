@@ -322,7 +322,7 @@ std::shared_ptr<ForkCandidate> ForkManager::CreateForkCandidate(
 
     // Deep forks (> MAX_AUTO_REORG_DEPTH) are handled by DisconnectToHeight()
     // in AttemptForkRecovery() before reaching this point.
-    // ActivateBestChain() enforces MAX_REORG_DEPTH=100 for shallow forks.
+    // ActivateBestChain() enforces Consensus::MAX_REORG_DEPTH for shallow forks.
 
     m_activeFork = std::make_shared<ForkCandidate>(forkTipHash, forkPointHeight, expectedTipHeight, expectedHashes);
 

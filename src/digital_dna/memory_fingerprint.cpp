@@ -1,4 +1,5 @@
 #include "memory_fingerprint.h"
+#include "dna_serialize.h"  // WF-1: explicit-LE consensus serialization helpers
 
 #include <algorithm>
 #include <cmath>
@@ -246,34 +247,27 @@ std::string MemoryFingerprint::to_json() const {
 }
 
 std::vector<uint8_t> MemoryFingerprint::serialize() const {
+    // WF-1: explicit little-endian (byte-identical on LE hosts to the previous
+    // reinterpret_cast copies; portable across architectures).
     std::vector<uint8_t> data;
 
     // Header: probe count (4 bytes)
     uint32_t count = static_cast<uint32_t>(access_curve.size());
-    data.insert(data.end(), reinterpret_cast<const uint8_t*>(&count),
-                reinterpret_cast<const uint8_t*>(&count) + 4);
+    dna_le::put_u32(data, count);
 
-    // Each probe: working_set_kb(4) + access_time_ns(8) + bandwidth_mbps(8) = 20 bytes
+    // Each probe: working_set_kb(4) + access_time_ns(8,double) + bandwidth_mbps(8,double) = 20 bytes
     for (const auto& p : access_curve) {
-        data.insert(data.end(), reinterpret_cast<const uint8_t*>(&p.working_set_kb),
-                    reinterpret_cast<const uint8_t*>(&p.working_set_kb) + 4);
-        data.insert(data.end(), reinterpret_cast<const uint8_t*>(&p.access_time_ns),
-                    reinterpret_cast<const uint8_t*>(&p.access_time_ns) + 8);
-        data.insert(data.end(), reinterpret_cast<const uint8_t*>(&p.bandwidth_mbps),
-                    reinterpret_cast<const uint8_t*>(&p.bandwidth_mbps) + 8);
+        dna_le::put_u32(data, p.working_set_kb);
+        dna_le::put_double(data, p.access_time_ns);
+        dna_le::put_double(data, p.bandwidth_mbps);
     }
 
     // Derived features: 5 doubles = 40 bytes
-    data.insert(data.end(), reinterpret_cast<const uint8_t*>(&estimated_l1_kb),
-                reinterpret_cast<const uint8_t*>(&estimated_l1_kb) + 8);
-    data.insert(data.end(), reinterpret_cast<const uint8_t*>(&estimated_l2_kb),
-                reinterpret_cast<const uint8_t*>(&estimated_l2_kb) + 8);
-    data.insert(data.end(), reinterpret_cast<const uint8_t*>(&estimated_l3_kb),
-                reinterpret_cast<const uint8_t*>(&estimated_l3_kb) + 8);
-    data.insert(data.end(), reinterpret_cast<const uint8_t*>(&dram_latency_ns),
-                reinterpret_cast<const uint8_t*>(&dram_latency_ns) + 8);
-    data.insert(data.end(), reinterpret_cast<const uint8_t*>(&peak_bandwidth_mbps),
-                reinterpret_cast<const uint8_t*>(&peak_bandwidth_mbps) + 8);
+    dna_le::put_double(data, estimated_l1_kb);
+    dna_le::put_double(data, estimated_l2_kb);
+    dna_le::put_double(data, estimated_l3_kb);
+    dna_le::put_double(data, dram_latency_ns);
+    dna_le::put_double(data, peak_bandwidth_mbps);
 
     return data;
 }
@@ -292,22 +286,23 @@ MemoryFingerprint MemoryFingerprint::deserialize(const std::vector<uint8_t>& dat
     // Sanity check
     if (count > 100 || data.size() < offset + count * 20 + 40) return fp;
 
+    // WF-1: explicit little-endian reads, matched to serialize() above.
     // Read probes
     fp.access_curve.reserve(count);
     for (uint32_t i = 0; i < count; i++) {
         MemoryProbeResult p;
-        std::memcpy(&p.working_set_kb, data.data() + offset, 4); offset += 4;
-        std::memcpy(&p.access_time_ns, data.data() + offset, 8); offset += 8;
-        std::memcpy(&p.bandwidth_mbps, data.data() + offset, 8); offset += 8;
+        p.working_set_kb = dna_le::get_u32(data.data() + offset); offset += 4;
+        p.access_time_ns = dna_le::get_double(data.data() + offset); offset += 8;
+        p.bandwidth_mbps = dna_le::get_double(data.data() + offset); offset += 8;
         fp.access_curve.push_back(p);
     }
 
     // Read derived features
-    std::memcpy(&fp.estimated_l1_kb, data.data() + offset, 8); offset += 8;
-    std::memcpy(&fp.estimated_l2_kb, data.data() + offset, 8); offset += 8;
-    std::memcpy(&fp.estimated_l3_kb, data.data() + offset, 8); offset += 8;
-    std::memcpy(&fp.dram_latency_ns, data.data() + offset, 8); offset += 8;
-    std::memcpy(&fp.peak_bandwidth_mbps, data.data() + offset, 8); offset += 8;
+    fp.estimated_l1_kb = dna_le::get_double(data.data() + offset); offset += 8;
+    fp.estimated_l2_kb = dna_le::get_double(data.data() + offset); offset += 8;
+    fp.estimated_l3_kb = dna_le::get_double(data.data() + offset); offset += 8;
+    fp.dram_latency_ns = dna_le::get_double(data.data() + offset); offset += 8;
+    fp.peak_bandwidth_mbps = dna_le::get_double(data.data() + offset); offset += 8;
 
     return fp;
 }
