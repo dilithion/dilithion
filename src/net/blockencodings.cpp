@@ -247,29 +247,27 @@ void CBlockHeaderAndShortTxIDs::FillShortTxIDSelector() const
     // MAINNET FIX: Document buffer layout and add compile-time bounds verification
     // Serialize header (80 bytes) + nonce (8 bytes) = 88 bytes total
     // Layout: [version:4][prevhash:32][merkle:32][time:4][bits:4][nonce:4][shortnonce:8]
-    static constexpr size_t HEADER_WITH_NONCE_SIZE = 88;
+    static constexpr size_t SHORTNONCE_OFFSET = MINING_HEADER_SIZE;
+    static constexpr size_t HEADER_WITH_NONCE_SIZE = SHORTNONCE_OFFSET + 8;  // 88
     uint8_t data[HEADER_WITH_NONCE_SIZE];
 
     // Compile-time bounds verification
-    static_assert(0 + 4 <= HEADER_WITH_NONCE_SIZE, "version overflow");
-    static_assert(4 + 32 <= HEADER_WITH_NONCE_SIZE, "prevhash overflow");
-    static_assert(36 + 32 <= HEADER_WITH_NONCE_SIZE, "merkle overflow");
-    static_assert(68 + 4 <= HEADER_WITH_NONCE_SIZE, "time overflow");
-    static_assert(72 + 4 <= HEADER_WITH_NONCE_SIZE, "bits overflow");
-    static_assert(76 + 4 <= HEADER_WITH_NONCE_SIZE, "nonce overflow");
-    static_assert(80 + 8 <= HEADER_WITH_NONCE_SIZE, "shortnonce overflow");
+    static_assert(MINING_HEADER_SIZE == 80, "legacy mining header must stay 80 bytes");
+    static_assert(HEADER_WITH_NONCE_SIZE == 88, "short-txid preimage must stay 88 bytes");
+    static_assert(SHORTNONCE_OFFSET + 8 <= HEADER_WITH_NONCE_SIZE, "shortnonce overflow");
 
-    // Header serialization (bounds verified at compile time)
+    // K1: this was a THIRD hand-written copy of the 80-byte header layout (bare literals
+    // 0/4/36/68/72/76), missed when the miner and helper copies were unified. It now routes
+    // through the single canonical assembler in primitives/block.h so a future layout change
+    // cannot silently desynchronise the short-txid selector from the miner's PoW preimage.
+    // Byte-identical to the previous inline sequence: WriteMiningHeaderLE writes exactly the
+    // same six fields at the same offsets with the same WriteLE32 calls, and uint256::begin()
+    // returns the same pointer as uint256::data.
+    //
     // WF-1: explicit little-endian for the multi-byte scalars so the SHA3
     // short-txid selector key is computed identically on every architecture.
-    // Byte-identical to the previous host-endian memcpy on LE hosts.
-    WriteLE32(data, static_cast<uint32_t>(header.nVersion));
-    memcpy(data + 4, header.hashPrevBlock.data, 32);
-    memcpy(data + 36, header.hashMerkleRoot.data, 32);
-    WriteLE32(data + 68, header.nTime);
-    WriteLE32(data + 72, header.nBits);
-    WriteLE32(data + 76, header.nNonce);
-    WriteLE64(data + 80, nonce);
+    WriteMiningHeaderLE(data, header, header.nNonce);
+    WriteLE64(data + SHORTNONCE_OFFSET, nonce);
 
     // SHA3-256 hash
     uint8_t hash[32];

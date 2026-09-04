@@ -5,6 +5,12 @@
 #define DILITHION_CONSENSUS_PARAMS_H
 
 #include <amount.h>
+#include <cstddef>  // std::size_t / size_t — several constants below are size_t-typed.
+                    // Without this, params.h is not self-contained: any TU that
+                    // includes it before something that drags in <cstddef>
+                    // fails with "'size_t' does not name a type" on libstdc++.
+                    // Caught when the standalone suites were first actually
+                    // compiled on Linux/gcc (F4); <cstdint> does not guarantee it.
 #include <cstdint>
 
 /**

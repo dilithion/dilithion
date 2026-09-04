@@ -1,0 +1,127 @@
+name: Standalone Test Suites (full tier)
+
+# ============================================================================
+# The slow / special-hardware half of the standalone test corpus.
+#
+# The PR-gating half runs as a step inside ci.yml's build-and-test job
+# (`make tests-fast`). This workflow runs `make tests-full`: suites that are
+# too slow for a PR gate, plus randomx_mode_test, which needs a hugetlb pool to
+# mean anything at all.
+#
+# WHY randomx_mode_test NEEDS THIS JOB
+#   Test 4 in src/test/randomx_mode_test.cpp is the control proving that using
+#   large pages does not perturb RandomX hash output — a consensus-critical
+#   property. On a host with NO hugetlb pool (i.e. every default CI runner and
+#   most dev machines) the large-page allocation silently falls back to
+#   standard pages, so the test compares hash_full against hash_full_lp when
+#   BOTH came from the same standard-page allocation: a value compared against
+#   itself. It passes while covering nothing.
+#
+#   The binary already ships the escape hatch —
+#   DILITHION_TEST_REQUIRE_LARGE_PAGES=1 turns "large pages did not engage"
+#   into a hard failure — but before this workflow, NO job and NO script
+#   anywhere set it. This job reserves the pool and sets it, so the control is
+#   real. If the pool cannot be reserved, the job FAILS rather than running the
+#   vacuous version, because a green tick on a self-comparison is worse than no
+#   tick. scripts/run_test_suites.sh separately reports the fallback-only run
+#   as DEGRADED (never PASS) anywhere else it is executed.
+# ============================================================================
+
+on:
+  schedule:
+    # 03:17 UTC daily — off the hour to avoid GitHub's scheduling spikes.
+    - cron: '17 3 * * *'
+  workflow_dispatch:
+  pull_request:
+    # Also run on PRs that touch the roster or this workflow, so a change to
+    # the tiering is validated by the tier it changes.
+    paths:
+      - 'scripts/run_test_suites.sh'
+      - '.github/workflows/test-suites-full.yml'
+      - 'Makefile'
+
+jobs:
+  full-tier:
+    name: Full-tier standalone suites (+ large pages)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v6
+      with:
+        submodules: recursive
+
+    - name: Install dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y \
+          build-essential \
+          cmake \
+          libleveldb-dev \
+          libssl-dev \
+          libboost-test-dev \
+          libminiupnpc-dev
+
+    - name: Reserve hugetlb pool for the RandomX large-page control
+      id: hugepages
+      run: |
+        # RandomX's full dataset is ~2080 MiB. With 2 MiB huge pages that is
+        # 1040 pages; ask for 1280 to leave headroom for the scratchpad/VM
+        # allocations that also request large pages.
+        sudo sysctl -w vm.nr_hugepages=1280 || true
+        cat /proc/meminfo | grep -i huge
+        TOTAL=$(awk '/HugePages_Total/ {print $2}' /proc/meminfo)
+        echo "HugePages_Total=$TOTAL"
+        if [ "${TOTAL:-0}" -lt 1040 ]; then
+          echo "::error::Could not reserve a hugetlb pool (got ${TOTAL:-0} pages, need >= 1040)."
+          echo "Without a pool, randomx_mode_test's large-page control compares a value"
+          echo "against itself and passes while covering nothing. Failing loudly instead."
+          exit 1
+        fi
+        echo "reserved=true" >> "$GITHUB_OUTPUT"
+
+    - name: Build RandomX
+      run: |
+        cd depends/randomx
+        mkdir -p build
+        cd build
+        cmake ..
+        make -j$(nproc)
+
+    - name: Build Dilithium library
+      run: |
+        if [ ! -f depends/dilithium/ref/sign.c ]; then
+          echo "ERROR: Dilithium source files missing. They should be tracked in the repo."
+          exit 1
+        fi
+        if [ ! -f depends/dilithium/ref/Makefile ]; then
+          echo 'CC ?= /usr/bin/cc' > depends/dilithium/ref/Makefile
+          echo 'CFLAGS += -Wall -Wextra -Wpedantic -Wmissing-prototypes -Wredundant-decls -Wshadow -Wvla -Wpointer-arith -O3 -fomit-frame-pointer' >> depends/dilithium/ref/Makefile
+          echo 'SOURCES = sign.c packing.c polyvec.c poly.c ntt.c reduce.c rounding.c fips202.c symmetric-shake.c randombytes.c' >> depends/dilithium/ref/Makefile
+          echo '.PHONY: all clean' >> depends/dilithium/ref/Makefile
+          echo 'all:' >> depends/dilithium/ref/Makefile
+          printf '\t$(CC) $(CFLAGS) -DDILITHIUM_MODE=3 -c $(SOURCES)\n' >> depends/dilithium/ref/Makefile
+          echo 'clean:' >> depends/dilithium/ref/Makefile
+          printf '\trm -f *.o\n' >> depends/dilithium/ref/Makefile
+        fi
+        cd depends/dilithium/ref
+        make clean || true
+        make -j$(nproc)
+
+    - name: Run full-tier suites (large pages REQUIRED)
+      env:
+        # The whole point of this job: make "large pages did not engage" a hard
+        # failure instead of a silent pass. Set by no other job or script.
+        DILITHION_TEST_REQUIRE_LARGE_PAGES: '1'
+      run: |
+        make tests-full -j$(nproc)
+
+    - name: Upload standalone suite logs
+      if: always()
+      uses: actions/upload-artifact@v7
+      with:
+        name: standalone-suite-logs-full
+        path: test-suite-logs/
+        retention-days: 14
+        if-no-files-found: ignore

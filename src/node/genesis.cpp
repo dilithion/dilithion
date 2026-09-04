@@ -9,6 +9,7 @@
 #include <core/chainparams.h>
 #include <vdf/coinbase_vdf.h>
 #include <util/base58.h>
+#include <util/logging.h>
 
 #include <cstring>
 #include <iostream>
@@ -211,22 +212,118 @@ CBlock CreateDilVGenesisBlock() {
     return genesis;
 }
 
+CBlock CreateGenesisBlockForChain() {
+    if (!Dilithion::g_chainParams) {
+        throw std::runtime_error("Chain parameters not initialized. Call InitChainParams() first.");
+    }
+    return Dilithion::g_chainParams->IsVdfFromGenesis()
+        ? CreateDilVGenesisBlock()
+        : CreateGenesisBlock();
+}
+
 uint256 GetGenesisHash() {
     static uint256 hash;
-    static bool initialized = false;
+    static std::string genesisFault;  // non-empty => persistent-mismatch, every call throws
+    static std::once_flag genesisHashOnce;
 
-    if (!initialized) {
-        // Use VDF genesis for any chain with VDF active from genesis (DilV, or testnet in VDF-only mode)
-        bool useVdfGenesis = Dilithion::g_chainParams &&
-            (Dilithion::g_chainParams->IsDilV() ||
-             (Dilithion::g_chainParams->vdfActivationHeight == 0 &&
-              Dilithion::g_chainParams->vdfExclusiveHeight == 0));
-        CBlock genesis = useVdfGenesis ?
-            CreateDilVGenesisBlock() : CreateGenesisBlock();
-        hash = genesis.GetHash();
-        initialized = true;
+    // ── SINGLE-SOURCE GENESIS HASH + INTEGRITY GUARD (2026-06-28) ─────────────
+    // call_once: the previous `static bool initialized` lazy-init was an unguarded
+    // data race — C++ magic-statics protect only the FIRST default construction of
+    // `hash`, NOT the later assignment inside the `if`, so two threads racing the
+    // first call could both enter the block (or read `hash` before the other's
+    // write was visible). call_once serializes it.
+    //
+    // Integrity: this accessor is the SINGLE canonical source of the genesis hash
+    // consumed across the node — the startup DB key (dilithion-node/dilv-node), the
+    // headers manager, the P2P version message AND the per-peer genesis/ban check
+    // (net.cpp:2248/:582). The RandomX (legacy) / SHA3 (VDF) recompute was observed
+    // once, on an 8GB+ miner, to transiently produce a WRONG value; persisting OR
+    // advertising it strands the node on a private 1-block chain and gets its IP
+    // banned (`invalid_genesis`). chainparams pins the canonical hash for mainnet +
+    // DilV and the pin cannot be attacker-influenced, so when a pin exists we TRUST
+    // IT: if the recompute disagrees, log loudly (fault stays visible) and use the
+    // pinned value — no consumer ever sees a miscomputed genesis. Testnet leaves the
+    // pin empty (computed at startup) → unguarded, as before.
+    std::call_once(genesisHashOnce, []() {
+        // Refuse to populate the cache before chainparams are selected: caching an
+        // UNVALIDATED (un-pinned) hash for the process lifetime would silently
+        // defeat the integrity check below. CreateGenesisBlock() already throws on
+        // null params, but enforce the invariant locally so it is self-documenting
+        // and survives a future refactor of that helper. Throwing leaves the
+        // once_flag un-armed, so a correctly-ordered later call performs the
+        // validated compute rather than poisoning the cache. (No such early caller
+        // exists today — g_chainParams is set at startup before any genesis work.)
+        // CAVEAT (2026-08-15): the unarmed-retry semantics hold on glibc only;
+        // MinGW/winpthreads call_once mishandles exceptional passthrough and a
+        // throw here would deadlock later callers on Windows. Kept as a throw
+        // because recover-on-retry is the intended contract and no caller can
+        // reach it today; if an early caller ever appears, convert to the
+        // fault-sentinel pattern used for the pin mismatch below.
+        if (!Dilithion::g_chainParams) {
+            throw std::runtime_error("GetGenesisHash() called before chainparams initialized");
+        }
+
+        // Use VDF genesis for any chain with VDF active from genesis (DilV,
+        // testnet, regtest). Semantics unchanged — the predicate that used to be
+        // inlined here now lives in ChainParams::IsVdfFromGenesis() so every
+        // consumer answers the question identically.
+        CBlock genesis = CreateGenesisBlockForChain();
+        uint256 computed = genesis.GetHash();
+
+        if (Dilithion::g_chainParams && !Dilithion::g_chainParams->genesisHash.empty()) {
+            const uint256 pinned = uint256S(Dilithion::g_chainParams->genesisHash);
+            if (!(computed == pinned)) {
+                // Mismatch. The pin cannot be attacker-influenced, but silently
+                // substituting it would let a node whose CONSTRUCTION (not just
+                // hashing) faulted persist a corrupt genesis block under the
+                // correct key (red-team B/HIGH-1: incoherent block store).
+                // Discriminate transient from persistent by reconstructing once:
+                //   - transient RandomX/compute fault (the observed 8GB+ miner
+                //     case): the retry matches the pin and the node proceeds —
+                //     liveness preserved, fault logged.
+                //   - persistent mismatch: this binary cannot reproduce its own
+                //     pinned genesis; nothing it computes can be trusted. Abort
+                //     loudly rather than run on substituted values. (Throwing
+                //     leaves the once_flag unarmed, so a restart retries.)
+                LogPrintf(ALL, ERROR,
+                    "[GENESIS] recomputed genesis hash %s does not match the value pinned in "
+                    "chainparams %s — reconstructing once to discriminate a transient compute "
+                    "fault (see ops board randomx-genesis-init-corruption)",
+                    computed.GetHex().c_str(), pinned.GetHex().c_str());
+                CBlock retry = CreateGenesisBlockForChain();
+                const uint256 recomputed = retry.GetHash();
+                if (recomputed == pinned) {
+                    LogPrintf(ALL, ERROR,
+                        "[GENESIS] retry matches the pin — transient compute fault healed "
+                        "in-process; continuing on the pinned value");
+                    computed = pinned;
+                } else {
+                    // Persistent fault. Record a FAULT SENTINEL and return
+                    // normally; the throw happens OUTSIDE the call_once below.
+                    // An exception must never propagate out of the call_once
+                    // lambda: MinGW/winpthreads' call_once does not implement
+                    // exceptional passthrough correctly — the flag is left
+                    // locked and every later caller DEADLOCKS (observed
+                    // first-hand: the test suite's corrupted-pin case wedged
+                    // at 0 CPU on Windows, 2026-08-15). Sentinel semantics are
+                    // also the RIGHT semantics: a persistent mismatch is fatal
+                    // for the process lifetime — every subsequent call must
+                    // throw too, not retry.
+                    genesisFault =
+                        "GetGenesisHash(): genesis recompute mismatches the chainparams pin "
+                        "twice (computed " + computed.GetHex() + ", retry " +
+                        recomputed.GetHex() + ", pinned " + pinned.GetHex() + ") — persistent "
+                        "compute fault; refusing to run on substituted consensus values";
+                    return;
+                }
+            }
+        }
+        hash = computed;
+    });
+
+    if (!genesisFault.empty()) {
+        throw std::runtime_error(genesisFault);
     }
-
     return hash;
 }
 
@@ -237,9 +334,7 @@ bool IsGenesisBlock(const CBlock& block) {
     }
 
     // Use VDF genesis for any chain with VDF active from genesis
-    bool useVdfGenesis = Dilithion::g_chainParams->IsDilV() ||
-        (Dilithion::g_chainParams->vdfActivationHeight == 0 &&
-         Dilithion::g_chainParams->vdfExclusiveHeight == 0);
+    const bool useVdfGenesis = Dilithion::g_chainParams->IsVdfFromGenesis();
 
     if (useVdfGenesis) {
         if (block.nVersion != CBlockHeader::VDF_VERSION) return false;
@@ -252,8 +347,7 @@ bool IsGenesisBlock(const CBlock& block) {
     if (block.nBits != Dilithion::g_chainParams->genesisNBits) return false;
 
     // Check merkle root matches expected
-    CBlock genesis = useVdfGenesis ?
-        CreateDilVGenesisBlock() : CreateGenesisBlock();
+    CBlock genesis = CreateGenesisBlockForChain();
     if (!(block.hashMerkleRoot == genesis.hashMerkleRoot)) return false;
 
     return true;

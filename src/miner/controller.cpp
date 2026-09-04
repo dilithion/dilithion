@@ -216,7 +216,27 @@ bool CMiningController::StartMining(const CBlockTemplate& blockTemplate) {
     // - Validation mode (LIGHT) is already initialized by node startup
     // - Mining can start immediately using LIGHT mode
     // - Mining will automatically upgrade to FULL mode when ready
+    // Reaching this line means this process is mining, so record the large-page opt-in
+    // NOW -- unconditionally, and before anything looks at mining-mode readiness.
+    //
+    // This used to sit inside the `else` branch below, which made it unreachable on the
+    // primary path: dilithion-node.cpp starts FULL-mode init at startup on any host with
+    // >= 8192 MB RAM, mining or not, so by the time a user starts mining
+    // randomx_is_mining_mode_ready() is already true, the `else` never runs, and the
+    // opt-in was never recorded. Large pages -- the headline of this feature -- were
+    // inert on exactly the machines that can use them.
+    //
+    // Ordering matters more than the branch did: whether the request is honoured depends
+    // only on whether it lands before the dataset allocation reads it. Setting it here
+    // honours it on every host where the dataset has not been built yet, and makes it
+    // reportable as too-late on every host where it has.
+    randomx_set_large_pages_allowed(1);
+
     std::cout << "[Mining] Detected RAM: " << total_ram_mb << " MB" << std::endl;
+    // Will this process ever build the 2GB FULL-mode dataset that large pages back?
+    // Either it already has, or it is about to below. Below 3GB of RAM it never will,
+    // and "large pages" has no referent -- reported as N/A rather than left unsaid.
+    const bool full_mode_expected = randomx_is_mining_mode_ready() || total_ram_mb >= 3072;
     if (randomx_is_mining_mode_ready()) {
         std::cout << "[Mining] Using RandomX FULL mode (~100 H/s)" << std::endl;
     } else {
@@ -228,6 +248,13 @@ bool CMiningController::StartMining(const CBlockTemplate& blockTemplate) {
             std::cout << "[Mining] FULL mode initializing in background - will auto-upgrade" << std::endl;
         }
     }
+
+    // A "Large pages:" line on every mining path. A miner who gets half the achievable
+    // hashrate must be able to see why in the log without reading source; silence here is
+    // what made the previous defect invisible. The call self-dedupes -- StartMining runs
+    // once per block template -- so it prints on the first start and again only when the
+    // status genuinely changes (REQUESTED -> ENABLED once the dataset lands).
+    randomx_log_large_page_status_for_mining(full_mode_expected ? 1 : 0);
     // Note: Mining proceeds immediately, no wait required
 
     // Store block template
@@ -441,7 +468,12 @@ void CMiningController::MiningWorker(uint32_t threadId) {
         // BUG #24 FIX: Fast nonce update (only 4 bytes, no allocations)
         // Update nonce in place at offset 76 (last 4 bytes of 80-byte header)
         uint32_t nonce32 = static_cast<uint32_t>(nonce64 & 0xFFFFFFFF);
-        WriteLE32(header + 76, nonce32);  // WF-1: explicit LE, byte-equal on LE hosts
+        // WF-1: explicit LE, byte-equal on LE hosts. The offset lives in
+        // WriteMiningNonceLE (primitives/block.h) so this hot-loop write and
+        // WriteMiningHeaderLE's template-change write cannot drift apart —
+        // the bare `header + 76` literal that used to be here was untested and
+        // a wrong offset silently invalidates every block this miner finds.
+        WriteMiningNonceLE(header, nonce32);
 
         // Compute RandomX hash
         try {
@@ -1176,9 +1208,8 @@ std::optional<CBlockTemplate> CMiningController::CreateBlockTemplate(
                 Dilithion::g_chainParams->dfmpV32ActivationHeight : 999999999;
             int dfmpV33Height = Dilithion::g_chainParams ?
                 Dilithion::g_chainParams->dfmpV33ActivationHeight : 999999999;
-            // C-3: saturating heat math gate (must match validator pow.cpp exactly).
-            bool dfmpSat = Dilithion::g_chainParams &&
-                static_cast<int>(nHeight) >= Dilithion::g_chainParams->dfmpOverflowFixActivationHeight;
+            // C-3: saturating heat math gate — single-sourced with the validator.
+            bool dfmpSat = DFMP::DfmpSaturatingMathActive(static_cast<int>(nHeight));
             int64_t multiplierFP;
             if (static_cast<int>(nHeight) >= dfmpV33Height) {
                 multiplierFP = DFMP::CalculateTotalMultiplierFP_V33(nHeight, firstSeen, heat, dfmpSat);
