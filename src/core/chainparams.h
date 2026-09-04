@@ -204,6 +204,20 @@ public:
     int vdfExclusiveHeight;
     uint64_t vdfIterations;
 
+    // LP-10 (CRITICAL/incident): VDF Wesolowski proof + coinbase MIK signature
+    // enforcement on the production connect path (ConnectTip). Before this
+    // height: blocks are grandfathered (the existing chain is NOT retroactively
+    // re-verified). At/above this height: every VDF block must carry a valid
+    // Wesolowski proof (CheckVDFProof) AND a valid coinbase MIK Dilithium
+    // signature, or it is rejected (BLOCK_FAILED_VALID).
+    //
+    // HARD FORK — all nodes must upgrade before this height or they will fork
+    // off. Will picks the real activation height at deploy; it MUST be strictly
+    // above the current live tip so activation cannot reject the existing chain.
+    //
+    // 999999999 = PLACEHOLDER sentinel / disabled (ships OFF — build is safe).
+    int vdfProofEnforcementHeight;
+
     // VDF Distribution parameters
     // vdfLotteryActivationHeight: Height at which "lowest output wins" activates
     // vdfLotteryGracePeriod: Seconds after first block at a height during which

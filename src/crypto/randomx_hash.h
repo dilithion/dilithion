@@ -155,6 +155,8 @@ void randomx_hash_thread(void* vm, const void* input, size_t input_len, void* ou
 #ifdef __cplusplus
 }
 
+#include <util/shutdown_progress.h>  // the guard below owns the FINAL Disarm
+
 // Declare ONE of these as the first local in main(). Its destructor runs on
 // every return from main -- the early config/genesis/wallet-refusal returns
 // included -- so no exit path can forget randomx_shutdown() and leave a joinable
@@ -165,7 +167,28 @@ void randomx_hash_thread(void* vm, const void* input, size_t input_len, void* ou
 // got missed.
 struct RandomXShutdownGuard {
     RandomXShutdownGuard() = default;
-    ~RandomXShutdownGuard() { randomx_shutdown(); }
+    ~RandomXShutdownGuard() {
+        // First local of main => destructs LAST, making this the final teardown
+        // actor on every exit path. It therefore owns the final watchdog
+        // disarm: anything disarming earlier leaves the
+        // joins below to hang with the watchdog already stood down -- the exact
+        // step the shutdown-deadline work exists to bound. Gated on an armed,
+        // not-yet-disarmed watchdog. SCOPE (honest): only paths that ARMED get
+        // a deadline -- the normal shutdown sequence and the unwind guard's
+        // path. Early returns BEFORE the unwind guard exists (config refusals,
+        // FULL-mode init failures) join with no deadline, as they always did,
+        // bounded by the join's cancellation-poll batches.
+        const bool covered =
+            Dilithion::ShutdownProgress::Armed().load(std::memory_order_acquire) &&
+            !Dilithion::ShutdownProgress::Disarmed().load(std::memory_order_acquire);
+        if (covered) {
+            Dilithion::ShutdownProgress::Stage("randomx thread join (final, RAII guard)");
+        }
+        randomx_shutdown();
+        if (covered) {
+            Dilithion::ShutdownProgress::Disarm();
+        }
+    }
     RandomXShutdownGuard(const RandomXShutdownGuard&) = delete;
     RandomXShutdownGuard& operator=(const RandomXShutdownGuard&) = delete;
 };
