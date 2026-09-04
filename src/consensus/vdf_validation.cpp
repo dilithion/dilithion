@@ -29,10 +29,16 @@ std::array<uint8_t, 32> ComputeVDFChallenge(
     const std::array<uint8_t, 20>& minerAddress)
 {
     // Preimage: prevHash(32) || height_le32(4) || minerAddress(20) = 56 bytes
+    // WF-1: height written in EXPLICIT little-endian (byte-shift), not a raw
+    // host-endian memcpy. Byte-identical to the previous copy on LE hosts; now
+    // portable to any architecture. Matches the correct pattern in mik.cpp.
     uint8_t preimage[56];
     std::memcpy(preimage,      prevHash.data, 32);
-    uint32_t hLE = static_cast<uint32_t>(height);
-    std::memcpy(preimage + 32, &hLE, 4);
+    uint32_t h = static_cast<uint32_t>(height);
+    preimage[32] = static_cast<uint8_t>(h);
+    preimage[33] = static_cast<uint8_t>(h >> 8);
+    preimage[34] = static_cast<uint8_t>(h >> 16);
+    preimage[35] = static_cast<uint8_t>(h >> 24);
     std::memcpy(preimage + 36, minerAddress.data(), 20);
 
     std::array<uint8_t, 32> challenge{};

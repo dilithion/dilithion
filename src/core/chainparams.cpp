@@ -94,6 +94,7 @@ ChainParams ChainParams::Mainnet() {
 
     // DFMP v3.4: verification-aware free tier (verified=12, unverified=3)
     params.dfmpV34ActivationHeight = 999999999;  // Disabled until DNA verification matures
+    params.dfmpOverflowFixActivationHeight = 93000;  // C-3 saturating heat math ACTIVATES at 93,000 (v4.6.0, Will 2026-08-15: live tip 85,143 + ~3wk adoption window @240s blocks). RE-PIN to actual-tip+window at release cut. Above the height the wrapped-overflow penalty inversion (heaviest miner gets the easiest target) is closed; below, byte-identical legacy math (consensus-frozen history).
 
     // Compact encoding fix: fixes BigToCompact sign bit bug that caused
     // difficulty to be ~5x harder than intended due to EDA + sign bit compounding.
@@ -314,6 +315,7 @@ ChainParams ChainParams::Testnet() {
 
     // DFMP v3.4 - disabled on testnet until DNA verification matures
     params.dfmpV34ActivationHeight = 999999999;
+    params.dfmpOverflowFixActivationHeight = 0;  // C-3 saturating math from genesis on testnet: no live testnet mesh exists (readiness test 2026-08-14 found the old incarnation dead with a stale genesis), so there is no history to retro-validate and the next testnet incarnation exercises the new math from block 1, weeks ahead of mainnet's 93,000 activation.
 
     // Compact encoding fix: always active on testnet (no legacy blocks to worry about)
     params.compactEncodingFixHeight = 0;
@@ -468,6 +470,7 @@ ChainParams ChainParams::DilV() {
     params.dfmpV32ActivationHeight = 0;
     params.dfmpV33ActivationHeight = 0;
     params.dfmpV34ActivationHeight = 999999999;  // Disabled until DNA verification matures
+    params.dfmpOverflowFixActivationHeight = 255000;  // C-3 saturating heat math ACTIVATES at 255,000 (v4.6.0, Will 2026-08-15: live tip 219,546 + ~3wk adoption window @~50s blocks). RE-PIN to actual-tip+window at release cut.
 
     // Compact encoding fix: active from genesis
     params.compactEncodingFixHeight = 0;
@@ -725,13 +728,16 @@ ChainParams ChainParams::Regtest() {
     params.genesisCoinbaseMsg = "Dilithion Regtest";
     params.genesisHash = "";  // computed at startup
 
-    // Phase 5 (2026-04-26): regtest IS a VDF chain, run via dilv-node binary.
+    // Phase 5 (2026-04-26): regtest IS a VDF chain.
     //
-    // Why dilv-node: dilithion-node calls Genesis::CreateGenesisBlock() at
-    // boot (non-VDF path), which fails IsGenesisBlock's nVersion check
-    // when genesis params indicate VDF-from-genesis. dilv-node correctly
-    // calls CreateDilVGenesisBlock(), so a fresh regtest datadir loads
-    // cleanly there.
+    // HISTORICAL NOTE (fixed 2026-08-08): regtest was previously documented as
+    // "run via dilv-node binary" because dilithion-node hard-coded
+    // Genesis::CreateGenesisBlock() at boot, which fails IsGenesisBlock's
+    // nVersion check when genesis params indicate VDF-from-genesis. That was a
+    // call-site bug, not a property of the network — the same bug also made
+    // `dilithion-node --testnet` unbootable. Both binaries now dispatch through
+    // Genesis::CreateGenesisBlockForChain() (ChainParams::IsVdfFromGenesis()),
+    // so regtest loads cleanly under either binary.
     //
     // The chain-selection algorithm is chain-agnostic (same CChainState,
     // same m_setBlockIndexCandidates, same ActivateBestChainStep

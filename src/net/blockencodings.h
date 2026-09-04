@@ -113,16 +113,10 @@ public:
      */
     bool IsValid() const;
 
-    /**
-     * Serialize to stream
-     */
-    std::vector<uint8_t> Serialize() const;
-
-    /**
-     * Deserialize from data
-     * @return true if successful
-     */
-    bool Deserialize(const uint8_t* data, size_t len);
+    // NOTE: Serialize()/Deserialize() were removed as dead code. The live
+    // CMPCTBLOCK wire is handled by CreateCmpctBlockMessage /
+    // ProcessCmpctBlockMessage in net.cpp (CDataStream, little-endian); these
+    // methods were a separate, never-wired format exercised only by tests.
 
 private:
     //! SipHash keys derived from header+nonce

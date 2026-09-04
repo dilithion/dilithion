@@ -2,11 +2,15 @@
 // Distributed under the MIT software license
 
 #include <api/http_server.h>
+#include <api/http_path_gate.h>
 #include <api/wallet_html.h>
 #include <net/sock.h>
+#include <rpc/host_validator.h>
+#include <rpc/ratelimiter.h>
 #include <iostream>
 #include <cstring>
 #include <sstream>
+#include <chrono>
 #ifndef _WIN32
 #include <errno.h>
 #endif
@@ -58,6 +62,16 @@ void CHttpServer::SetMetricsHandler(MetricsHandler handler) {
 // Set REST API handler function for /api/v1/* endpoints
 void CHttpServer::SetRestApiHandler(RestApiHandler handler) {
     m_rest_api_handler = handler;
+}
+
+// LP-12 (H-01): configure the anti-DNS-rebinding Host allowlist. Mirrors
+// CRPCServer::Start()'s m_hostValidator.Configure() exactly: the validator is
+// keyed to THIS server's port and the operator-explicit extra hosts; loopback
+// names are always allowed by the validator itself. Setting the ready flag last
+// keeps the fail-closed invariant (an un-configured validator rejects all REST).
+void CHttpServer::ConfigureHostAllowlist(const std::vector<std::string>& extraAllowedHosts) {
+    m_host_validator.Configure(static_cast<uint16_t>(m_port), extraAllowedHosts);
+    m_host_validator_ready.store(true);
 }
 
 // Start the HTTP server
@@ -122,6 +136,11 @@ bool CHttpServer::Start() {
 
         // Launch accept thread
         m_accept_thread = std::thread(&CHttpServer::AcceptThread, this);
+
+        // LP-12 (M-01): launch the rate-limiter maintenance thread so the per-IP
+        // record map is pruned on a cadence (bounded memory under rotating IPs).
+        m_cleanup_thread = std::thread(&CHttpServer::CleanupThread, this);
+
         std::cout << "[HttpServer] Started on port " << m_port << " with " << m_num_threads << " workers" << std::endl;
         return true;
     } catch (const std::exception& e) {
@@ -169,6 +188,11 @@ void CHttpServer::Stop() {
     // Wait for accept thread to finish
     if (m_accept_thread.joinable()) {
         m_accept_thread.join();
+    }
+
+    // LP-12 (M-01): wait for the rate-limiter maintenance thread to finish.
+    if (m_cleanup_thread.joinable()) {
+        m_cleanup_thread.join();
     }
 
     // Wait for worker threads to finish
@@ -244,8 +268,63 @@ void CHttpServer::WorkerThread() {
     }
 }
 
+// LP-12 (M-01): rate-limiter maintenance thread. Faithful mirror of
+// CRPCServer::CleanupThread() — 5-minute cadence, wakes every second to observe
+// m_running for prompt shutdown, wraps the body so a maintenance exception can
+// never take down the process. Without this, the REST limiter's per-IP record
+// map grows unbounded as source IPs rotate (slow memory-DoS), because the
+// standalone HTTP server (unlike the RPC server) never ran the cleanup before.
+void CHttpServer::CleanupThread() {
+    try {
+        const std::chrono::minutes CLEANUP_INTERVAL(5);
+        (void)CLEANUP_INTERVAL;  // documented cadence; loop below counts seconds
+
+        while (m_running.load()) {
+            // Sleep up to 5 minutes, waking each second to honor shutdown.
+            for (int i = 0; i < 300 && m_running.load(); i++) {
+                std::this_thread::sleep_for(std::chrono::seconds(1));
+            }
+
+            if (!m_running.load()) {
+                break;
+            }
+
+            // Prune stale per-IP records (no-op if no limiter registered).
+            if (m_rate_limiter) {
+                m_rate_limiter->CleanupOldRecords();
+            }
+        }
+    } catch (const std::exception& e) {
+        std::cerr << "[HttpServer] Cleanup thread exception: " << e.what() << std::endl;
+    } catch (...) {
+        std::cerr << "[HttpServer] Cleanup thread unknown exception" << std::endl;
+    }
+}
+
+// LP-12: extract the REAL kernel-reported peer IP from the connected socket
+// (getpeername), mirroring CRPCServer::GetClientIP. Used for (a) the loopback
+// wallet-HTML origin gate and (b) per-IP REST rate-limiting/attribution. Never
+// trusts the client-supplied Host header. Returns "unknown" on failure, which
+// IsLoopbackIP treats as non-loopback (default-deny).
+static std::string GetPeerIP(SOCKET client_socket) {
+    struct sockaddr_storage ss;
+    socklen_t addr_size = sizeof(ss);
+    if (getpeername(client_socket, (struct sockaddr*)&ss, &addr_size) != 0) {
+        return "unknown";
+    }
+    std::string ip_str;
+    uint16_t port;
+    if (CSock::ExtractAddress(ss, ip_str, port)) {
+        return ip_str;
+    }
+    return "unknown";
+}
+
 // Handle a single HTTP request
 void CHttpServer::HandleRequest(SOCKET client_socket) {
+    // LP-12: resolve the real peer IP once, up front, from the kernel socket.
+    const std::string clientIP = GetPeerIP(client_socket);
+
     // Read request
     char buffer[4096];
 #ifdef _WIN32
@@ -261,16 +340,64 @@ void CHttpServer::HandleRequest(SOCKET client_socket) {
     buffer[bytes_read] = '\0';
     std::string request(buffer);
 
+    // LP-12 (gate-bypass fold, MEDIUM) — TRUNCATION FAIL-CLOSED. We read at most
+    // one 4095-byte chunk. If it came back completely full, the request may be
+    // truncated mid-header, and a Host value cut at the buffer boundary
+    // ("Host: 127.0.0.1<cut>.evil.com" -> "127.0.0.1") could spuriously match
+    // the allowlist while the FULL header would not. We cannot see the complete
+    // headers, so treat the request as untrusted: it is gated like any sensitive
+    // path below and rejected unless the (possibly partial) Host still passes.
+    // Rather than rely on that, force the gate's fail-closed branch.
+    const bool requestMaybeTruncated =
+        (static_cast<size_t>(bytes_read) >= sizeof(buffer) - 1);
+
     // Parse request
-    std::string method, path;
-    if (!ParseRequest(request, method, path)) {
+    std::string method, rawPath;
+    if (!ParseRequest(request, method, rawPath)) {
         Send500(client_socket);
         return;
     }
 
-    // STRESS TEST FIX: Handle GET /api/health - simple health check that NEVER blocks
-    // This endpoint is always available, even during high load
-    if (method == "GET" && path == "/api/health") {
+    // ========================================================================
+    // LP-12 (gate-bypass fold) — NORMALIZE THE PATH BEFORE ANY DECISION.
+    //
+    // The external-consensus review found the H-01 gate decided on the RAW
+    // request path, so every alternate spelling of a sensitive path evaded it
+    // (`/wallet?x`, `/wallet/`, `/API/v1/`, `/%61pi/v1/`, `/api/v1/../x402/`,
+    // `//api//v1//`). We now canonicalize ONCE here — strip query/fragment,
+    // percent-decode, collapse `//`, resolve `.`/`..`, drop the trailing slash —
+    // and drive BOTH the gate AND handler dispatch off the SAME normalized path,
+    // so a spelling can never reach a node-touching handler while skipping the
+    // gate. A path that will not normalize (bad %-escape, `..` above root, an
+    // embedded NUL) is treated as sensitive AND not routed — fail-closed.
+    // ========================================================================
+    const api::NormalizedPath norm = api::NormalizeRequestPath(rawPath);
+    const std::string& path = norm.path;  // canonical; gate + dispatch DECISION use this
+
+    // LP-12 (x402 query-preservation, MEDIUM functional regression fix).
+    // NormalizeRequestPath STRIPS the `?...` query — correct for the gate and for
+    // choosing WHICH handler runs, but the x402 endpoint
+    // `GET /x402/dna-attest?address=ADDR` parses `address=` from that query
+    // (CFacilitator::HandleDnaAttest). Carving the query off the gate path made
+    // every such request fail with "Missing address parameter". We therefore
+    // carry the ORIGINAL raw query forward and hand the handlers a query-
+    // preserving path — WITHOUT ever feeding the query back into the gate.
+    //
+    // INVARIANT (do NOT weaken): the query is extracted from the RAW path and is
+    // used ONLY to rebuild a handler's input. The sensitivity classification and
+    // the which-handler dispatch decision below both key on the normalized,
+    // query-stripped `path`. A query string can never reach IsSensitiveSurface
+    // and so can never smuggle a sensitive path past the gate, nor un-gate one.
+    // It is also reconstructed ONLY on the norm.ok path: a non-normalizable
+    // request is rejected (403/404) before this value is ever consulted.
+    const std::string rawQuery = api::ExtractRawQuery(rawPath);
+
+    // STRESS TEST FIX: Handle GET /api/health - simple health check that NEVER
+    // blocks. Stays ABOVE the Host gate as an intentional load-balancer probe;
+    // it returns a STATIC liveness string only (no node/identity data). Matched
+    // on the normalized path so a disguised spelling cannot smuggle something
+    // else through this pre-gate branch. A non-normalizable path never matches.
+    if (norm.ok && method == "GET" && path == "/api/health") {
         SendResponse(client_socket, 200, "application/json", R"({"status":"ok"})");
         return;
     }
@@ -292,7 +419,55 @@ void CHttpServer::HandleRequest(SOCKET client_socket) {
         return;
     }
 
-    // Handle REST API requests for light wallet (/api/v1/*) and x402 facilitator (/x402/*)
+    // ========================================================================
+    // LP-12 (H-01) — ANTI-DNS-REBINDING HOST-HEADER ALLOWLIST.
+    //
+    // Mirrors CRPCServer::HandleRequest (server.cpp:~1095-1139). The standalone
+    // CHttpServer routed /api/v1/* (incl. /api/v1/broadcast → mempool) and
+    // /x402/* with NO Host check, so a DNS-rebound page (evil.com → a
+    // --public-api seed IP) could POST a broadcast or scrape telemetry. This
+    // gate rejects a missing / empty / duplicate / non-allowlisted Host BEFORE
+    // any of those branches dispatch. The Host header is the only input here;
+    // we deliberately do NOT consult X-Forwarded-* (attacker-controlled).
+    //
+    // ORDERING: strictly ABOVE the REST, wallet-HTML, /api/stats and /metrics
+    // branches (every node-touching surface). Only /api/health (an intentional
+    // load-balancer probe) and OPTIONS (already a blanket 403) sit above it.
+    //
+    // FAIL-CLOSED: if the validator was never configured (ready flag false),
+    // REJECT rather than skip — an un-configured validator denies all REST, so
+    // a future reorder of Start() can never silently disable the gate. In
+    // production ConfigureHostAllowlist() runs before Start() spawns workers.
+    // ========================================================================
+    {
+        // Fail-closed: a path that would not normalize (bad %-escape, traversal
+        // above root, embedded NUL) is treated as sensitive — it must NOT slip
+        // past the Host gate. Otherwise classify the canonical path.
+        const bool sensitive_surface =
+            !norm.ok || api::IsSensitiveSurface(path);
+        if (sensitive_surface &&
+            (requestMaybeTruncated ||
+             !m_host_validator_ready.load() ||
+             !m_host_validator.IsRequestHostAllowed(request))) {
+            SendResponse(client_socket, 403, "application/json",
+                R"({"error":"Forbidden: Host header not allowed (DNS-rebinding protection). Connect via 127.0.0.1/localhost or configure --rpcallowhost.","code":-32600})");
+            return;
+        }
+        // A non-normalizable path that somehow passed the Host check (e.g. a
+        // loopback operator hitting a malformed URL) is still never routed to a
+        // node-touching handler: every dispatch branch below keys on the
+        // canonical `path`, which is empty/garbage when !norm.ok, so it falls
+        // through to 404. Make that explicit and fail-closed.
+        if (!norm.ok) {
+            Send404(client_socket);
+            return;
+        }
+    }
+
+    // Handle REST API requests for light wallet (/api/v1/*) and x402 facilitator
+    // (/x402/*). The which-handler DISPATCH DECISION keys on the normalized,
+    // query-stripped `path` (so the gate's normalize-once-drives-both invariant
+    // holds); only the handler's INPUT regains the original query, below.
     if (path.rfind("/api/v1/", 0) == 0 || path.rfind("/x402/", 0) == 0) {
         if (m_rest_api_handler) {
             try {
@@ -306,8 +481,21 @@ void CHttpServer::HandleRequest(SOCKET client_socket) {
                     }
                 }
 
-                // Call REST API handler (returns full HTTP response)
-                std::string response = m_rest_api_handler(method, path, body, "0.0.0.0");
+                // LP-12 query-preservation: hand the handler the canonical path
+                // with the ORIGINAL query re-attached, so query-parsing endpoints
+                // (x402 /dna-attest reads `address=` from the query) work again.
+                // The dispatch decision above already used the query-stripped
+                // `path`; this only restores the handler's own input. Downstream
+                // handlers (CFacilitator / CRestAPI) strip the query themselves.
+                const std::string dispatchPath =
+                    rawQuery.empty() ? path : (path + "?" + rawQuery);
+
+                // Call REST API handler (returns full HTTP response).
+                // LP-12: pass the REAL peer IP (was hardcoded "0.0.0.0", which
+                // collapsed every client onto one rate-limit bucket and erased
+                // attribution). Per-IP limiting on the REST broadcast path now
+                // keys on the actual connection.
+                std::string response = m_rest_api_handler(method, dispatchPath, body, clientIP);
 
                 // Send raw response (handler builds complete HTTP response)
 #ifdef _WIN32
@@ -329,6 +517,57 @@ void CHttpServer::HandleRequest(SOCKET client_socket) {
 
     // Handle GET /wallet or /wallet.html - serve embedded web wallet
     if (method == "GET" && (path == "/wallet" || path == "/wallet.html" || path == "/")) {
+        // ====================================================================
+        // LP-12 (mirrors server.cpp:1169-1232, C-01b/F-003) — the wallet UI is a
+        // token-minting desktop affordance, NOT a seed feature. Bring the
+        // standalone CHttpServer to parity with the RPC server, which previously
+        // protected this same HTML while this path served it unconditionally.
+        //
+        //  1. On a --public-api node (all-interfaces bind) the wallet UI is
+        //     DISABLED ENTIRELY — no page — regardless of socket peer. This
+        //     structurally removes the remote-admin-token / phishing-origin class
+        //     on network-bound seeds. Checked FIRST.
+        //  2. Otherwise (localhost default bind) require the REAL kernel socket
+        //     peer to be a loopback IP literal (IsLoopbackIP on getpeername's
+        //     result) — the Host header is never trusted for this decision.
+        // ====================================================================
+        if (m_public_api) {
+            SendResponse(client_socket, 403, "application/json",
+                R"({"error":"Forbidden: the wallet UI is disabled on a public-API node. SSH-tunnel to a loopback RPC to use the wallet.","code":-32600})");
+            return;
+        }
+        // LP-12 (gate-bypass fold, finding #3) — IPv4-mapped-IPv6 loopback spoof
+        // is NOT exploitable here. clientIP is GetPeerIP(), which calls
+        // getpeername() (kernel-reported peer, not attacker-supplied) and then
+        // CSock::ExtractAddress(), which UNWRAPS any IPv4-mapped v6 source
+        // (IN6_IS_ADDR_V4MAPPED -> dotted IPv4) BEFORE it reaches IsLoopbackIP.
+        // So a REMOTE peer can never present "::ffff:127.0.0.1" to this check:
+        // the kernel reports the peer's real address, and a real remote address
+        // unwraps to its real (non-127) IPv4. A 127.x source on a remote socket
+        // would be a martian packet rejected by the OS network stack. Belt-and-
+        // suspenders: on --public-api nodes the wallet UI is already disabled
+        // entirely above (the public-node branch), so this loopback gate is only
+        // reached on a localhost-bound server in the first place.
+        if (!rpc::HostValidator::IsLoopbackIP(clientIP)) {
+            SendResponse(client_socket, 403, "application/json",
+                R"({"error":"Forbidden: the wallet UI is served to loopback connections only. Use an SSH tunnel for remote access.","code":-32600})");
+            return;
+        }
+        // ====================================================================
+        // LP-12 (M-03) — SECONDARY loopback-Host check, for parity with the RPC
+        // server's wallet gate (server.cpp:~1240-1261), which requires BOTH a
+        // loopback socket peer (above) AND a loopback Host. The socket-peer gate
+        // is the load-bearing loopback-ORIGIN assertion; this Host check is the
+        // belt-and-suspenders anti-rebinding layer. Fail-closed if the validator
+        // is not ready. Either failing rejects the token-minting page.
+        // ====================================================================
+        if (requestMaybeTruncated ||
+            !m_host_validator_ready.load() ||
+            !m_host_validator.IsRequestLoopbackHost(request)) {
+            SendResponse(client_socket, 403, "application/json",
+                R"({"error":"Forbidden: the wallet UI is served on loopback only (127.0.0.1/localhost). Use an SSH tunnel for remote access.","code":-32600})");
+            return;
+        }
         try {
             const std::string& html = GetWalletHTML();
             SendResponse(client_socket, 200, "text/html; charset=utf-8", html);
@@ -403,8 +642,10 @@ void CHttpServer::SendResponse(SOCKET client_socket,
     response << "HTTP/1.1 " << status_code << " ";
     switch (status_code) {
         case 200: response << "OK"; break;
+        case 403: response << "Forbidden"; break;
         case 404: response << "Not Found"; break;
         case 500: response << "Internal Server Error"; break;
+        case 503: response << "Service Unavailable"; break;
         default: response << "Unknown"; break;
     }
     response << "\r\n";
