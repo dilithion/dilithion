@@ -485,9 +485,46 @@ static std::string findSrcDir() {
         "repo root, or set DILITHION_SRC_ROOT");
 }
 
+// Strip // and /* */ comments so the G3 scan counts CODE, not prose.
+//
+// ⛔ WHY THIS EXISTS. G3 asserts a site names the gate parameter ZERO times.
+// The scan was a raw string::find over the whole file, so it could not tell a
+// call from a comment -- and on 2026-08-10 a commit added a COMMENT to
+// consensus/pow.cpp explaining the parameter. The comment is good: it documents
+// the live activation height. The test failed anyway, and main's gcc/Release
+// leg stayed red for three weeks while every PR inherited the failure.
+//
+// A test that punishes documentation for the thing it guards is not guarding
+// it -- it is training people to delete explanations. The property G3 actually
+// cares about is "no site RE-DERIVES the gate in code"; comments cannot
+// re-derive anything.
+//
+// Deliberately simple: no string-literal tracking, because the identifiers
+// this file scans for never appear inside string literals in the sites it
+// reads. If that ever changes, this must grow a literal-aware pass rather than
+// have the assertion relaxed.
+static std::string stripComments(const std::string& src) {
+    std::string out;
+    out.reserve(src.size());
+    for (size_t i = 0; i < src.size(); ) {
+        if (src[i] == '/' && i + 1 < src.size() && src[i + 1] == '/') {
+            while (i < src.size() && src[i] != '\n') ++i;   // keep the newline
+        } else if (src[i] == '/' && i + 1 < src.size() && src[i + 1] == '*') {
+            i += 2;
+            while (i + 1 < src.size() && !(src[i] == '*' && src[i + 1] == '/')) ++i;
+            i = (i + 1 < src.size()) ? i + 2 : src.size();
+            out += ' ';                                            // keep tokens apart
+        } else {
+            out += src[i++];
+        }
+    }
+    return out;
+}
+
 static size_t countOccurrences(const std::string& hay, const std::string& needle) {
+    const std::string code = stripComments(hay);
     size_t n = 0, pos = 0;
-    while ((pos = hay.find(needle, pos)) != std::string::npos) { n++; pos += needle.size(); }
+    while ((pos = code.find(needle, pos)) != std::string::npos) { n++; pos += needle.size(); }
     return n;
 }
 
