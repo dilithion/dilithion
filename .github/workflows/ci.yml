@@ -228,6 +228,12 @@ jobs:
         ./test_dilithion --log_level=test_suite --report_level=short --run_test='!wallet_hd_tests:!rpc_hd_wallet_tests:!hd_wallet_standalone_tests'
         echo "✅ ASan tests passed (no memory errors)"
 
+  # ⚠️ -fno-sanitize-recover=all IS REQUIRED, and removing `|| true` alone is
+  # NOT sufficient. By default UBSan REPORTS a finding and CONTINUES, exiting 0
+  # — so an un-recovered UBSan job stays green while printing real findings, and
+  # would look armed while being dead. Verified in CI 2026-09-04: with this flag
+  # the UBSan leg goes COMPLETED/FAILURE on a real finding; ASan passed and TSan
+  # failed in the same run, so all three legs are demonstrably able to fail.
   sanitizer-ubsan:
     name: UndefinedBehaviorSanitizer
     runs-on: ubuntu-24.04
@@ -255,8 +261,8 @@ jobs:
       run: |
         echo "CC=clang" >> $GITHUB_ENV
         echo "CXX=clang++" >> $GITHUB_ENV
-        echo "CFLAGS=-fsanitize=undefined -fno-omit-frame-pointer -g" >> $GITHUB_ENV
-        echo "CXXFLAGS=-fsanitize=undefined -fno-omit-frame-pointer -g -std=c++17" >> $GITHUB_ENV
+        echo "CFLAGS=-fsanitize=undefined -fno-sanitize-recover=all -fno-omit-frame-pointer -g" >> $GITHUB_ENV
+        echo "CXXFLAGS=-fsanitize=undefined -fno-sanitize-recover=all -fno-omit-frame-pointer -g -std=c++17" >> $GITHUB_ENV
         echo "LDFLAGS=-fsanitize=undefined" >> $GITHUB_ENV
 
     - name: Build RandomX
@@ -264,8 +270,8 @@ jobs:
         cd depends/randomx
         mkdir -p build
         cd build
-        cmake .. -DCMAKE_C_FLAGS="-fsanitize=undefined -fno-omit-frame-pointer" \
-                 -DCMAKE_CXX_FLAGS="-fsanitize=undefined -fno-omit-frame-pointer"
+        cmake .. -DCMAKE_C_FLAGS="-fsanitize=undefined -fno-sanitize-recover=all -fno-omit-frame-pointer" \
+                 -DCMAKE_CXX_FLAGS="-fsanitize=undefined -fno-sanitize-recover=all -fno-omit-frame-pointer"
         make -j$(nproc)
 
     - name: Build Dilithium library
@@ -287,7 +293,7 @@ jobs:
         fi
         cd depends/dilithium/ref
         make clean || true
-        CFLAGS="-fsanitize=undefined -fno-omit-frame-pointer -O2 -DDILITHIUM_MODE=3" make -j$(nproc)
+        CFLAGS="-fsanitize=undefined -fno-sanitize-recover=all -fno-omit-frame-pointer -O2 -DDILITHIUM_MODE=3" make -j$(nproc)
 
     - name: Build with UBSan
       run: |
