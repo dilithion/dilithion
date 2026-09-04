@@ -30,8 +30,10 @@ static void SerializeUint64(std::vector<uint8_t>& data, uint64_t value) {
     data.push_back(static_cast<uint8_t>(value >> 56));
 }
 
-/** Helper function to serialize a compact size (Bitcoin-style varint) */
-static void SerializeCompactSize(std::vector<uint8_t>& data, uint64_t size) {
+/** Helper function to serialize a compact size (Bitcoin-style varint).
+ *  Declared in primitives/transaction.h and exported (non-static) so the
+ *  single-source sighash preimage builder reuses this one encoder — FIX-1 HIGH-1. */
+void SerializeCompactSize(std::vector<uint8_t>& data, uint64_t size) {
     if (size < 253) {
         data.push_back(static_cast<uint8_t>(size));
     } else if (size <= 0xFFFF) {

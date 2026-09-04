@@ -169,6 +169,20 @@ private:
     std::atomic<uint64_t> m_acceptedSession{0};
     // Network manager placeholder — not yet needed (P2P layer handles networking directly)
 
+    // Perf fix 2026-07-12: RPC_GetHolderCount did a full UTXO-set scan on
+    // every call. Holder count only changes when a block connects/disconnects,
+    // but the explorer polls this far more often than that — cache the
+    // rendered JSON, keyed on the tip's block HASH (not height: a same-height
+    // VDF sibling replacement — DilV ShouldReplaceVDFTip / Case 2.5 — swaps
+    // in a different coinbase/tx set at an unchanged height, so height alone
+    // is not a valid holder-set cache key; port-reviewer GAP-3). Thread pool
+    // means concurrent callers need this mutex, not just cs_main, since it's
+    // server-local state unrelated to CChainState.
+    mutable std::mutex m_holderCountCacheMutex;
+    mutable std::string m_holderCountCacheJson;
+    mutable uint256 m_holderCountCacheTipHash;
+    mutable bool m_holderCountCacheValid{false};
+
     // RPC handlers
     std::map<std::string, RPCHandler> m_handlers;
     std::mutex m_handlersMutex;
