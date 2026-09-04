@@ -215,8 +215,8 @@ jobs:
         # Phase 8: Run tests with ASan to detect memory errors
         # Skip HD wallet tests - BUG-77 (GetNewHDAddress hangs)
         echo "Running tests with AddressSanitizer..."
-        ./test_dilithion --log_level=test_suite --report_level=short --run_test='!wallet_hd_tests:!rpc_hd_wallet_tests:!hd_wallet_standalone_tests' || true
-        echo "✅ ASan tests completed (check output above for memory errors)"
+        ./test_dilithion --log_level=test_suite --report_level=short --run_test='!wallet_hd_tests:!rpc_hd_wallet_tests:!hd_wallet_standalone_tests'
+        echo "ASan tests completed with no memory errors."
 
   sanitizer-ubsan:
     name: UndefinedBehaviorSanitizer
@@ -245,8 +245,8 @@ jobs:
       run: |
         echo "CC=clang" >> $GITHUB_ENV
         echo "CXX=clang++" >> $GITHUB_ENV
-        echo "CFLAGS=-fsanitize=undefined -fno-omit-frame-pointer -g" >> $GITHUB_ENV
-        echo "CXXFLAGS=-fsanitize=undefined -fno-omit-frame-pointer -g -std=c++17" >> $GITHUB_ENV
+        echo "CFLAGS=-fsanitize=undefined -fno-sanitize-recover=all -fno-omit-frame-pointer -g" >> $GITHUB_ENV
+        echo "CXXFLAGS=-fsanitize=undefined -fno-sanitize-recover=all -fno-omit-frame-pointer -g -std=c++17" >> $GITHUB_ENV
         echo "LDFLAGS=-fsanitize=undefined" >> $GITHUB_ENV
 
     - name: Build RandomX
@@ -254,8 +254,8 @@ jobs:
         cd depends/randomx
         mkdir -p build
         cd build
-        cmake .. -DCMAKE_C_FLAGS="-fsanitize=undefined -fno-omit-frame-pointer" \
-                 -DCMAKE_CXX_FLAGS="-fsanitize=undefined -fno-omit-frame-pointer"
+        cmake .. -DCMAKE_C_FLAGS="-fsanitize=undefined -fno-sanitize-recover=all -fno-omit-frame-pointer" \
+                 -DCMAKE_CXX_FLAGS="-fsanitize=undefined -fno-sanitize-recover=all -fno-omit-frame-pointer"
         make -j$(nproc)
 
     - name: Build Dilithium library
@@ -277,7 +277,7 @@ jobs:
         fi
         cd depends/dilithium/ref
         make clean || true
-        CFLAGS="-fsanitize=undefined -fno-omit-frame-pointer -O2 -DDILITHIUM_MODE=3" make -j$(nproc)
+        CFLAGS="-fsanitize=undefined -fno-sanitize-recover=all -fno-omit-frame-pointer -O2 -DDILITHIUM_MODE=3" make -j$(nproc)
 
     - name: Build with UBSan
       run: |
@@ -289,8 +289,8 @@ jobs:
         # Phase 8: Run tests with UBSan to detect undefined behavior
         # Skip HD wallet tests - BUG-77 (GetNewHDAddress hangs)
         echo "Running tests with UndefinedBehaviorSanitizer..."
-        ./test_dilithion --log_level=test_suite --report_level=short --run_test='!wallet_hd_tests:!rpc_hd_wallet_tests:!hd_wallet_standalone_tests' || true
-        echo "✅ UBSan tests completed (check output above for undefined behavior)"
+        ./test_dilithion --log_level=test_suite --report_level=short --run_test='!wallet_hd_tests:!rpc_hd_wallet_tests:!hd_wallet_standalone_tests'
+        echo "UBSan tests completed with no undefined behaviour."
 
   sanitizer-tsan:
     name: ThreadSanitizer (Data Races)
@@ -363,8 +363,8 @@ jobs:
         # Phase 8: Run tests with TSan to detect data races
         # Skip HD wallet tests - BUG-77 (GetNewHDAddress hangs)
         echo "Running tests with ThreadSanitizer..."
-        ./test_dilithion --log_level=test_suite --report_level=short --run_test='!wallet_hd_tests:!rpc_hd_wallet_tests:!hd_wallet_standalone_tests' || true
-        echo "✅ TSan tests completed (check output above for data races)"
+        ./test_dilithion --log_level=test_suite --report_level=short --run_test='!wallet_hd_tests:!rpc_hd_wallet_tests:!hd_wallet_standalone_tests'
+        echo "TSan tests completed with no data races."
 
   static-analysis:
     name: Static Analysis
