@@ -99,8 +99,10 @@ fast|reorg_wal_crash_injection_tests|300|
 fast|wallet_persistence_tests|300|
 fast|wallet_load_guard_tests|120|
 fast|wallet_encryption_integration_tests|600|
+fast|genesis_all_networks_tests|600|
+fast|shutdown_disarm_ownership_tests|60|
 fast|phase1_test|120|STALE TEST (diagnosed, fix deliberately NOT taken here): phase1_simple_test.cpp:25 hard-codes "MIN_TX_FEE = 50000, FEE_PER_BYTE = 25"; the live values in consensus/fees.h:14,17 are MIN_TX_FEE = 0 and FEE_PER_BYTE = 5, so both the fee assert (:26) and the rate assert (:30, expects 25..50 ions/byte, actual 5.0) fail. NOTE FOR WHOEVER FIXES IT: do not just substitute the current constants -- CalculateMinFee IS "MIN_TX_FEE + size*FEE_PER_BYTE" (fees.cpp:10), so an expectation written that way is a tautology that restates the implementation and covers nothing. Un-quarantine only with assertions that hold independently of the formula (e.g. rate == FEE_PER_BYTE exactly, which catches a flat base being reintroduced; strict monotonicity in tx size).
-fast|timestamp_tests|120|SUSPECTED REAL: post-fork min-gap branch computes required=1410859008s (timestamp_tests.cpp:267 -> CheckBlockTimestamp). A ~44-year required inter-block gap is a nonsense value, not a moved goalpost. Needs a consensus owner before this is called stale.
+fast|timestamp_tests|120|
 fast|seed_attestation_key_tests|180|UNTRIAGED: 3 of ~40 checks fail around key-file MAC verification / migration. Needs the seed-attestation owner; failure mode is not obviously stale.
 fast|test_passphrase_validator|60|SUSPECTED REAL (policy): 2 of 16 cases -- two passphrases the suite expects REJECTED are now ACCEPTED at "Moderate (57/100)". Either the strength policy was deliberately loosened (then fix the expectations, with a reason) or it regressed. Do not just flip the expectations.
 fast|chain_case_2_5_equivalence_tests|180|UNTRIAGED: scenario_2 (connect-replacement-fails-then-recovers) now truncates the chain and triggers auto_rebuild instead of recovering (chain_case_2_5_equivalence_tests.cpp:304). Behaviour change in ActivateBestChainStep; needs a chainstate owner to say which side is right.
@@ -109,11 +111,12 @@ full|wallet_tests|300|STALE TEST (likely): 4 assertions fail on coin selection /
 full|rpc_tests|300|STALE TEST: the harness calls CRPCServer::Start() without RPCAuth::InitializeAuth(), which the server now refuses by design. The test needs to initialise auth; the refusal itself is correct behaviour.
 full|integration_tests|600|
 full|connman_tests|600|SUSPECTED REAL: high-load throughput test loses messages (pop_count != NUM_MESSAGES, connman_tests.cpp:552). Message loss under load in CConnman is not a stale expectation.
-full|tx_relay_tests|600|REAL HANG, RE-CONFIRMED 2026-08-10 on the merged tree: all 6 tests print PASSED, then the process never exits -- killed at 600s (exit 124). Hang is after the last test, i.e. in teardown. NOT fixed by the J1/F6 shutdown PRs, which did fix the integration_tests abort, so this is a distinct teardown path. Also NOT the separately-tracked ~3600s runner freeze (testaccept_positive_path / fee_wiring_eviction_notifies) -- different signature, different binary. Do NOT lift by raising the timeout. Observed on Windows/MSYS2; still wants a Linux confirmation run.
+full|tx_relay_tests|600|WINDOWS-ONLY teardown hang (re-scoped 2026-08-15): all 6 tests PASS, then the process never exits on Windows/MSYS2 (exit 124 at 600s; teardown-path, post-J1/F6). LINUX CONFIRMATION DONE: under TSan on Linux (WSL, gcc, -fsanitize=thread) the binary runs all tests AND EXITS CLEANLY, zero data-race warnings -- so the hang is a Windows-specific teardown path (likely winsock/thread-join semantics), not a portable logic bug. Do NOT lift the quarantine on Windows by raising the timeout; needs a Windows-teardown owner. Linux CI can run this suite ungated.
 full|mining_integration_tests|900|MIXED, ONE SUSPECTED CONSENSUS GAP: (a) coinbase_transaction_creation expects 1 coinbase output and gets 3 -- stale, DFMP splits the coinbase; (b) block_validation_coinbase asserts CheckCoinbase REJECTS a coinbase paying 100 DIL at height 0 and it is ACCEPTED. (b) is a possible missing consensus check and must be triaged by a consensus owner before this quarantine is lifted.
 full|dfmp_mik_tests|600|
 full|net_tests|600|NOBUILD: source no longer compiles. References a removed global g_peer_manager and calls CNetMessageProcessor::CreateVersionMessage() with a signature that no longer exists. Needs a P2P owner to port the harness forward.
 full|randomx_mode_test|1800|
+full|large_pages_optin_test|2100|
 '
 
 # ---------------------------------------------------------------------------

@@ -240,8 +240,13 @@ void TestRealisticChain() {
 void TestPostForkTimestamp() {
     std::cout << "\nTesting post-fork timestamp validation (600s limit)..." << std::endl;
 
-    // Set up g_chainParams with a known activation height
-    Dilithion::ChainParams testParams;
+    // Set up g_chainParams with a known activation height.
+    // Value-initialize ({}) — ChainParams has no in-class member initializers, so a
+    // bare construction leaves minBlockTimestampGap/minBlockTimestampGapHeight
+    // indeterminate and Rule 3 reads stack garbage (the "required=1410859008s"
+    // failure that had this suite quarantined). Zeroed gap fields = Rule 3 disabled,
+    // which is correct for this test: it exercises the future-limit rules only.
+    Dilithion::ChainParams testParams{};
     testParams.timestampValidationHeight = 24500;
     Dilithion::ChainParams* prevParams = Dilithion::g_chainParams;
     Dilithion::g_chainParams = &testParams;
