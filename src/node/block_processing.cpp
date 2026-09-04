@@ -696,6 +696,10 @@ BlockProcessResult ProcessNewBlock(
                 CBlockIndex* pindex = g_chainstate.GetBlockIndex(blockHash);
                 if (pindex) {
                     pindex->nStatus |= CBlockIndex::BLOCK_FAILED_VALID;
+                    // Perf fix 2026-07-12: this flips validity status on an
+                    // already-indexed entry outside AddBlockIndex, so the
+                    // GetChainTips() cache needs an explicit nudge.
+                    g_chainstate.InvalidateChainTipsCache();
                     std::cerr << "[ProcessNewBlock] Block marked BLOCK_FAILED_VALID - will not retry" << std::endl;
                     // Persist to disk
                     if (ctx.blockchain_db) {

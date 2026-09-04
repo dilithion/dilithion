@@ -157,36 +157,10 @@ BOOST_AUTO_TEST_CASE(test_prefilled_transactions)
     BOOST_CHECK(true);
 }
 
-/**
- * Test 4: Compact block serialization/deserialization
- */
-BOOST_AUTO_TEST_CASE(test_compact_block_serialization)
-{
-    std::cout << "\n[TEST] test_compact_block_serialization" << std::endl;
-
-    CBlock block = CreateTestBlock(5);
-    CBlockHeaderAndShortTxIDs original(block);
-
-    // Serialize
-    std::vector<uint8_t> serialized = original.Serialize();
-    std::cout << "  Serialized size: " << serialized.size() << " bytes" << std::endl;
-
-    // Deserialize
-    CBlockHeaderAndShortTxIDs restored;
-    bool success = restored.Deserialize(serialized.data(), serialized.size());
-
-    BOOST_CHECK(success);
-    if (success) {
-        // Verify header matches
-        BOOST_CHECK_EQUAL(restored.header.nVersion, original.header.nVersion);
-        BOOST_CHECK(restored.header.hashPrevBlock == original.header.hashPrevBlock);
-        BOOST_CHECK_EQUAL(restored.nonce, original.nonce);
-        BOOST_CHECK_EQUAL(restored.shorttxids.size(), original.shorttxids.size());
-        std::cout << "  Deserialization successful" << std::endl;
-    }
-
-    std::cout << "  Compact block serialization: PASS" << std::endl;
-}
+// NOTE: former "Test 4: Compact block serialization/deserialization" removed —
+// it exercised CBlockHeaderAndShortTxIDs::Serialize()/Deserialize(), which were
+// dead (never-wired) code and have been deleted. The live CMPCTBLOCK wire is
+// covered by the net.cpp CDataStream path.
 
 /**
  * Test 5: IsValid() check
@@ -280,32 +254,7 @@ BOOST_AUTO_TEST_CASE(test_get_short_id_consistency)
     std::cout << "  GetShortID consistency: PASS" << std::endl;
 }
 
-/**
- * Test 9: Round-trip serialization
- */
-BOOST_AUTO_TEST_CASE(test_round_trip)
-{
-    std::cout << "\n[TEST] test_round_trip" << std::endl;
-
-    CBlock original = CreateTestBlock(5);
-    CBlockHeaderAndShortTxIDs compact(original);
-
-    // Serialize
-    std::vector<uint8_t> data = compact.Serialize();
-
-    // Deserialize
-    CBlockHeaderAndShortTxIDs restored;
-    BOOST_CHECK(restored.Deserialize(data.data(), data.size()));
-
-    // Compare all fields
-    BOOST_CHECK_EQUAL(restored.header.nVersion, compact.header.nVersion);
-    BOOST_CHECK_EQUAL(restored.header.nTime, compact.header.nTime);
-    BOOST_CHECK_EQUAL(restored.header.nBits, compact.header.nBits);
-    BOOST_CHECK_EQUAL(restored.nonce, compact.nonce);
-    BOOST_CHECK_EQUAL(restored.shorttxids.size(), compact.shorttxids.size());
-    BOOST_CHECK_EQUAL(restored.prefilledtxn.size(), compact.prefilledtxn.size());
-
-    std::cout << "  Round-trip serialization: PASS" << std::endl;
-}
+// NOTE: former "Test 9: Round-trip serialization" removed — it exercised
+// CBlockHeaderAndShortTxIDs::Serialize()/Deserialize() (dead code, now deleted).
 
 BOOST_AUTO_TEST_SUITE_END()

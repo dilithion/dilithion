@@ -166,7 +166,8 @@ bool CCrypter::Decrypt(const std::vector<uint8_t>& ciphertext,
 // ============================================================================
 
 bool CCrypter::ComputeMAC(const std::vector<uint8_t>& ciphertext,
-                          std::vector<uint8_t>& mac) {
+                          std::vector<uint8_t>& mac,
+                          bool useLegacyKeying) {
     if (!fKeySet) return false;
     if (ciphertext.empty()) return false;
 
@@ -179,24 +180,48 @@ bool CCrypter::ComputeMAC(const std::vector<uint8_t>& ciphertext,
     data.insert(data.end(), vchIV.begin(), vchIV.end());
     data.insert(data.end(), ciphertext.begin(), ciphertext.end());
 
-    // Compute HMAC-SHA3-512
     mac.resize(64);
-    HMAC_SHA3_512(vchKey.data_ptr(), vchKey.size(),
+
+    if (useLegacyKeying) {
+        // LEGACY (v3-v6 wallets): HMAC was keyed with the AES key itself.
+        // This branch exists ONLY to verify MACs on records that were written
+        // before the LP-7 key-separation fix, so that pre-fix encrypted wallets
+        // still unlock and can be migrated. Never used when WRITING new records.
+        HMAC_SHA3_512(vchKey.data_ptr(), vchKey.size(),
+                      data.data(), data.size(),
+                      mac.data());
+        return true;
+    }
+
+    // LP-7 (wallet-Inv-2): KEY-SEPARATION FIX (v7+).
+    // The same key must not be used for two different primitives (AES-CBC and
+    // HMAC). Derive a distinct MAC key from the AES key via HKDF-SHA3-256 with a
+    // dedicated context so the HMAC key is independent of the cipher key.
+    std::vector<uint8_t> aesKey(vchKey.data_ptr(), vchKey.data_ptr() + vchKey.size());
+    std::vector<uint8_t> macKey;
+    DeriveEncryptionKey(aesKey, "wallet-record-mac", macKey);
+    memory_cleanse(aesKey.data(), aesKey.size());
+
+    // Compute HMAC-SHA3-512 keyed with the SEPARATE MAC key (not the AES key)
+    HMAC_SHA3_512(macKey.data(), macKey.size(),
                   data.data(), data.size(),
                   mac.data());
+
+    memory_cleanse(macKey.data(), macKey.size());
 
     return true;
 }
 
 bool CCrypter::VerifyMAC(const std::vector<uint8_t>& ciphertext,
-                         const std::vector<uint8_t>& mac) {
+                         const std::vector<uint8_t>& mac,
+                         bool useLegacyKeying) {
     if (!fKeySet) return false;
     if (ciphertext.empty()) return false;
     if (mac.size() != 64) return false;  // HMAC-SHA3-512 is 64 bytes
 
     // Compute expected MAC
     std::vector<uint8_t> expected_mac;
-    if (!ComputeMAC(ciphertext, expected_mac)) {
+    if (!ComputeMAC(ciphertext, expected_mac, useLegacyKeying)) {
         return false;
     }
 

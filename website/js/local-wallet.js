@@ -113,7 +113,11 @@ class LocalWallet {
 
     /**
      * Create a new wallet
-     * @param {string|null} password - Wallet password (null for unencrypted)
+     *
+     * A passphrase is MANDATORY (min 8 chars). The unencrypted-at-rest path was
+     * removed (LP-9): the raw HD seed is never persisted in plaintext to IndexedDB.
+     *
+     * @param {string} password - Wallet password (required, min 8 chars)
      * @param {string[]} mnemonic - Optional mnemonic (generates new if not provided)
      * @returns {Promise<Object>} {walletId, mnemonic, addresses}
      */
@@ -124,10 +128,8 @@ class LocalWallet {
             throw new Error('Crypto module not available');
         }
 
-        const isEncrypted = password && password.length > 0;
-
-        // Validate password if provided
-        if (isEncrypted && password.length < 8) {
+        // LP-9: passphrase is mandatory — never persist a plaintext seed at rest.
+        if (!password || password.length < 8) {
             throw new Error('Password must be at least 8 characters');
         }
 
@@ -141,14 +143,9 @@ class LocalWallet {
         // Convert mnemonic to seed
         const seed = await this.crypto.mnemonicToSeed(mnemonic);
 
-        // Encrypt seed with password, or store raw for unencrypted wallets
-        let storedSeed;
-        if (isEncrypted) {
-            storedSeed = await this.crypto.encrypt(seed, password);
-        } else {
-            // Store raw seed bytes (Uint8Array is stored directly in IndexedDB)
-            storedSeed = new Uint8Array(seed);
-        }
+        // Encrypt seed with password (AES-256-GCM via PBKDF2). Plaintext seed is
+        // never written to persistent storage.
+        const storedSeed = await this.crypto.encrypt(seed, password);
 
         // Generate wallet ID
         const walletId = this.generateUUID();
@@ -162,7 +159,7 @@ class LocalWallet {
         const wallet = {
             id: walletId,
             version: 1,
-            encrypted: isEncrypted,
+            encrypted: true,
             encryptedSeed: storedSeed,
             createdAt: Date.now(),
             accounts: [{
@@ -191,11 +188,9 @@ class LocalWallet {
         this.decryptedSeed = seed;
         this.isUnlocked = true;
         this.accounts = wallet.accounts;
-        if (isEncrypted) {
-            this.startLockTimer();
-        }
+        this.startLockTimer();
 
-        console.log('[LocalWallet] Wallet created:', walletId, isEncrypted ? '(encrypted)' : '(unencrypted)');
+        console.log('[LocalWallet] Wallet created:', walletId, '(encrypted)');
 
         return {
             walletId,
@@ -206,7 +201,7 @@ class LocalWallet {
 
     /**
      * Import wallet from mnemonic
-     * @param {string|null} password - New password (null for unencrypted)
+     * @param {string} password - New password (REQUIRED, min 8 chars; LP-9: no plaintext-at-rest path)
      * @param {string[]} mnemonic - 24-word mnemonic
      * @returns {Promise<Object>} {walletId, addresses}
      */
@@ -322,7 +317,8 @@ class LocalWallet {
 
     /**
      * Unlock wallet with password
-     * @param {string|null} password - Wallet password (null for unencrypted wallets)
+     * @param {string} password - Wallet password (REQUIRED; legacy unencrypted wallets are
+     *   rejected with WALLET_NEEDS_ENCRYPTION — there is no null/unencrypted unlock path)
      * @returns {Promise<boolean>} True if unlocked successfully
      */
     async unlock(password) {
@@ -334,16 +330,19 @@ class LocalWallet {
             throw new Error('No wallet found');
         }
 
-        if (wallet.encrypted) {
-            // Decrypt seed
-            try {
-                this.decryptedSeed = await this.crypto.decrypt(wallet.encryptedSeed, password);
-            } catch (e) {
-                throw new Error('Wrong password');
-            }
-        } else {
-            // Unencrypted wallet - seed is stored directly
-            this.decryptedSeed = new Uint8Array(wallet.encryptedSeed);
+        if (!wallet.encrypted) {
+            // LP-9: legacy unencrypted wallets must be migrated to encrypted-at-rest
+            // before they can be unlocked. The UI routes these through
+            // encryptExisting() (a blocking "secure your wallet" step) — there is no
+            // silent unlock path for a plaintext-at-rest seed.
+            throw new Error('WALLET_NEEDS_ENCRYPTION');
+        }
+
+        // Decrypt seed
+        try {
+            this.decryptedSeed = await this.crypto.decrypt(wallet.encryptedSeed, password);
+        } catch (e) {
+            throw new Error('Wrong password');
         }
 
         // Update state
@@ -351,16 +350,141 @@ class LocalWallet {
         this.isUnlocked = true;
         this.accounts = wallet.accounts;
 
-        // Start auto-lock timer (only for encrypted wallets)
-        if (wallet.encrypted) {
-            this.startLockTimer();
-        }
+        // Start auto-lock timer
+        this.startLockTimer();
 
         // Emit event
         this.emit('unlock', { walletId: this.walletId });
 
         console.log('[LocalWallet] Wallet unlocked');
         return true;
+    }
+
+    /**
+     * Encrypt an already-existing UNENCRYPTED wallet in place (LP-9 migration).
+     *
+     * Reads the plaintext seed currently stored in IndexedDB, AES-256-GCM-encrypts
+     * it with `newPassword` (PBKDF2/100k), and atomically replaces the wallet record
+     * with the ciphertext-only version (`encrypted:true`). On success the wallet is
+     * left unlocked.
+     *
+     * Safety properties:
+     *  - Interruption-safe: the ciphertext is round-trip VERIFIED (decrypt back to the
+     *    exact original seed bytes) BEFORE the plaintext record is replaced. The replace
+     *    is a single IndexedDB `put` of the same keyPath, so the store transitions
+     *    plaintext -> ciphertext in one atomic write — there is no intermediate
+     *    "no seed" state. A crash before the put leaves the original plaintext intact
+     *    (next load re-prompts migration); a crash after leaves a fully-encrypted,
+     *    verified record.
+     *  - Race-tolerant (M-1): the final check-and-write is a SINGLE atomic IndexedDB
+     *    readwrite transaction (re-read the record, verify still unencrypted, put the
+     *    ciphertext). If a concurrent tab encrypted the wallet first — even with a
+     *    different password — this aborts the put (never clobbering the other tab's
+     *    ciphertext) and throws a clear "encrypted in another tab" message. An early
+     *    pre-check still short-circuits the common already-migrated case via `return false`.
+     *  - Zeroizing: the in-memory plaintext working copies are wiped, and the stored
+     *    record no longer carries the raw seed (the old value is overwritten, not kept).
+     *
+     * @param {string} newPassword - New password (min 8 chars)
+     * @returns {Promise<boolean>} True on success (wallet now encrypted + unlocked)
+     */
+    async encryptExisting(newPassword) {
+        await this.init();
+
+        if (!newPassword || newPassword.length < 8) {
+            throw new Error('Password must be at least 8 characters');
+        }
+
+        // Re-read current state (race-tolerant: another tab may have migrated already)
+        const wallet = await this.getWallet();
+        if (!wallet) {
+            throw new Error('No wallet found');
+        }
+        if (wallet.encrypted === true) {
+            // Already migrated by another tab/process — nothing to do here.
+            // Caller should fall back to a normal unlock.
+            return false;
+        }
+
+        // The plaintext seed is stored directly as bytes for legacy unencrypted wallets.
+        // Make a private working copy we control (so we can zeroize it).
+        const plaintextSeed = new Uint8Array(wallet.encryptedSeed);
+
+        let encrypted;
+        try {
+            // Encrypt (AES-256-GCM via PBKDF2).
+            encrypted = await this.crypto.encrypt(plaintextSeed, newPassword);
+
+            // VERIFY before we destroy the plaintext: decrypt the ciphertext back and
+            // confirm it equals the original seed byte-for-byte. If this fails we throw
+            // and leave the original plaintext record untouched (no data loss).
+            const roundTrip = await this.crypto.decrypt(encrypted, newPassword);
+            if (!this._bytesEqual(roundTrip, plaintextSeed)) {
+                roundTrip.fill(0);
+                throw new Error('Encryption self-check failed; wallet left unchanged');
+            }
+            roundTrip.fill(0);
+        } catch (e) {
+            plaintextSeed.fill(0);
+            throw e;
+        }
+
+        // Atomic check-and-replace (M-1): re-read the record and write the ciphertext
+        // INSIDE A SINGLE IndexedDB readwrite transaction. IndexedDB transactions are
+        // atomic, so if another tab already encrypted this wallet (possibly with a
+        // DIFFERENT password) between our initial read and now, the in-transaction
+        // re-check sees encrypted===true and ABORTS the put — we never clobber the
+        // other tab's ciphertext (which would lock the user out with this password).
+        // A plain re-read-then-put outside a transaction would still leave that gap.
+        const migrated = {
+            ...wallet,
+            encrypted: true,
+            encryptedSeed: encrypted
+        };
+        let putResult;
+        try {
+            putResult = await this._atomicMigratePut(wallet.id, migrated);
+        } catch (e) {
+            // Write/quota failure: original plaintext record is still intact.
+            plaintextSeed.fill(0);
+            throw new Error('Could not save encrypted wallet (storage error). Your wallet is unchanged — please try again. ' + (e && e.message ? e.message : ''));
+        }
+        if (putResult === 'raced') {
+            // Another tab encrypted this wallet first. Do NOT overwrite it and do NOT
+            // unlock from our plaintext copy — the stored ciphertext now belongs to the
+            // OTHER tab's password. Surface a clear, recoverable message.
+            plaintextSeed.fill(0);
+            throw new Error('This wallet was just encrypted in another tab. Use that tab\'s password to unlock, or reload this page and unlock there.');
+        }
+
+        // Establish unlocked in-memory state from the (now verified) seed.
+        this.walletId = wallet.id;
+        this.decryptedSeed = new Uint8Array(plaintextSeed);
+        this.isUnlocked = true;
+        this.accounts = wallet.accounts;
+        this.startLockTimer();
+
+        // Wipe the working copy.
+        plaintextSeed.fill(0);
+
+        this.emit('unlock', { walletId: this.walletId });
+        console.log('[LocalWallet] Wallet migrated to encrypted-at-rest');
+        return true;
+    }
+
+    /**
+     * Constant-ish byte-array equality (length + per-byte).
+     * @param {Uint8Array} a
+     * @param {Uint8Array} b
+     * @returns {boolean}
+     */
+    _bytesEqual(a, b) {
+        if (!a || !b || a.length !== b.length) return false;
+        let diff = 0;
+        for (let i = 0; i < a.length; i++) {
+            diff |= a[i] ^ b[i];
+        }
+        return diff === 0;
     }
 
     /**
@@ -604,12 +728,25 @@ class LocalWallet {
 
     /**
      * Delete wallet (irreversible!)
-     * @param {string} password - Password to confirm (ignored for unencrypted wallets)
+     *
+     * L-1: a delete is NEVER performed without password proof, regardless of the stored
+     * `encrypted` flag. A legacy unencrypted (`encrypted:false`) record has no password to
+     * verify against — and its `encryptedSeed` is raw plaintext bytes, not a decryptable
+     * ciphertext — so rather than allow a password-free delete (the L-1 hole), we refuse
+     * with WALLET_NEEDS_ENCRYPTION, mirroring unlock(): the wallet must be migrated to
+     * encrypted-at-rest first, after which a normal password-verified delete applies.
+     *
+     * @param {string} password - Password to confirm (required for any delete).
      */
     async deleteWallet(password) {
-        // Verify password for encrypted wallets
         const wallet = await this.getWallet();
-        if (wallet && wallet.encrypted) {
+        if (wallet) {
+            if (wallet.encrypted !== true) {
+                // Legacy plaintext record: no password exists to verify. Force migration
+                // first instead of permitting a password-free destructive delete.
+                throw new Error('WALLET_NEEDS_ENCRYPTION');
+            }
+            // Encrypted record: require correct password before destroying anything.
             try {
                 await this.crypto.decrypt(wallet.encryptedSeed, password);
             } catch (e) {
@@ -692,6 +829,46 @@ class LocalWallet {
 
             request.onsuccess = () => resolve();
             request.onerror = () => reject(request.error);
+        });
+    }
+
+    /**
+     * Atomic check-and-write for the LP-9 plaintext->ciphertext migration (M-1).
+     *
+     * Inside a SINGLE IndexedDB readwrite transaction: re-read the wallet record by id,
+     * verify it is still NOT encrypted, then put the encrypted record. IndexedDB
+     * transactions are atomic, so a concurrent tab cannot interleave between the re-read
+     * and the put. If the record is already `encrypted===true` (another tab won the race),
+     * the put is skipped and the call resolves 'raced' WITHOUT overwriting it.
+     *
+     * @param {string} walletId - id (keyPath) of the wallet record to migrate.
+     * @param {Object} migrated - the encrypted wallet record to write.
+     * @returns {Promise<'ok'|'raced'>} 'ok' if written, 'raced' if already encrypted.
+     */
+    async _atomicMigratePut(walletId, migrated) {
+        await this.init();
+
+        return new Promise((resolve, reject) => {
+            const tx = this.db.transaction(WALLET_STORE, 'readwrite');
+            const store = tx.objectStore(WALLET_STORE);
+            let outcome = 'ok';
+
+            const getReq = store.get(walletId);
+            getReq.onsuccess = () => {
+                const current = getReq.result;
+                if (current && current.encrypted === true) {
+                    // Lost the race: another tab already encrypted. Do not clobber it.
+                    outcome = 'raced';
+                    return;  // skip the put; let the (empty) transaction complete
+                }
+                // Still unencrypted (or record vanished — recreate it): write ciphertext.
+                store.put(migrated);
+            };
+            getReq.onerror = () => reject(getReq.error);
+
+            tx.oncomplete = () => resolve(outcome);
+            tx.onerror = () => reject(tx.error);
+            tx.onabort = () => reject(tx.error || new Error('migration transaction aborted'));
         });
     }
 

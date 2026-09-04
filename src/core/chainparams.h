@@ -139,6 +139,9 @@ public:
     // After this height: verified MIKs get 12, unverified get 3 free blocks
     int dfmpV34ActivationHeight;
 
+    // C-3 overflow fix: below = legacy heat math (frozen); at/above = saturating. OFF until set at deploy.
+    int dfmpOverflowFixActivationHeight;
+
     // Phase 3 port: minimum chain-work threshold for HeadersSync PRESYNC
     // gating. A peer's claimed header chain must accumulate at least this
     // much work in PRESYNC before transitioning to REDOWNLOAD. Mainnet:
@@ -200,6 +203,20 @@ public:
     int vdfActivationHeight;
     int vdfExclusiveHeight;
     uint64_t vdfIterations;
+
+    // LP-10 (CRITICAL/incident): VDF Wesolowski proof + coinbase MIK signature
+    // enforcement on the production connect path (ConnectTip). Before this
+    // height: blocks are grandfathered (the existing chain is NOT retroactively
+    // re-verified). At/above this height: every VDF block must carry a valid
+    // Wesolowski proof (CheckVDFProof) AND a valid coinbase MIK Dilithium
+    // signature, or it is rejected (BLOCK_FAILED_VALID).
+    //
+    // HARD FORK — all nodes must upgrade before this height or they will fork
+    // off. Will picks the real activation height at deploy; it MUST be strictly
+    // above the current live tip so activation cannot reject the existing chain.
+    //
+    // 999999999 = PLACEHOLDER sentinel / disabled (ships OFF — build is safe).
+    int vdfProofEnforcementHeight;
 
     // VDF Distribution parameters
     // vdfLotteryActivationHeight: Height at which "lowest output wins" activates
@@ -516,6 +533,27 @@ public:
     bool IsTestnet() const { return network == TESTNET; }
     bool IsDilV() const { return network == DILV; }
     bool IsRegtest() const { return network == REGTEST; }
+
+    /**
+     * True when this chain runs VDF consensus from height 0, i.e. its genesis
+     * block is a VDF block (CBlockHeader::VDF_VERSION) rather than a legacy
+     * RandomX block.
+     *
+     * WHY THIS EXISTS: `IsDilV()` was used across the codebase as a proxy for
+     * "is a VDF chain". That proxy is WRONG for TESTNET (converted to VDF-only
+     * from genesis in d6e67172, 2026-03-25) and for REGTEST (which derives from
+     * Testnet). Each site that got bitten patched itself independently
+     * (pow.cpp::GetNextWorkRequired added `|| IsRegtest()`; genesis.cpp inlined
+     * the height check) while other sites silently kept the wrong answer —
+     * which is exactly how `dilithion-node --testnet` / `--regtest` came to
+     * build a legacy genesis and fail its own IsGenesisBlock() check.
+     *
+     * Use this predicate for any "which genesis / which consensus" question.
+     * Do NOT re-derive it inline.
+     */
+    bool IsVdfFromGenesis() const {
+        return IsDilV() || (vdfActivationHeight == 0 && vdfExclusiveHeight == 0);
+    }
 
     /**
      * MAINNET SECURITY: Get the last checkpoint at or before given height
