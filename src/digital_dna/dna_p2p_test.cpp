@@ -33,33 +33,9 @@ static int g_failed = 0;
     } \
 } while(0)
 
-// =================================================================
-// Test 1: TimeSyncMessage serialize/deserialize roundtrip
-// =================================================================
-void test_timesync_roundtrip() {
-    std::cout << "\n=== Test 1: TimeSyncMessage serialize/deserialize ===" << std::endl;
-
-    TimeSyncMessage msg;
-    msg.sender_timestamp_us = 1234567890123ULL;
-    msg.sender_wall_ms = 1700000000000ULL;
-    msg.nonce = 0xDEADBEEF12345678ULL;
-    msg.is_response = false;
-
-    auto data = msg.serialize();
-    CHECK(data.size() == 25, "TimeSyncMessage serializes to 25 bytes");
-
-    auto decoded = TimeSyncMessage::deserialize(data);
-    CHECK(decoded.sender_timestamp_us == msg.sender_timestamp_us, "sender_timestamp_us roundtrip");
-    CHECK(decoded.sender_wall_ms == msg.sender_wall_ms, "sender_wall_ms roundtrip");
-    CHECK(decoded.nonce == msg.nonce, "nonce roundtrip");
-    CHECK(decoded.is_response == false, "is_response=false roundtrip");
-
-    // Test response variant
-    msg.is_response = true;
-    data = msg.serialize();
-    decoded = TimeSyncMessage::deserialize(data);
-    CHECK(decoded.is_response == true, "is_response=true roundtrip");
-}
+// NOTE: former "Test 1: TimeSyncMessage serialize/deserialize roundtrip" removed —
+// the TimeSyncMessage struct + its serialize()/deserialize() were dead code (the
+// live MSG_DNA_TIME_SYNC wire is the net.cpp CDataStream path) and have been deleted.
 
 // =================================================================
 // Test 2: BandwidthFingerprint serialize/deserialize roundtrip
@@ -224,7 +200,6 @@ int main() {
     std::cout << "Digital DNA P2P Protocol Tests" << std::endl;
     std::cout << "==============================" << std::endl;
 
-    test_timesync_roundtrip();
     test_bandwidth_roundtrip();
     test_clock_drift_from_exchanges();
     test_bandwidth_from_measurements();

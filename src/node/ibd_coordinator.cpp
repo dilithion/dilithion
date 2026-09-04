@@ -1575,6 +1575,9 @@ bool CIbdCoordinator::FetchBlocks() {
             if (pindex->pprev && pindex->pprev->IsInvalid()) {
                 // Mark this block as failed child
                 pindex->nStatus |= CBlockIndex::BLOCK_FAILED_CHILD;
+                // Perf fix 2026-07-12: nudge GetChainTips()'s cache — this
+                // mutates an already-indexed entry outside AddBlockIndex.
+                m_chainstate.InvalidateChainTipsCache();
                 failed_skip_count++;
                 continue;
             }
@@ -1826,6 +1829,10 @@ bool CIbdCoordinator::FetchBlocks() {
             if (pindex && pindex->IsInvalid()) {
                 // Clear the failed flags
                 pindex->nStatus &= ~CBlockIndex::BLOCK_FAILED_MASK;
+                // Perf fix 2026-07-12 (port-reviewer GAP-1): this flips an
+                // already-indexed block's validity status outside
+                // AddBlockIndex, same as the BLOCK_FAILED_CHILD flip above.
+                m_chainstate.InvalidateChainTipsCache();
                 cleared_count++;
 
                 // Undo cooldown tracker state for this block so re-validation

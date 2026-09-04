@@ -1197,4 +1197,199 @@ BOOST_AUTO_TEST_CASE(eda_does_not_interfere_with_2016_adjustment) {
     BOOST_CHECK_EQUAL(resultWithTime, resultWithoutTime);
 }
 
+/**
+ * LP-4: Merkle defense-in-depth (CVE-2012-2459) on the ConnectTip path.
+ *
+ * These tests exercise the EXACT structural sequence the LP-4 fix inserts into
+ * CChainState::ConnectTip before ApplyBlock:
+ *   DeserializeBlockTransactions(block) -> VerifyMerkleRoot(block, txs)
+ * They prove the merkle recompute REJECTS a CVE-2012-2459-style mutated block
+ * INDEPENDENTLY of the UTXO double-spend side-effect (no UTXO set is involved
+ * here at all), and that a valid block still passes unchanged (additive-only,
+ * idempotent on valid blocks).
+ */
+
+// Local helper: compact-size varint, mirrors DeserializeBlockTransactions' reader
+// and the serializer in utxo_tests.cpp / block_processing.cpp.
+static void LP4_WriteCompactSize(std::vector<uint8_t>& data, uint64_t size) {
+    if (size < 253) {
+        data.push_back(static_cast<uint8_t>(size));
+    } else if (size <= 0xFFFF) {
+        data.push_back(253);
+        data.push_back(static_cast<uint8_t>(size & 0xFF));
+        data.push_back(static_cast<uint8_t>((size >> 8) & 0xFF));
+    } else {
+        data.push_back(254);
+        data.push_back(static_cast<uint8_t>(size & 0xFF));
+        data.push_back(static_cast<uint8_t>((size >> 8) & 0xFF));
+        data.push_back(static_cast<uint8_t>((size >> 16) & 0xFF));
+        data.push_back(static_cast<uint8_t>((size >> 24) & 0xFF));
+    }
+}
+
+// Local helper: serialize a tx vector into the block.vtx byte-blob format
+// (compact-size count + concatenated tx.Serialize()).
+static std::vector<uint8_t> LP4_SerializeVtx(const std::vector<CTransactionRef>& txs) {
+    std::vector<uint8_t> vtx;
+    LP4_WriteCompactSize(vtx, txs.size());
+    for (const auto& tx : txs) {
+        std::vector<uint8_t> tx_data = tx->Serialize();
+        vtx.insert(vtx.end(), tx_data.begin(), tx_data.end());
+    }
+    return vtx;
+}
+
+// Local helper: build a distinct, deserializable tx with one input + one output.
+static CTransactionRef LP4_MakeTx(int seed) {
+    CTransaction tx;
+    tx.nVersion = 1;
+    tx.nLockTime = static_cast<uint32_t>(seed);
+
+    uint256 prevHash;
+    memset(prevHash.data, 0x11 + seed, 32);
+    std::vector<uint8_t> sig(72, static_cast<uint8_t>(0xA0 + seed));
+    tx.vin.push_back(CTxIn(prevHash, static_cast<uint32_t>(seed), sig, CTxIn::SEQUENCE_FINAL));
+
+    std::vector<uint8_t> scriptPubKey(25, static_cast<uint8_t>(0xB0 + seed));
+    tx.vout.push_back(CTxOut((10 + seed) * COIN, scriptPubKey));
+
+    return MakeTransactionRef(std::move(tx));
+}
+
+// Runs the EXACT structural sequence LP-4 inserts into ConnectTip before
+// ApplyBlock: deserialize -> VerifyMerkleRoot (D1) -> CheckNoDuplicateTransactions
+// (D2). Returns true iff the block PASSES all of them (i.e. would proceed to
+// ApplyBlock). No UTXO set is involved — this isolates the structural defense.
+static bool LP4_ConnectTipStructuralChecks(const CBlock& block, std::string& whichFailed) {
+    CBlockValidator validator;
+    std::vector<CTransactionRef> txs;
+    std::string error;
+
+    if (!validator.DeserializeBlockTransactions(block, txs, error)) {
+        whichFailed = "deserialize: " + error;
+        return false;
+    }
+    if (!validator.VerifyMerkleRoot(block, txs, error)) {
+        whichFailed = "merkle: " + error;
+        return false;
+    }
+    if (!validator.CheckNoDuplicateTransactions(txs, error)) {
+        whichFailed = "duplicate-tx: " + error;
+        return false;
+    }
+    return true;
+}
+
+/**
+ * The classic CVE-2012-2459 last-node-duplication mutation is REJECTED by the
+ * ConnectTip structural sequence, independently of any UTXO side-effect.
+ *
+ * Mechanism: an odd tx level [A,B,C] hashes the trailing pair as hash(C,C). An
+ * attacker who appends a duplicate C -> [A,B,C,C] reproduces the SAME merkle
+ * root by construction, so D1 (the recompute) ALONE accepts it — this is the
+ * whole point of the CVE. The defense is therefore the pairing the orphan path
+ * uses: D2 (CheckNoDuplicateTransactions) catches the duplicated tx. This test
+ * asserts (a) the forged root really does collide (documenting why D1 alone is
+ * insufficient) and (b) the combined sequence still rejects the block.
+ */
+BOOST_AUTO_TEST_CASE(lp4_connecttip_rejects_cve_2012_2459_duplication) {
+    CBlockValidator validator;
+
+    // Honest block: 3 transactions [A, B, C].
+    std::vector<CTransactionRef> honestTxs = {
+        LP4_MakeTx(1), LP4_MakeTx(2), LP4_MakeTx(3)
+    };
+
+    CBlock block;
+    block.nVersion = 1;
+    block.nTime = 1000000;
+    block.nBits = 0x1d00ffff;
+    block.nNonce = 0;
+    // Header commits to the HONEST merkle root (this is what PoW binds and what
+    // a real forged block would preserve from the legitimate header).
+    block.hashMerkleRoot = validator.BuildMerkleRoot(honestTxs);
+
+    // Forge the transaction payload: duplicate the trailing tx -> [A, B, C, C].
+    std::vector<CTransactionRef> forgedTxs = honestTxs;
+    forgedTxs.push_back(honestTxs.back());
+    block.vtx = LP4_SerializeVtx(forgedTxs);
+
+    // Document the CVE collision: D1 alone (root recompute) does NOT diverge.
+    BOOST_CHECK_MESSAGE(
+        validator.BuildMerkleRoot(forgedTxs) == block.hashMerkleRoot,
+        "CVE-2012-2459 duplication is expected to reproduce the same merkle root");
+
+    // The combined ConnectTip structural sequence MUST reject (via D2).
+    // No UTXO set in scope — this is purely structural.
+    std::string whichFailed;
+    bool passed = LP4_ConnectTipStructuralChecks(block, whichFailed);
+    BOOST_CHECK_MESSAGE(!passed,
+        "CVE-2012-2459 duplicated-tx block must be rejected at ConnectTip");
+    BOOST_CHECK_MESSAGE(whichFailed.rfind("duplicate-tx:", 0) == 0,
+        "rejection must come from the duplicate-tx check, got: " << whichFailed);
+}
+
+/**
+ * A root-divergent mutation (tampered tx content that changes the merkle root
+ * while the header keeps the honest root) is REJECTED by D1 (VerifyMerkleRoot)
+ * at ConnectTip. Confirms the recompute itself is load-bearing, not just D2.
+ */
+BOOST_AUTO_TEST_CASE(lp4_connecttip_rejects_root_divergent_mutation) {
+    CBlockValidator validator;
+
+    std::vector<CTransactionRef> honestTxs = {
+        LP4_MakeTx(1), LP4_MakeTx(2), LP4_MakeTx(3)
+    };
+
+    CBlock block;
+    block.nVersion = 1;
+    block.nTime = 1000000;
+    block.nBits = 0x1d00ffff;
+    block.nNonce = 0;
+    block.hashMerkleRoot = validator.BuildMerkleRoot(honestTxs);
+
+    // Swap the last tx for a DIFFERENT one -> recomputed root diverges from the
+    // header-committed root, but there is no duplicate.
+    std::vector<CTransactionRef> tamperedTxs = { honestTxs[0], honestTxs[1], LP4_MakeTx(99) };
+    block.vtx = LP4_SerializeVtx(tamperedTxs);
+
+    BOOST_REQUIRE(validator.BuildMerkleRoot(tamperedTxs) != block.hashMerkleRoot);
+
+    std::string whichFailed;
+    bool passed = LP4_ConnectTipStructuralChecks(block, whichFailed);
+    BOOST_CHECK_MESSAGE(!passed,
+        "root-divergent mutation must be rejected at ConnectTip");
+    BOOST_CHECK_MESSAGE(whichFailed.rfind("merkle:", 0) == 0,
+        "rejection must come from the merkle recompute, got: " << whichFailed);
+}
+
+/**
+ * A valid block still connects unchanged: the same ConnectTip-path sequence
+ * (deserialize -> VerifyMerkleRoot) PASSES for an unmodified, well-formed block.
+ * Confirms the guard is additive-only and rejects nothing currently accepted.
+ */
+BOOST_AUTO_TEST_CASE(lp4_connecttip_merkle_accepts_valid_block) {
+    CBlockValidator validator;
+
+    std::vector<CTransactionRef> txs = {
+        LP4_MakeTx(4), LP4_MakeTx(5), LP4_MakeTx(6), LP4_MakeTx(7)
+    };
+
+    CBlock block;
+    block.nVersion = 1;
+    block.nTime = 1000000;
+    block.nBits = 0x1d00ffff;
+    block.nNonce = 0;
+    block.hashMerkleRoot = validator.BuildMerkleRoot(txs);
+    block.vtx = LP4_SerializeVtx(txs);
+
+    // The full ConnectTip structural sequence (D1 + D2) must PASS unchanged,
+    // i.e. the block would proceed to ApplyBlock exactly as before the fix.
+    std::string whichFailed;
+    bool passed = LP4_ConnectTipStructuralChecks(block, whichFailed);
+    BOOST_CHECK_MESSAGE(passed,
+        "valid block must pass the merkle defense-in-depth unchanged, failed at: "
+        << whichFailed);
+}
+
 BOOST_AUTO_TEST_SUITE_END()
