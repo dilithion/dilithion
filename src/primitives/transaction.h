@@ -9,6 +9,12 @@
 #include <vector>
 #include <memory>
 
+/** Serialize a compact size (Bitcoin-style varint) into a byte buffer.
+ *  Exported so downstream consensus code (e.g. the single-source sighash
+ *  preimage builder) reuses THIS one canonical encoder instead of hand-rolling
+ *  a duplicate — see FIX-1 HIGH-1. There must be exactly one CompactSize encoder. */
+void SerializeCompactSize(std::vector<uint8_t>& data, uint64_t size);
+
 /**
  * An outpoint - a combination of a transaction hash and an index n into its vout
  */

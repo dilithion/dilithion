@@ -3,6 +3,7 @@
 
 #include <script/interpreter.h>
 #include <crypto/sha3.h>
+#include <consensus/sighash_preimage.h>
 #include <cstring>
 #include <algorithm>
 
@@ -66,40 +67,18 @@ bool TransactionSignatureChecker::CheckSig(
         if (allZeros || allOnes) return false;
     }
 
-    // Construct signature message: tx_signing_hash(32) + input_idx(4) + version(4) + chain_id(4)
+    // Construct signature message via the single-source builder:
+    //   tx_signing_hash(32) + input_idx(4LE) + version(4LE) + chain_id(4LE)
+    // (byte-identical to the prior open-coded 44-byte form).
     uint256 tx_hash = m_tx.GetSigningHash();
-
-    std::vector<uint8_t> sig_message;
-    sig_message.reserve(44);
-
-    // Transaction hash (32 bytes)
-    sig_message.insert(sig_message.end(), tx_hash.begin(), tx_hash.end());
-
-    // Input index (4 bytes LE)
-    uint32_t idx = m_input_idx;
-    sig_message.push_back(static_cast<uint8_t>(idx & 0xFF));
-    sig_message.push_back(static_cast<uint8_t>((idx >> 8) & 0xFF));
-    sig_message.push_back(static_cast<uint8_t>((idx >> 16) & 0xFF));
-    sig_message.push_back(static_cast<uint8_t>((idx >> 24) & 0xFF));
-
-    // Transaction version (4 bytes LE)
-    uint32_t version = static_cast<uint32_t>(m_tx.nVersion);
-    sig_message.push_back(static_cast<uint8_t>(version & 0xFF));
-    sig_message.push_back(static_cast<uint8_t>((version >> 8) & 0xFF));
-    sig_message.push_back(static_cast<uint8_t>((version >> 16) & 0xFF));
-    sig_message.push_back(static_cast<uint8_t>((version >> 24) & 0xFF));
-
-    // Chain ID (4 bytes LE)
-    sig_message.push_back(static_cast<uint8_t>(m_chain_id & 0xFF));
-    sig_message.push_back(static_cast<uint8_t>((m_chain_id >> 8) & 0xFF));
-    sig_message.push_back(static_cast<uint8_t>((m_chain_id >> 16) & 0xFF));
-    sig_message.push_back(static_cast<uint8_t>((m_chain_id >> 24) & 0xFF));
-
-    if (sig_message.size() != 44) return false;
 
     // Hash the signature message
     uint8_t sig_hash[32];
-    SHA3_256(sig_message.data(), sig_message.size(), sig_hash);
+    Consensus::ComputeSighash(tx_hash,
+                              static_cast<uint32_t>(m_input_idx),
+                              static_cast<uint32_t>(m_tx.nVersion),
+                              m_chain_id,
+                              sig_hash);
 
     // Verify Dilithium3 signature
     int result = pqcrystals_dilithium3_ref_verify(
