@@ -1733,6 +1733,14 @@ bool CChainState::ConnectTip(CBlockIndex* pindex, const CBlock& block, bool skip
     }
 
     // ====================================================================
+    // ⚠️ ORDERING IS DELIBERATE — LP-4 (below, cheap) RUNS BEFORE LP-10 (VDF).
+    // Both PRs independently placed their check 'immediately before ApplyBlock',
+    // so they collided on merge. LP-4's merkle recompute + duplicate-tx scan are
+    // microsecond, side-effect-free, structural checks on the block's own bytes.
+    // LP-10's Wesolowski verify is ~44 ms of class-group arithmetic and its own
+    // comment states it is placed LAST for exactly that DoS reason. Running the
+    // cheap structural checks first preserves BOTH rationales; inverting them
+    // would spend 44 ms on blocks the microsecond check already rejects.
     // LP-4: MERKLE-ROOT DEFENSE-IN-DEPTH (CVE-2012-2459, restore D1)
     // ====================================================================
     // Recompute the merkle root from this block's own transactions and
@@ -1795,6 +1803,54 @@ bool CChainState::ConnectTip(CBlockIndex* pindex, const CBlock& block, bool skip
             std::cerr << "[Chain] ERROR: Block " << pindex->nHeight
                       << " REJECTED: duplicate transactions (CVE-2012-2459 defense)" << std::endl;
             std::cerr << "[Chain] " << merkleError << std::endl;
+
+            pindex->nStatus |= CBlockIndex::BLOCK_FAILED_VALID;
+            if (pdb != nullptr) {
+                pdb->WriteBlockIndex(blockHash, *pindex);
+            }
+            return false;
+        }
+    }
+
+    // LP-10 (CRITICAL/incident, subsumes LP-8): VDF Wesolowski proof +
+    // coinbase MIK-signature verification — the authoritative enforcement
+    // point on the production connect path.
+    // ====================================================================
+    // Before this fix, CheckVDFProof and the VDF-block MIK signature were
+    // NOT verified on any production connect path (they lived only in dead
+    // CBlockValidator::CheckBlock; CheckProofOfWorkDFMP early-returns true
+    // for VDF blocks). A forged vdfOutput/proof or MIK signature was accepted.
+    //
+    // Both checks are STRUCTURAL (no chain/identity-state dependence beyond a
+    // reorg-safe reference-pubkey lookup that degrades to pass-on-missing), so
+    // they run for ALL connect paths INCLUDING skipValidation=true reorg
+    // reconnects — VDF block selection is effectively a reorg every block, so
+    // a reorg-connected forged block must not bypass this.
+    //
+    // Activation-gated by vdfProofEnforcementHeight: below it, blocks are
+    // grandfathered (the existing chain is never retroactively re-verified);
+    // at/above it, a forged proof or signature is rejected. Runs BEFORE
+    // ApplyBlock so a forged block never mutates the UTXO set.
+    if (block.IsVDFBlock()) {
+        std::string vdfProofError;
+        if (!CheckVDFProofConnect(block, pindex->nHeight,
+                                  block.hashPrevBlock, vdfProofError)) {
+            std::cerr << "[Chain] ERROR: Block " << pindex->nHeight
+                      << " REJECTED: VDF proof verification failed" << std::endl;
+            std::cerr << "[Chain] " << vdfProofError << std::endl;
+
+            pindex->nStatus |= CBlockIndex::BLOCK_FAILED_VALID;
+            if (pdb != nullptr) {
+                pdb->WriteBlockIndex(blockHash, *pindex);
+            }
+            return false;
+        }
+
+        std::string mikSigError;
+        if (!CheckVDFBlockMIKSignature(block, pindex->nHeight, mikSigError)) {
+            std::cerr << "[Chain] ERROR: Block " << pindex->nHeight
+                      << " REJECTED: VDF block MIK signature invalid" << std::endl;
+            std::cerr << "[Chain] " << mikSigError << std::endl;
 
             pindex->nStatus |= CBlockIndex::BLOCK_FAILED_VALID;
             if (pdb != nullptr) {
