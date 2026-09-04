@@ -1,4 +1,5 @@
 #include "bandwidth_proof.h"
+#include "dna_serialize.h"  // WF-1: explicit-LE consensus serialization helpers
 
 #include <algorithm>
 #include <cmath>
@@ -137,15 +138,17 @@ std::string BandwidthFingerprint::to_json() const {
 
 std::vector<uint8_t> BandwidthFingerprint::serialize() const {
     // Derived metrics only: 4 doubles (32 bytes) + measurement count (4 bytes)
+    // WF-1: explicit little-endian (byte-identical on LE hosts to the previous
+    // memcpy copies; portable across architectures).
     std::vector<uint8_t> data(36);
     size_t offset = 0;
 
-    std::memcpy(data.data() + offset, &median_upload_mbps, 8); offset += 8;
-    std::memcpy(data.data() + offset, &median_download_mbps, 8); offset += 8;
-    std::memcpy(data.data() + offset, &median_asymmetry, 8); offset += 8;
-    std::memcpy(data.data() + offset, &bandwidth_stability, 8); offset += 8;
+    dna_le::set_double(data.data() + offset, median_upload_mbps); offset += 8;
+    dna_le::set_double(data.data() + offset, median_download_mbps); offset += 8;
+    dna_le::set_double(data.data() + offset, median_asymmetry); offset += 8;
+    dna_le::set_double(data.data() + offset, bandwidth_stability); offset += 8;
     uint32_t count = static_cast<uint32_t>(measurements.size());
-    std::memcpy(data.data() + offset, &count, 4); offset += 4;
+    dna_le::set_u32(data.data() + offset, count); offset += 4;
 
     return data;
 }
@@ -154,11 +157,12 @@ BandwidthFingerprint BandwidthFingerprint::deserialize(const std::vector<uint8_t
     BandwidthFingerprint fp;
     if (data.size() < 36) return fp;
 
+    // WF-1: explicit little-endian reads, matched to serialize() above.
     size_t offset = 0;
-    std::memcpy(&fp.median_upload_mbps, data.data() + offset, 8); offset += 8;
-    std::memcpy(&fp.median_download_mbps, data.data() + offset, 8); offset += 8;
-    std::memcpy(&fp.median_asymmetry, data.data() + offset, 8); offset += 8;
-    std::memcpy(&fp.bandwidth_stability, data.data() + offset, 8); offset += 8;
+    fp.median_upload_mbps = dna_le::get_double(data.data() + offset); offset += 8;
+    fp.median_download_mbps = dna_le::get_double(data.data() + offset); offset += 8;
+    fp.median_asymmetry = dna_le::get_double(data.data() + offset); offset += 8;
+    fp.bandwidth_stability = dna_le::get_double(data.data() + offset); offset += 8;
     // measurement count is informational only (no raw measurements in serialized form)
 
     return fp;

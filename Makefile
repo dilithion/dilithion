@@ -34,6 +34,51 @@ CXXFLAGS += -MMD -MP
 CFLAGS ?= -O2 -fstack-protector-strong -D_FORTIFY_SOURCE=2 -Wformat -Wformat-security
 CFLAGS += -MMD -MP
 
+# ---------------------------------------------------------------------------
+# CONSENSUS-CRITICAL: -fwrapv is NOT optional and NOT a hardening nicety.
+#
+# The legacy (pre-C-3-gate) DFMP heat-penalty path grows an int64_t by repeated
+#   penalty = (penalty * FP_HEAT_GROWTH) / 100
+# with NO overflow guard (src/dfmp/dfmp.cpp CalculateHeatMultiplierFP, saturate=false;
+# likewise mik.cpp CalculateTotalMultiplierFP_V2). On the live V33/V34 curves that
+# product exceeds INT64_MAX once the exponent reaches 59 — i.e. at
+#   heat == effectiveFreeThreshold + 60
+# (heat 72 for the default 12-block free tier), which is ~20% of the 360-block
+# observation window and is reachable by exactly the concentrated miner DFMP exists
+# to penalise.
+#
+# In standard C++ that is signed integer overflow: UNDEFINED BEHAVIOUR. The
+# consensus rule then depends on the wrapped-negative product being caught by the
+# floor in CalculateEffectiveTarget() (`if (multiplierFP < FP_SCALE) multiplierFP =
+# FP_SCALE`), which only behaves as documented if the overflow actually WRAPS.
+#
+# The C-3 saturating fix is gated OFF (activation height 999999999) on all three
+# chains, so the UB path is the LIVE consensus rule today, not a historical one.
+# We ship three separately-compiled binaries (GCC/Linux, GCC/MSYS2, Clang/macOS);
+# today they agree only because both compilers happen to emit a wrapping imul at
+# -O2 and the floor tests the runtime value. That is a codegen accident, not a
+# language guarantee — it would break under LTO (cross-TU range propagation can
+# prove `penalty > 0` and fold the floor away), under any compiler upgrade, or
+# under a UBSan build.
+#
+# -fwrapv freezes today's de-facto two's-complement wrapping as a DEFINED language
+# guarantee, bit-for-bit identical across all three toolchains, with zero
+# behavioural delta on current binaries. Removing it re-opens a consensus split.
+#
+# WHY A SEPARATE VARIABLE, not `CXXFLAGS += -fwrapv`:
+# CXXFLAGS/CFLAGS above are `?=`, so a CI job, distro packager, or
+# `make CXXFLAGS=...` invocation would silently drop an appended flag and produce a
+# consensus-divergent binary. `override CXXFLAGS += -fwrapv` fixes that but has a
+# nasty side effect — it permanently marks CXXFLAGS as override-origin, after which
+# GNU make SILENTLY IGNORES every later plain `CXXFLAGS +=` in this file (-DZMQ_STATIC
+# and the whole platform-specific block below). Verified: it broke the link.
+#
+# So the flag lives in its own variable that nothing else ever assigns to, and is
+# injected directly into the compile recipes. `override` here is safe (no other
+# assignment to collide with) and stops `make CONSENSUS_CXXFLAGS=` from removing it.
+# Every first-party compile recipe MUST include $(CONSENSUS_CXXFLAGS).
+override CONSENSUS_CXXFLAGS := -fwrapv
+
 # Include paths (base)
 INCLUDES := -I src \
             -I depends/randomx/src \
@@ -180,6 +225,7 @@ CONSENSUS_SOURCES := src/consensus/fees.cpp \
                      src/consensus/chain_verifier.cpp \
                      src/consensus/tx_validation.cpp \
                      src/consensus/signature_batch_verifier.cpp \
+                     src/consensus/sighash_preimage.cpp \
                      src/consensus/validation.cpp \
                      src/consensus/vdf_validation.cpp \
                      src/consensus/port/chain_selector_impl.cpp
@@ -300,6 +346,7 @@ RPC_SOURCES := src/rpc/server.cpp \
                src/rpc/host_validator.cpp
 
 API_SOURCES := src/api/http_server.cpp \
+               src/api/http_path_gate.cpp \
                src/api/cached_stats.cpp
 
 X402_SOURCES := src/x402/x402_types.cpp \
@@ -383,11 +430,13 @@ WALLET_TEST_SOURCE := src/test/wallet_tests.cpp
 RPC_TEST_SOURCE := src/test/rpc_tests.cpp
 RPC_AUTH_TEST_SOURCE := src/test/rpc_auth_tests.cpp
 RPC_HOST_HEADER_TEST_SOURCE := src/test/rpc_host_header_tests.cpp
+HTTP_SERVER_WALLET_GATE_TEST_SOURCE := src/test/http_server_wallet_gate_tests.cpp
 RPC_HD_WALLET_TEST_SOURCE := src/test/rpc_hd_wallet_tests.cpp
 RPC_SSL_TEST_SOURCE := src/test/rpc_ssl_tests.cpp
 RPC_WEBSOCKET_TEST_SOURCE := src/test/rpc_websocket_tests.cpp
 TIMESTAMP_TEST_SOURCE := src/test/timestamp_tests.cpp
 CRYPTER_TEST_SOURCE := src/test/crypter_tests.cpp
+SEED_ATTESTATION_KEY_TEST_SOURCE := src/test/seed_attestation_key_tests.cpp
 WALLET_ENCRYPTION_INTEGRATION_TEST_SOURCE := src/test/wallet_encryption_integration_tests.cpp
 WALLET_PERSISTENCE_TEST_SOURCE := src/test/wallet_persistence_tests.cpp
 INTEGRATION_TEST_SOURCE := src/test/integration_tests.cpp
@@ -397,6 +446,7 @@ TX_VALIDATION_TEST_SOURCE := src/test/tx_validation_tests.cpp
 TX_RELAY_TEST_SOURCE := src/test/tx_relay_tests.cpp
 MINING_INTEGRATION_TEST_SOURCE := src/test/mining_integration_tests.cpp
 DFMP_MIK_TEST_SOURCE := src/test/dfmp_mik_tests.cpp
+DFMP_HEAT_OVERFLOW_TEST_SOURCE := src/test/dfmp_heat_overflow_tests.cpp
 MIK_REG_PERSIST_TEST_SOURCE := src/test/mik_registration_persistence_tests.cpp
 REGISTRATION_MANAGER_TEST_SOURCE := src/test/registration_manager_tests.cpp
 DNA_PROPAGATION_TEST_SOURCE := src/test/dna_propagation_tests.cpp
@@ -491,14 +541,98 @@ dilv-genesis-vdf: $(CORE_OBJECTS) $(OBJ_DIR)/tools/dilv_genesis_vdf.o $(DILITHIU
 # Test Binaries
 # ============================================================================
 
-tests: phase1_test miner_tests wallet_tests rpc_tests rpc_auth_tests rpc_host_header_tests ratelimiter_tests timestamp_tests crypter_tests wallet_encryption_integration_tests wallet_persistence_tests integration_tests net_tests connman_tests tx_validation_tests tx_relay_tests mining_integration_tests bug_003_block_size_tests dfmp_mik_tests mik_registration_persistence_tests dna_propagation_tests test_passphrase_validator script_tests addrman_v2_tests peer_scorer_tests peer_scorer_banman_integration_tests header_proof_checker_tests chain_selector_tests getchaintips_equivalence_tests chain_case_2_5_equivalence_tests chain_work_smoke_tests reorg_wal_crash_injection_tests competing_sibling_below_checkpoint_tests headers_manager_to_chain_selector_wiring_tests fast_path_2_boundary_tests v4_1_checkpoint_enforcement_tests v4_1_chain_selector_suppression_tests auto_rebuild_marker_mode_symmetry_tests add_block_index_flag_merge_tests port_chain_selector_invariants_tests legacy_vs_port_differential_tests chainstate_integrity_tests
-	@echo "$(COLOR_GREEN)✓ All tests built successfully$(COLOR_RESET)"
+# ----------------------------------------------------------------------------
+# Standalone (non-Boost) test suites.
+#
+# HISTORY / WHY THIS LOOKS LIKE THIS
+# Until F4, `tests:` listed ~46 binaries and had exactly one recipe line:
+#     @echo "✓ All tests built successfully"
+# It BUILT them and RAN NONE. .github/workflows/ci.yml never invoked it either.
+# The whole standalone corpus had therefore never been executed by any
+# automated process; several suites had rotted to the point of not compiling
+# and nobody could tell.
+#
+# The roster (which suites exist, which tier, timeout, quarantine + reason) is
+# single-sourced in scripts/run_test_suites.sh. The build lists below are
+# DERIVED from it, so the set that gets built can never drift from the set that
+# gets run.
+#
+#   make tests        build every suite, then RUN every non-quarantined suite
+#   make tests-fast   the PR-gating tier (build + run)
+#   make tests-full   the scheduled tier (build + run)
+#   make tests-build  build only (no execution) — for memcheck/coverage plumbing
+# ----------------------------------------------------------------------------
+TEST_SUITES_ALL  := $(shell bash scripts/run_test_suites.sh --list all)
+TEST_SUITES_FAST := $(shell bash scripts/run_test_suites.sh --list fast)
+TEST_SUITES_FULL := $(shell bash scripts/run_test_suites.sh --list full)
+
+# If run_test_suites.sh cannot be parsed (e.g. a stray apostrophe in a
+# quarantine reason closes the single-quoted ROSTER string), `--list` prints
+# NOTHING and $(shell ...) yields an empty list. `tests-build` would then have
+# no prerequisites and its recipe is only an echo, so it would report success
+# having built nothing at all — exactly the vacuous green this whole PR exists
+# to remove. `tests-fast`/`tests-full` happen to survive because their recipes
+# re-invoke the script and inherit its non-zero exit, but tests-build does not.
+# Fail loudly at parse time instead.
+ifeq ($(strip $(TEST_SUITES_ALL)),)
+$(error scripts/run_test_suites.sh --list all produced an empty roster. \
+Run 'bash scripts/run_test_suites.sh --list all' directly to see the error \
+(a lone apostrophe in a quarantine reason is the usual cause). Refusing to \
+continue with an empty test-suite list, which would build and run nothing \
+while reporting success.)
+endif
+
+# Every standalone suite links $(LIBS), which includes -lzmq, so each one needs
+# the vendored static libzmq the same way dilithion-node does. Declaring it here
+# (rather than per-target) keeps the dependency single-sourced off the roster.
+#
+# This is an ORDER-ONLY prerequisite on each suite binary, not on the aggregate
+# tests-* targets: an order-only prereq of `tests-build` would only be ordered
+# against tests-build's own recipe, leaving the suite links free to race ahead
+# of it under -j. Attaching it to the binaries themselves is what actually
+# serialises correctly.
+#
+# Found by CI: the full-tier workflow's first make invocation is `make
+# tests-full`, so nothing had built libzmq first and every suite that links
+# CORE_OBJECTS died on "cannot find -lzmq". ci.yml only escaped it because
+# `make dilithion-node` runs earlier in that job and drags libzmq in.
+$(TEST_SUITES_ALL): | libzmq
+
+.PHONY: tests tests-build tests-fast tests-full
+
+tests-build: $(TEST_SUITES_ALL)
+	@echo "$(COLOR_GREEN)✓ All test suites built (NOT run — use 'make tests')$(COLOR_RESET)"
+
+tests: tests-build
+	@bash scripts/run_test_suites.sh all
+
+tests-fast: $(TEST_SUITES_FAST)
+	@bash scripts/run_test_suites.sh fast
+
+tests-full: $(TEST_SUITES_FULL)
+	@bash scripts/run_test_suites.sh full
 
 phase1_test: $(CORE_OBJECTS) $(OBJ_DIR)/test/phase1_simple_test.o $(DILITHIUM_OBJECTS) $(CHIAVDF_OBJECTS)
 	@echo "$(COLOR_BLUE)[LINK]$(COLOR_RESET) $@"
 	@$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS) $(LIBS)
 
 miner_tests: $(CORE_OBJECTS) $(OBJ_DIR)/test/miner_tests.o $(DILITHIUM_OBJECTS) $(CHIAVDF_OBJECTS)
+	@echo "$(COLOR_BLUE)[LINK]$(COLOR_RESET) $@"
+	@$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS) $(LIBS)
+
+# src/test/randomx_mode_test.cpp existed with no way to build it. It asserts LIGHT
+# and FULL mode hash identically, which is also the control that proves the
+# large-page allocation path does not perturb hash output: LIGHT is allocated on
+# standard pages, FULL requests large pages, and the two must still agree.
+randomx_mode_test: $(CORE_OBJECTS) $(OBJ_DIR)/test/randomx_mode_test.o $(DILITHIUM_OBJECTS) $(CHIAVDF_OBJECTS)
+	@echo "$(COLOR_BLUE)[LINK]$(COLOR_RESET) $@"
+	@$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS) $(LIBS)
+
+# Ordering test for the large-page opt-in. randomx_mode_test proves the allocation is
+# SAFE; this proves it is REACHED -- the opt-in shipped unreachable on the primary path
+# (dataset already built by the 8GB+ IBD speedup before mining ever asked) and no log
+# line said so. Re-execs itself once per ordering; the module's mode state is global.
+large_pages_optin_test: $(CORE_OBJECTS) $(OBJ_DIR)/test/large_pages_optin_test.o $(DILITHIUM_OBJECTS) $(CHIAVDF_OBJECTS)
 	@echo "$(COLOR_BLUE)[LINK]$(COLOR_RESET) $@"
 	@$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS) $(LIBS)
 
@@ -521,6 +655,13 @@ rpc_host_header_tests: $(OBJ_DIR)/rpc/host_validator.o $(OBJ_DIR)/test/rpc_host_
 	@echo "$(COLOR_BLUE)[LINK]$(COLOR_RESET) $@"
 	@$(CXX) $(CXXFLAGS) -o $@ $^
 
+# LP-12: CHttpServer wallet-HTML serving-gate unit tests. Self-contained — links
+# ONLY host_validator.o (the IsLoopbackIP SSoT predicate), so it builds and runs
+# WITHOUT the node's depends/ (libzmq/randomx/chiavdf). No CORE_OBJECTS dependency.
+http_server_wallet_gate_tests: $(OBJ_DIR)/rpc/host_validator.o $(OBJ_DIR)/api/http_path_gate.o $(OBJ_DIR)/test/http_server_wallet_gate_tests.o
+	@echo "$(COLOR_BLUE)[LINK]$(COLOR_RESET) $@"
+	@$(CXX) $(CXXFLAGS) -o $@ $^
+
 ratelimiter_tests: $(CORE_OBJECTS) $(OBJ_DIR)/test/ratelimiter_tests.o $(DILITHIUM_OBJECTS) $(CHIAVDF_OBJECTS)
 	@echo "$(COLOR_BLUE)[LINK]$(COLOR_RESET) $@"
 	@$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS) $(LIBS)
@@ -533,11 +674,29 @@ crypter_tests: $(CORE_OBJECTS) $(OBJ_DIR)/test/crypter_tests.o $(DILITHIUM_OBJEC
 	@echo "$(COLOR_BLUE)[LINK]$(COLOR_RESET) $@"
 	@$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS) $(LIBS)
 
+# LP-13: seed-attestation private key at-rest hardening tests
+seed_attestation_key_tests: $(CORE_OBJECTS) $(OBJ_DIR)/test/seed_attestation_key_tests.o $(DILITHIUM_OBJECTS) $(CHIAVDF_OBJECTS)
+	@echo "$(COLOR_BLUE)[LINK]$(COLOR_RESET) $@"
+	@$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS) $(LIBS)
+
 wallet_encryption_integration_tests: $(CORE_OBJECTS) $(OBJ_DIR)/test/wallet_encryption_integration_tests.o $(DILITHIUM_OBJECTS) $(CHIAVDF_OBJECTS)
 	@echo "$(COLOR_BLUE)[LINK]$(COLOR_RESET) $@"
 	@$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS) $(LIBS)
 
 wallet_persistence_tests: $(CORE_OBJECTS) $(OBJ_DIR)/test/wallet_persistence_tests.o $(DILITHIUM_OBJECTS) $(CHIAVDF_OBJECTS)
+	@echo "$(COLOR_BLUE)[LINK]$(COLOR_RESET) $@"
+	@$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS) $(LIBS)
+
+# wallet/wallet_load_guard.h is header-only and depends on nothing but the
+# standard library, so this test links against its own object alone — no
+# CORE_OBJECTS, and it builds in seconds.
+wallet_load_guard_tests: $(OBJ_DIR)/test/wallet_load_guard_tests.o
+	@echo "$(COLOR_BLUE)[LINK]$(COLOR_RESET) $@"
+	@$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS)
+
+# LP-7: wallet encryption-at-rest fix tests (secrecy regression + negative control,
+# migration round-trip + interrupted migration, auth-tamper rejection).
+wallet_encryption_at_rest_tests: $(CORE_OBJECTS) $(OBJ_DIR)/test/wallet_encryption_at_rest_tests.o $(DILITHIUM_OBJECTS) $(CHIAVDF_OBJECTS)
 	@echo "$(COLOR_BLUE)[LINK]$(COLOR_RESET) $@"
 	@$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS) $(LIBS)
 
@@ -569,9 +728,13 @@ connman_tests: $(CORE_OBJECTS) $(OBJ_DIR)/test/connman_tests.o $(DILITHIUM_OBJEC
 	@echo "$(COLOR_BLUE)[LINK]$(COLOR_RESET) $@"
 	@$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS) $(LIBS)
 
-tx_validation_tests: $(CORE_OBJECTS) $(OBJ_DIR)/test/tx_validation_tests.o $(DILITHIUM_OBJECTS) $(CHIAVDF_OBJECTS)
-	@echo "$(COLOR_BLUE)[LINK]$(COLOR_RESET) $@"
-	@$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS) $(LIBS)
+# F4: the `tx_validation_tests` standalone target was DELETED. It compiled
+# src/test/tx_validation_tests.cpp — a BOOST_AUTO_TEST_SUITE file that is
+# already an entry in BOOST_TEST_OBJECTS and therefore already built and run
+# inside test_dilithion. Standalone it has no Boost main and no
+# unit_test_framework link, so it could never link at all: the target had been
+# permanently broken and nobody noticed because `make tests` only echoed.
+# The coverage is not lost — it runs as part of test_dilithion on every CI run.
 
 tx_relay_tests: $(CORE_OBJECTS) $(OBJ_DIR)/test/tx_relay_tests.o $(DILITHIUM_OBJECTS) $(CHIAVDF_OBJECTS)
 	@echo "$(COLOR_BLUE)[LINK]$(COLOR_RESET) $@"
@@ -589,6 +752,16 @@ bug_003_block_size_tests: $(CORE_OBJECTS) $(OBJ_DIR)/test/bug_003_block_size_tes
 dfmp_mik_tests: $(CORE_OBJECTS) $(OBJ_DIR)/test/dfmp_mik_tests.o $(DILITHIUM_OBJECTS) $(CHIAVDF_OBJECTS)
 	@echo "$(COLOR_BLUE)[LINK]$(COLOR_RESET) $@"
 	@$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS) $(LIBS)
+
+dfmp_heat_overflow_tests: $(CORE_OBJECTS) $(OBJ_DIR)/test/dfmp_heat_overflow_tests.o $(DILITHIUM_OBJECTS) $(CHIAVDF_OBJECTS)
+	@echo "$(COLOR_BLUE)[LINK]$(COLOR_RESET) $@"
+	@$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS) $(LIBS)
+
+# Structural pin only — reads source files, links nothing from the node.
+shutdown_disarm_ownership_tests: $(OBJ_DIR)/test/shutdown_disarm_ownership_tests.o
+	@echo "$(COLOR_BLUE)[LINK]$(COLOR_RESET) $@"
+	@$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS)
+	@echo "$(COLOR_GREEN)✓ shutdown_disarm_ownership_tests built successfully$(COLOR_RESET)"
 
 mik_registration_persistence_tests: $(CORE_OBJECTS) $(OBJ_DIR)/test/mik_registration_persistence_tests.o $(DILITHIUM_OBJECTS) $(CHIAVDF_OBJECTS)
 	@echo "$(COLOR_BLUE)[LINK]$(COLOR_RESET) $@"
@@ -745,7 +918,31 @@ auto_rebuild_marker_mode_symmetry_tests: $(CORE_OBJECTS) $(OBJ_DIR)/test/auto_re
 # block in [highest_checkpoint+1 .. tip] has a present, SHA3-checksummed undo
 # record. Detects the missing/corrupt undo-data corruption mode that crash-looped
 # NYC + LDN on 2026-04-25. See src/test/chainstate_integrity_tests.cpp.
-chainstate_integrity_tests: $(CORE_OBJECTS) $(OBJ_DIR)/test/chainstate_integrity_tests.o $(DILITHIUM_OBJECTS) $(CHIAVDF_OBJECTS)
+# extreview PR #120 (HIGH): the undo-fetch fault injector must NOT exist in any
+# shipped binary. It is guarded by DILITHION_ENABLE_FAULT_INJECTION, defined ONLY
+# for this private test recompile of utxo_set.cpp. The production CORE utxo_set.o
+# (linked by dilithion-node / dilv-node) is built WITHOUT the macro, so the
+# injectable seam is compiled out entirely. We substitute the fault-injection
+# object for the CORE one in this test's link line so there is exactly one
+# utxo_set definition (no duplicate-symbol clash).
+INTEGRITY_TEST_FAULT_OBJ := $(OBJ_DIR)/test/utxo_set_faultinject.o
+$(INTEGRITY_TEST_FAULT_OBJ): src/node/utxo_set.cpp | $(OBJ_DIR)/test
+	@echo "$(COLOR_BLUE)[CXX]$(COLOR_RESET)  $< (fault-injection enabled, test-only)"
+	@$(CXX) $(CXXFLAGS) $(CONSENSUS_CXXFLAGS) -DDILITHION_ENABLE_FAULT_INJECTION $(INCLUDES) -c $< -o $@
+
+# The test driver references g_undo_fetch_fault_injector, so its own object must
+# also see DILITHION_ENABLE_FAULT_INJECTION. Built via a target-specific recompile
+# (distinct .o name) so it doesn't collide with the generic src/%.o rule.
+INTEGRITY_TEST_DRIVER_OBJ := $(OBJ_DIR)/test/chainstate_integrity_tests_faultinject.o
+$(INTEGRITY_TEST_DRIVER_OBJ): src/test/chainstate_integrity_tests.cpp | $(OBJ_DIR)/test
+	@echo "$(COLOR_BLUE)[CXX]$(COLOR_RESET)  $< (fault-injection enabled, test-only)"
+	@$(CXX) $(CXXFLAGS) $(CONSENSUS_CXXFLAGS) -DDILITHION_ENABLE_FAULT_INJECTION $(INCLUDES) -c $< -o $@
+
+CHAINSTATE_INTEGRITY_CORE_OBJECTS := \
+	$(filter-out $(OBJ_DIR)/node/utxo_set.o,$(CORE_OBJECTS)) \
+	$(INTEGRITY_TEST_FAULT_OBJ)
+
+chainstate_integrity_tests: $(CHAINSTATE_INTEGRITY_CORE_OBJECTS) $(INTEGRITY_TEST_DRIVER_OBJ) $(DILITHIUM_OBJECTS) $(CHIAVDF_OBJECTS)
 	@echo "$(COLOR_BLUE)[LINK]$(COLOR_RESET) $@"
 	@$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS) $(LIBS)
 	@echo "$(COLOR_GREEN)✓ chainstate_integrity_tests built successfully$(COLOR_RESET)"
@@ -757,6 +954,14 @@ port_chain_selector_invariants_tests: $(CORE_OBJECTS) $(OBJ_DIR)/test/port_chain
 	@echo "$(COLOR_BLUE)[LINK]$(COLOR_RESET) $@"
 	@$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS) $(LIBS)
 	@echo "$(COLOR_GREEN)✓ port_chain_selector_invariants_tests built successfully$(COLOR_RESET)"
+
+# Magnet v1a (fork-resistance, OBSERVABILITY ONLY): canonical node-health
+# accessor tests — IsOnCanonical() / OffCanonicalReason() / off-canonical
+# edge-trigger. See src/test/magnet_canonical_health_tests.cpp.
+magnet_canonical_health_tests: $(CORE_OBJECTS) $(OBJ_DIR)/test/magnet_canonical_health_tests.o $(DILITHIUM_OBJECTS) $(CHIAVDF_OBJECTS)
+	@echo "$(COLOR_BLUE)[LINK]$(COLOR_RESET) $@"
+	@$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS) $(LIBS)
+	@echo "$(COLOR_GREEN)✓ magnet_canonical_health_tests built successfully$(COLOR_RESET)"
 
 # v4.3.3 T2: differential testing harness — legacy vs port path equivalence
 # enforcement (audit modality 3 from feedback_audit_techniques_beyond_code_review).
@@ -779,6 +984,18 @@ competing_sibling_below_checkpoint_tests: $(CORE_OBJECTS) $(OBJ_DIR)/test/compet
 	@echo "$(COLOR_BLUE)[LINK]$(COLOR_RESET) $@"
 	@$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS) $(LIBS)
 	@echo "$(COLOR_GREEN)✓ competing_sibling_below_checkpoint_tests built successfully$(COLOR_RESET)"
+
+# Genesis validity regression suite — pins that EVERY network's genesis block
+# constructs and passes the node's own boot-time IsGenesisBlock() gate.
+# Added 2026-08-08 after dilithion-node --testnet / --regtest were found
+# unbootable for ~4.5 months with no test covering it.
+# Run once per network to also cover GetGenesisHash() (call_once-cached):
+#   ./genesis_all_networks_tests mainnet && ./genesis_all_networks_tests testnet \
+#     && ./genesis_all_networks_tests dilv && ./genesis_all_networks_tests regtest
+genesis_all_networks_tests: $(CORE_OBJECTS) $(OBJ_DIR)/test/genesis_all_networks_tests.o $(DILITHIUM_OBJECTS) $(CHIAVDF_OBJECTS)
+	@echo "$(COLOR_BLUE)[LINK]$(COLOR_RESET) $@"
+	@$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS) $(LIBS)
+	@echo "$(COLOR_GREEN)✓ genesis_all_networks_tests built successfully$(COLOR_RESET)"
 
 # Phase 5 Day 5: regtest mode scaffold smoke test.
 regtest_chainparams_smoke: $(CORE_OBJECTS) $(OBJ_DIR)/test/regtest_chainparams_smoke.o $(DILITHIUM_OBJECTS) $(CHIAVDF_OBJECTS)
@@ -848,7 +1065,10 @@ v4_2_time_decay_cooldown_tests: $(OBJ_DIR)/test/v4_2_time_decay_cooldown_tests.o
 	@$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS)
 	@echo "$(COLOR_GREEN)✓ v4_2_time_decay_cooldown_tests built successfully$(COLOR_RESET)"
 
-test_passphrase_validator: $(OBJ_DIR)/wallet/passphrase_validator.o $(OBJ_DIR)/test_passphrase_validator.o
+# F4: passphrase_validator.o references RPCAuth::SecureCompare, which lives in
+# rpc/auth.o. The link had been broken since that reference was introduced —
+# invisible because nothing ever built this target (`make tests` only echoed).
+test_passphrase_validator: $(OBJ_DIR)/wallet/passphrase_validator.o $(OBJ_DIR)/rpc/auth.o $(OBJ_DIR)/crypto/sha3.o $(OBJ_DIR)/crypto/hmac_sha3.o $(OBJ_DIR)/crypto/pbkdf2_sha3.o $(OBJ_DIR)/util/logging.o $(OBJ_DIR)/test_passphrase_validator.o $(DILITHIUM_OBJECTS)
 	@echo "$(COLOR_BLUE)[LINK]$(COLOR_RESET) $@"
 	@$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS) $(LIBS)
 
@@ -867,6 +1087,16 @@ four_node_test:
 	@echo "$(COLOR_BLUE)[TEST]$(COLOR_RESET) 4-node regtest harness (scripts/four_node_local.sh)"
 	@bash scripts/four_node_local.sh smoke 10 180
 	@echo "$(COLOR_GREEN)✓ four_node_test passed$(COLOR_RESET)"
+
+# Regression: an unreadable wallet.dat must never be overwritten by the
+# create-new-wallet path. Drives the real binaries, so both are built first.
+# BOTH node binaries own a wallet and both carried the bug — see the script
+# header for the v4.5.0 incident this pins.
+.PHONY: wallet_load_guard_test
+wallet_load_guard_test: dilithion-node dilv-node
+	@echo "$(COLOR_BLUE)[TEST]$(COLOR_RESET) unreadable-wallet preservation guard (scripts/wallet_load_guard_test.sh)"
+	@bash scripts/wallet_load_guard_test.sh
+	@echo "$(COLOR_GREEN)✓ wallet_load_guard_test passed$(COLOR_RESET)"
 
 # ============================================================================
 # Boost Unit Test Binaries
@@ -897,6 +1127,8 @@ BOOST_TEST_OBJECTS := $(OBJ_DIR)/test/test_dilithion.o \
 	$(OBJ_DIR)/test/consensus_validation_tests.o \
 	$(OBJ_DIR)/test/utxo_tests.o \
 	$(OBJ_DIR)/test/tx_validation_tests.o \
+	$(OBJ_DIR)/test/phase4_5_consensus_fixes_tests.o \
+	$(OBJ_DIR)/test/sighash_preimage_tests.o \
 	$(OBJ_DIR)/test/ibd_coordinator_tests.o \
 	$(OBJ_DIR)/test/misbehavior_scoring_tests.o \
 	$(OBJ_DIR)/test/ibd_functional_tests.o \
@@ -913,6 +1145,10 @@ BOOST_TEST_OBJECTS := $(OBJ_DIR)/test/test_dilithion.o \
 	$(OBJ_DIR)/test/fee_persist_tests.o \
 	$(OBJ_DIR)/test/fee_wiring_tests.o \
 	$(OBJ_DIR)/test/zmq_tests.o \
+	$(OBJ_DIR)/test/seed_attestation_glue_tests.o \
+	$(OBJ_DIR)/test/wf1_host_endian_differential_test.o \
+	$(OBJ_DIR)/test/miner_nonce_write_tests.o \
+	$(OBJ_DIR)/test/chain_tips_cache_invalidation_tests.o \
 	$(CRYPTO_PROPERTY_OBJECTS)
 
 # Link test objects + full library (CORE_OBJECTS) to avoid hand-picked object drift
@@ -931,6 +1167,17 @@ difficulty_determinism_test: $(OBJ_DIR)/test/difficulty_determinism_test.o $(OBJ
 	@$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS) $(LIBS)
 	@echo "$(COLOR_GREEN)✓ Difficulty determinism test built successfully$(COLOR_RESET)"
 
+# F4: the `sighash_differential_tests` standalone target and its source
+# (src/test/sighash_differential_tests.cpp) were DELETED as a duplicate.
+# src/test/sighash_preimage_tests.cpp is the same differential proof wired into
+# BOOST_TEST_OBJECTS, so it already runs in test_dilithion on every CI run. Each
+# file carried its OWN verbatim copy of the pre-refactor "legacy" byte layout —
+# the ground truth of the proof — and each only ever compared against its own
+# copy, so the two mirrors could silently drift apart without any test noticing.
+# Two independently-maintained copies of a ground truth is the hazard, not the
+# safeguard; the Boost copy is the one CI actually executes, so it is the one
+# that was kept.
+
 eda_test:
 	@echo "$(COLOR_BLUE)[CXX+LINK]$(COLOR_RESET) src/test/eda_test.cpp (standalone)"
 	@$(CXX) -std=c++17 -O2 -o $@ src/test/eda_test.cpp
@@ -942,63 +1189,59 @@ asert_test:
 	@echo "$(COLOR_GREEN)✓ ASERT test built successfully$(COLOR_RESET)"
 
 # ============================================================================
+# LP-5 batch-verifier concurrency race + differential harness (CRITICAL-1/MED-2)
+# Links only the verifier object + Dilithium primitives (no full CORE_OBJECTS):
+# the race lives entirely in CSignatureBatchVerifier's per-batch state.
+# Build under ThreadSanitizer on Linux:  make TSAN=1 batch_verifier_race_tests
+# ============================================================================
+batch_verifier_race_tests: $(OBJ_DIR)/consensus/signature_batch_verifier.o $(OBJ_DIR)/test/batch_verifier_race_tests.o $(DILITHIUM_OBJECTS)
+	@echo "$(COLOR_BLUE)[LINK]$(COLOR_RESET) $@"
+	@$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS) $(LIBS)
+	@echo "$(COLOR_GREEN)✓ batch_verifier_race_tests built$(COLOR_RESET)"
+
+# ----------------------------------------------------------------------------
+# A-010 CONTROL target: SAME harness source, -DPREFIX_API, linked against the
+# FROZEN pre-fix verifier (src/test/lp5_control/, a verbatim copy of bb933d53).
+# This deterministically HANGS — proving the harness is a real discriminator,
+# not a no-op. The control-red and the fix-green therefore come from one source.
+#   make batch_verifier_race_control   # then run with a timeout; expect a HANG.
+# Distinct object dir so the -DPREFIX_API harness object never collides with the
+# default (no-PREFIX_API) batch_verifier_race_tests.o.
+$(OBJ_DIR)/test/lp5_control:
+	@mkdir -p $@
+
+$(OBJ_DIR)/test/lp5_control/signature_batch_verifier_prefix.o: src/test/lp5_control/signature_batch_verifier_prefix.cpp | $(OBJ_DIR)/test/lp5_control
+	@echo "$(COLOR_BLUE)[CXX]$(COLOR_RESET)  $< (LP-5 control, frozen pre-fix)"
+	@$(CXX) $(CXXFLAGS) $(CONSENSUS_CXXFLAGS) $(INCLUDES) -I src/test/lp5_control -c $< -o $@
+
+$(OBJ_DIR)/test/lp5_control/batch_verifier_race_tests.o: src/test/batch_verifier_race_tests.cpp | $(OBJ_DIR)/test/lp5_control
+	@echo "$(COLOR_BLUE)[CXX]$(COLOR_RESET)  $< (-DPREFIX_API control variant)"
+	@$(CXX) $(CXXFLAGS) $(CONSENSUS_CXXFLAGS) $(INCLUDES) -I src/test/lp5_control -DPREFIX_API -c $< -o $@
+
+batch_verifier_race_control: $(OBJ_DIR)/test/lp5_control/signature_batch_verifier_prefix.o $(OBJ_DIR)/test/lp5_control/batch_verifier_race_tests.o $(DILITHIUM_OBJECTS)
+	@echo "$(COLOR_BLUE)[LINK]$(COLOR_RESET) $@"
+	@$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS) $(LIBS)
+	@echo "$(COLOR_GREEN)✓ batch_verifier_race_control built (A-010 control — expect HANG when run)$(COLOR_RESET)"
+
+# ============================================================================
 # Run Tests
 # ============================================================================
 
-test: tests test_dilithion asert_test
+# `make test` = the full local gate: every standalone suite (build + RUN) plus
+# the Boost suite plus the wallet-preservation guard.
+#
+# F4: this recipe used to hand-maintain its own subset of ./binary invocations —
+# ~20 of the 46 suites — and swallowed failures with `|| true` on the Boost
+# suite, wallet_tests and rpc_tests. Both problems are gone: the roster is
+# single-sourced in scripts/run_test_suites.sh and nothing is `|| true`'d.
+test: tests test_dilithion asert_test wallet_load_guard_test
 	@echo "$(COLOR_YELLOW)========================================$(COLOR_RESET)"
 	@echo "$(COLOR_YELLOW)Running Boost Unit Test Suite$(COLOR_RESET)"
 	@echo "$(COLOR_YELLOW)========================================$(COLOR_RESET)"
-	@./test_dilithion --log_level=test_suite --report_level=short || true
-	@echo ""
-	@echo "$(COLOR_YELLOW)========================================$(COLOR_RESET)"
-	@echo "$(COLOR_YELLOW)Running Legacy Test Suite$(COLOR_RESET)"
-	@echo "$(COLOR_YELLOW)========================================$(COLOR_RESET)"
-	@echo ""
-	@echo "$(COLOR_YELLOW)Running Phase 1 tests...$(COLOR_RESET)"
-	@./phase1_test
-	@echo ""
-	@echo "$(COLOR_YELLOW)Running Phase 3 miner tests...$(COLOR_RESET)"
-	@./miner_tests
-	@echo ""
-	@echo "$(COLOR_YELLOW)Running Phase 4 wallet tests...$(COLOR_RESET)"
-	@timeout 10 ./wallet_tests || true
-	@echo ""
-	@echo "$(COLOR_YELLOW)Running Phase 4 RPC tests...$(COLOR_RESET)"
-	@timeout 10 ./rpc_tests || true
-	@echo ""
-	@echo "$(COLOR_YELLOW)Running RPC authentication tests...$(COLOR_RESET)"
-	@./rpc_auth_tests
-	@echo ""
-	@echo "$(COLOR_YELLOW)Running RPC Host-header allowlist + session-token tests...$(COLOR_RESET)"
-	@./rpc_host_header_tests
-	@echo ""
-	@echo "$(COLOR_YELLOW)Running rate limiter regression tests...$(COLOR_RESET)"
-	@./ratelimiter_tests
-	@echo ""
-	@echo "$(COLOR_YELLOW)Running timestamp validation tests...$(COLOR_RESET)"
-	@./timestamp_tests
-	@echo ""
-	@echo "$(COLOR_YELLOW)Running wallet encryption tests...$(COLOR_RESET)"
-	@./crypter_tests
-	@echo ""
-	@echo "$(COLOR_YELLOW)Running wallet encryption integration tests...$(COLOR_RESET)"
-	@./wallet_encryption_integration_tests
-	@echo ""
-	@echo "$(COLOR_YELLOW)Running wallet persistence tests...$(COLOR_RESET)"
-	@./wallet_persistence_tests
-	@echo ""
-	@echo "$(COLOR_YELLOW)Running passphrase validator tests...$(COLOR_RESET)"
-	@./test_passphrase_validator
-	@echo ""
-	@echo "$(COLOR_YELLOW)Running integration tests...$(COLOR_RESET)"
-	@./integration_tests
+	@./test_dilithion --log_level=test_suite --report_level=short
 	@echo ""
 	@echo "$(COLOR_YELLOW)Running ASERT difficulty tests...$(COLOR_RESET)"
 	@./asert_test
-	@echo ""
-	@echo "$(COLOR_YELLOW)Running Phase 6 script system tests...$(COLOR_RESET)"
-	@./script_tests
 	@echo ""
 	@echo "$(COLOR_GREEN)✓ All test suites complete$(COLOR_RESET)"
 
@@ -1040,10 +1283,15 @@ $(OBJ_DIR)/test/fuzz:
 # Compile C++ source files
 $(OBJ_DIR)/%.o: src/%.cpp | $(OBJ_DIR)/attestation $(OBJ_DIR)/consensus $(OBJ_DIR)/consensus/port $(OBJ_DIR)/core $(OBJ_DIR)/crypto $(OBJ_DIR)/db $(OBJ_DIR)/dfmp $(OBJ_DIR)/index $(OBJ_DIR)/kernel $(OBJ_DIR)/miner $(OBJ_DIR)/net $(OBJ_DIR)/net/port $(OBJ_DIR)/node $(OBJ_DIR)/primitives $(OBJ_DIR)/rpc $(OBJ_DIR)/wallet $(OBJ_DIR)/util $(OBJ_DIR)/api $(OBJ_DIR)/vdf $(OBJ_DIR)/digital_dna $(OBJ_DIR)/script $(OBJ_DIR)/policy $(OBJ_DIR)/tools $(OBJ_DIR)/x402 $(OBJ_DIR)/zmq $(OBJ_DIR)/test
 	@echo "$(COLOR_BLUE)[CXX]$(COLOR_RESET)  $<"
-	@$(CXX) $(CXXFLAGS) $(INCLUDES) -c $< -o $@
+	@$(CXX) $(CXXFLAGS) $(CONSENSUS_CXXFLAGS) $(INCLUDES) -c $< -o $@
 
 # Compile chiavdf C++ wrapper (third-party, suppress warnings with -w)
-# Half-word Lehmer (32-bit approx) avoids signed overflow — no -fwrapv needed.
+# NOTE: this recipe hardcodes its flags and does NOT use $(CXXFLAGS), so it is the one
+# first-party-invoked C++ compile that does not inherit the project-wide -fwrapv (see the
+# CONSENSUS-CRITICAL block near the top of this file — the project DOES build with -fwrapv).
+# That is acceptable here and only here: the half-word Lehmer path (32-bit approx) does not
+# rely on signed overflow, so its result is well-defined either way. Do NOT extend this
+# hardcoded-flags pattern to any consensus-path translation unit.
 $(OBJ_DIR)/chiavdf/c_wrapper.o: depends/chiavdf/src/c_bindings/c_wrapper.cpp | $(OBJ_DIR)/chiavdf
 	@echo "$(COLOR_BLUE)[CXX]$(COLOR_RESET)  $< (chiavdf)"
 	@$(CXX) -std=c++17 -O2 -pipe -w $(CPPFLAGS) -I depends/chiavdf/src -I depends/chiavdf/src/c_bindings -c $< -o $@
@@ -1051,17 +1299,17 @@ $(OBJ_DIR)/chiavdf/c_wrapper.o: depends/chiavdf/src/c_bindings/c_wrapper.cpp | $
 # Compile chiavdf lzcnt utility (C file)
 $(OBJ_DIR)/chiavdf/lzcnt.o: depends/chiavdf/src/refcode/lzcnt.c | $(OBJ_DIR)/chiavdf
 	@echo "$(COLOR_BLUE)[CC]$(COLOR_RESET)   $< (chiavdf)"
-	@gcc $(CFLAGS) -w -c $< -o $@
+	@gcc $(CFLAGS) $(CONSENSUS_CXXFLAGS) -w -c $< -o $@
 
 # Compile utility C++ files from root directory
 $(OBJ_DIR)/%.o: %.cpp | $(OBJ_DIR)
 	@echo "$(COLOR_BLUE)[CXX]$(COLOR_RESET)  $<"
-	@$(CXX) $(CXXFLAGS) $(INCLUDES) -c $< -o $@
+	@$(CXX) $(CXXFLAGS) $(CONSENSUS_CXXFLAGS) $(INCLUDES) -c $< -o $@
 
 # Compile Dilithium C files
 $(DILITHIUM_DIR)/%.o: $(DILITHIUM_DIR)/%.c
 	@echo "$(COLOR_BLUE)[CC]$(COLOR_RESET)   $<"
-	@gcc $(CFLAGS) -DDILITHIUM_MODE=3 -I $(DILITHIUM_DIR) -c $< -o $@
+	@gcc $(CFLAGS) $(CONSENSUS_CXXFLAGS) -DDILITHIUM_MODE=3 -I $(DILITHIUM_DIR) -c $< -o $@
 
 # Fuzzer harness files (MUST compile with sanitizers for libFuzzer integration)
 $(OBJ_DIR)/test/fuzz/%.o: src/test/fuzz/%.cpp | $(OBJ_DIR)/test/fuzz
@@ -1071,7 +1319,7 @@ $(OBJ_DIR)/test/fuzz/%.o: src/test/fuzz/%.cpp | $(OBJ_DIR)/test/fuzz
 # Fuzz stubs: compiled WITHOUT sanitizers (dependency code, not harness)
 $(OBJ_DIR)/test/fuzz/fuzz_stubs.o: src/test/fuzz/fuzz_stubs.cpp | $(OBJ_DIR)/test/fuzz
 	@echo "$(COLOR_BLUE)[CXX]$(COLOR_RESET)  $< (fuzz stubs)"
-	@$(CXX) $(CXXFLAGS) $(INCLUDES) -c $< -o $@
+	@$(CXX) $(CXXFLAGS) $(CONSENSUS_CXXFLAGS) $(INCLUDES) -c $< -o $@
 
 # ============================================================================
 # Dependencies
@@ -1143,7 +1391,7 @@ clean:
 	@echo "$(COLOR_YELLOW)Cleaning build artifacts...$(COLOR_RESET)"
 	@rm -rf $(BUILD_DIR)
 	@rm -f dilithion-node genesis_gen
-	@rm -f phase1_test miner_tests wallet_tests rpc_tests rpc_auth_tests timestamp_tests crypter_tests wallet_encryption_integration_tests wallet_persistence_tests integration_tests net_tests tx_validation_tests tx_relay_tests mining_integration_tests dfmp_mik_tests mik_registration_persistence_tests registration_manager_tests dna_propagation_tests
+	@rm -f phase1_test miner_tests wallet_tests rpc_tests rpc_auth_tests timestamp_tests crypter_tests seed_attestation_key_tests wallet_encryption_integration_tests wallet_persistence_tests integration_tests net_tests tx_validation_tests tx_relay_tests mining_integration_tests dfmp_mik_tests mik_registration_persistence_tests registration_manager_tests dna_propagation_tests
 	@rm -f test_dilithion
 	@rm -f $(DILITHIUM_OBJECTS)
 	@echo "$(COLOR_GREEN)✓ Clean complete$(COLOR_RESET)"
@@ -1172,8 +1420,11 @@ help:
 	@echo "  genesis_gen      - Build the genesis block generator"
 	@echo ""
 	@echo "$(COLOR_BLUE)Test Targets:$(COLOR_RESET)"
-	@echo "  tests            - Build all test binaries"
-	@echo "  test             - Build and run all tests"
+	@echo "  tests            - Build AND RUN every standalone test suite"
+	@echo "  tests-fast       - Build+run the PR-gating tier only"
+	@echo "  tests-full       - Build+run the scheduled (slow) tier only"
+	@echo "  tests-build      - Build the suites WITHOUT running them"
+	@echo "  test             - tests + Boost suite + wallet-preservation guard"
 	@echo "  phase1_test      - Build Phase 1 core tests"
 	@echo "  miner_tests      - Build Phase 3 mining tests"
 	@echo "  wallet_tests     - Build Phase 4 wallet tests"
@@ -1198,7 +1449,7 @@ help:
 	@echo "$(COLOR_BLUE)Examples:$(COLOR_RESET)"
 	@echo "  make                    # Build main binaries"
 	@echo "  make -j8                # Build with 8 parallel jobs"
-	@echo "  make tests              # Build all tests"
+	@echo "  make tests              # Build and run all standalone suites"
 	@echo "  make test               # Build and run all tests"
 	@echo "  make clean all          # Clean rebuild"
 	@echo "  make depends all        # Build dependencies and main binaries"
@@ -1244,7 +1495,9 @@ lint:
 	fi
 
 # Memory leak detection
-memcheck: tests
+# F4: depends on tests-build, not tests — this target runs the binaries itself
+# under valgrind; `tests` would now run them all a second time natively first.
+memcheck: tests-build
 	@echo "$(COLOR_YELLOW)Running memory leak detection...$(COLOR_RESET)"
 	@if command -v valgrind >/dev/null 2>&1; then \
 		valgrind --leak-check=full --show-leak-kinds=all \
@@ -1304,6 +1557,44 @@ quality: analyze
 # Fuzz test compiler (requires Clang with libFuzzer support)
 # Try clang++-14 first, fall back to clang++ (any version), or use environment variable
 FUZZ_CXX ?= $(shell command -v clang++-14 2>/dev/null || command -v clang++ 2>/dev/null || echo clang++)
+# ---------------------------------------------------------------------------
+# DO NOT ADD -fwrapv TO FUZZ_CXXFLAGS. (M4; supersedes the K1 trade-off.)
+#
+# -fwrapv makes signed overflow well-defined, which means Clang emits NO
+# `signed-integer-overflow` check for the TU. Putting it in FUZZ_CXXFLAGS
+# therefore does not "silence a false positive" — it deletes an entire UBSan
+# bug class from every harness in the fuzz build, permanently and invisibly, to
+# quiet ONE known, deliberate site. A check that still runs and no longer checks
+# is worse than no check, because the green run is read as evidence.
+#
+# The exemption is scoped at the source instead, three ways:
+#
+#  1. The deliberate DFMP wrap sites carry DILITHION_DELIBERATE_SIGNED_WRAP
+#     (src/util/deliberate_wrap.h) on the individual functions. That is
+#     per-function, greppable, and documented at the site. It is
+#     instrumentation-only: zero codegen effect, consensus output unchanged.
+#
+#  2. Consensus/library objects linked into the fuzz binaries are built by the
+#     ordinary $(OBJ_DIR)/%.o recipe, which already carries
+#     $(CONSENSUS_CXXFLAGS) = -fwrapv. So the arithmetic SEMANTICS the fuzzers
+#     link against are identical to the shipped binaries regardless of this
+#     line — the semantics-parity argument for adding -fwrapv here does not
+#     apply, because this variable governs harness TUs only.
+#
+#  3. Harness TUs (src/test/fuzz/*.cpp) are test code and must never rely on
+#     signed wrapping. They keep full UBSan, signed-integer-overflow included.
+#
+# Measured with clang++-14 (a deliberate int64 overflow injected into a fuzz
+# harness TU, then reverted):
+#   with    -fwrapv: no __ubsan_handle_{mul,add,sub}_overflow reference is
+#                    emitted at all, and the run completes silently with the
+#                    wrapped value -- the check is not merely quiet, it is gone.
+#   without -fwrapv: the reference is emitted and UBSan reports the overflow at
+#                    the exact source line.
+# And with src/dfmp/dfmp.cpp itself compiled under -fsanitize=undefined: the
+# attributed heat functions overflow silently, while an unattributed function in
+# the SAME translation unit still reports -- so the exemption does not leak.
+# ---------------------------------------------------------------------------
 FUZZ_CXXFLAGS := -fsanitize=fuzzer,address,undefined -std=c++17 -O1 -g $(INCLUDES) -DDILITHIUM_MODE=3
 
 # Fuzz test sources (Week 3 Phase 4 - 9 harnesses, 42+ targets)
@@ -1374,6 +1665,7 @@ FUZZ_CONSENSUS_OBJECTS := $(OBJ_DIR)/consensus/pow.o \
                           $(OBJ_DIR)/consensus/fees.o \
                           $(OBJ_DIR)/consensus/tx_validation.o \
                           $(OBJ_DIR)/consensus/validation.o \
+                          $(OBJ_DIR)/consensus/sighash_preimage.o \
                           $(OBJ_DIR)/consensus/signature_batch_verifier.o
 
 FUZZ_DFMP_OBJECTS := $(OBJ_DIR)/dfmp/dfmp.o \

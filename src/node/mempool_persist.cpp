@@ -7,6 +7,7 @@
 #include <net/serialize.h>
 #include <crypto/sha3.h>
 #include <primitives/transaction.h>
+#include <util/atomic_file.h>
 
 #include <cerrno>
 #include <cstdio>
@@ -78,36 +79,12 @@ void XorScramble(uint8_t* data, size_t length,
     }
 }
 
-// fsync the parent directory of `file_path` so the rename() durability
-// requirement is met on POSIX filesystems (XFS, ext4 in non-default config,
-// btrfs). On Windows this is a no-op since rename durability is a separate
-// concern handled by NTFS.
-//
-// Returns empty string on success, error message on failure.
-std::string FsyncParentDir(const std::filesystem::path& file_path) {
-#ifdef _WIN32
-    (void)file_path;
-    return std::string();   // Windows: NTFS handles rename durability differently
-#else
-    const std::filesystem::path parent = file_path.parent_path();
-    if (parent.empty()) return std::string();   // current directory; skip
+// (FsyncParentDir removed: the parent-directory fsync now lives in
+//  util::AtomicReplaceFile(durable=true), so there is one implementation.)
 
-    int dir_fd = ::open(parent.c_str(), O_RDONLY);
-    if (dir_fd < 0) {
-        return "open parent dir for fsync failed: " + std::string(std::strerror(errno));
-    }
-    if (::fsync(dir_fd) != 0) {
-        const std::string err = std::strerror(errno);
-        ::close(dir_fd);
-        return "fsync parent dir failed: " + err;
-    }
-    ::close(dir_fd);
-    return std::string();
-#endif
-}
-
-// Write `bytes` to `target` atomically: write to .new, fsync file, rename,
-// fsync parent directory.
+// Write `bytes` to `target` atomically: write to .new, fsync the file, then
+// atomically replace `target` via util::AtomicReplaceFile (durable=true, which
+// also covers the parent-directory fsync on POSIX).
 //
 // Test seams:
 //   g_force_dump_failure       -- fires BEFORE fopen (no .new file created)
@@ -172,23 +149,29 @@ std::string AtomicWrite(const std::filesystem::path& target,
 
     std::fclose(f);
 
-    std::error_code ec;
-    std::filesystem::rename(tmp, target, ec);
-    if (ec) {
-        const std::string err = ec.message();
+    // Publish atomically, and NOT with std::filesystem::rename.
+    //
+    // This used to be a bare fs::rename(tmp, target). On POSIX that is correct,
+    // and on the libstdc++ we currently ship it is correct on Windows too
+    // (measured: it performs a real replace). But that is library behaviour we
+    // do not control and MinGW has not always provided it.
+    // util::AtomicReplaceFile states the requirement instead:
+    // MoveFileExW(MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) on
+    // Windows, rename(2) + parent-dir fsync on POSIX -- so `target` is at every
+    // instant either the complete old file or the complete new one, and the
+    // replace is durable. See src/util/atomic_file.h.
+    //
+    // durable=true subsumes the parent-directory fsync this function used to do
+    // via its own local FsyncParentDir (now removed -- one implementation, in
+    // util::AtomicReplaceFile). As before, a durability-only failure does NOT
+    // remove the freshly renamed file: it is on disk and correct, only its
+    // directory entry may not have been committed.
+    std::string move_err;
+    if (!util::AtomicReplaceFile(tmp, target, &move_err, /*durable=*/true)) {
+        // Removes the tmp if the replace never happened; a no-op if it did and
+        // only the durability step failed. `target` is never removed either way.
         cleanup_tmp();
-        return "rename(" + tmp.string() + " -> " + target.string() + ") failed: " + err;
-    }
-
-    // Parent-directory fsync ensures the rename is durable across power loss
-    // on filesystems that don't auto-commit metadata after rename (XFS, btrfs).
-    const std::string dir_err = FsyncParentDir(target);
-    if (!dir_err.empty()) {
-        // Rename succeeded but parent fsync didn't. The file is on disk; only
-        // its existence may not be durable. Return the error to surface it,
-        // but do NOT remove the renamed file -- the operator can choose to
-        // re-run savemempool if they consider this a hard failure.
-        return dir_err;
+        return move_err;
     }
 
     return std::string();   // success

@@ -222,7 +222,7 @@ bool Test_EncryptedKeyGeneration() {
     TEST_ASSERT(wallet.GetKeyPoolSize() == 3, "Should have 3 keys");
 
     // Get an address
-    CAddress addr = wallet.GetNewAddress();
+    CDilithiumAddress addr = wallet.GetNewAddress();
     TEST_ASSERT(addr.IsValid(), "Address should be valid");
     TEST_SUCCESS("Got valid address from encrypted wallet");
 
@@ -317,7 +317,7 @@ bool Test_KeyPersistence() {
     // Generate keys before encryption
     wallet.GenerateNewKey();
     wallet.GenerateNewKey();
-    CAddress addr1 = wallet.GetNewAddress();
+    CDilithiumAddress addr1 = wallet.GetNewAddress();
 
     // Get key data before encryption
     CKey keyBefore;
@@ -345,7 +345,7 @@ bool Test_KeyPersistence() {
 
     // Generate more keys
     wallet.GenerateNewKey();
-    CAddress addr2 = wallet.GetNewAddress();
+    CDilithiumAddress addr2 = wallet.GetNewAddress();
 
     // Verify both old and new keys accessible
     CKey key1, key2;
@@ -445,7 +445,7 @@ bool Test_StressMultipleKeys() {
     CWallet wallet;
 
     const int numKeys = 20;
-    std::vector<CAddress> addresses;
+    std::vector<CDilithiumAddress> addresses;
 
     // Generate many keys before encryption
     TEST_INFO("Generating " + std::to_string(numKeys) + " keys...");

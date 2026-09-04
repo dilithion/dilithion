@@ -11,6 +11,73 @@
 #include <cstring>
 #include <iostream>
 #include <atomic>
+#include <set>
+
+// v4.4 (fix/integrity-monitor-self-heal): classify a non-ok leveldb::Status
+// from an undo-record Get() into the (cause, transient) taxonomy the periodic
+// ChainstateIntegrityMonitor routes on. The monitor uses the transient flag to
+// decide whether to TOLERATE (keep running, re-check next cycle) or to
+// confirm-and-rebuild (marker + shutdown). Extracted to namespace scope and
+// declared in the header so the safety-critical mapping is unit-testable with
+// synthetic leveldb::Status values (see chainstate_integrity_tests.cpp Test 9b).
+//
+//   * IsCorruption() -> transient=false. LevelDB's signal for REAL on-disk data
+//     damage: a failed SST block CRC32C checksum, a malformed block handle, or a
+//     corrupt manifest/log. It REPRODUCES on every read (that is the whole point
+//     of the checksum), so it survives the monitor's retry loop. Classifying it
+//     transient would route a genuinely-corrupt node into the tolerate branch
+//     and mask real corruption FOREVER (the inverse, more-dangerous failure
+//     mode). It must go through the cs_main revalidation gate -> marker ->
+//     shutdown -> rebuild, exactly like the application-level checksum_mismatch
+//     / size_invalid cases.
+//
+//   * IsIOError() -> transient=true. A recoverable storage-layer blip
+//     (open-file-handle exhaustion, an EIO hiccup, a momentary AV file lock on
+//     Windows). May clear across the retry loop; we must not wipe-and-resync a
+//     healthy chain because of a flaky disk. (A *persistent* IsIOError that
+//     never clears is still tolerated with a loud stderr warning — a known,
+//     accepted residual: limp-with-warning beats bricking on a transient blip.)
+//
+//   * else (IsNotFound and any other unexpected non-ok status) -> "missing" /
+//     non-transient. A genuinely-absent key on an active-chain block is real
+//     corruption; anything unexpected fails safe toward the corruption gate
+//     (shutdown) rather than tolerate.
+// v4.4 test-only fault-injection hook (see utxo_set.h). Compiled OUT of
+// production builds — exists only when DILITHION_ENABLE_FAULT_INJECTION is
+// defined (the chainstate_integrity_tests object). extreview PR #120 HIGH.
+#ifdef DILITHION_ENABLE_FAULT_INJECTION
+std::function<leveldb::Status()> g_undo_fetch_fault_injector = nullptr;
+#endif
+
+void ClassifyUndoFetchStatus(const leveldb::Status& st, UndoIntegrityFailure& failure_out) {
+    // ORDERING IS SAFETY-CRITICAL (extreview PR #120, two models flagged this as
+    // non-obvious). IsCorruption() is checked FIRST, BEFORE IsIOError(). A
+    // leveldb::Status can in principle satisfy both predicates; checking
+    // corruption first guarantees any such overlapping status is hard-failed
+    // (transient=false -> corruption gate -> marker + shutdown), never
+    // mislabelled transient and tolerated. Do NOT reorder these branches: putting
+    // IsIOError() first would route a corruption-AND-ioerror status into the
+    // tolerate branch and mask real on-disk damage forever. The both-predicate
+    // case is locked by a regression test (chainstate_integrity_tests.cpp).
+    //
+    // The trailing else is the FAIL-CLOSED bucket: IsNotFound and EVERY other
+    // unmapped/unexpected non-ok status (NotSupported / InvalidArgument / Busy /
+    // future LevelDB statuses) fall here -> cause="missing", transient=false
+    // (hard-fail). We deliberately do NOT enumerate them: anything we did not
+    // explicitly classify as a recoverable IOError blip is treated as real
+    // corruption and routed to the shutdown/rebuild gate, never silently
+    // tolerated. New status classes are safe-by-default.
+    if (st.IsCorruption()) {
+        failure_out.cause = "io_corruption";
+        failure_out.transient = false;
+    } else if (st.IsIOError()) {
+        failure_out.cause = "io_error";
+        failure_out.transient = true;
+    } else {
+        failure_out.cause = "missing";
+        failure_out.transient = false;
+    }
+}
 
 namespace {
 
@@ -53,11 +120,25 @@ bool FetchAndVerifyUndo(leveldb::DB* db,
     undoKey.append(reinterpret_cast<const char*>(blockHash.data), 32);
 
     std::string undoValue;
-    leveldb::Status st = db->Get(leveldb::ReadOptions(), undoKey, &undoValue);
+    leveldb::Status st = leveldb::Status::OK();
+#ifdef DILITHION_ENABLE_FAULT_INJECTION
+    // TEST-ONLY fault injection (extreview PR #120: the whole seam is compiled
+    // out of production via DILITHION_ENABLE_FAULT_INJECTION). A non-ok injected
+    // Status simulates a storage-layer fault (IsCorruption / IsIOError) that real
+    // on-disk data can't easily produce, so the monitor's retry/tolerate/confirm
+    // routing is exercised end-to-end. In a shipped binary this block, the global,
+    // and its declaration do not exist — there is no injectable seam.
+    if (g_undo_fetch_fault_injector) {
+        st = g_undo_fetch_fault_injector();
+    }
+#endif
+    if (st.ok()) {
+        st = db->Get(leveldb::ReadOptions(), undoKey, &undoValue);
+    }
     if (!st.ok()) {
         failure_out.height = height;
         failure_out.blockHash = blockHash;
-        failure_out.cause = "missing";
+        ClassifyUndoFetchStatus(st, failure_out);
         return false;
     }
     switch (VerifyUndoChecksum(undoValue)) {
@@ -507,10 +588,26 @@ bool CUTXOSet::ApplyBlock(const CBlock& block, uint32_t height, const uint256& b
     // Step 3: Process each transaction
     leveldb::WriteBatch batch;
 
+    // CVE-2012-2459 defense-in-depth: explicit duplicate-txid guard on the live
+    // connect path (ApplyBlock runs on every ConnectTip). A block containing two
+    // transactions with the same txid is already rejected incidentally by the
+    // input-not-found check below (the first copy spends+deletes the outpoints,
+    // the second hits GetUTXO -> false), but that closure is incidental. This
+    // makes the rejection explicit and structural. Reject-only: no consensus
+    // rule changes, no accepted-block hash changes.
+    std::set<uint256> seen_txids;
+
     for (size_t tx_idx = 0; tx_idx < transactions.size(); ++tx_idx) {
         const CTransactionRef& tx = transactions[tx_idx];
         bool is_coinbase = (tx_idx == 0);
         uint256 txid = tx->GetHash();
+
+        if (!seen_txids.insert(txid).second) {
+            std::cerr << "[ERROR] CUTXOSet::ApplyBlock: Duplicate transaction in block "
+                      << "(CVE-2012-2459 guard): tx " << tx_idx << " txid "
+                      << txid.GetHex() << std::endl;
+            return false;
+        }
 
         // Step 3a: Spend inputs (skip for coinbase)
         if (!is_coinbase) {
