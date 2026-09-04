@@ -1,4 +1,5 @@
 #include "behavioral_profile.h"
+#include "dna_serialize.h"  // WF-1: explicit-LE consensus serialization helpers
 
 #include <algorithm>
 #include <cmath>
@@ -244,33 +245,27 @@ std::string BehavioralProfile::to_json() const {
 }
 
 std::vector<uint8_t> BehavioralProfile::serialize() const {
+    // WF-1: explicit little-endian (byte-identical on LE hosts to the previous
+    // reinterpret_cast copies; portable across architectures).
     std::vector<uint8_t> data;
 
     // hourly_activity: 24 * 8 = 192 bytes
     for (size_t i = 0; i < 24; i++) {
-        data.insert(data.end(), reinterpret_cast<const uint8_t*>(&hourly_activity[i]),
-                    reinterpret_cast<const uint8_t*>(&hourly_activity[i]) + 8);
+        dna_le::put_double(data, hourly_activity[i]);
     }
 
     // 6 doubles: 48 bytes
-    auto push_double = [&](double v) {
-        data.insert(data.end(), reinterpret_cast<const uint8_t*>(&v),
-                    reinterpret_cast<const uint8_t*>(&v) + 8);
-    };
-    push_double(mean_relay_delay_ms);
-    push_double(relay_consistency);
-    push_double(avg_peer_session_duration_sec);
-    push_double(peer_diversity_score);
-    push_double(tx_relay_rate);
-    push_double(tx_timing_entropy);
+    dna_le::put_double(data, mean_relay_delay_ms);
+    dna_le::put_double(data, relay_consistency);
+    dna_le::put_double(data, avg_peer_session_duration_sec);
+    dna_le::put_double(data, peer_diversity_score);
+    dna_le::put_double(data, tx_relay_rate);
+    dna_le::put_double(data, tx_timing_entropy);
 
     // Metadata: 4 + 8 + 8 = 20 bytes
-    data.insert(data.end(), reinterpret_cast<const uint8_t*>(&observation_blocks),
-                reinterpret_cast<const uint8_t*>(&observation_blocks) + 4);
-    data.insert(data.end(), reinterpret_cast<const uint8_t*>(&start_time),
-                reinterpret_cast<const uint8_t*>(&start_time) + 8);
-    data.insert(data.end(), reinterpret_cast<const uint8_t*>(&end_time),
-                reinterpret_cast<const uint8_t*>(&end_time) + 8);
+    dna_le::put_u32(data, observation_blocks);
+    dna_le::put_u64(data, start_time);
+    dna_le::put_u64(data, end_time);
 
     // Total: 192 + 48 + 20 = 260 bytes
     return data;
@@ -282,16 +277,16 @@ BehavioralProfile BehavioralProfile::deserialize(const std::vector<uint8_t>& dat
 
     size_t offset = 0;
 
+    // WF-1: explicit little-endian reads, matched to serialize() above.
     // hourly_activity: 192 bytes
     for (size_t i = 0; i < 24; i++) {
-        std::memcpy(&profile.hourly_activity[i], data.data() + offset, 8);
+        profile.hourly_activity[i] = dna_le::get_double(data.data() + offset);
         offset += 8;
     }
 
     // 6 doubles: 48 bytes
     auto read_double = [&]() -> double {
-        double v;
-        std::memcpy(&v, data.data() + offset, 8);
+        double v = dna_le::get_double(data.data() + offset);
         offset += 8;
         return v;
     };
@@ -303,9 +298,9 @@ BehavioralProfile BehavioralProfile::deserialize(const std::vector<uint8_t>& dat
     profile.tx_timing_entropy = read_double();
 
     // Metadata
-    std::memcpy(&profile.observation_blocks, data.data() + offset, 4); offset += 4;
-    std::memcpy(&profile.start_time, data.data() + offset, 8); offset += 8;
-    std::memcpy(&profile.end_time, data.data() + offset, 8); offset += 8;
+    profile.observation_blocks = dna_le::get_u32(data.data() + offset); offset += 4;
+    profile.start_time = dna_le::get_u64(data.data() + offset); offset += 8;
+    profile.end_time = dna_le::get_u64(data.data() + offset); offset += 8;
 
     return profile;
 }

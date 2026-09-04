@@ -195,6 +195,32 @@ private:
         ChainRebuildReason::UndoFailure};
 
     // ============================================================
+    // Magnet v1a (fork-resistance, OBSERVABILITY ONLY): canonical
+    // node-health signal. A node must never SILENTLY persist on a
+    // losing / non-canonical fork — this exposes a loud, machine-
+    // readable "I am off-canonical" signal. Pure read + report:
+    // adds NO consensus state, changes NO fork-choice / reorg /
+    // validation / mining behavior. See IsOnCanonical() below.
+    //
+    // Edge-trigger latch for the ONE structured ERROR log line emitted
+    // when the node transitions INTO the off-canonical state. Set true
+    // on the false→true transition so we log once, not every block;
+    // cleared when the node returns on-canonical (e.g. rebuild flag
+    // cleared) so a later re-entry logs again. mutable: the edge-trigger
+    // is toggled from the const LogOffCanonicalTransition() accessor.
+    mutable std::atomic<bool> m_off_canonical_logged{false};
+
+    // Magnet v1a: monotonically counts how many times the edge-trigger in
+    // LogOffCanonicalTransition ACTUALLY emitted (i.e. won the false→true
+    // latch transition). Incremented ONLY on the emit path, so it directly
+    // observes the latch: double-logging within one episode, or a failure to
+    // re-arm, is detectable by the unit test (magnet_canonical_health_tests
+    // M5) that IsOnCanonical() alone cannot see (IsOnCanonical reads the
+    // rebuild flag, not this latch). Observability-only; production never
+    // reads it. mutable: toggled from the const emitter.
+    mutable std::atomic<uint64_t> m_off_canonical_emit_count{0};
+
+    // ============================================================
     // Phase 5: TEST-ONLY hooks for Patch B equivalence harness.
     // ============================================================
     //
@@ -355,6 +381,68 @@ public:
         m_chain_needs_rebuild.store(true, std::memory_order_release);
     }
 
+    // ============================================================
+    // Magnet v1a (fork-resistance): canonical node-health accessors.
+    // OBSERVABILITY ONLY — pure read + report, no behavior change.
+    // ============================================================
+    /**
+     * Magnet v1a: is this node on the canonical (best-known) chain?
+     *
+     * Returns false ("off-canonical") when EITHER:
+     *   1. A pending chain-rebuild caused by DepthRejection exists — a
+     *      strictly-better chain exists beyond MAX_REORG_DEPTH that the
+     *      node knows about but cannot auto-switch to in-process
+     *      (chain.cpp DepthRejection site). The canonical "I am stuck
+     *      off the best chain" state.
+     *   2. Drift signal: a candidate leaf in m_setBlockIndexCandidates
+     *      has strictly greater chain-work than the active tip but was
+     *      not adopted. Pure read of existing state under cs_main using
+     *      ChainWorkGreaterThan — no new consensus state.
+     *
+     * Lock-free for case (1) (atomic loads); acquires cs_main briefly
+     * for the case (2) candidate-vs-tip work comparison. Safe to call
+     * from RPC threads. Does NOT mutate any state.
+     *
+     * @return true if on-canonical (nothing strictly better is known),
+     *         false if off-canonical.
+     */
+    bool IsOnCanonical() const;
+
+    /**
+     * Magnet v1a: machine-readable reason string, empty when on-canonical.
+     * One of: "" (on-canonical) or "depth-rejection" (a strictly-better chain
+     * exists beyond MAX_REORG_DEPTH that the node cannot auto-switch to — the
+     * node is genuinely stuck behind a better chain). The earlier "work-drift"
+     * reason (a heavier candidate leaf was not adopted) was DROPPED per
+     * red-team MED-1: its unique cases were false-positives (see chain.cpp).
+     * Genuine drift detection is a v2 item (F7 anchored-root).
+     */
+    std::string OffCanonicalReason() const;
+
+    /**
+     * Magnet v1a: edge-triggered emitter for the single structured
+     * ERROR log line on the on→off-canonical transition. Call at sites
+     * that flag an off-canonical condition (e.g. the DepthRejection
+     * rebuild site). Emits at most one line per off-canonical episode
+     * via m_off_canonical_logged; the latch is cleared when the node
+     * returns on-canonical. OBSERVABILITY ONLY — logs, changes nothing.
+     *
+     * @param reason        the off-canonical reason string (see above)
+     * @param best_known_ht best-known height beyond the tip if available
+     *                      (< 0 when unknown); local tip height is read here.
+     */
+    void LogOffCanonicalTransition(const std::string& reason, int64_t best_known_ht) const;
+
+    /**
+     * Magnet v1a TEST OBSERVABILITY: number of times LogOffCanonicalTransition
+     * has actually emitted (won the edge-trigger latch). Lets the unit test
+     * verify exactly-one-emit-per-episode and re-arm — behavior IsOnCanonical()
+     * cannot observe. Not used by production code.
+     */
+    uint64_t OffCanonicalEmitCount() const {
+        return m_off_canonical_emit_count.load(std::memory_order_acquire);
+    }
+
     /**
      * v4.3.3 F10 + F15 (Layer-3 round 3 HIGH-1, 2026-05-04): anchor the
      * VDF grace-period clock ONLY when a block at a NEW height connects.
@@ -482,7 +570,7 @@ public:
      * Test-only: Set tip without mapBlockIndex invariant check.
      * Used by unit tests that construct CBlockIndex objects directly.
      */
-    void SetTipForTest(CBlockIndex* pindex) { pindexTip = pindex; }
+    void SetTipForTest(CBlockIndex* pindex) { pindexTip = pindex; m_chainTipsCacheDirty = true; }
 
     /**
      * Add (or merge) a block index entry in the in-memory map.
@@ -658,6 +746,33 @@ public:
     };
     std::vector<ChainTip> GetChainTips() const;
 
+    /**
+     * Perf fix 2026-07-12: force the next GetChainTips() call to recompute.
+     * mapBlockIndex insert/erase/clear already trigger this internally.
+     * Call this too whenever code mutates an already-indexed CBlockIndex's
+     * nStatus/pprev directly (bypassing AddBlockIndex) in a way that could
+     * change a tip's reported status or membership — e.g. flagging a block
+     * BLOCK_FAILED_VALID after the fact. Cheap and safe to over-call.
+     */
+    void InvalidateChainTipsCache() const {
+        std::lock_guard<std::recursive_mutex> lock(cs_main);
+        m_chainTipsCacheDirty = true;
+    }
+
+private:
+    // Perf fix 2026-07-12: GetChainTips() did a full double-scan of
+    // mapBlockIndex on every call (44% of sampled CPU on a DilV seed
+    // whose mapBlockIndex has grown to 161K+ entries — explorer polls
+    // this RPC frequently). Cache the result and invalidate it only
+    // when mapBlockIndex membership or pprev topology actually changes:
+    // AddBlockIndex (insert or merge-adopt-pprev), EvictLowestWorkNotOnBestChain
+    // (erase), and Cleanup (clear) all flip this dirty. GetChainTips()
+    // itself is the only reader/recomputer, always called under cs_main,
+    // so no separate cache mutex is needed.
+    mutable std::vector<ChainTip> m_chainTipsCache;
+    mutable bool m_chainTipsCacheDirty{true};
+
+public:
     /**
      * Clean up in-memory index
      * Deletes all CBlockIndex pointers

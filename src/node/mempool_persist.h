@@ -43,11 +43,23 @@
 // with a valid one, so the truncation is acceptable. Load cost is sub-ms over
 // any plausible mempool size.
 //
-// Atomicity: DumpMempool writes to <datadir>/mempool.dat.new, fsyncs, and
-// renames to mempool.dat. The rename is atomic on POSIX; on Windows it uses
-// std::filesystem::rename which is also atomic on NTFS for same-volume moves.
-// On torn write (power loss between fsync and rename), the prior mempool.dat
-// remains intact.
+// Atomicity: DumpMempool writes to <datadir>/mempool.dat.new, fsyncs it, and
+// then publishes it over mempool.dat via util::AtomicReplaceFile() --
+// rename(2) on POSIX, MoveFileExW(MOVEFILE_REPLACE_EXISTING |
+// MOVEFILE_WRITE_THROUGH) on Windows. Both are single filesystem operations,
+// so mempool.dat is at every instant either the complete previous file or the
+// complete new one: never torn, never absent. If the publish fails, the .new
+// file is removed and the prior mempool.dat is left intact.
+//
+// CORRECTION (M4): this paragraph previously said the publish used
+// std::filesystem::rename, "which is also atomic on NTFS for same-volume
+// moves". The conclusion happened to hold on the toolchain we ship, but the
+// stated reason was wrong and the guarantee was not ours to make: the
+// atomicity comes from the Win32 replace call libstdc++ chooses to make, not
+// from NTFS, and older MinGW libstdc++ releases made a different choice
+// (_wrename, which cannot replace an existing file at all). The publish is now
+// stated explicitly in the source rather than inherited from library
+// behaviour. Measured results are recorded in src/util/atomic_file.h.
 
 #include <atomic>
 #include <cstddef>
@@ -103,7 +115,9 @@ struct LoadResult {
 };
 
 /**
- * Atomic save: write to <datadir>/mempool.dat.new, fsync, rename to mempool.dat.
+ * Atomic save: write to <datadir>/mempool.dat.new, fsync, then atomically
+ * replace mempool.dat via util::AtomicReplaceFile() (NOT std::filesystem::rename
+ * -- see the header comment above and src/util/atomic_file.h).
  * Caller must hold no mempool lock; this function takes the mempool lock
  * internally via GetAllEntries().
  *

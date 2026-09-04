@@ -169,6 +169,20 @@ private:
     std::atomic<uint64_t> m_acceptedSession{0};
     // Network manager placeholder — not yet needed (P2P layer handles networking directly)
 
+    // Perf fix 2026-07-12: RPC_GetHolderCount did a full UTXO-set scan on
+    // every call. Holder count only changes when a block connects/disconnects,
+    // but the explorer polls this far more often than that — cache the
+    // rendered JSON, keyed on the tip's block HASH (not height: a same-height
+    // VDF sibling replacement — DilV ShouldReplaceVDFTip / Case 2.5 — swaps
+    // in a different coinbase/tx set at an unchanged height, so height alone
+    // is not a valid holder-set cache key; port-reviewer GAP-3). Thread pool
+    // means concurrent callers need this mutex, not just cs_main, since it's
+    // server-local state unrelated to CChainState.
+    mutable std::mutex m_holderCountCacheMutex;
+    mutable std::string m_holderCountCacheJson;
+    mutable uint256 m_holderCountCacheTipHash;
+    mutable bool m_holderCountCacheValid{false};
+
     // RPC handlers
     std::map<std::string, RPCHandler> m_handlers;
     std::mutex m_handlersMutex;
@@ -217,6 +231,25 @@ private:
     Attestation::CSeedAttestationKey* m_seedAttestationKey{nullptr};
     CASNDatabase* m_asnDatabase{nullptr};
     int m_seedId{-1};  // This seed's index (0-3), or -1 if not a seed
+    // H-3 (consolidated): set on a valid seed whose ASN database failed to load.
+    // The node stays online for relay/P2P but attestation is NOT registered
+    // (m_seedAttestationKey stays null). This flag lets getmikattestation return
+    // a DISTINCT "ASN database not loaded" diagnostic instead of the generic
+    // "only available on seed nodes", so the degraded state is queryable.
+    bool m_seedAttestationAsnDegraded{false};
+    int m_seedAttestationDegradedSeedId{-1};  // resolved seed_id for the degraded diagnostic
+public:
+    // Fix 1 (extreview PR#121): WHY a valid seed is running attestation-degraded.
+    // Surfaced by getmikattestation so an operator can tell the two distinct
+    // degraded causes apart (and from a plain non-seed).
+    enum class SeedDegradedReason {
+        NONE,             // not degraded
+        NO_ASN,           // ip2asn-v4.tsv failed to load (zero attestation capacity)
+        NO_DATACENTER_LIST,  // datacenter-asns.txt empty on a datacenter-ban chain
+                             // (IsDatacenterIP would fail open -> datacenter Sybil ban off)
+    };
+private:
+    SeedDegradedReason m_seedAttestationDegradedReason{SeedDegradedReason::NONE};
 
     // Attestation rate limiting (Sybil defense Phase 0)
     // Rate limits NEW MIK registrations per /24 subnet per day.
@@ -626,6 +659,24 @@ public:
         m_seedAttestationKey = key;
         m_asnDatabase = asnDb;
         m_seedId = seedId;
+        m_seedAttestationAsnDegraded = false;
+        m_seedAttestationDegradedReason = SeedDegradedReason::NONE;
+    }
+
+    /**
+     * H-3 (consolidated) + Fix 1: mark this seed as ATTESTATION-DEGRADED. Does NOT
+     * register a signing key — the node stays online for relay/P2P, attestation
+     * stays unavailable — but flips getmikattestation's error from the generic
+     * "only available on seed nodes" to a distinct, diagnosable error keyed on
+     * `reason`, so an operator can tell a degraded seed apart from a plain
+     * non-seed AND tell the two degraded causes apart. Defaults to NO_ASN to keep
+     * existing callers/tests that pass only a seed_id unchanged.
+     */
+    void RegisterSeedAttestationDegraded(
+        int seedId, SeedDegradedReason reason = SeedDegradedReason::NO_ASN) {
+        m_seedAttestationAsnDegraded = true;
+        m_seedAttestationDegradedSeedId = seedId;
+        m_seedAttestationDegradedReason = reason;
     }
 
     /**

@@ -192,7 +192,7 @@ is_legacy() {
 # Check 1 — root-level whitelist
 # ─────────────────────────────────────────────────────────────
 echo ""
-echo "[1/7] Checking root-level whitelist …"
+echo "[1/8] Checking root-level whitelist …"
 
 while IFS= read -r path; do
   [[ -z "$path" ]] && continue
@@ -212,7 +212,7 @@ done < <(git ls-tree HEAD | awk -F'\t' '{ split($1, cols, " "); if (cols[2]=="bl
 # Check 2 — binary/build outputs at root
 # ─────────────────────────────────────────────────────────────
 echo ""
-echo "[2/7] Checking for binary/build outputs at root …"
+echo "[2/8] Checking for binary/build outputs at root …"
 
 while IFS= read -r path; do
   [[ -z "$path" ]] && continue
@@ -228,7 +228,7 @@ done < <(git ls-tree HEAD | awk -F'\t' '{ split($1, cols, " "); if (cols[2]=="bl
 # Check 3 — coverage output at root
 # ─────────────────────────────────────────────────────────────
 echo ""
-echo "[3/7] Checking for LCOV coverage reports at root …"
+echo "[3/8] Checking for LCOV coverage reports at root …"
 
 # LCOV often creates directories at root named after src/ subdirs.
 # Any of these at root with .html inside = coverage, not source.
@@ -250,7 +250,7 @@ done
 # Check 4 — dated / session-artifact filenames
 # ─────────────────────────────────────────────────────────────
 echo ""
-echo "[4/7] Checking for dated session-artifact filenames …"
+echo "[4/8] Checking for dated session-artifact filenames …"
 
 # Pattern: filename contains YYYY-MM-DD somewhere
 while IFS= read -r path; do
@@ -276,7 +276,7 @@ done < <(git ls-tree HEAD | awk -F'\t' '{ split($1, cols, " "); if (cols[2]=="bl
 # Check 5 — Windows path-escape / unicode bugs
 # ─────────────────────────────────────────────────────────────
 echo ""
-echo "[5/7] Checking for Windows path-escape / unicode-garbage paths …"
+echo "[5/8] Checking for Windows path-escape / unicode-garbage paths …"
 
 while IFS= read -r path; do
   [[ -z "$path" ]] && continue
@@ -292,7 +292,7 @@ done < <(git ls-files)
 # Check 6 — private content
 # ─────────────────────────────────────────────────────────────
 echo ""
-echo "[6/7] Checking for private / AI-assistant content …"
+echo "[6/8] Checking for private / AI-assistant content …"
 
 if git ls-tree -r HEAD -- .claude 2>/dev/null | grep -q .; then
   block "Private .claude/ directory is tracked — remove with 'git rm --cached -r .claude/'"
@@ -308,7 +308,7 @@ fi
 # Check 7 — line endings: index must match .gitattributes
 # ─────────────────────────────────────────────────────────────
 echo ""
-echo "[7/7] Checking index line endings against .gitattributes …"
+echo "[7/8] Checking index line endings against .gitattributes …"
 
 # `git ls-files --eol` prints:  i/<eol>  w/<eol>  attr/text [eol=...]  <path>
 # A blocking violation is when the INDEX has CRLF for a file that
@@ -321,6 +321,21 @@ while IFS= read -r path; do
   [[ -z "$path" ]] && continue
   block "Index has CRLF but .gitattributes mandates LF: $path"
 done < <(git ls-files --eol | grep '^i/crlf' | grep -F 'eol=lf' | sed 's/.*\t//')
+
+# ─────────────────────────────────────────────────────────────
+# Check 8 — merge-conflict / editor leftover files (*.orig, *.rej)
+# ─────────────────────────────────────────────────────────────
+echo ""
+echo "[8/8] Checking for merge-conflict / editor leftover files …"
+
+# *.orig and *.rej are produced by git merge/rebase conflicts and by
+# patch(1). They are never source — a tracked one is always a leftover.
+# (Caught early by the *.orig / *.rej .gitignore patterns; this is the
+#  CI backstop for anything force-added or committed before that landed.)
+while IFS= read -r path; do
+  [[ -z "$path" ]] && continue
+  block "Merge-conflict / editor leftover tracked in repo: $path (delete it — it's a git/patch artifact, not source)"
+done < <(git ls-files '*.orig' '*.rej')
 
 # ─────────────────────────────────────────────────────────────
 # Summary

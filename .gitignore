@@ -712,3 +712,7 @@ _review_agent_comms/
 # leaving the IDE workspace).
 /agent-comms/
 /dilithion-strategy/
+
+# Merge-conflict / editor leftovers (caught by scripts/check-repo-hygiene.sh)
+*.orig
+*.rej

@@ -14,6 +14,16 @@
 #include <vector>
 #include <memory>
 
+// LP-12 (H-01 / M-01 / M-03): the standalone HTTP server reuses the RPC
+// server's anti-DNS-rebinding Host-allowlist validator and the same per-IP
+// rate limiter, so the public REST surface (/api/v1/*, /x402/*) is brought to
+// parity with the RPC server. host_validator.h is intentionally dependency-free.
+#include <rpc/host_validator.h>
+
+// Forward declaration — CRateLimiter lives in rpc/ratelimiter.h. The server only
+// holds a borrowed pointer and drives its periodic CleanupOldRecords().
+class CRateLimiter;
+
 // Forward declare SOCKET type (cross-platform)
 #ifdef _WIN32
     #include <winsock2.h>
@@ -186,6 +196,28 @@ public:
     void SetRestApiHandler(RestApiHandler handler);
 
     /**
+     * LP-12 (H-01): configure the anti-DNS-rebinding Host-header allowlist for
+     * the public REST surface (/api/v1/*, /x402/*). Mirrors CRPCServer's
+     * m_hostValidator.Configure(): loopback names (127.0.0.1 / ::1 / localhost)
+     * are ALWAYS allowed; only operator-explicit --rpcallowhost entries are
+     * added. MUST be called before Start() so worker threads see a ready
+     * validator — the gate is fail-closed (un-configured => reject all REST).
+     *
+     * @param extraAllowedHosts operator --rpcallowhost entries (same source the
+     *                          RPC server uses; loopback added implicitly).
+     */
+    void ConfigureHostAllowlist(const std::vector<std::string>& extraAllowedHosts);
+
+    /**
+     * LP-12 (M-01): register the per-IP REST rate limiter so the server can run
+     * its own periodic CleanupOldRecords() (the limiter is also wired into the
+     * CRestAPI for enforcement). Without this, m_records grows unbounded from
+     * rotating source IPs (slow memory-DoS). Mirrors CRPCServer's cleanup
+     * thread. Borrowed pointer — caller retains ownership; must outlive Stop().
+     */
+    void SetRateLimiter(CRateLimiter* rate_limiter) { m_rate_limiter = rate_limiter; }
+
+    /**
      * Start the HTTP server
      * @return true if started successfully
      */
@@ -220,6 +252,15 @@ private:
      * Processes requests from the work queue
      */
     void WorkerThread();
+
+    /**
+     * LP-12 (M-01): rate-limiter maintenance thread. Mirrors
+     * CRPCServer::CleanupThread() — wakes on a 5-minute cadence (checking
+     * m_running each second) and calls m_rate_limiter->CleanupOldRecords() so
+     * the per-IP record map stays bounded under rotating-IP load. No-op when no
+     * limiter has been registered.
+     */
+    void CleanupThread();
 
     /**
      * Handle a single HTTP request
@@ -276,8 +317,19 @@ private:
     // Server state - STRESS TEST FIX: Thread pool pattern
     std::thread m_accept_thread;           // Accept thread (listens for connections)
     std::vector<std::thread> m_workers;    // Worker threads (process requests)
+    std::thread m_cleanup_thread;          // LP-12 (M-01): rate-limiter maintenance
     CHttpWorkQueue<SOCKET> m_work_queue;   // Work queue for pending requests
     std::atomic<bool> m_running{false};    // Running flag
+
+    // LP-12 (H-01): anti-DNS-rebinding Host allowlist for the public REST
+    // surface. Configured before Start(); the gate is fail-closed when not
+    // ready (mirrors CRPCServer::m_hostValidator / m_hostValidatorReady).
+    rpc::HostValidator m_host_validator;
+    std::atomic<bool> m_host_validator_ready{false};
+
+    // LP-12 (M-01): borrowed per-IP REST rate limiter (owned by the node main).
+    // The server drives its periodic cleanup; nullptr => cleanup is a no-op.
+    CRateLimiter* m_rate_limiter{nullptr};
 
 #ifdef _WIN32
     SOCKET m_server_socket{INVALID_SOCKET}; // Server socket file descriptor

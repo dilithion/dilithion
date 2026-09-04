@@ -264,21 +264,27 @@ public:
      *
      * @param ciphertext Encrypted data
      * @param mac Output buffer for 64-byte HMAC
+     * @param useLegacyKeying LP-7: if true, key HMAC with the AES key (legacy
+     *        v3-v6 behaviour, used ONLY to verify pre-fix records for migration);
+     *        if false (default), key HMAC with a separately-derived MAC key
+     *        (v7+ key-separation). New records MUST use the default (false).
      * @return true on success, false if key not set
      */
     bool ComputeMAC(const std::vector<uint8_t>& ciphertext,
-                    std::vector<uint8_t>& mac);
+                    std::vector<uint8_t>& mac,
+                    bool useLegacyKeying = false);
 
     /**
      * FIX-009: Template overload for ComputeMAC() to support SecureAllocator
      */
     template<typename Alloc1, typename Alloc2>
     bool ComputeMAC(const std::vector<uint8_t, Alloc1>& ciphertext,
-                    std::vector<uint8_t, Alloc2>& mac) {
+                    std::vector<uint8_t, Alloc2>& mac,
+                    bool useLegacyKeying = false) {
         std::vector<uint8_t> cipher_std(ciphertext.begin(), ciphertext.end());
         std::vector<uint8_t> mac_std;
 
-        bool result = ComputeMAC(cipher_std, mac_std);
+        bool result = ComputeMAC(cipher_std, mac_std, useLegacyKeying);
 
         if (result) {
             mac.assign(mac_std.begin(), mac_std.end());
@@ -295,21 +301,26 @@ public:
      *
      * @param ciphertext Encrypted data
      * @param mac MAC to verify (must be 64 bytes)
+     * @param useLegacyKeying LP-7: verify against the legacy AES-keyed HMAC
+     *        (v3-v6 records) when true; against the separately-derived MAC key
+     *        (v7+) when false (default).
      * @return true if MAC is valid, false otherwise
      */
     bool VerifyMAC(const std::vector<uint8_t>& ciphertext,
-                   const std::vector<uint8_t>& mac);
+                   const std::vector<uint8_t>& mac,
+                   bool useLegacyKeying = false);
 
     /**
      * FIX-009: Template overload for VerifyMAC() to support SecureAllocator
      */
     template<typename Alloc1, typename Alloc2>
     bool VerifyMAC(const std::vector<uint8_t, Alloc1>& ciphertext,
-                   const std::vector<uint8_t, Alloc2>& mac) {
+                   const std::vector<uint8_t, Alloc2>& mac,
+                   bool useLegacyKeying = false) {
         std::vector<uint8_t> cipher_std(ciphertext.begin(), ciphertext.end());
         std::vector<uint8_t> mac_std(mac.begin(), mac.end());
 
-        return VerifyMAC(cipher_std, mac_std);
+        return VerifyMAC(cipher_std, mac_std, useLegacyKeying);
     }
 
     /**
