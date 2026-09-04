@@ -8,6 +8,9 @@
 #include <vdf/vdf.h>
 #include <vdf/coinbase_vdf.h>
 #include <crypto/sha3.h>
+#include <core/chainparams.h>
+#include <dfmp/mik.h>
+#include <dfmp/dfmp.h>
 #include <iostream>
 #include <cassert>
 #include <cstring>
@@ -132,6 +135,124 @@ static CBlock MakeVDFBlock(
     SHA3_256(vtxData.data() + 1, vtxData.size() - 1, block.hashMerkleRoot.data);
 
     return block;
+}
+
+// ---------------------------------------------------------------------------
+// LP-10 helper: build a VDF block whose coinbase carries a REAL Dilithium
+// registration-MIK signature, plus a real Wesolowski proof. Used to test the
+// connect-path MIK-signature wiring (CheckVDFBlockMIKSignature).
+// ---------------------------------------------------------------------------
+static CBlock MakeVDFBlockWithSignedMIK(
+    const uint256& prevHash,
+    int height,
+    DFMP::CMiningIdentityKey& mik,   // already Generate()'d by caller
+    uint64_t iterations)
+{
+    CBlock block;
+    block.nVersion = CBlockHeader::VDF_VERSION;
+    block.hashPrevBlock = prevHash;
+    block.nBits = 0x1d00ffff;
+    block.nTime = 1700000000;
+    block.nNonce = 0;
+
+    // Miner payout address = MIK identity bytes (any 20 bytes work for the proof).
+    std::array<uint8_t, 20> minerAddr{};
+    std::memcpy(minerAddr.data(), mik.identity.data, 20);
+
+    // Real VDF proof.
+    auto challenge = ComputeVDFChallenge(prevHash, height, minerAddr);
+    vdf::VDFConfig cfg;
+    cfg.target_iterations = iterations;
+    vdf::VDFResult result = vdf::compute(challenge, iterations, cfg);
+
+    std::memcpy(block.vdfOutput.data, result.output.data(), 32);
+    block.vdfProofHash = CoinbaseVDF::ComputeProofHash(result.proof);
+
+    // Real MIK signature over (prevHash, height, nTime).
+    std::vector<uint8_t> mikSig;
+    bool signedOk = mik.Sign(prevHash, height, block.nTime, mikSig);
+    if (!signedOk) {
+        // Surface as an obviously-invalid block; the test will fail loudly.
+        block.vtx.clear();
+        return block;
+    }
+
+    // Registration MIK scriptSig data: [0xDF][0x01][pubkey][signature]
+    std::vector<uint8_t> mikScriptData;
+    DFMP::BuildMIKScriptSigRegistration(mik.pubkey, mikSig, mikScriptData);
+
+    // --- Build coinbase manually (same layout as MakeVDFBlock). ---
+    std::vector<uint8_t> vtxData;
+    vtxData.push_back(1);  // tx count
+
+    int32_t txVersion = 1;
+    vtxData.insert(vtxData.end(), reinterpret_cast<uint8_t*>(&txVersion),
+                   reinterpret_cast<uint8_t*>(&txVersion) + 4);
+    vtxData.push_back(1);  // vin count
+    for (int i = 0; i < 32; i++) vtxData.push_back(0);
+    uint32_t coinbaseIndex = 0xFFFFFFFF;
+    vtxData.insert(vtxData.end(), reinterpret_cast<uint8_t*>(&coinbaseIndex),
+                   reinterpret_cast<uint8_t*>(&coinbaseIndex) + 4);
+
+    // scriptSig: BIP34 height(3) + MIK registration data + VDF proof.
+    std::vector<uint8_t> scriptSig;
+    scriptSig.push_back(0x03);
+    uint32_t h = static_cast<uint32_t>(height);
+    scriptSig.push_back(static_cast<uint8_t>(h & 0xFF));
+    scriptSig.push_back(static_cast<uint8_t>((h >> 8) & 0xFF));
+    scriptSig.push_back(static_cast<uint8_t>((h >> 16) & 0xFF));
+    scriptSig.insert(scriptSig.end(), mikScriptData.begin(), mikScriptData.end());
+
+    CTxIn tempIn;
+    tempIn.scriptSig = scriptSig;
+    CoinbaseVDF::EmbedProof(tempIn, result.proof);
+    scriptSig = tempIn.scriptSig;
+
+    // scriptSig length (varint — this is > 253, so 0xFD + 2 LE bytes).
+    if (scriptSig.size() < 253) {
+        vtxData.push_back(static_cast<uint8_t>(scriptSig.size()));
+    } else {
+        vtxData.push_back(253);
+        uint16_t len16 = static_cast<uint16_t>(scriptSig.size());
+        vtxData.push_back(static_cast<uint8_t>(len16 & 0xFF));
+        vtxData.push_back(static_cast<uint8_t>((len16 >> 8) & 0xFF));
+    }
+    vtxData.insert(vtxData.end(), scriptSig.begin(), scriptSig.end());
+
+    uint32_t seq = 0xFFFFFFFF;
+    vtxData.insert(vtxData.end(), reinterpret_cast<uint8_t*>(&seq),
+                   reinterpret_cast<uint8_t*>(&seq) + 4);
+
+    vtxData.push_back(1);  // vout count
+    uint64_t value = 50ULL * 100000000ULL;
+    vtxData.insert(vtxData.end(), reinterpret_cast<uint8_t*>(&value),
+                   reinterpret_cast<uint8_t*>(&value) + 8);
+
+    std::vector<uint8_t> spk = {0x76, 0xa9, 0x14};
+    spk.insert(spk.end(), minerAddr.begin(), minerAddr.end());
+    spk.push_back(0x88);
+    spk.push_back(0xac);
+    vtxData.push_back(static_cast<uint8_t>(spk.size()));
+    vtxData.insert(vtxData.end(), spk.begin(), spk.end());
+
+    uint32_t locktime = 0;
+    vtxData.insert(vtxData.end(), reinterpret_cast<uint8_t*>(&locktime),
+                   reinterpret_cast<uint8_t*>(&locktime) + 4);
+
+    block.vtx = vtxData;
+    SHA3_256(vtxData.data() + 1, vtxData.size() - 1, block.hashMerkleRoot.data);
+    return block;
+}
+
+// LP-10: install a DilV-like chainparams with a known VDF iteration count and
+// a controllable proof-enforcement activation height.
+static void InstallLP10ChainParams(uint64_t vdfIters, int enforcementHeight)
+{
+    if (!Dilithion::g_chainParams) {
+        Dilithion::g_chainParams = new Dilithion::ChainParams(Dilithion::ChainParams::DilV());
+    }
+    Dilithion::g_chainParams->vdfIterations = vdfIters;
+    Dilithion::g_chainParams->vdfProofEnforcementHeight = enforcementHeight;
 }
 
 // ---------------------------------------------------------------------------
@@ -271,6 +392,167 @@ static void test_tampered_proof_hash_rejected()
     PASS();
 }
 
+// ===========================================================================
+// LP-10 connect-path wiring tests
+// ===========================================================================
+
+// POSITIVE (load-bearing): an honestly-mined VDF block PASSES the gated
+// connect-path proof check at a height AT/ABOVE the activation height.
+// This proves the new wiring does NOT reject honest blocks.
+static void test_lp10_honest_block_accepted_above_activation()
+{
+    TEST(lp10_honest_block_accepted_above_activation);
+    const uint64_t iters = 1000;
+    const int activation = 100;
+    const int height = 200;   // >= activation
+    InstallLP10ChainParams(iters, activation);
+
+    uint256 prevHash; prevHash.data[0] = 0xDE; prevHash.data[1] = 0xAD;
+    std::array<uint8_t, 20> addr{}; addr[0] = 0x42;
+    CBlock block = MakeVDFBlock(prevHash, height, addr, iters);
+
+    std::string error;
+    bool ok = CheckVDFProofConnect(block, height, prevHash, error);
+    if (!ok) { std::cout << "FAIL: honest block rejected: " << error << "\n"; ++failed; return; }
+    CHECK(ok);
+    PASS();
+}
+
+// NEGATIVE: a forged (corrupted output) VDF block is REJECTED at/above activation.
+static void test_lp10_forged_proof_rejected_above_activation()
+{
+    TEST(lp10_forged_proof_rejected_above_activation);
+    const uint64_t iters = 1000;
+    const int activation = 100;
+    const int height = 200;
+    InstallLP10ChainParams(iters, activation);
+
+    uint256 prevHash; prevHash.data[0] = 0xDE; prevHash.data[1] = 0xAD;
+    std::array<uint8_t, 20> addr{}; addr[0] = 0x42;
+    CBlock block = MakeVDFBlock(prevHash, height, addr, iters);
+
+    // Corrupt one byte of the VDF output (attacker-set lowest-output grind).
+    block.vdfOutput.data[0] ^= 0x01;
+
+    std::string error;
+    bool ok = CheckVDFProofConnect(block, height, prevHash, error);
+    CHECK(!ok);   // must be rejected
+    PASS();
+}
+
+// GRANDFATHER: the SAME forged block is ACCEPTED BELOW the activation height.
+static void test_lp10_forged_proof_accepted_below_activation()
+{
+    TEST(lp10_forged_proof_accepted_below_activation);
+    const uint64_t iters = 1000;
+    const int activation = 1000;
+    const int height = 200;   // < activation -> grandfathered
+    InstallLP10ChainParams(iters, activation);
+
+    uint256 prevHash; prevHash.data[0] = 0xDE; prevHash.data[1] = 0xAD;
+    std::array<uint8_t, 20> addr{}; addr[0] = 0x42;
+    CBlock block = MakeVDFBlock(prevHash, height, addr, iters);
+    block.vdfOutput.data[0] ^= 0x01;   // forged
+
+    std::string error;
+    bool ok = CheckVDFProofConnect(block, height, prevHash, error);
+    CHECK(ok);   // below activation: grandfathered, accepted
+    PASS();
+}
+
+// SENTINEL: with enforcement OFF (sentinel 999999999), even a forged block at a
+// realistic height is accepted (build ships safe).
+static void test_lp10_disabled_sentinel_accepts_forged()
+{
+    TEST(lp10_disabled_sentinel_accepts_forged);
+    const uint64_t iters = 1000;
+    InstallLP10ChainParams(iters, 999999999);  // OFF
+
+    uint256 prevHash; prevHash.data[0] = 0xDE; prevHash.data[1] = 0xAD;
+    std::array<uint8_t, 20> addr{}; addr[0] = 0x42;
+    CBlock block = MakeVDFBlock(prevHash, 50000, addr, iters);
+    block.vdfOutput.data[0] ^= 0x01;
+
+    std::string error;
+    bool ok = CheckVDFProofConnect(block, 50000, prevHash, error);
+    CHECK(ok);
+    PASS();
+}
+
+// POSITIVE (MIK): an honestly-signed registration-MIK VDF block PASSES the
+// gated connect-path MIK-signature check at/above activation.
+static void test_lp10_honest_mik_signature_accepted_above_activation()
+{
+    TEST(lp10_honest_mik_signature_accepted_above_activation);
+    const uint64_t iters = 1000;
+    const int activation = 100;
+    const int height = 200;
+    InstallLP10ChainParams(iters, activation);
+
+    DFMP::CMiningIdentityKey mik;
+    if (!mik.Generate()) { std::cout << "FAIL: MIK generate\n"; ++failed; return; }
+
+    uint256 prevHash; prevHash.data[0] = 0xBE; prevHash.data[1] = 0xEF;
+    CBlock block = MakeVDFBlockWithSignedMIK(prevHash, height, mik, iters);
+    if (block.vtx.empty()) { std::cout << "FAIL: block build/sign\n"; ++failed; return; }
+
+    std::string error;
+    bool ok = CheckVDFBlockMIKSignature(block, height, error);
+    if (!ok) { std::cout << "FAIL: honest MIK sig rejected: " << error << "\n"; ++failed; return; }
+    CHECK(ok);
+    PASS();
+}
+
+// NEGATIVE (MIK): a corrupted MIK signature is REJECTED at/above activation,
+// and the same block is ACCEPTED below activation (grandfathered).
+static void test_lp10_forged_mik_signature_rejected_above_accepted_below()
+{
+    TEST(lp10_forged_mik_signature_rejected_above_accepted_below);
+    const uint64_t iters = 1000;
+
+    DFMP::CMiningIdentityKey mik;
+    if (!mik.Generate()) { std::cout << "FAIL: MIK generate\n"; ++failed; return; }
+
+    uint256 prevHash; prevHash.data[0] = 0xBE; prevHash.data[1] = 0xEF;
+    const int height = 200;
+    CBlock block = MakeVDFBlockWithSignedMIK(prevHash, height, mik, iters);
+    if (block.vtx.empty()) { std::cout << "FAIL: block build/sign\n"; ++failed; return; }
+
+    // Corrupt one byte of the MIK signature inside the coinbase scriptSig.
+    // The signature is the last 3309 bytes before the VDF-proof marker; flip a
+    // byte well inside the MIK data region. Robust approach: re-parse, flip in
+    // the raw vtx by locating the MIK marker.
+    bool flipped = false;
+    for (size_t i = 0; i + 1 < block.vtx.size(); ++i) {
+        if (block.vtx[i] == DFMP::MIK_MARKER &&
+            block.vtx[i + 1] == DFMP::MIK_TYPE_REGISTRATION) {
+            // pubkey(1952) starts at i+2; signature(3309) starts at i+2+1952.
+            size_t sigStart = i + 2 + DFMP::MIK_PUBKEY_SIZE;
+            if (sigStart + 100 < block.vtx.size()) {
+                block.vtx[sigStart + 50] ^= 0xFF;  // corrupt the signature
+                flipped = true;
+            }
+            break;
+        }
+    }
+    if (!flipped) { std::cout << "FAIL: could not locate MIK sig to corrupt\n"; ++failed; return; }
+    // Merkle root no longer matters for this isolated check.
+
+    // Above activation: rejected.
+    InstallLP10ChainParams(iters, 100);
+    std::string error;
+    bool okAbove = CheckVDFBlockMIKSignature(block, height, error);
+    if (okAbove) { std::cout << "FAIL: forged MIK sig accepted above activation\n"; ++failed; return; }
+
+    // Below activation: grandfathered, accepted.
+    InstallLP10ChainParams(iters, 1000);
+    std::string error2;
+    bool okBelow = CheckVDFBlockMIKSignature(block, height, error2);
+    if (!okBelow) { std::cout << "FAIL: forged MIK sig rejected below activation: " << error2 << "\n"; ++failed; return; }
+
+    PASS();
+}
+
 int main()
 {
     std::cout << "\nVDF Consensus Validation Tests\n";
@@ -290,6 +572,14 @@ int main()
     test_missing_proof_rejected();
     test_null_vdf_output_rejected();
     test_tampered_proof_hash_rejected();
+
+    // LP-10 connect-path wiring tests (proof + MIK signature, activation-gated)
+    test_lp10_honest_block_accepted_above_activation();
+    test_lp10_forged_proof_rejected_above_activation();
+    test_lp10_forged_proof_accepted_below_activation();
+    test_lp10_disabled_sentinel_accepts_forged();
+    test_lp10_honest_mik_signature_accepted_above_activation();
+    test_lp10_forged_mik_signature_rejected_above_accepted_below();
 
     vdf::shutdown();
 
