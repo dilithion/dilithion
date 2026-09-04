@@ -255,8 +255,9 @@ void test_t1_2_reorg_depth_cap_rejects_deep_sibling()
     CBlockIndex* genesis = active.genesis;
 
     // Sibling chain forking at genesis (h=0), walking to h=350. Reorg depth
-    // when activating sibling-leaf: tip(200) - fork(0) = 200 > 100. F4 trips.
-    // ALL ancestors have BLOCK_HAVE_DATA so F5 wouldn't reject — F4 must.
+    // when activating sibling-leaf: tip(200) - fork(0) = 200 > MAX_REORG_DEPTH
+    // (60). F4 trips. ALL ancestors have BLOCK_HAVE_DATA so F5 wouldn't
+    // reject — F4 must.
     CBlockIndex* sibPrev = genesis;
     for (int h = 1; h <= 350; ++h) {
         auto p = MakeIdx(/*chain_id=*/0x80, sibPrev, h,
@@ -285,7 +286,7 @@ void test_t1_2_reorg_depth_cap_rejects_deep_sibling()
                                        fInvalidFound);
 
     // F4 (post-F8 semantics, Layer-3 HIGH-2 + state-replay S3): depth
-    // 200 > 100 → erase from candidates (NOT MarkBlockAsFailed) + set
+    // 200 > MAX_REORG_DEPTH (60) → erase from candidates (NOT MarkBlockAsFailed) + set
     // m_chain_needs_rebuild for wrapper-driven recovery via the
     // v4.3.2-M1 main-loop helper.
     assert(!ok);

@@ -3,6 +3,7 @@
 
 #include <dfmp/mik.h>
 #include <crypto/sha3.h>
+#include <util/deliberate_wrap.h>
 #include <wallet/crypter.h>  // For memory_cleanse()
 
 #include <atomic>
@@ -770,6 +771,13 @@ int64_t CalculateMaturityPenaltyFP_V2(int currentHeight, int firstSeenHeight) {
     return FP_SCALE;  // 1.0x (mature, 400+ blocks)
 }
 
+// UBSan opt-out (instrumentation only, zero codegen effect). The 1.08^n exponential below
+// deliberately overflows int64_t at high blocksInWindow with no saturation guard; the
+// wrapped value is caught downstream by the 1.0x floor in CalculateEffectiveTarget().
+// -fwrapv makes it defined; this attribute keeps -fsanitize=undefined LIVE everywhere
+// else instead of disabling signed-overflow detection build-wide.
+// See src/util/deliberate_wrap.h.
+DILITHION_DELIBERATE_SIGNED_WRAP
 int64_t CalculateHeatPenaltyFP_V2(int blocksInWindow, int uniqueMiners) {
     // Dynamic free tier: scale by active miner count
     int effectiveFreeThreshold = FREE_TIER_THRESHOLD_V2;  // Default: 20
@@ -802,6 +810,9 @@ int64_t CalculateHeatPenaltyFP_V2(int blocksInWindow, int uniqueMiners) {
     return penalty;
 }
 
+// UBSan opt-out (instrumentation only). Multiplies a possibly-wrapped heat penalty by
+// maturity in the legacy int64 expression. See src/util/deliberate_wrap.h.
+DILITHION_DELIBERATE_SIGNED_WRAP
 int64_t CalculateTotalMultiplierFP_V2(int currentHeight, int firstSeenHeight, int blocksInWindow, int uniqueMiners) {
     int64_t maturityFP = CalculateMaturityPenaltyFP_V2(currentHeight, firstSeenHeight);
     int64_t heatFP = CalculateHeatPenaltyFP_V2(blocksInWindow, uniqueMiners);

@@ -40,7 +40,7 @@ int main() {
         wallet1.GenerateNewKey();
         wallet1.GenerateNewKey();
 
-        CAddress addr1 = wallet1.GetNewAddress();
+        CDilithiumAddress addr1 = wallet1.GetNewAddress();
         std::cout << COLOR_GREEN << "✓ Generated 2 keys" << COLOR_RESET << std::endl;
 
         // Save wallet

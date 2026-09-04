@@ -5,8 +5,10 @@
 
 #include <crypto/sha3.h>
 #include <dfmp/mik.h>
+#include <util/atomic_file.h>
 
 #include <cstdio>
+#include <string>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -84,13 +86,27 @@ bool SaveMIKRegistration(const std::string& datadir,
         out.flush();
     }
 
-    std::error_code ec;
-    std::filesystem::rename(tmpPath, finalPath, ec);
-    if (ec) {
-        // Fallback: remove then rename (Windows sometimes needs this)
-        std::filesystem::remove(finalPath, ec);
-        std::filesystem::rename(tmpPath, finalPath, ec);
-        if (ec) return false;
+    // Publish atomically. This file holds a MINED registration proof-of-work --
+    // it is not reconstructible from chain, so losing it costs the operator real
+    // work.
+    //
+    // The previous code did fs::rename and, on any error, fell back to
+    // fs::remove(finalPath) followed by a second fs::rename. That fallback is
+    // what is being removed here. On the toolchain we ship it never ran
+    // (fs::rename succeeds over an existing destination -- measured), and in the
+    // realistic triggers where fs::rename DOES fail (destination held open by
+    // another handle; destination read-only) the fallback's remove() fails too,
+    // so nothing was actually lost. But the SHAPE is destructive wherever it is
+    // reached: a condition-triggered kill placed between the remove and the
+    // rename left this file ABSENT on 20 of 20 killed writes. A single
+    // MoveFileExW replace has no such point to be killed at.
+    // durable=true: MOVEFILE_WRITE_THROUGH / parent-dir fsync.
+    // See src/util/atomic_file.h.
+    std::string moveErr;
+    if (!util::AtomicReplaceFile(tmpPath, finalPath, &moveErr, /*durable=*/true)) {
+        std::error_code rm_ec;
+        std::filesystem::remove(tmpPath, rm_ec);  // previous file left intact
+        return false;
     }
     return true;
 }

@@ -63,16 +63,10 @@ struct ClockDriftFingerprint {
     static ClockDriftFingerprint deserialize(const std::vector<uint8_t>& data);
 };
 
-// Time sync message exchanged between peers (via MSG_DNA_TIME_SYNC)
-struct TimeSyncMessage {
-    uint64_t sender_timestamp_us;   // Sender's monotonic clock (microseconds)
-    uint64_t sender_wall_ms;        // Sender's wall clock (milliseconds since epoch)
-    uint64_t nonce;                 // Random nonce for matching request/response
-    bool is_response = false;       // True if this is a response to a request
-
-    std::vector<uint8_t> serialize() const;
-    static TimeSyncMessage deserialize(const std::vector<uint8_t>& data);
-};
+// NOTE: The TimeSyncMessage struct + its serialize()/deserialize() were removed
+// as dead code. The live MSG_DNA_TIME_SYNC wire is produced/consumed by
+// CreateDNATimeSyncMessage / ProcessDNATimeSyncMessage in net.cpp via CDataStream
+// (little-endian); the struct was a separate, never-wired format used only by tests.
 
 class ClockDriftCollector {
 public:

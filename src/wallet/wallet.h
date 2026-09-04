@@ -302,6 +302,14 @@ private:
     // HD seed. Used to (a) verify legacy MACs with the correct keying, and (b)
     // detect a legacy plaintext-seed encrypted wallet that needs migration on unlock.
     uint32_t m_loadedFileVersion{0};
+    // LP-7 / ecosystem-sweep C-1: a per-record MAC must be keyed to MATCH the
+    // verify side. A wallet loaded from a pre-v7 file (and a non-HD v6 wallet that
+    // never migrates) uses legacy AES-keyed HMAC; a freshly-created in-memory
+    // wallet (m_loadedFileVersion==0) and a loaded v7+ wallet use v7 keying.
+    // Single source of truth for that predicate — it has drifted/bitten twice.
+    bool LegacyRecordKeying() const {
+        return m_loadedFileVersion != 0 && m_loadedFileVersion < WALLET_FILE_VERSION_7;
+    }
     // LP-7: set true at load when an encrypted wallet was read in a pre-v7 format
     // with a plaintext HD seed at rest (the bug condition). Triggers atomic
     // re-encryption + v7 rewrite on the next successful unlock.

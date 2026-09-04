@@ -19,6 +19,7 @@
 #include <consensus/tx_validation.h>
 #include <consensus/fees.h>
 #include <consensus/sighash.h>  // WALLET-015 FIX: SIGHASH types
+#include <consensus/sighash_preimage.h>  // Single-source ML-DSA sighash preimage builder
 #include <consensus/validation.h>  // BUG #112 FIX: For CBlockValidator::DeserializeBlockTransactions
 #include <core/chainparams.h>  // CHAIN-ID FIX: For replay protection
 
@@ -235,6 +236,24 @@ bool CWallet::GenerateNewKey() {
             return false;
         }
 
+        // LP-7: a per-address at-rest key MUST carry a v7 MAC, or Load() (which
+        // rejects any v7 record with an empty vchMAC) refuses the WHOLE wallet on
+        // the next start — silent funds-access loss. Mirror EncryptWallet's per-
+        // address MAC compute; GetKeyUnlocked already verifies it symmetrically.
+        // The MAC keying MUST match the verify side (VerifyRecordMAC in
+        // GetKeyUnlocked): a loaded v3-v6 wallet uses legacy AES-keyed HMAC, and a
+        // non-HD v6 wallet never migrates — so a v7-keyed MAC written here would
+        // make the freshly-minted key UNSPENDABLE on the next load. Select keying
+        // by the loaded file version, exactly as EncryptWallet/ChangePassphrase do.
+        const bool legacyKeying = LegacyRecordKeying();
+        if (!ComputeRecordMAC(crypter, encKey.vchCryptedKey, encKey.vchMAC, legacyKeying)) {
+            memory_cleanse(masterKeyVec.data(), masterKeyVec.size());
+            key.Clear();   // defense-in-depth: wipe the plaintext key on the failure
+                           // path (mirrors DeriveAndCacheHDAddress's fail branch); CKey
+                           // RAII already wipes on return, this makes the intent explicit.
+            return false;
+        }
+
         mapCryptedKeys[address] = encKey;
         memory_cleanse(masterKeyVec.data(), masterKeyVec.size());
     } else {
@@ -359,8 +378,7 @@ bool CWallet::VerifyRecordMAC(CCrypter& crypter,
     // matches the on-disk version: legacy AES-keyed HMAC for v3-v6, separated
     // MAC key for v7. (m_loadedFileVersion == 0 means a freshly-created in-memory
     // wallet whose records this build wrote with the default separated keying.)
-    const bool legacyKeying =
-        (m_loadedFileVersion != 0 && m_loadedFileVersion < WALLET_FILE_VERSION_7);
+    const bool legacyKeying = LegacyRecordKeying();
     return crypter.VerifyMAC(ciphertext, mac, legacyKeying);
 }
 
@@ -479,6 +497,21 @@ bool CWallet::ImportKey(const CKey& key, const CDilithiumAddress& address) {
         }
 
         if (!crypter.Encrypt(key.vchPrivKey, encKey.vchCryptedKey)) {
+            memory_cleanse(masterKeyVec.data(), masterKeyVec.size());
+            return false;
+        }
+
+        // LP-7: a per-address at-rest key MUST carry a v7 MAC, or Load() (which
+        // rejects any v7 record with an empty vchMAC) refuses the WHOLE wallet on
+        // the next start — silent funds-access loss. Mirror EncryptWallet's per-
+        // address MAC compute; GetKeyUnlocked already verifies it symmetrically.
+        // The MAC keying MUST match the verify side (VerifyRecordMAC in
+        // GetKeyUnlocked): a loaded v3-v6 wallet uses legacy AES-keyed HMAC, and a
+        // non-HD v6 wallet never migrates — so a v7-keyed MAC written here would
+        // make the freshly-minted key UNSPENDABLE on the next load. Select keying
+        // by the loaded file version, exactly as EncryptWallet/ChangePassphrase do.
+        const bool legacyKeying = LegacyRecordKeying();
+        if (!ComputeRecordMAC(crypter, encKey.vchCryptedKey, encKey.vchMAC, legacyKeying)) {
             memory_cleanse(masterKeyVec.data(), masterKeyVec.size());
             return false;
         }
@@ -1882,8 +1915,7 @@ bool CWallet::ChangePassphrase(const std::string& passphraseOld,
     //   - loaded v7 / 0 -> separated v7 keying (file is/stays v7)
     // (The single v6->v7 migration — which DOES recompute every MAC to separated
     // keying — still happens exactly once, on the next Unlock, never here.)
-    const bool legacyMasterKeying =
-        (m_loadedFileVersion != 0 && m_loadedFileVersion < WALLET_FILE_VERSION_7);
+    const bool legacyMasterKeying = LegacyRecordKeying();
     std::vector<uint8_t> newMAC;
     if (!ComputeRecordMAC(crypterNew, newCryptedKey, newMAC, legacyMasterKeying)) {
         memory_cleanse(derivedKeyOld.data(), derivedKeyOld.size());
@@ -3027,8 +3059,7 @@ bool CWallet::SaveUnlocked(const std::string& filename) const {
     // m_loadedFileVersion to v7, so this writer then emits v7 from then on. A freshly
     // created in-memory wallet (m_loadedFileVersion == 0) and an already-v7 wallet
     // both write v7.
-    const bool writeLegacyV6 =
-        (m_loadedFileVersion != 0 && m_loadedFileVersion < WALLET_FILE_VERSION_7);
+    const bool writeLegacyV6 = LegacyRecordKeying();
 
     if (writeLegacyV6) {
         file.write(WALLET_FILE_MAGIC_V6, 8);  // "DILWLT06" — keep the loaded version
@@ -5051,34 +5082,16 @@ bool CWallet::SignTransaction(CTransaction& tx, CUTXOSet& utxo_set, std::string&
 
             // VULN-003 FIX: Create signature message with version
             // CHAIN-ID FIX: Include chain ID to prevent cross-chain replay attacks (EIP-155 style)
-            std::vector<uint8_t> sig_message;
-            sig_message.reserve(32 + 4 + 4 + 4);  // hash + index + version + chainID
-            sig_message.insert(sig_message.end(), tx_hash.begin(), tx_hash.end());
-
-            // Add input index (4 bytes, little-endian)
-            uint32_t input_idx = static_cast<uint32_t>(i);
-            sig_message.push_back(static_cast<uint8_t>(input_idx & 0xFF));
-            sig_message.push_back(static_cast<uint8_t>((input_idx >> 8) & 0xFF));
-            sig_message.push_back(static_cast<uint8_t>((input_idx >> 16) & 0xFF));
-            sig_message.push_back(static_cast<uint8_t>((input_idx >> 24) & 0xFF));
-
-            // Add transaction version
-            sig_message.push_back(static_cast<uint8_t>(version & 0xFF));
-            sig_message.push_back(static_cast<uint8_t>((version >> 8) & 0xFF));
-            sig_message.push_back(static_cast<uint8_t>((version >> 16) & 0xFF));
-            sig_message.push_back(static_cast<uint8_t>((version >> 24) & 0xFF));
-
-            // Add chain ID
-            sig_message.push_back(static_cast<uint8_t>(chain_id & 0xFF));
-            sig_message.push_back(static_cast<uint8_t>((chain_id >> 8) & 0xFF));
-            sig_message.push_back(static_cast<uint8_t>((chain_id >> 16) & 0xFF));
-            sig_message.push_back(static_cast<uint8_t>((chain_id >> 24) & 0xFF));
-
-            // Hash the signature message
+            // Routed through the single-source builder — byte-identical to the
+            // prior open-coded 44-byte form (hash + index + version + chainID).
             SigningData data;
             data.input_index = i;
             data.sig_hash.resize(32);
-            SHA3_256(sig_message.data(), sig_message.size(), data.sig_hash.data());
+            Consensus::ComputeSighash(tx_hash,
+                                      static_cast<uint32_t>(i),
+                                      static_cast<uint32_t>(version),
+                                      chain_id,
+                                      data.sig_hash.data());
             data.scriptPubKey = utxo_entry.out.scriptPubKey;
 
             // Find the key for this address
@@ -5690,6 +5703,24 @@ bool CWallet::DeriveAndCacheHDAddress(const CHDKeyPath& path) {
         }
 
         if (!crypter.Encrypt(key.vchPrivKey, encKey.vchCryptedKey)) {
+            memory_cleanse(masterKeyVec.data(), masterKeyVec.size());
+            key.Clear();
+            derived.Wipe();
+            master_copy.Wipe();
+            return false;
+        }
+
+        // LP-7: a per-address at-rest key MUST carry a v7 MAC, or Load() (which
+        // rejects any v7 record with an empty vchMAC) refuses the WHOLE wallet on
+        // the next start — silent funds-access loss. Mirror EncryptWallet's per-
+        // address MAC compute; GetKeyUnlocked already verifies it symmetrically.
+        // The MAC keying MUST match the verify side (VerifyRecordMAC in
+        // GetKeyUnlocked): a loaded v3-v6 wallet uses legacy AES-keyed HMAC, and a
+        // non-HD v6 wallet never migrates — so a v7-keyed MAC written here would
+        // make the freshly-minted key UNSPENDABLE on the next load. Select keying
+        // by the loaded file version, exactly as EncryptWallet/ChangePassphrase do.
+        const bool legacyKeying = LegacyRecordKeying();
+        if (!ComputeRecordMAC(crypter, encKey.vchCryptedKey, encKey.vchMAC, legacyKeying)) {
             memory_cleanse(masterKeyVec.data(), masterKeyVec.size());
             key.Clear();
             derived.Wipe();
