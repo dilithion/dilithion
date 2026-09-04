@@ -46,10 +46,14 @@
 #include <uint256.h>
 
 #include <cassert>
+#include <cstdlib>
 #include <cstring>
 #include <iostream>
 #include <string>
 #include <vector>
+#ifndef _WIN32
+#include <sys/wait.h>  // WIFEXITED/WEXITSTATUS for the corrupted-pin child
+#endif
 
 using Dilithion::ChainParams;
 
@@ -232,10 +236,73 @@ void test_get_genesis_hash_agrees(const NetworkCase& c)
     }
 }
 
+// ---------------------------------------------------------------------------
+// (5) The pinned-mismatch guard ABORTS instead of silently substituting.
+//
+// v4.6 fold (red-team B/HIGH-1): GetGenesisHash() used to LOG a recompute/pin
+// mismatch and carry on with the pinned value — meaning a node whose genesis
+// CONSTRUCTION (not just hashing) faulted could persist a corrupt genesis
+// block under the correct key. The fold made the guard retry-then-abort:
+// transient fault → retry matches → proceed; persistent mismatch → throw.
+// This test drives the PERSISTENT arm with a synthetic wrong pin (both
+// computes are honest, so they mismatch the corrupted pin twice) and asserts
+// the throw. It MUST run before anything arms the call_once cache; throwing
+// leaves the once_flag unarmed, so the real accessor test still works after.
+// Only meaningful on pinned networks (mainnet, dilv).
+// ---------------------------------------------------------------------------
+// Runs in a CHILD PROCESS (see --corrupted-pin-abort in main): the fault
+// sentinel deliberately poisons GetGenesisHash() for the process lifetime, so
+// the abort case can't share a process with the agree-test. Child protocol:
+// exit 42 = guard threw (correct); exit 0 = silent substitution (the exact
+// defect this pins); anything else = child malfunction. Uses the dilv case
+// regardless of the parent's arm: the guard is network-agnostic code and the
+// VDF genesis makes the child's double-construct cheap (the mainnet child
+// costs ~80 min of RandomX on a loaded box for identical coverage).
+void test_pinned_mismatch_aborts(const char* self)
+{
+    std::cout << "  [dilv-child] corrupted pin makes GetGenesisHash() abort..." << std::endl;
+    std::string cmd = std::string("\"") + self + "\" --corrupted-pin-abort dilv";
+    int rc = std::system(cmd.c_str());
+#ifdef _WIN32
+    int code = rc;  // Windows system() reports the child's exit code directly
+#else
+    int code = WIFEXITED(rc) ? WEXITSTATUS(rc) : -1;
+#endif
+    CHECK(code == 42,
+        "corrupted-pin child must exit 42 (guard threw); got " + std::to_string(code) +
+        " — 0 means the guard silently substituted the pinned value");
+}
+
+int RunCorruptedPinAbortChild(const std::string& network)
+{
+    for (const NetworkCase& c : AllNetworks()) {
+        if (network != c.name) continue;
+        if (!c.expectPinnedHash) return 3;
+        InstallParams(c);
+        std::string& pin = Dilithion::g_chainParams->genesisHash;
+        pin[0] = (pin[0] == 'f') ? '0' : (pin[0] == '9') ? 'a' : pin[0] + 1;
+        try {
+            (void)Genesis::GetGenesisHash();
+        } catch (const std::exception&) {
+            return 42;  // guard threw => correct
+        }
+        return 0;  // silent substitution => the defect
+    }
+    return 3;
+}
+
 } // namespace
 
 int main(int argc, char** argv)
 {
+    // Child mode for the corrupted-pin abort case — must be first, before any
+    // banner output (the parent only reads the exit code, but keep it quiet).
+    if (argc == 3 && std::string(argv[1]) == "--corrupted-pin-abort") {
+        const char* rx_key_child = "Dilithion-RandomX-v1";
+        randomx_init_validation_mode(rx_key_child, strlen(rx_key_child));
+        return RunCorruptedPinAbortChild(argv[2]);
+    }
+
     std::cout << "\n=== Genesis validity — all networks ===\n" << std::endl;
 
     // Mainnet genesis hashes with RandomX; initialise LIGHT validation mode so
@@ -260,6 +327,10 @@ int main(int argc, char** argv)
         test_genesis_validates(c);
         test_wrong_constructor_is_rejected(c);
     }
+
+    // The corrupted-pin abort case runs in a CHILD process (the fault sentinel
+    // poisons GetGenesisHash for a process lifetime — see the function comment).
+    test_pinned_mismatch_aborts(argv[0]);
 
     // One network's GetGenesisHash() per process (call_once cache).
     const std::string want = (argc > 1) ? argv[1] : "mainnet";

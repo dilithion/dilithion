@@ -33,6 +33,9 @@
  *  - G3     the four consensus-critical sites (consensus/pow.cpp, miner/controller.cpp,
  *           node/dilithion-node.cpp, node/dilv-node.cpp) all route through that ONE
  *           predicate and no file outside chainparams re-derives the comparison.
+ *  - G4     -fwrapv (which makes this file's whole subject — signed wrap — DEFINED
+ *           behavior) is machine-enforced: the Makefile's CONSENSUS_CXXFLAGS override
+ *           exists and every first-party compile recipe includes it.
  */
 
 #include <dfmp/dfmp.h>
@@ -425,33 +428,40 @@ TEST(g1_activation_predicate_boundary) {
 // KILLS: an accidental/silent change of dfmpOverflowFixActivationHeight.
 // =======================================================================
 TEST(g2_shipped_params_gate_is_off) {
-    const int kOff = 999999999;
-    struct { const char* name; Dilithion::ChainParams params; } chains[] = {
-        { "Mainnet", Dilithion::ChainParams::Mainnet() },
-        { "Testnet", Dilithion::ChainParams::Testnet() },
-        { "DilV",    Dilithion::ChainParams::DilV()    },
-        { "Regtest", Dilithion::ChainParams::Regtest() },
+    // v4.6.0 ACTIVATION (Will, 2026-08-15): the gate is no longer frozen OFF —
+    // it activates at a per-chain height (~3wk adoption window from the live
+    // tips at decision time; RE-PIN at release cut). This test's job flips
+    // with it: pin the DECIDED heights so an accidental/silent change — in
+    // EITHER direction — still goes RED, and prove the predicate is exact at
+    // each chain's boundary.
+    struct { const char* name; Dilithion::ChainParams params; int activation; } chains[] = {
+        { "Mainnet", Dilithion::ChainParams::Mainnet(), 93000  },
+        { "Testnet", Dilithion::ChainParams::Testnet(), 0      },
+        { "DilV",    Dilithion::ChainParams::DilV(),    255000 },
+        { "Regtest", Dilithion::ChainParams::Regtest(), 0      },  // derives from Testnet
     };
     for (auto& c : chains) {
-        ASSERT(c.params.dfmpOverflowFixActivationHeight == kOff,
+        ASSERT(c.params.dfmpOverflowFixActivationHeight == c.activation,
             std::string("dfmpOverflowFixActivationHeight changed on ")
                 .append(c.name)
                 .append(" — that is a CONSENSUS decision, not a refactor").c_str());
 
         Dilithion::ChainParams local = c.params;
         ScopedChainParams guard(&local);
-        // Every realistic live height stays on the legacy path.
-        const int heights[] = { 0, 1, 1000, 100000, 10000000, kOff - 1 };
-        for (int h : heights) {
-            ASSERT(DfmpSaturatingMathActive(h) == false,
-                std::string("gate must be OFF on ").append(c.name)
-                    .append(" at a live height").c_str());
+        // Exact boundary: legacy math strictly below, saturating at and above.
+        if (c.activation > 0) {
+            ASSERT(DfmpSaturatingMathActive(0) == false,
+                std::string("gate must be OFF at genesis on ").append(c.name).c_str());
+            ASSERT(DfmpSaturatingMathActive(c.activation - 1) == false,
+                std::string("gate must be OFF just below activation on ").append(c.name).c_str());
         }
-        // ...and the predicate still flips exactly at the (unreachable) height.
-        ASSERT(DfmpSaturatingMathActive(kOff) == true,
-            "predicate must still flip at the configured activation height");
+        ASSERT(DfmpSaturatingMathActive(c.activation) == true,
+            std::string("gate must flip exactly at activation on ").append(c.name).c_str());
+        ASSERT(DfmpSaturatingMathActive(c.activation + 1) == true,
+            std::string("gate must stay ON above activation on ").append(c.name).c_str());
     }
-    std::cout << "    gate OFF (999999999) on Mainnet/Testnet/DilV/Regtest" << std::endl;
+    std::cout << "    activation pinned: Mainnet 93000, Testnet 0, DilV 255000, Regtest 0"
+              << std::endl;
 }
 
 // -----------------------------------------------------------------------
@@ -485,10 +495,67 @@ static std::string findSrcDir() {
         "repo root, or set DILITHION_SRC_ROOT");
 }
 
+// Strip // and /* */ comments so the G3 scan counts CODE, not prose.
+//
+// ⛔ WHY THIS EXISTS. G3 asserts a site names the gate parameter ZERO times.
+// The scan was a raw string::find over the whole file, so it could not tell a
+// call from a comment -- and on 2026-08-10 a commit added a COMMENT to
+// consensus/pow.cpp explaining the parameter. The comment is good: it documents
+// the live activation height. The test failed anyway, and main's gcc/Release
+// leg stayed red for three weeks while every PR inherited the failure.
+//
+// A test that punishes documentation for the thing it guards is not guarding
+// it -- it is training people to delete explanations. The property G3 actually
+// cares about is "no site RE-DERIVES the gate in code"; comments cannot
+// re-derive anything.
+//
+// Deliberately simple: no string-literal tracking, because the identifiers
+// this file scans for never appear inside string literals in the sites it
+// reads. If that ever changes, this must grow a literal-aware pass rather than
+// have the assertion relaxed.
+static std::string stripComments(const std::string& src) {
+    std::string out;
+    out.reserve(src.size());
+    for (size_t i = 0; i < src.size(); ) {
+        if (src[i] == '/' && i + 1 < src.size() && src[i + 1] == '/') {
+            while (i < src.size() && src[i] != '\n') ++i;   // keep the newline
+        } else if (src[i] == '/' && i + 1 < src.size() && src[i + 1] == '*') {
+            i += 2;
+            while (i + 1 < src.size() && !(src[i] == '*' && src[i + 1] == '/')) ++i;
+            i = (i + 1 < src.size()) ? i + 2 : src.size();
+            out += ' ';                                            // keep tokens apart
+        } else {
+            out += src[i++];
+        }
+    }
+    return out;
+}
+
 static size_t countOccurrences(const std::string& hay, const std::string& needle) {
+    const std::string code = stripComments(hay);
     size_t n = 0, pos = 0;
-    while ((pos = hay.find(needle, pos)) != std::string::npos) { n++; pos += needle.size(); }
+    while ((pos = code.find(needle, pos)) != std::string::npos) { n++; pos += needle.size(); }
     return n;
+}
+
+// G3/G4 assert about CODE, not prose: a rationale comment naming the parameter
+// (e.g. the k1 -fwrapv comment at pow.cpp:418) must not trip the single-source
+// sweep. Strips //-to-EOL only — the dominant style here; a block comment naming
+// the param would still count, which fails safe (a human looks, then rewords).
+static std::string stripLineComments(const std::string& body) {
+    std::string out;
+    out.reserve(body.size());
+    size_t pos = 0;
+    while (pos < body.size()) {
+        size_t eol = body.find('\n', pos);
+        if (eol == std::string::npos) eol = body.size();
+        size_t slashes = body.find("//", pos);
+        size_t end = (slashes != std::string::npos && slashes < eol) ? slashes : eol;
+        out.append(body, pos, end - pos);
+        out.push_back('\n');
+        pos = eol + 1;
+    }
+    return out;
 }
 
 // =======================================================================
@@ -518,7 +585,7 @@ TEST(g3_four_call_sites_single_sourced) {
         "node/dilv-node.cpp",
     };
     for (const char* rel : sites) {
-        const std::string body = readWholeFile((src / rel).string());
+        const std::string body = stripLineComments(readWholeFile((src / rel).string()));
         ASSERT(countOccurrences(body, kCall) >= 1,
             std::string(rel) + " must call DFMP::DfmpSaturatingMathActive()");
         ASSERT(countOccurrences(body, kParam) == 0,
@@ -536,7 +603,7 @@ TEST(g3_four_call_sites_single_sourced) {
         const std::string ext = e.path().extension().string();
         if (ext != ".cpp" && ext != ".h" && ext != ".hpp") continue;
         const std::string rel = std::filesystem::relative(e.path(), src).generic_string();
-        const std::string body = readWholeFile(e.path().string());
+        const std::string body = stripLineComments(readWholeFile(e.path().string()));
         if (countOccurrences(body, kParam) == 0) continue;
         if (rel == "core/chainparams.h" || rel == "core/chainparams.cpp") continue;
         if (rel == "dfmp/dfmp.cpp") { predicateFileHits++; continue; }
@@ -563,6 +630,75 @@ TEST(g3_four_call_sites_single_sourced) {
     std::cout << "    single source verified (>= + null guard)" << std::endl;
 }
 
+// =======================================================================
+// G4: -fwrapv is machine-enforced, not comment-enforced.
+//
+// The heat arithmetic this suite hardens is DEFINED behavior only under
+// -fwrapv (signed overflow wraps); without it the compiler may legally
+// assume no overflow and emit a consensus-divergent binary. The Makefile
+// carries the full rationale for the delivery mechanism (`override
+// CONSENSUS_CXXFLAGS := -fwrapv`, injected per-recipe because `override
+// CXXFLAGS +=` silently breaks every later plain `+=`). Until now that
+// mechanism was enforced only by a comment saying recipes MUST include
+// it. This test pins both halves, so dropping the variable or writing a
+// compile recipe without it fails a suite instead of shipping UB.
+// =======================================================================
+TEST(g4_consensus_fwrapv_machine_enforced) {
+    const std::filesystem::path srcPath = findSrcDir();
+    const std::filesystem::path root = srcPath.parent_path();
+    const std::string mk = readWholeFile((root / "Makefile").string());
+
+    // 1) The override variable exists, exactly once, with the flag.
+    ASSERT(countOccurrences(mk, "override CONSENSUS_CXXFLAGS := -fwrapv") == 1,
+        "Makefile must define `override CONSENSUS_CXXFLAGS := -fwrapv` exactly once");
+
+    // 2) Every first-party compile recipe includes $(CONSENSUS_CXXFLAGS).
+    //    A compile recipe = a tab-indented recipe line invoking $(CXX) with -c.
+    //    Scoped to recipes that use $(CXXFLAGS): the consensus-flag contract
+    //    rides with first-party flag sets. Hardcoded-flag third-party recipes
+    //    (chiavdf c_wrapper) are a separately-documented exemption — see the
+    //    "Do NOT extend this hardcoded-flags pattern" comment above that rule.
+    // Join backslash-continuations FIRST — a recipe split across lines would
+    // otherwise evade every substring check (fold: red-team M-3; the two
+    // Dilithium-primitive recipes were invisible to the first version).
+    std::string mkJoined;
+    mkJoined.reserve(mk.size());
+    for (size_t i = 0; i < mk.size(); ++i) {
+        if (mk[i] == '\\' && i + 1 < mk.size() && mk[i + 1] == '\n') { mkJoined += ' '; ++i; continue; }
+        if (mk[i] == '\\' && i + 2 < mk.size() && mk[i + 1] == '\r' && mk[i + 2] == '\n') { mkJoined += ' '; i += 2; continue; }
+        mkJoined += mk[i];
+    }
+
+    std::vector<std::string> naked;
+    std::istringstream lines(mkJoined);
+    std::string line;
+    size_t lineno = 0, recipes = 0;
+    while (std::getline(lines, line)) {
+        lineno++;
+        if (line.empty() || line[0] != '\t') continue;          // recipe lines only
+        if (line.find("$(CXX)") == std::string::npos) continue;
+        if (line.find(" -c ") == std::string::npos) continue;   // compile, not link
+        if (line.find("$(CXXFLAGS)") == std::string::npos) continue;  // third-party exemption
+        recipes++;
+        if (line.find("$(CONSENSUS_CXXFLAGS)") == std::string::npos) {
+            naked.push_back("Makefile(joined-line):" + std::to_string(lineno));
+        }
+    }
+    // 7 first-party compile recipes exist today (incl. the two Dilithium
+    // primitive recipes only visible after continuation-joining). A DROP below
+    // that is a recipe escaping the sweep, not legitimate shrinkage.
+    ASSERT(recipes >= 7,
+        "first-party compile recipe count dropped below 7 — a recipe is evading the sweep "
+        "(continuation trick or variable rename); fix the matcher, don't relax this");
+    if (!naked.empty()) {
+        std::string msg = "compile recipes missing $(CONSENSUS_CXXFLAGS) (CONSENSUS-UB RISK):";
+        for (const auto& n : naked) msg += " " + n;
+        throw std::runtime_error(msg);
+    }
+    std::cout << "    " << recipes << " compile recipes checked, all carry $(CONSENSUS_CXXFLAGS)"
+              << std::endl;
+}
+
 int main() {
     std::cout << YELLOW << "========================================" << RESET << std::endl;
     std::cout << YELLOW << "C-3 DFMP Heat Overflow Tests" << RESET << std::endl;
@@ -577,6 +713,7 @@ int main() {
     test_g1_activation_predicate_boundary_wrapper();
     test_g2_shipped_params_gate_is_off_wrapper();
     test_g3_four_call_sites_single_sourced_wrapper();
+    test_g4_consensus_fwrapv_machine_enforced_wrapper();
 
     std::cout << std::endl;
     std::cout << YELLOW << "========================================" << RESET << std::endl;
