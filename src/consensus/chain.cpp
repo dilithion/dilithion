@@ -881,6 +881,17 @@ bool CChainState::ActivateBestChain(CBlockIndex* pindexNew, const CBlock& block,
         std::cerr << "[Chain] ERROR: Reorganization too deep: " << reorg_depth << " blocks" << std::endl;
         std::cerr << "  Maximum allowed: " << reorg_cap << " blocks" << std::endl;
         std::cerr << "  This may indicate a long-range attack or network partition" << std::endl;
+        // v4.6 fold (A/HIGH-2): the node now knows a strictly-better chain
+        // exists beyond the reorg cap and cannot switch — the canonical
+        // off-canonical transition, on the LEGACY (default) path. Latch +
+        // one structured ERROR line; OffCanonicalReason() reads the latch, so
+        // getblockchaininfo's on_canonical goes false for real. OBSERVABILITY
+        // ONLY — deliberately NO FlagChainRebuild here: giving the legacy
+        // path the new path's auto-recovery (wipe+resync via the wrapper) is
+        // a behavior decision tracked separately, not smuggled in with a
+        // signal fix.
+        LogOffCanonicalTransition("depth-rejection",
+                                  static_cast<int64_t>(pindexNew->nHeight));
         return false;
     }
 
@@ -1721,6 +1732,134 @@ bool CChainState::ConnectTip(CBlockIndex* pindex, const CBlock& block, bool skip
         }
     }
 
+    // ====================================================================
+    // ⚠️ ORDERING IS DELIBERATE — LP-4 (below, cheap) RUNS BEFORE LP-10 (VDF).
+    // Both PRs independently placed their check 'immediately before ApplyBlock',
+    // so they collided on merge. LP-4's merkle recompute + duplicate-tx scan are
+    // microsecond, side-effect-free, structural checks on the block's own bytes.
+    // LP-10's Wesolowski verify is ~44 ms of class-group arithmetic and its own
+    // comment states it is placed LAST for exactly that DoS reason. Running the
+    // cheap structural checks first preserves BOTH rationales; inverting them
+    // would spend 44 ms on blocks the microsecond check already rejects.
+    // LP-4: MERKLE-ROOT DEFENSE-IN-DEPTH (CVE-2012-2459, restore D1)
+    // ====================================================================
+    // Recompute the merkle root from this block's own transactions and
+    // compare it to the header-committed hashMerkleRoot (which PoW binds).
+    // This is the principled, mechanism-independent guard against the
+    // CVE-2012-2459 merkle-malleability attack: a forged block keeps a valid
+    // header but supplies a DIFFERENT block.vtx that reproduces the same root
+    // via last-node duplication. The orphan arrival path already does this
+    // (block_processing.cpp:1115); the tip-connect path historically did not,
+    // leaving CVE closure to rest INCIDENTALLY on ApplyBlock's UTXO double-
+    // spend catch. Restoring D1 here makes the defense refactor-proof (e.g.
+    // survives any future assume-valid / UTXO-skip fast path).
+    //
+    // UNCONDITIONAL by design: runs for ALL ConnectTip calls, including
+    // skipValidation=true reorg reconnects, with NO assume-valid exemption.
+    // Both checks are structural properties of the block's own bytes and are
+    // idempotent on valid blocks (recomputed root == committed root bit-for-
+    // bit, and a well-formed block has no duplicate txids), so this is PURELY
+    // ADDITIVE and rejects nothing currently accepted. It only adds a cheap,
+    // side-effect-free rejection point ahead of UTXO application.
+    //
+    // Mirrors the orphan-path defense (block_processing.cpp:1115/1127): the
+    // recompute (D1) catches mutations that alter the root (tampered/reordered/
+    // truncated txs), while the duplicate-tx check (D2) catches the specific
+    // CVE-2012-2459 last-node-duplication shape, whose forged tx list
+    // reproduces an IDENTICAL root by construction and therefore slips past D1
+    // alone. Without D2 here, that shape would be caught only INCIDENTALLY by
+    // ApplyBlock's intra-block double-spend detection — the exact UTXO-layer
+    // dependence this defense-in-depth restore is meant to remove.
+    {
+        CBlockValidator validator;
+        std::vector<CTransactionRef> merkleTxs;
+        std::string merkleError;
+
+        if (!validator.DeserializeBlockTransactions(block, merkleTxs, merkleError)) {
+            std::cerr << "[Chain] ERROR: Block " << pindex->nHeight
+                      << " REJECTED: failed to deserialize transactions for merkle check" << std::endl;
+            std::cerr << "[Chain] " << merkleError << std::endl;
+
+            pindex->nStatus |= CBlockIndex::BLOCK_FAILED_VALID;
+            if (pdb != nullptr) {
+                pdb->WriteBlockIndex(blockHash, *pindex);
+            }
+            return false;
+        }
+
+        if (!validator.VerifyMerkleRoot(block, merkleTxs, merkleError)) {
+            std::cerr << "[Chain] ERROR: Block " << pindex->nHeight
+                      << " REJECTED: merkle root mismatch (CVE-2012-2459 defense)" << std::endl;
+            std::cerr << "[Chain] " << merkleError << std::endl;
+
+            pindex->nStatus |= CBlockIndex::BLOCK_FAILED_VALID;
+            if (pdb != nullptr) {
+                pdb->WriteBlockIndex(blockHash, *pindex);
+            }
+            return false;
+        }
+
+        if (!validator.CheckNoDuplicateTransactions(merkleTxs, merkleError)) {
+            std::cerr << "[Chain] ERROR: Block " << pindex->nHeight
+                      << " REJECTED: duplicate transactions (CVE-2012-2459 defense)" << std::endl;
+            std::cerr << "[Chain] " << merkleError << std::endl;
+
+            pindex->nStatus |= CBlockIndex::BLOCK_FAILED_VALID;
+            if (pdb != nullptr) {
+                pdb->WriteBlockIndex(blockHash, *pindex);
+            }
+            return false;
+        }
+    }
+
+    // LP-10 (CRITICAL/incident, subsumes LP-8): VDF Wesolowski proof +
+    // coinbase MIK-signature verification — the authoritative enforcement
+    // point on the production connect path.
+    // ====================================================================
+    // Before this fix, CheckVDFProof and the VDF-block MIK signature were
+    // NOT verified on any production connect path (they lived only in dead
+    // CBlockValidator::CheckBlock; CheckProofOfWorkDFMP early-returns true
+    // for VDF blocks). A forged vdfOutput/proof or MIK signature was accepted.
+    //
+    // Both checks are STRUCTURAL (no chain/identity-state dependence beyond a
+    // reorg-safe reference-pubkey lookup that degrades to pass-on-missing), so
+    // they run for ALL connect paths INCLUDING skipValidation=true reorg
+    // reconnects — VDF block selection is effectively a reorg every block, so
+    // a reorg-connected forged block must not bypass this.
+    //
+    // Activation-gated by vdfProofEnforcementHeight: below it, blocks are
+    // grandfathered (the existing chain is never retroactively re-verified);
+    // at/above it, a forged proof or signature is rejected. Runs BEFORE
+    // ApplyBlock so a forged block never mutates the UTXO set.
+    if (block.IsVDFBlock()) {
+        std::string vdfProofError;
+        if (!CheckVDFProofConnect(block, pindex->nHeight,
+                                  block.hashPrevBlock, vdfProofError)) {
+            std::cerr << "[Chain] ERROR: Block " << pindex->nHeight
+                      << " REJECTED: VDF proof verification failed" << std::endl;
+            std::cerr << "[Chain] " << vdfProofError << std::endl;
+
+            pindex->nStatus |= CBlockIndex::BLOCK_FAILED_VALID;
+            if (pdb != nullptr) {
+                pdb->WriteBlockIndex(blockHash, *pindex);
+            }
+            return false;
+        }
+
+        std::string mikSigError;
+        if (!CheckVDFBlockMIKSignature(block, pindex->nHeight, mikSigError)) {
+            std::cerr << "[Chain] ERROR: Block " << pindex->nHeight
+                      << " REJECTED: VDF block MIK signature invalid" << std::endl;
+            std::cerr << "[Chain] " << mikSigError << std::endl;
+
+            pindex->nStatus |= CBlockIndex::BLOCK_FAILED_VALID;
+            if (pdb != nullptr) {
+                pdb->WriteBlockIndex(blockHash, *pindex);
+            }
+            return false;
+        }
+    }
+
     // Step 1: Update UTXO set (CS-004)
     if (pUTXOSet != nullptr) {
         if (!pUTXOSet->ApplyBlock(block, pindex->nHeight, blockHash)) {
@@ -2264,6 +2403,18 @@ std::string CChainState::OffCanonicalReason() const {
     // rejected leaf to m_setBlockIndexCandidates, so the old predicate fired on
     // a healthy on-canonical node → cry-wolf monitor.py alerts. Genuine drift
     // detection (distinct from depth-rejection) is a v2 item (F7 anchored-root).
+    // v4.6 fold (A/HIGH-2, Will's call 2026-08-15: wire it for real): the
+    // off-canonical LATCH also drives the signal. The legacy activation path
+    // rejects a too-deep reorg WITHOUT flagging a rebuild (no auto-recovery
+    // there — that behavioral parity is a separate decision), so before this
+    // the signal could only ever fire behind the default-OFF useNewPath gate:
+    // green-by-construction, and monitoring read it as health. The latch is
+    // set by LogOffCanonicalTransition at BOTH paths' depth-rejection sites
+    // and cleared by ClearChainRebuildFlag on recovery, so it IS the
+    // episode marker.
+    if (m_off_canonical_logged.load(std::memory_order_acquire)) {
+        return "depth-rejection";
+    }
     if (m_chain_needs_rebuild.load(std::memory_order_acquire) &&
         m_chain_rebuild_reason.load(std::memory_order_acquire) ==
             ChainRebuildReason::DepthRejection) {

@@ -5,6 +5,7 @@
 #include <randomx.h>
 
 #include <algorithm>
+#include <string>
 #include <vector>
 #include <mutex>
 #include <stdexcept>
@@ -158,14 +159,64 @@ namespace {
     // non-swappable memory on a relay node that never mines is a bad trade -- see
     // the header comment for the full reasoning.
 
-    std::atomic<bool> g_large_pages_allowed{false};
+    // The opt-in, and what the FULL-mode mining dataset did with it. Both under one
+    // mutex because the question that matters is a compound one -- "was the flag set
+    // before or after the dataset committed to a page size?" -- and answering that from
+    // independent atomics is a race, not an answer.
+    std::mutex g_lp_mutex;
+    bool g_lp_allowed = false;    // current opt-in
+    // Single state variable for the dataset's use of the opt-in. Deliberately ONE
+    // variable and not a (latched, latched_value, outcome) trio: the trio had a member
+    // no test could distinguish, and an untestable field in a correctness mechanism is
+    // where the next silent regression lives.
+    enum class LargePageOutcome {
+        Pending,       // the mining dataset has not read the opt-in yet
+        Requested,     // read with the opt-in ON; allocating, result not known yet
+        Granted,       // requested and the OS gave large pages
+        Refused,       // requested and the OS refused; running on 4KB pages
+        NotRequested   // read with the opt-in OFF -- committed to 4KB, too late to change
+    };
+    LargePageOutcome g_lp_outcome = LargePageOutcome::Pending;
+    // Last line emitted by randomx_log_large_page_status_for_mining(), for change-only
+    // printing -- mining restarts once per block template.
+    std::string g_lp_last_logged;
 
     // Whether the most recent FULL-mode dataset allocation actually landed on large
     // pages. Reported via randomx_large_pages_active().
     std::atomic<bool> g_large_pages_active{false};
 
     bool LargePagesAllowed() {
-        return g_large_pages_allowed.load(std::memory_order_relaxed);
+        std::lock_guard<std::mutex> lock(g_lp_mutex);
+        return g_lp_allowed;
+    }
+
+    // Called once by the FULL-mode mining init, immediately before it allocates the
+    // dataset. Returns the opt-in it must honour and, atomically with that read, moves
+    // the state off Pending.
+    //
+    // Recording it HERE rather than after the allocation is the fix. "Is it too late to
+    // opt in?" was previously approximated by g_mining_ready, which is not set until the
+    // 2GB dataset has finished BUILDING 30-120 seconds later -- so a request landing in
+    // that window was swallowed in silence while the dataset it was meant to affect had
+    // already been committed to 4KB pages. Deciding at the read makes the boundary
+    // exact: before it the request is honoured, after it the request is known-too-late
+    // and reportable as such.
+    //
+    // Lock ordering note: callers may hold g_mining_mutex when they get here. Nothing
+    // takes g_lp_mutex and then g_mining_mutex, so the two cannot deadlock.
+    bool DecideLargePagesForMining() {
+        std::lock_guard<std::mutex> lock(g_lp_mutex);
+        const bool requested = g_lp_allowed;
+        g_lp_outcome = requested ? LargePageOutcome::Requested
+                                 : LargePageOutcome::NotRequested;
+        return requested;
+    }
+
+    void RecordMiningDatasetOutcome(bool requested, bool got_large_pages) {
+        std::lock_guard<std::mutex> lock(g_lp_mutex);
+        g_lp_outcome = !requested ? LargePageOutcome::NotRequested
+                     : got_large_pages ? LargePageOutcome::Granted
+                                       : LargePageOutcome::Refused;
     }
 
     // Takes the caller's snapshot of the flag rather than re-reading it, so a setter
@@ -218,22 +269,89 @@ extern "C" int randomx_large_pages_active() {
 }
 
 extern "C" void randomx_set_large_pages_allowed(int allowed) {
-    const bool want = (allowed != 0);
-    const bool was = g_large_pages_allowed.exchange(want, std::memory_order_relaxed);
+    std::lock_guard<std::mutex> lock(g_lp_mutex);
+    g_lp_allowed = (allowed != 0);
+    // Deliberately silent. Whether this request will be honoured is not knowable from
+    // the setter alone -- it depends on whether the mining dataset has already read the
+    // flag (see DecideLargePagesForMining) -- and an earlier revision that guessed from
+    // g_mining_ready got it wrong in the common case: a set(1) landing while the dataset
+    // build was still in flight saw g_mining_ready==false, printed nothing, and was
+    // swallowed anyway. Reporting is single-sourced in
+    // randomx_log_large_page_status_for_mining(), which reads the recorded decision.
+}
 
-    // Turning the flag on after the dataset already exists does nothing: the FULL-mode
-    // init is idempotent (it early-returns once g_mining_ready is set), so the dataset
-    // built on standard pages is the one that will be used for the process lifetime.
-    // This happens to a node started WITHOUT --mine on a 8GB+ box -- the IBD-speedup
-    // init builds the dataset before any mining path can opt in. Re-allocating here is
-    // not safe (live mining VMs hold pointers into the dataset), so say so loudly
-    // instead of leaving the operator to wonder why their hashrate did not move.
-    if (want && !was && g_mining_ready.load()) {
-        std::cout << "  [MINING] Large pages requested, but the RandomX dataset is already"
-                  << " allocated on standard pages - request ignored." << std::endl;
-        std::cout << "  [MINING] Restart the node with --mine to allocate it with large pages."
-                  << std::endl;
+// One line, always, for a node that is actually mining. See the contract in the header.
+//
+// This exists because the status was previously reported only from inside the dataset
+// allocator, and only when the opt-in was already on. A node started without --mine on
+// an 8GB+ host builds its dataset at startup with the opt-in off, so when the user later
+// began mining the allocator had long since run, the "not requested" branch had returned
+// early, and the log contained no large-page line of any kind. The operator saw half the
+// hashrate and nothing explaining it.
+extern "C" void randomx_log_large_page_status_for_mining(int full_mode_expected) {
+    bool allowed;
+    LargePageOutcome outcome;
+    {
+        std::lock_guard<std::mutex> lock(g_lp_mutex);
+        allowed = g_lp_allowed;
+        outcome = g_lp_outcome;
     }
+
+    std::string msg;
+
+    if (!full_mode_expected) {
+        // No 2GB dataset will ever exist on this host, so "large pages" has no referent.
+        // Say that rather than saying nothing -- silence is what hid the original defect.
+        msg = "  [MINING] Large pages: N/A - LIGHT mode only (the 2GB FULL-mode dataset"
+              " that large pages back needs >= 3072 MB RAM).";
+    } else {
+        switch (outcome) {
+        case LargePageOutcome::Requested:
+            // In flight: the allocation has read the opt-in but has not reported what it
+            // got. Promise the follow-up rather than claiming an outcome.
+            msg = "  [MINING] Large pages: REQUESTED - the 2GB dataset is being allocated"
+                  " now; the ENABLED/UNAVAILABLE result follows.";
+            break;
+        case LargePageOutcome::Granted:
+            msg = "  [MINING] Large pages: ENABLED (2GB dataset)";
+            break;
+        case LargePageOutcome::Refused:
+            msg = "  [MINING] Large pages: UNAVAILABLE - mining on standard 4KB pages, expect"
+                  " roughly half the achievable hashrate.\n"
+                  "  [MINING] To enable, see docs/MINING-LARGE-PAGES.md"
+                  " (Linux: vm.nr_hugepages; Windows: Lock pages in memory).";
+            break;
+        case LargePageOutcome::NotRequested:
+            // The dataset READ the opt-in while it was off, so it is committed to 4KB
+            // pages -- whether or not it has finished building. The node was started
+            // without --mine on an 8GB+ host and the IBD speedup got there first.
+            // Re-allocating is not safe (mining VMs hold pointers into the dataset), so
+            // this is terminal for the process.
+            msg = "  [MINING] Large pages: IGNORED - the 2GB dataset was already allocated on"
+                  " standard pages before mining started, and cannot be moved.\n"
+                  "  [MINING] Restart the node with --mine to allocate it with large pages.";
+            break;
+        case LargePageOutcome::Pending:
+            msg = allowed
+                ? "  [MINING] Large pages: REQUESTED - will be applied when the 2GB FULL-mode"
+                  " dataset is allocated."
+                : "  [MINING] Large pages: NOT REQUESTED (no opt-in on this path).";
+            break;
+        }
+    }
+
+    // Print only on change. Mining is (re)started once per block template, so an
+    // unconditional print here would put this line in the log every few seconds. Keyed on
+    // the message rather than a once-flag so the genuine transition REQUESTED -> ENABLED
+    // is still reported -- a once-flag would freeze the log on the provisional answer.
+    {
+        std::lock_guard<std::mutex> lock(g_lp_mutex);
+        if (msg == g_lp_last_logged) {
+            return;
+        }
+        g_lp_last_logged = msg;
+    }
+    std::cout << msg << std::endl;
 }
 
 extern "C" void randomx_init_for_hashing(const void* key, size_t key_len, int light_mode) {
@@ -345,13 +463,44 @@ extern "C" void randomx_init_for_hashing(const void* key, size_t key_len, int li
 
             // Capture local pointer copies, not globals - prevents race condition
             init_threads.emplace_back([dataset_ptr, cache_ptr, start_item, count]() {
-                randomx_init_dataset(dataset_ptr, cache_ptr, start_item, count);
+                // K2-(4, related LOW): batched with a cancellation poll, same as
+                // the mining-mode build. This is exported API with no in-tree
+                // caller that can escape the async wrappers today, but an
+                // unbatched call here would make randomx_shutdown()'s join wait
+                // out an entire 2GB dataset build -- and the std::atexit
+                // backstop runs that join on every exit path.
+                const unsigned long kBatchItems = 65536;
+                for (unsigned long done = 0; done < count; done += kBatchItems) {
+                    if (g_randomx_shutdown.load(std::memory_order_acquire)) {
+                        return;  // partial dataset; discarded by the check below
+                    }
+                    const unsigned long n = std::min<unsigned long>(kBatchItems, count - done);
+                    randomx_init_dataset(dataset_ptr, cache_ptr, start_item + done, n);
+                }
             });
         }
 
         // Wait for all threads to complete
         for (auto& thread : init_threads) {
             thread.join();
+        }
+
+        // A cancelled build leaves a PARTIAL dataset. Never wrap a VM around it
+        // -- a VM over a half-built dataset would produce wrong hashes. Release
+        // and return; the process is exiting.
+        //
+        // g_randomx_ready is forced FALSE rather than merely left alone: the
+        // cleanup at the top of this function already destroyed any previous VM
+        // and nulled g_randomx_vm, so returning with a stale ready==true (which
+        // a direct caller of this legacy entry point could be carrying from an
+        // earlier successful init) would advertise a VM that no longer exists.
+        if (g_randomx_shutdown.load(std::memory_order_acquire)) {
+            randomx_release_dataset(g_randomx_dataset);
+            randomx_release_cache(g_randomx_cache);
+            g_randomx_dataset = nullptr;
+            g_randomx_cache = nullptr;
+            g_randomx_ready = false;
+            return;
         }
 
         // Ensure all dataset writes are visible before creating VM
@@ -450,9 +599,14 @@ extern "C" void randomx_init_async(const void* key, size_t key_len, int light_mo
         return;
     }
 
-    // Refuse to start new background work once shutdown has begun -- otherwise
-    // a late call could hand randomx_shutdown() a thread it has already joined
-    // past, and we would be back to terminating at static destruction.
+    // Refuse to start new background work once shutdown has begun. This early
+    // check is only a cheap fast path -- on its own it does NOT establish the
+    // property, because randomx_shutdown() can run to completion in the window
+    // between it and the handle lock below. The check that actually establishes
+    // it is the re-test UNDER g_init_threads_mutex further down; see K2-(4)
+    // there. (The comment that used to sit here credited this test with the
+    // full guarantee. It never had it: safety rested on the std::atexit
+    // backstop and on the lambda's own cancellation point, not on this line.)
     if (g_randomx_shutdown.load(std::memory_order_acquire)) {
         g_randomx_initializing = false;
         return;
@@ -469,6 +623,32 @@ extern "C" void randomx_init_async(const void* key, size_t key_len, int light_mo
     std::vector<uint8_t> key_copy((const uint8_t*)key, (const uint8_t*)key + key_len);
 
     std::lock_guard<std::mutex> thread_lock(g_init_threads_mutex);
+
+    // K2-(4): re-test the shutdown flag UNDER the handle lock, and only here is
+    // the "no thread is assigned after shutdown has joined" property actually
+    // established. randomx_shutdown() stores the flag, THEN takes this same
+    // mutex, THEN joins. The interleaving the pre-lock check cannot stop:
+    //
+    //   caller                          randomx_shutdown()
+    //   ------                          ------------------
+    //   reads flag == false
+    //                                   stores flag = true
+    //                                   locks g_init_threads_mutex
+    //                                   joins both handles
+    //                                   unlocks  <-- shutdown is DONE
+    //   locks g_init_threads_mutex
+    //   assigns a NEW thread to an already-joined handle
+    //
+    // That new thread has nothing left to join it, so its std::thread member
+    // is still joinable at static-destruction time -- std::terminate(), the
+    // exact fault this module exists to remove. Because randomx_shutdown()
+    // publishes the flag BEFORE acquiring the lock, any shutdown that has
+    // reached the lock is guaranteed visible to this acquire-load, so the
+    // window is closed rather than narrowed.
+    if (g_randomx_shutdown.load(std::memory_order_acquire)) {
+        g_randomx_initializing = false;
+        return;
+    }
 
     // Join any existing thread
     if (g_randomx_init_thread.joinable()) {
@@ -674,8 +854,9 @@ extern "C" void randomx_init_mining_mode_async(const void* key, size_t key_len) 
         return;  // Already initialized
     }
 
-    // Refuse to start new background work once shutdown has begun. See the same
-    // guard in randomx_init_async().
+    // Cheap fast path only -- not the guarantee. See the same pair of checks in
+    // randomx_init_async(); the one that establishes the property is under
+    // g_init_threads_mutex below.
     if (g_randomx_shutdown.load(std::memory_order_acquire)) {
         g_mining_initializing = false;
         return;
@@ -688,6 +869,16 @@ extern "C" void randomx_init_mining_mode_async(const void* key, size_t key_len) 
     std::vector<uint8_t> key_copy((const uint8_t*)key, (const uint8_t*)key + key_len);
 
     std::lock_guard<std::mutex> thread_lock(g_init_threads_mutex);
+
+    // K2-(4): re-test under the handle lock. Same race, same reasoning, same
+    // consequence as in randomx_init_async() -- see the interleaving diagram
+    // there. Without this, a call that passed the pre-lock check could assign a
+    // new thread to a handle randomx_shutdown() had already joined and walked
+    // away from.
+    if (g_randomx_shutdown.load(std::memory_order_acquire)) {
+        g_mining_initializing = false;
+        return;
+    }
 
     // Join any existing thread
     if (g_mining_init_thread.joinable()) {
@@ -725,10 +916,12 @@ extern "C" void randomx_init_mining_mode_async(const void* key, size_t key_len) 
             // FULL mode flags
             randomx_flags flags = randomx_get_flags() | RANDOMX_FLAG_FULL_MEM;
 
-            // Snapshot the opt-in once: the allocation below and the status line
-            // afterwards must describe the same decision even if a setter call lands
-            // in between.
-            const bool large_pages_allowed = LargePagesAllowed();
+            // Read the opt-in once, and record the decision atomically with the read:
+            // the allocation below and the status line afterwards must describe the same
+            // decision even if a setter call lands in between, and any set(1) arriving
+            // after this point must be reportable as too-late instead of being silently
+            // swallowed.
+            const bool large_pages_allowed = DecideLargePagesForMining();
 
             // Allocate cache. Never large pages -- it would eat the pages the dataset
             // needs; see the ordering hazard in the scope note on the helpers above.
@@ -747,8 +940,15 @@ extern "C" void randomx_init_mining_mode_async(const void* key, size_t key_len) 
                 throw std::runtime_error("Failed to allocate RandomX mining dataset");
             }
 
+            // Record the outcome before reporting it, so a mining start racing this
+            // allocation reads the settled answer rather than "pending".
+            RecordMiningDatasetOutcome(large_pages_allowed, dataset_large_pages);
+
             // Tell the miner which path they got. Without this a user has no way to
             // tell a ~2x hashrate deficit from normal behaviour for their hardware.
+            // Silent when large pages were never requested -- a relay node has nothing
+            // to report. A node that IS mining gets its guaranteed line from
+            // randomx_log_large_page_status_for_mining() instead.
             ReportLargePageStatus(large_pages_allowed, dataset_large_pages);
 
             // Multi-threaded dataset initialization

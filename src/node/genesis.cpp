@@ -223,6 +223,7 @@ CBlock CreateGenesisBlockForChain() {
 
 uint256 GetGenesisHash() {
     static uint256 hash;
+    static std::string genesisFault;  // non-empty => persistent-mismatch, every call throws
     static std::once_flag genesisHashOnce;
 
     // ── SINGLE-SOURCE GENESIS HASH + INTEGRITY GUARD (2026-06-28) ─────────────
@@ -252,6 +253,12 @@ uint256 GetGenesisHash() {
         // once_flag un-armed, so a correctly-ordered later call performs the
         // validated compute rather than poisoning the cache. (No such early caller
         // exists today — g_chainParams is set at startup before any genesis work.)
+        // CAVEAT (2026-08-15): the unarmed-retry semantics hold on glibc only;
+        // MinGW/winpthreads call_once mishandles exceptional passthrough and a
+        // throw here would deadlock later callers on Windows. Kept as a throw
+        // because recover-on-retry is the intended contract and no caller can
+        // reach it today; if an early caller ever appears, convert to the
+        // fault-sentinel pattern used for the pin mismatch below.
         if (!Dilithion::g_chainParams) {
             throw std::runtime_error("GetGenesisHash() called before chainparams initialized");
         }
@@ -266,17 +273,57 @@ uint256 GetGenesisHash() {
         if (Dilithion::g_chainParams && !Dilithion::g_chainParams->genesisHash.empty()) {
             const uint256 pinned = uint256S(Dilithion::g_chainParams->genesisHash);
             if (!(computed == pinned)) {
+                // Mismatch. The pin cannot be attacker-influenced, but silently
+                // substituting it would let a node whose CONSTRUCTION (not just
+                // hashing) faulted persist a corrupt genesis block under the
+                // correct key (red-team B/HIGH-1: incoherent block store).
+                // Discriminate transient from persistent by reconstructing once:
+                //   - transient RandomX/compute fault (the observed 8GB+ miner
+                //     case): the retry matches the pin and the node proceeds —
+                //     liveness preserved, fault logged.
+                //   - persistent mismatch: this binary cannot reproduce its own
+                //     pinned genesis; nothing it computes can be trusted. Abort
+                //     loudly rather than run on substituted values. (Throwing
+                //     leaves the once_flag unarmed, so a restart retries.)
                 LogPrintf(ALL, ERROR,
                     "[GENESIS] recomputed genesis hash %s does not match the value pinned in "
-                    "chainparams %s — using the pinned value (transient compute fault; see ops "
-                    "board randomx-genesis-init-corruption)",
+                    "chainparams %s — reconstructing once to discriminate a transient compute "
+                    "fault (see ops board randomx-genesis-init-corruption)",
                     computed.GetHex().c_str(), pinned.GetHex().c_str());
-                computed = pinned;
+                CBlock retry = CreateGenesisBlockForChain();
+                const uint256 recomputed = retry.GetHash();
+                if (recomputed == pinned) {
+                    LogPrintf(ALL, ERROR,
+                        "[GENESIS] retry matches the pin — transient compute fault healed "
+                        "in-process; continuing on the pinned value");
+                    computed = pinned;
+                } else {
+                    // Persistent fault. Record a FAULT SENTINEL and return
+                    // normally; the throw happens OUTSIDE the call_once below.
+                    // An exception must never propagate out of the call_once
+                    // lambda: MinGW/winpthreads' call_once does not implement
+                    // exceptional passthrough correctly — the flag is left
+                    // locked and every later caller DEADLOCKS (observed
+                    // first-hand: the test suite's corrupted-pin case wedged
+                    // at 0 CPU on Windows, 2026-08-15). Sentinel semantics are
+                    // also the RIGHT semantics: a persistent mismatch is fatal
+                    // for the process lifetime — every subsequent call must
+                    // throw too, not retry.
+                    genesisFault =
+                        "GetGenesisHash(): genesis recompute mismatches the chainparams pin "
+                        "twice (computed " + computed.GetHex() + ", retry " +
+                        recomputed.GetHex() + ", pinned " + pinned.GetHex() + ") — persistent "
+                        "compute fault; refusing to run on substituted consensus values";
+                    return;
+                }
             }
         }
         hash = computed;
     });
 
+    if (!genesisFault.empty()) {
+        throw std::runtime_error(genesisFault);
+    }
     return hash;
 }
 
