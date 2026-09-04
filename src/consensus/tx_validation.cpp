@@ -4,6 +4,7 @@
 #include <consensus/tx_validation.h>
 #include <consensus/fees.h>
 #include <consensus/signature_batch_verifier.h>  // Phase 3.2: Batch sig verification
+#include <consensus/sighash_preimage.h>
 #include <script/script.h>
 #include <script/interpreter.h>
 #include <crypto/sha3.h>
@@ -748,42 +749,23 @@ bool CTransactionValidator::PrepareSignatureData(const CTransaction& tx, size_t 
         return false;
     }
 
-    // Construct signature message (same as VerifyScript)
-    uint256 tx_hash = tx.GetSigningHash();
-
-    std::vector<uint8_t> sig_message;
-    sig_message.reserve(44);  // hash + index + version + chainID
-
-    sig_message.insert(sig_message.end(), tx_hash.begin(), tx_hash.end());
-
-    // Add input index
-    uint32_t input_idx = static_cast<uint32_t>(inputIdx);
-    sig_message.push_back(static_cast<uint8_t>(input_idx & 0xFF));
-    sig_message.push_back(static_cast<uint8_t>((input_idx >> 8) & 0xFF));
-    sig_message.push_back(static_cast<uint8_t>((input_idx >> 16) & 0xFF));
-    sig_message.push_back(static_cast<uint8_t>((input_idx >> 24) & 0xFF));
-
-    // Add transaction version
-    uint32_t version = tx.nVersion;
-    sig_message.push_back(static_cast<uint8_t>(version & 0xFF));
-    sig_message.push_back(static_cast<uint8_t>((version >> 8) & 0xFF));
-    sig_message.push_back(static_cast<uint8_t>((version >> 16) & 0xFF));
-    sig_message.push_back(static_cast<uint8_t>((version >> 24) & 0xFF));
-
-    // Add chain ID
+    // Construct signature message (same as VerifyScript) via the single-source
+    // builder — byte-identical to the prior open-coded 44-byte form.
     if (Dilithion::g_chainParams == nullptr) {
         error = "Chain parameters not initialized";
         return false;
     }
     uint32_t chain_id = Dilithion::g_chainParams->chainID;
-    sig_message.push_back(static_cast<uint8_t>(chain_id & 0xFF));
-    sig_message.push_back(static_cast<uint8_t>((chain_id >> 8) & 0xFF));
-    sig_message.push_back(static_cast<uint8_t>((chain_id >> 16) & 0xFF));
-    sig_message.push_back(static_cast<uint8_t>((chain_id >> 24) & 0xFF));
+
+    uint256 tx_hash = tx.GetSigningHash();
 
     // Hash the signature message
     message.resize(32);
-    SHA3_256(sig_message.data(), sig_message.size(), message.data());
+    Consensus::ComputeSighash(tx_hash,
+                              static_cast<uint32_t>(inputIdx),
+                              static_cast<uint32_t>(tx.nVersion),
+                              chain_id,
+                              message.data());
 
     return true;
 }
@@ -796,8 +778,22 @@ bool CTransactionValidator::BatchVerifyScripts(const CTransaction& tx, CUTXOSet&
         return false;
     }
 
-    // Begin new batch
-    g_signature_verifier->BeginBatch();
+    // Begin a new batch. The session is owned for the lifetime of this call
+    // (CRITICAL-1 / LP-5): concurrent BatchVerifyScripts callers each get their
+    // own session, so their batch state cannot cross-contaminate.
+    //
+    // The RAII guard (CCheckQueueControl pattern, see checkqueue.h) drains the
+    // session via Wait() on EVERY exit path that does not consume the result —
+    // both early-return branches below and any future exception. Draining is a
+    // latency bound, not a safety requirement: every queued task shared_ptr-
+    // owns the session (signature_batch_verifier.h S-005), so an abandoned
+    // session is UAF-safe — the guard only avoids spending CPU on signatures
+    // we're about to discard and a leaked-task-on-an-abandoned-session waste.
+    // The guard's drain uses a throwaway error internally, so a bad signature
+    // in an already-queued task can never clobber the real operator-facing
+    // `error` we set on the early-return branches.
+    std::shared_ptr<CBatchSession> session = g_signature_verifier->BeginBatch();
+    CBatchSessionGuard guard(g_signature_verifier, session);
 
     // Prepare and add all signature verification tasks
     for (size_t i = 0; i < tx.vin.size(); ++i) {
@@ -807,7 +803,7 @@ bool CTransactionValidator::BatchVerifyScripts(const CTransaction& tx, CUTXOSet&
         CUTXOEntry entry;
         if (!utxoSet.GetUTXO(txin.prevout, entry)) {
             error = "Failed to retrieve UTXO for batch verification";
-            return false;
+            return false;  // guard drains queued tasks; `error` preserved
         }
 
         // Prepare signature data
@@ -819,13 +815,14 @@ bool CTransactionValidator::BatchVerifyScripts(const CTransaction& tx, CUTXOSet&
             snprintf(buf, sizeof(buf), "Failed to prepare signature data for input %zu: %s",
                      i, prep_error.c_str());
             error = buf;
-            return false;
+            return false;  // guard drains queued tasks; `error` preserved
         }
 
-        // Add to batch
-        g_signature_verifier->Add(signature, message, pubkey, i);
+        // Add to this batch's session
+        g_signature_verifier->Add(session, signature, message, pubkey, i);
     }
 
-    // Wait for all verifications to complete
-    return g_signature_verifier->Wait(error);
+    // Wait for all verifications in this session to complete. WaitResult()
+    // consumes the verdict so the guard does NOT drain again on destruction.
+    return guard.WaitResult(error);
 }

@@ -4,10 +4,14 @@
 #include <attestation/seed_attestation.h>
 #include <crypto/sha3.h>
 #include <util/strencodings.h>
-#include <wallet/crypter.h>  // For memory_cleanse()
+#include <wallet/crypter.h>  // For memory_cleanse() + CCrypter/DeriveKey (LP-13 encrypt-at-rest)
 
 #include <algorithm>
+#include <cctype>  // Finding C: std::tolower for IPv6 case canonicalization
+#include <cerrno>
+#include <cstdlib>
 #include <cstring>
+#include <filesystem>  // LP-13 (extreview HIGH): presence test, not readability
 #include <fstream>
 #include <iostream>
 #include <sstream>
@@ -15,6 +19,7 @@
 #ifdef _WIN32
 #include <winsock2.h>
 #include <ws2tcpip.h>
+#include <windows.h>   // LP-13 H-2: MoveFileExW for atomic key-file replace
 #pragma comment(lib, "ws2_32.lib")
 #else
 #include <sys/socket.h>
@@ -22,6 +27,8 @@
 #include <arpa/inet.h>
 #include <unistd.h>
 #include <netdb.h>
+#include <sys/stat.h>   // LP-13: chmod/fchmod for 0600 key file perms
+#include <fcntl.h>
 #endif
 
 // Dilithium3 reference implementation
@@ -41,7 +48,234 @@ namespace Attestation {
 
 // File format magic and version
 static constexpr uint32_t KEY_FILE_MAGIC = 0x444C4154;  // "DLAT" (Dilithion Attestation)
-static constexpr uint8_t KEY_FILE_VERSION = 1;
+// v1: plaintext private key (legacy — still readable for backward-compat migration)
+// v2 (LP-13): private key encrypted at rest (AES-256-CBC, PBKDF2-SHA3, encrypt-then-MAC)
+static constexpr uint8_t KEY_FILE_VERSION_V1 = 1;
+static constexpr uint8_t KEY_FILE_VERSION_V2 = 2;
+
+// LP-13 v2 on-disk sizes (bytes)
+static constexpr size_t SEED_KEY_SALT_SIZE = 16;  // PBKDF2 salt (== WALLET_CRYPTO_SALT_SIZE)
+static constexpr size_t SEED_KEY_IV_SIZE   = 16;  // AES-CBC IV     (== WALLET_CRYPTO_IV_SIZE)
+static constexpr size_t SEED_KEY_MAC_SIZE  = 64;  // HMAC-SHA3-512  (encrypt-then-MAC)
+
+// LP-13: PBKDF2 rounds for the seed-key passphrase. Reuse the wallet constant
+// for a single hardened KDF cost across the codebase.
+static constexpr unsigned int SEED_KEY_PBKDF2_ROUNDS = WALLET_CRYPTO_PBKDF2_ROUNDS;
+
+// ============================================================================
+// LP-13 helpers
+// ============================================================================
+
+// Read the operator passphrase from the environment. Empty => not configured
+// (Save falls back to legacy v1 plaintext; Load cannot decrypt a v2 file).
+static std::string GetSeedKeyPassphrase() {
+    const char* env = std::getenv(Attestation::SEED_KEY_PASSPHRASE_ENV);
+    if (env == nullptr) return std::string();
+    return std::string(env);
+}
+
+// Restrict a key file to owner read/write only. POSIX: chmod 0600. Windows:
+// best-effort no-op (NTFS confines the per-user profile data dir; documented).
+// Returns true if perms are owner-only after the call (Windows: always true).
+static bool RestrictKeyFilePerms(const std::string& path) {
+#ifndef _WIN32
+    // 0600 = owner rw, no group/other. Failure is logged; the caller decides
+    // whether it is fatal (Save M-4 fail-closed) or merely a warning.
+    if (chmod(path.c_str(), S_IRUSR | S_IWUSR) != 0) {
+        std::cerr << "[Attestation] WARNING: could not chmod 0600 key file: " << path << std::endl;
+        return false;
+    }
+    return true;
+#else
+    (void)path;  // Windows: relies on NTFS ACL of the user profile data dir.
+    return true;
+#endif
+}
+
+// LP-13 M-3: on Load, report whether a pre-existing file is group/other-readable
+// (a legacy v1 file may have been written 0644 before this hardening landed).
+// POSIX only; Windows relies on the NTFS ACL of the profile dir.
+#ifndef _WIN32
+static bool KeyFileIsPermissive(const std::string& path) {
+    struct stat st;
+    if (stat(path.c_str(), &st) != 0) return false;  // can't tell; don't warn
+    return (st.st_mode & (S_IRWXG | S_IRWXO)) != 0;   // any group/other bit set
+}
+#endif
+
+// LP-13 (extreview HIGH): presence test (stat), not readability. See header.
+bool SeedKeyFilePresent(const std::string& dataDir) {
+    std::error_code ec;
+    bool present = std::filesystem::exists(dataDir + "/" + SEED_KEY_FILENAME, ec);
+    // A stat error (ec set) means we cannot prove ABSENCE; fail closed (report
+    // present) so an unstattable-but-genuine key still drives fail-loud startup.
+    if (ec) return true;
+    return present;
+}
+
+// ============================================================================
+// LP-13 M-1/M-2 SEED-IDENTITY RESOLUTION (HIGH-1 / HIGH-2 fold)
+// ============================================================================
+
+// Finding C (extreview PR#121): lowercase an IPv6 literal so case-variant input
+// (e.g. "2001:DB8::1") canonicalizes to the configured form. Hex digits and the
+// ':' separator are the only characters in a textual IPv6 literal; lowercasing
+// is safe and idempotent. The configured seed set is IPv4-only today, so this is
+// forward-compat for when an IPv6 seed is added — it never affects IPv4 matching.
+static std::string LowercaseIPv6(std::string s) {
+    std::transform(s.begin(), s.end(), s.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    return s;
+}
+
+std::string NormalizeExternalIpForSeedMatch(const std::string& externalIp) {
+    // 1) Trim surrounding whitespace (HIGH-2: quoting/templating artifacts).
+    //    Finding C: also collapse/strip any INTERIOR whitespace — a textual IP
+    //    literal (v4 or v6) never legitimately contains spaces/tabs, so removing
+    //    them lets "138.197. 68.128" or "[ 2001:db8::1 ]" style artifacts resolve
+    //    rather than silently SKIP. (Trailing-dot and case are handled below.)
+    size_t b = externalIp.find_first_not_of(" \t\r\n");
+    if (b == std::string::npos) return std::string();
+    size_t e = externalIp.find_last_not_of(" \t\r\n");
+    std::string s = externalIp.substr(b, e - b + 1);
+    s.erase(std::remove_if(s.begin(), s.end(),
+                           [](unsigned char c) { return c == ' ' || c == '\t' ||
+                                                        c == '\r' || c == '\n'; }),
+            s.end());
+    if (s.empty()) return std::string();
+
+    // 2) IPv6 handling — do NOT strip on a raw IPv6 literal (it contains
+    //    colons legitimately). Bracketed form "[addr]" or "[addr]:port" keeps
+    //    the address inside the brackets; a bare value with >1 colon is treated
+    //    as IPv6 and returned trimmed-only. The configured seed set is IPv4-only,
+    //    so an IPv6 externalip simply fails to match -> SKIP_NOT_A_SEED, never a
+    //    false FATAL. Finding C: lowercase the IPv6 result for case-insensitive
+    //    match (IPv6 hex digits are case-insensitive per RFC 5952).
+    if (!s.empty() && s.front() == '[') {
+        size_t rb = s.find(']');
+        if (rb != std::string::npos) {
+            return LowercaseIPv6(s.substr(1, rb - 1));  // inside brackets, drop any ":port"
+        }
+        return LowercaseIPv6(s);  // malformed; leave as-is (won't match IPv4 set)
+    }
+    if (std::count(s.begin(), s.end(), ':') > 1) {
+        return LowercaseIPv6(s);  // bare IPv6 literal; lowercased, no port strip
+    }
+
+    // 3) IPv4 / hostname: strip a single trailing ":port" suffix
+    //    (HIGH-2: --externalip=138.197.68.128:8444 must resolve).
+    size_t colon = s.find(':');
+    if (colon != std::string::npos) {
+        s = s.substr(0, colon);
+    }
+    // Finding C: strip a single trailing dot (a fully-qualified DNS name like
+    // "seed.example.com." or a dotted-quad written "138.197.68.128." is valid but
+    // would not string-equal the configured form). One trailing dot only.
+    if (!s.empty() && s.back() == '.') {
+        s.pop_back();
+    }
+    return s;
+}
+
+SeedIdentityResult ResolveSeedIdentity(
+    const std::vector<std::string>& seedIPs,
+    const std::vector<std::vector<uint8_t>>& seedPubkeys,
+    const std::string& externalIp,
+    const std::vector<uint8_t>& loadedPubkey,
+    bool asnLoaded,
+    bool datacenterBanChain,
+    bool datacenterListLoaded) {
+    SeedIdentityResult r;
+
+    // Final disposition for a would-be REGISTER (valid identity). Folds the
+    // availability dependencies LAST and in the documented order: a down ASN DB
+    // degrades first (DEGRADED_NO_ASN — no attestation capacity at all), then a
+    // ban-chain-with-empty-datacenter-list degrades
+    // (DEGRADED_NO_DATACENTER_LIST — IsDatacenterIP() would fail open and let
+    // datacenter miners through the Sybil ban). On a non-ban chain (DIL) the
+    // datacenter condition is inert, so the result is REGISTER unchanged. Each can
+    // only SOFTEN a REGISTER; this helper is only ever reached after
+    // FATAL_MISMATCH / SKIP_NOT_A_SEED have already been ruled out.
+    auto registerOrDegrade = [&]() -> SeedIdentityDecision {
+        if (!asnLoaded) return SeedIdentityDecision::DEGRADED_NO_ASN;
+        if (datacenterBanChain && !datacenterListLoaded)
+            return SeedIdentityDecision::DEGRADED_NO_DATACENTER_LIST;
+        return SeedIdentityDecision::REGISTER;
+    };
+
+    // Resolve seedId by matching our normalized --externalip against the known
+    // seed IPs. seedAttestationIPs[i] and seedAttestationPubkeys[i] are
+    // index-aligned (same NYC/London/Singapore/Sydney order), so the resolved
+    // index is also the index into the consensus pubkey set.
+    int seedId = -1;
+    if (!externalIp.empty()) {
+        std::string normIp = NormalizeExternalIpForSeedMatch(externalIp);
+        if (!normIp.empty()) {
+            for (size_t i = 0; i < seedIPs.size(); i++) {
+                if (seedIPs[i] == normIp) {
+                    seedId = static_cast<int>(i);
+                    break;
+                }
+            }
+        }
+    }
+
+    if (seedPubkeys.empty()) {
+        // Testnet: no consensus pubkey to enforce. Preserve the prior lenient
+        // behavior — register under the resolved index, or default 0 with a
+        // WARN when unresolved.
+        if (seedId < 0) {
+            r.seedId = 0;
+            r.usedTestnetDefault = true;
+        } else {
+            r.seedId = seedId;
+        }
+        // H-3 + Fix 1: a valid (testnet) identity that would register degrades if
+        // the ASN DB is down, or (on a ban chain) if the datacenter list is empty.
+        // Otherwise REGISTER. (Testnet typically runs DIL-shaped non-ban params, so
+        // the datacenter condition is normally inert here.)
+        r.decision = registerOrDegrade();
+        return r;
+    }
+
+    // Mainnet (configured seed set present).
+    if (seedId < 0) {
+        // HIGH-1 fix: externalip matches no configured seed slot. This node is
+        // NOT one of the seeds (even if a key file is on disk). Skip
+        // registration rather than abort: consensus rejects a non-seed's
+        // attestations anyway, so aborting is a pure availability regression
+        // with zero security gain. This still fixes the original M-2 bug — a
+        // non-seed never silently registers under wrong-index-0.
+        r.decision = SeedIdentityDecision::SKIP_NOT_A_SEED;
+        r.seedId = -1;
+        return r;
+    }
+
+    // seedId resolved to a real seed slot: the key MUST match that slot's
+    // consensus pubkey (M-1). A mismatch (or out-of-range index) is a genuine
+    // misconfig — fail loud.
+    if (static_cast<size_t>(seedId) >= seedPubkeys.size() ||
+        loadedPubkey != seedPubkeys[seedId]) {
+        r.decision = SeedIdentityDecision::FATAL_MISMATCH;
+        r.seedId = seedId;
+        return r;
+    }
+
+    // Identity is valid for this seed slot. H-3 + Fix 1: fold the availability
+    // dependencies in LAST — a valid identity with the ASN DB down, or (on a ban
+    // chain) with an empty datacenter list, DEGRADES (stay online, don't register,
+    // loud + diagnosable) rather than registering. A trust failure (FATAL_MISMATCH
+    // above) is never reached here, so these can only ever soften a would-be
+    // REGISTER, never a FATAL.
+    r.seedId = seedId;
+    r.decision = registerOrDegrade();
+    return r;
+}
+
+// LP-13 H-2 atomic-save test seam (see header). nullptr in production.
+bool (*g_seedKeySaveFailpoint)() = nullptr;
+// LP-13 B-1 fsync-failure test seam (see header). nullptr in production.
+bool (*g_seedKeyFsyncFailpoint)() = nullptr;
 
 // ============================================================================
 // CSeedAttestationKey
@@ -57,6 +291,7 @@ void CSeedAttestationKey::Clear() {
     }
     m_privkey.clear();
     m_pubkey.clear();
+    m_loadedV1Plaintext = false;
 }
 
 bool CSeedAttestationKey::Generate() {
@@ -73,92 +308,645 @@ bool CSeedAttestationKey::Generate() {
 
 bool CSeedAttestationKey::Load(const std::string& dataDir) {
     std::string path = dataDir + "/" + SEED_KEY_FILENAME;
+    m_loadedV1Plaintext = false;
+
+    // LP-13 M-3: repair perms on a pre-existing key file BEFORE reading its
+    // secret bytes. A legacy v1 file may have been written world/group-readable
+    // (0644) prior to this hardening; chmod it back to 0600 and warn loudly so
+    // the operator knows the key was exposed at rest.
+#ifndef _WIN32
+    if (KeyFileIsPermissive(path)) {
+        std::cerr << "[Attestation] WARNING: key file " << path
+                  << " was group/other-readable; repairing to 0600. The consensus"
+                     " signing key may have been exposed — consider rotating it."
+                  << std::endl;
+        RestrictKeyFilePerms(path);
+    }
+#endif
+
+    // Read the whole file up front so v2 length/format checks are robust against
+    // truncation, and so we never leave a half-read secret in memory on error.
     std::ifstream file(path, std::ios::binary);
     if (!file.is_open()) {
         return false;
     }
+    std::vector<uint8_t> buf((std::istreambuf_iterator<char>(file)),
+                              std::istreambuf_iterator<char>());
+    file.close();
 
-    // Read and verify magic
+    // magic(4) + version(1) header
+    if (buf.size() < 5) {
+        std::cerr << "[Attestation] Key file too short" << std::endl;
+        return false;
+    }
+
     uint32_t magic = 0;
-    file.read(reinterpret_cast<char*>(&magic), 4);
+    std::memcpy(&magic, buf.data(), 4);
     if (magic != KEY_FILE_MAGIC) {
         std::cerr << "[Attestation] Invalid key file magic" << std::endl;
         return false;
     }
 
-    // Read and verify version
-    uint8_t version = 0;
-    file.read(reinterpret_cast<char*>(&version), 1);
-    if (version != KEY_FILE_VERSION) {
-        std::cerr << "[Attestation] Unsupported key file version: " << (int)version << std::endl;
-        return false;
-    }
+    uint8_t version = buf[4];
+    size_t off = 5;
 
-    // Read public key
-    m_pubkey.resize(DFMP::MIK_PUBKEY_SIZE);
-    file.read(reinterpret_cast<char*>(m_pubkey.data()), DFMP::MIK_PUBKEY_SIZE);
-
-    // Read private key
-    m_privkey.resize(DFMP::MIK_PRIVKEY_SIZE);
-    file.read(reinterpret_cast<char*>(m_privkey.data()), DFMP::MIK_PRIVKEY_SIZE);
-
-    if (!file.good()) {
-        std::cerr << "[Attestation] Key file read error" << std::endl;
-        Clear();
-        return false;
-    }
-
-    std::cout << "[Attestation] Loaded seed attestation key: " << GetPubKeyHex().substr(0, 16) << "..." << std::endl;
-    return true;
-}
-
-bool CSeedAttestationKey::Save(const std::string& dataDir) const {
-    if (!IsValid()) return false;
-
-    std::string path = dataDir + "/" + SEED_KEY_FILENAME;
-    std::ofstream file(path, std::ios::binary | std::ios::trunc);
-    if (!file.is_open()) {
-        std::cerr << "[Attestation] Failed to open key file for writing: " << path << std::endl;
-        return false;
-    }
-
-    // Write magic
-    uint32_t magic = KEY_FILE_MAGIC;
-    file.write(reinterpret_cast<const char*>(&magic), 4);
-
-    // Write version
-    uint8_t version = KEY_FILE_VERSION;
-    file.write(reinterpret_cast<const char*>(&version), 1);
-
-    // Write public key
-    file.write(reinterpret_cast<const char*>(m_pubkey.data()), m_pubkey.size());
-
-    // Write private key
-    file.write(reinterpret_cast<const char*>(m_privkey.data()), m_privkey.size());
-
-    if (!file.good()) {
-        std::cerr << "[Attestation] Key file write error" << std::endl;
-        return false;
-    }
-
-    std::cout << "[Attestation] Saved seed attestation key to: " << path << std::endl;
-    return true;
-}
-
-bool CSeedAttestationKey::LoadOrGenerate(const std::string& dataDir) {
-    if (Load(dataDir)) {
+    if (version == KEY_FILE_VERSION_V1) {
+        // Legacy plaintext format (backward compat for un-migrated seeds):
+        //   magic(4) version(1) pubkey(1952) privkey(4032)
+        if (buf.size() < off + DFMP::MIK_PUBKEY_SIZE + DFMP::MIK_PRIVKEY_SIZE) {
+            std::cerr << "[Attestation] v1 key file truncated" << std::endl;
+            return false;
+        }
+        m_pubkey.assign(buf.begin() + off, buf.begin() + off + DFMP::MIK_PUBKEY_SIZE);
+        off += DFMP::MIK_PUBKEY_SIZE;
+        m_privkey.assign(buf.begin() + off, buf.begin() + off + DFMP::MIK_PRIVKEY_SIZE);
+        // Wipe the plaintext private key out of the read buffer.
+        memory_cleanse(buf.data() + off, DFMP::MIK_PRIVKEY_SIZE);
+        m_loadedV1Plaintext = true;  // LP-13 H-1: provenance for require-encryption gate
+        std::cout << "[Attestation] Loaded seed attestation key (v1 plaintext): "
+                  << GetPubKeyHex().substr(0, 16) << "..." << std::endl;
+        std::cerr << "[Attestation] NOTE: key file is unencrypted (v1). Set "
+                  << SEED_KEY_PASSPHRASE_ENV << " to re-save it encrypted (v2)." << std::endl;
         return true;
     }
 
-    std::cout << "[Attestation] No existing attestation key found, generating new keypair..." << std::endl;
+    if (version == KEY_FILE_VERSION_V2) {
+        // LP-13 encrypted format:
+        //   magic(4) version(1) pubkey(1952) salt(16) iv(16) mac(64)
+        //   ctlen(4 LE) ciphertext(ctlen)
+        size_t headerEnd = off + DFMP::MIK_PUBKEY_SIZE + SEED_KEY_SALT_SIZE +
+                           SEED_KEY_IV_SIZE + SEED_KEY_MAC_SIZE + 4;
+        if (buf.size() < headerEnd) {
+            std::cerr << "[Attestation] v2 key file truncated (header)" << std::endl;
+            return false;
+        }
+
+        m_pubkey.assign(buf.begin() + off, buf.begin() + off + DFMP::MIK_PUBKEY_SIZE);
+        off += DFMP::MIK_PUBKEY_SIZE;
+
+        std::vector<uint8_t> salt(buf.begin() + off, buf.begin() + off + SEED_KEY_SALT_SIZE);
+        off += SEED_KEY_SALT_SIZE;
+        std::vector<uint8_t> iv(buf.begin() + off, buf.begin() + off + SEED_KEY_IV_SIZE);
+        off += SEED_KEY_IV_SIZE;
+        std::vector<uint8_t> mac(buf.begin() + off, buf.begin() + off + SEED_KEY_MAC_SIZE);
+        off += SEED_KEY_MAC_SIZE;
+
+        uint32_t ctlen = static_cast<uint32_t>(buf[off]) |
+                         (static_cast<uint32_t>(buf[off + 1]) << 8) |
+                         (static_cast<uint32_t>(buf[off + 2]) << 16) |
+                         (static_cast<uint32_t>(buf[off + 3]) << 24);
+        off += 4;
+
+        if (buf.size() != off + ctlen || ctlen == 0 || (ctlen % 16) != 0) {
+            std::cerr << "[Attestation] v2 key file truncated or malformed ciphertext" << std::endl;
+            return false;
+        }
+        std::vector<uint8_t> ciphertext(buf.begin() + off, buf.begin() + off + ctlen);
+
+        std::string passphrase = GetSeedKeyPassphrase();
+        if (passphrase.empty()) {
+            std::cerr << "[Attestation] ERROR: key file is encrypted (v2) but "
+                      << SEED_KEY_PASSPHRASE_ENV << " is not set. Cannot decrypt." << std::endl;
+            Clear();
+            return false;
+        }
+
+        // LP-13 M-3 (Cursor): RAII exception-safe wipe of the v2 decrypt secrets —
+        // mirrors Save()'s SecretScopeWipe (Cursor flagged the asymmetry). passphrase
+        // / aesKey / plain are cleansed on EVERY exit from here including a thrown
+        // std::bad_alloc, not just the explicit returns below (which keep their
+        // earlier inline cleanses for minimal live-window hygiene; double-cleansing
+        // already-zeroed bytes is harmless).
+        std::vector<uint8_t> aesKey, plain;
+        struct LoadSecretWipe {
+            std::string& p; std::vector<uint8_t>& k; std::vector<uint8_t>& pl;
+            ~LoadSecretWipe() {
+                if (!p.empty()) memory_cleanse(&p[0], p.size());
+                if (!k.empty()) memory_cleanse(k.data(), k.size());
+                if (!pl.empty()) memory_cleanse(pl.data(), pl.size());
+            }
+        } loadSecretWipe{passphrase, aesKey, plain};
+
+        // Derive AES key from passphrase + salt, then encrypt-then-MAC verify.
+        if (!DeriveKey(passphrase, salt, SEED_KEY_PBKDF2_ROUNDS, aesKey)) {
+            std::cerr << "[Attestation] ERROR: key derivation failed" << std::endl;
+            memory_cleanse(&passphrase[0], passphrase.size());
+            Clear();
+            return false;
+        }
+        memory_cleanse(&passphrase[0], passphrase.size());
+
+        CCrypter crypter;
+        if (!crypter.SetKey(aesKey, iv)) {
+            std::cerr << "[Attestation] ERROR: failed to set decryption key" << std::endl;
+            memory_cleanse(aesKey.data(), aesKey.size());
+            Clear();
+            return false;
+        }
+        memory_cleanse(aesKey.data(), aesKey.size());
+
+        // Verify MAC BEFORE decrypt (prevents padding-oracle / tamper). A wrong
+        // passphrase yields a different derived key => MAC mismatch => reject.
+        if (!crypter.VerifyMAC(ciphertext, mac)) {
+            std::cerr << "[Attestation] ERROR: key file MAC verification failed "
+                      << "(wrong passphrase or tampered/corrupt file)." << std::endl;
+            Clear();
+            return false;
+        }
+
+        if (!crypter.Decrypt(ciphertext, plain) || plain.size() != DFMP::MIK_PRIVKEY_SIZE) {
+            std::cerr << "[Attestation] ERROR: key file decryption failed" << std::endl;
+            if (!plain.empty()) memory_cleanse(plain.data(), plain.size());
+            Clear();
+            return false;
+        }
+        m_privkey.assign(plain.begin(), plain.end());
+        memory_cleanse(plain.data(), plain.size());
+
+        std::cout << "[Attestation] Loaded seed attestation key (v2 encrypted): "
+                  << GetPubKeyHex().substr(0, 16) << "..." << std::endl;
+        return true;
+    }
+
+    std::cerr << "[Attestation] Unsupported key file version: " << (int)version << std::endl;
+    return false;
+}
+
+// LP-13 MEDIUM-1: zero a transient buffer that may hold the plaintext private
+// key on the v1 Save path. Exposed (declared in the header) so the test suite
+// can assert the wipe actually happens — deleting the memory_cleanse below is
+// the mutation the cleanse test is designed to catch.
+void CleanseSeedKeyBuffer(std::vector<uint8_t>& buf) {
+    if (!buf.empty()) memory_cleanse(buf.data(), buf.size());
+}
+
+bool CSeedAttestationKey::Save(const std::string& dataDir, bool allowPlaintext) const {
+    if (!IsValid()) return false;
+
+    std::string path = dataDir + "/" + SEED_KEY_FILENAME;
+
+    // LP-13 CL-1 (DEFAULT-ON ENCRYPTION — inverted from the prior default): the
+    // seed consensus signing key is encrypted at rest by default. We refuse to
+    // write a plaintext (v1) key unless the operator EXPLICITLY opts out via
+    // allowPlaintext (--allow-plaintext-seed-key). Without the passphrase we
+    // cannot encrypt, so on the default path (allowPlaintext=false + no
+    // passphrase) we FAIL LOUD rather than silently persist an unencrypted
+    // consensus key. The passphrase is provisioned at deploy via
+    // DILITHION_SEED_KEY_PASSPHRASE.
+    if (GetSeedKeyPassphrase().empty() && !allowPlaintext) {
+        std::cerr << "[Attestation] FATAL: " << SEED_KEY_PASSPHRASE_ENV
+                  << " is unset and seed-key encryption is mandatory by default."
+                     " Refusing to write an UNENCRYPTED (v1) seed consensus signing"
+                     " key. Provision the passphrase (recommended), or pass"
+                     " --allow-plaintext-seed-key to explicitly opt out of"
+                     " encryption-at-rest." << std::endl;
+        return false;
+    }
+
+    // LP-13: assemble the full serialized blob in memory first, then write it
+    // in one shot. This lets us harden file permissions BEFORE any secret bytes
+    // hit the disk (POSIX: create with 0600), avoiding a world-readable window.
+    std::vector<uint8_t> out;
+    auto putU32 = [&out](uint32_t v) {
+        out.push_back(static_cast<uint8_t>(v & 0xff));
+        out.push_back(static_cast<uint8_t>((v >> 8) & 0xff));
+        out.push_back(static_cast<uint8_t>((v >> 16) & 0xff));
+        out.push_back(static_cast<uint8_t>((v >> 24) & 0xff));
+    };
+
+    // magic(4, native order to match Load's memcpy) + version(1)
+    uint32_t magic = KEY_FILE_MAGIC;
+    const uint8_t* magicBytes = reinterpret_cast<const uint8_t*>(&magic);
+    out.insert(out.end(), magicBytes, magicBytes + 4);
+
+    std::string passphrase = GetSeedKeyPassphrase();
+    bool encrypt = !passphrase.empty();
+
+    // LP-13 (exception-safety fold, convergent across red-team + extreview grok/
+    // qwen3/nemotron): the finish() lambda below + the inline memory_cleanse calls
+    // only run on EXPLICIT returns. A std::bad_alloc thrown mid-assembly (e.g. an
+    // out.insert / DeriveKey allocation) would unwind PAST them, leaving the
+    // plaintext private key (v1 `out`) or the passphrase in freed heap. This RAII
+    // guard makes the wipe exception-safe: it cleanses both on EVERY scope exit,
+    // including a throw. (Double-cleansing already-zeroed bytes on the normal path
+    // is harmless.)
+    struct SecretScopeWipe {
+        std::vector<uint8_t>& buf;
+        std::string& pass;
+        ~SecretScopeWipe() {
+            CleanseSeedKeyBuffer(buf);
+            if (!pass.empty()) memory_cleanse(&pass[0], pass.size());
+        }
+    } secretScopeWipe{out, passphrase};
+
+    // LP-13 MEDIUM-1: on the v1 (default, un-passphrased) path `out` holds the
+    // plaintext Dilithium3 private key; on the v2 path it holds only ciphertext.
+    // Cleanse `out` UNCONDITIONALLY before every return so the plaintext key is
+    // never left in freed heap (cleansing the non-secret v2 buffer is harmless).
+    // The actual wipe lives in CleanseSeedKeyBuffer (a test seam — see
+    // seed_attestation_key_tests.cpp); this lambda is the single exit gate for
+    // all returns past this point.
+    auto finish = [&out](bool ok) -> bool {
+        CleanseSeedKeyBuffer(out);
+        return ok;
+    };
+
+    if (!encrypt) {
+        // ---- Legacy v1 plaintext (no passphrase configured) ----
+        out.push_back(KEY_FILE_VERSION_V1);
+        out.insert(out.end(), m_pubkey.begin(), m_pubkey.end());
+        out.insert(out.end(), m_privkey.begin(), m_privkey.end());
+        std::cerr << "[Attestation] WARNING: " << SEED_KEY_PASSPHRASE_ENV
+                  << " not set — writing UNENCRYPTED (v1) key file. Set it to "
+                     "encrypt the consensus signing key at rest." << std::endl;
+    } else {
+        // ---- LP-13 v2 encrypted: AES-256-CBC, PBKDF2-SHA3, encrypt-then-MAC ----
+        std::vector<uint8_t> salt, iv;
+        if (!GenerateSalt(salt) || !GenerateIV(iv)) {
+            std::cerr << "[Attestation] ERROR: failed to generate salt/IV" << std::endl;
+            memory_cleanse(&passphrase[0], passphrase.size());
+            return finish(false);
+        }
+
+        std::vector<uint8_t> aesKey;
+        if (!DeriveKey(passphrase, salt, SEED_KEY_PBKDF2_ROUNDS, aesKey)) {
+            std::cerr << "[Attestation] ERROR: key derivation failed" << std::endl;
+            memory_cleanse(&passphrase[0], passphrase.size());
+            return finish(false);
+        }
+        memory_cleanse(&passphrase[0], passphrase.size());
+
+        CCrypter crypter;
+        if (!crypter.SetKey(aesKey, iv)) {
+            std::cerr << "[Attestation] ERROR: failed to set encryption key" << std::endl;
+            memory_cleanse(aesKey.data(), aesKey.size());
+            return finish(false);
+        }
+        memory_cleanse(aesKey.data(), aesKey.size());
+
+        // LP-13 LOW-1: ComputeMAC keys the HMAC with the SAME 32-byte AES key
+        // (no separate k_mac). This is a DELIBERATE reuse of the audited wallet
+        // CCrypter construction (encrypt-then-MAC, MAC verified BEFORE decrypt at
+        // Load → no padding-oracle surface), not an oversight. AES-256-CBC and
+        // HMAC-SHA3-512 are independent constructions with no known cross-protocol
+        // interaction under shared keying, so this is no weaker than the wallet's
+        // at-rest format. Documented here so it is not re-litigated in review.
+        std::vector<uint8_t> ciphertext, mac;
+        if (!crypter.Encrypt(m_privkey, ciphertext) ||
+            !crypter.ComputeMAC(ciphertext, mac)) {
+            std::cerr << "[Attestation] ERROR: encryption/MAC failed" << std::endl;
+            return finish(false);
+        }
+
+        // magic(4) version(1) pubkey(1952) salt(16) iv(16) mac(64) ctlen(4) ct
+        out.push_back(KEY_FILE_VERSION_V2);
+        out.insert(out.end(), m_pubkey.begin(), m_pubkey.end());
+        out.insert(out.end(), salt.begin(), salt.end());
+        out.insert(out.end(), iv.begin(), iv.end());
+        out.insert(out.end(), mac.begin(), mac.end());
+        putU32(static_cast<uint32_t>(ciphertext.size()));
+        out.insert(out.end(), ciphertext.begin(), ciphertext.end());
+    }
+
+    // LP-13 H-2 / B-1: ATOMIC, FAIL-CLOSED-DURABLE SAVE. Mirror the wallet's
+    // proven temp+fsync+rename pattern (CWallet::SaveUnlocked), but make the
+    // durability fatal: the consensus signing key is irreplaceable (not derivable
+    // from chainparams), so a failed/partial write hits "<file>.tmp" only — the
+    // live "<file>" is left byte-intact and replaced ONLY by an atomic rename of
+    // a fully-written, fsync'd temp; if the fsync (POSIX) / FlushFileBuffers
+    // (Windows) cannot be confirmed, Save deletes the temp and returns WITHOUT
+    // renaming. LP-13 CL-2: there is NO plaintext "<file>.bak" staging copy — the
+    // atomic rename alone gives the no-key-loss guarantee (the live "<file>" is
+    // untouched until the single rename publishes the fully-flushed temp), so a
+    // second (possibly plaintext) copy of the key on disk was both unnecessary and
+    // a custody hazard. The guarantee that a crash / partial write / power loss
+    // cannot destroy the only copy rests on fsync-before-rename being fatal + the
+    // atomic rename + the post-rename dir-fsync below.
+    std::string tmpPath = path + ".tmp";
+    std::string bakPath = path + ".bak";
+
+#ifndef _WIN32
+    // Create the temp with 0600 from the outset (no world-readable window).
+    // LP-13 (PARTIAL symlink-hardening, nemotron extreview finding): O_NOFOLLOW
+    // refuses to open the temp if its final path component is ALREADY a symlink at
+    // open() time — closing the pre-open half of the symlink-swap vector (an
+    // attacker pre-planting "<file>.tmp" as a symlink to redirect the key write).
+    // We do NOT add O_EXCL: a stale ".tmp" from a prior crashed save is
+    // legitimately re-truncated; O_EXCL would wedge the save.
+    //
+    // SCOPE / KNOWN RESIDUAL (Cursor C-1, accepted out-of-scope): O_NOFOLLOW does
+    // NOT close the close()->rename() TOCTOU — between this fd being closed and the
+    // ::rename below, a writer in the data dir could swap "<file>.tmp" for a symlink
+    // and have rename publish that symlink over the canonical key. Closing that
+    // fully needs an O_TMPFILE+linkat (POSIX) / reparse-point (Windows) restructure.
+    // It is deliberately NOT done here: it defends only against an attacker who
+    // already has WRITE access to the seed's root-owned 0600/0700 data dir (i.e. is
+    // already root-equivalent and can destroy the key directly), and this atomic
+    // temp+rename mirrors the audited CWallet::SaveUnlocked, which carries the same
+    // accepted residual under the same operator-owned-datadir threat model. Accepted
+    // as a deferred follow-up (not a #113 blocker); the deferred items are tracked
+    // out-of-tree in the project's security record rather than enumerated here, to
+    // avoid expanding public detail on un-deployed fixes during the disclosure window.
+    int fd = ::open(tmpPath.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW, S_IRUSR | S_IWUSR);
+    if (fd < 0) {
+        std::cerr << "[Attestation] Failed to open temp key file for writing: " << tmpPath
+                  << " (errno " << errno << "; O_NOFOLLOW rejects a symlinked temp)" << std::endl;
+        return finish(false);
+    }
+    // LP-13 M-4: re-assert 0600 on the open fd. O_TRUNC does NOT reset the mode
+    // of a pre-existing temp. Track whether owner-only perms were established;
+    // if BOTH this and the post-write chmod fail we fail-closed below.
+    bool permOk = (::fchmod(fd, S_IRUSR | S_IWUSR) == 0);
+    if (!permOk) {
+        std::cerr << "[Attestation] WARNING: fchmod 0600 on temp key file failed (errno "
+                  << errno << "); will re-assert after write." << std::endl;
+    }
+    size_t written = 0;
+    bool writeOk = true;
+    while (written < out.size()) {
+        ssize_t n = ::write(fd, out.data() + written, out.size() - written);
+        if (n <= 0) { writeOk = false; break; }
+        written += static_cast<size_t>(n);
+    }
+    // fsync the data to physical disk BEFORE the rename, so a power loss after
+    // rename cannot expose a zero-length/partial file as the live key.
+    // LP-13 B-1 (fail-closed durability): a failed fsync means the temp's bytes
+    // are NOT guaranteed on stable storage. The consensus signing key is NOT
+    // recoverable if lost (not derivable from chainparams), so — unlike
+    // wallet.cpp's warn-and-continue (the wallet is seed-recoverable) — we treat
+    // fsync failure as FATAL: close, remove the temp, and return WITHOUT
+    // renaming. The canonical "<file>" is left byte-intact rather than risk
+    // publishing un-flushed (possibly zero-length/partial) data as the live key.
+    bool fsyncOk = writeOk && (::fsync(fd) == 0);
+    if (writeOk && !fsyncOk) {
+        std::cerr << "[Attestation] FATAL: fsync of temp key file failed (errno "
+                  << errno << "); refusing to publish un-flushed consensus key. "
+                     "Canonical key at " << path << " left untouched." << std::endl;
+    }
+    // LP-13 B-1 TEST SEAM: let a test force the "fsync failed" branch without a
+    // real disk fault (checked here, mirroring g_seedKeySaveFailpoint). nullptr
+    // in production (no overhead, no behavior change).
+    if (writeOk && fsyncOk && g_seedKeyFsyncFailpoint && g_seedKeyFsyncFailpoint()) {
+        std::cerr << "[Attestation] (test) fsync failpoint fired — treating as FATAL fsync failure" << std::endl;
+        fsyncOk = false;
+    }
+    ::close(fd);
+    if (writeOk && !fsyncOk) {
+        ::unlink(tmpPath.c_str());
+        return finish(false);
+    }
+
+    // Belt-and-braces: re-assert 0600 on the path in case fchmod was unsupported.
+    bool permOk2 = RestrictKeyFilePerms(tmpPath);
+
+    if (!writeOk) {
+        std::cerr << "[Attestation] Key file write error (temp)" << std::endl;
+        ::unlink(tmpPath.c_str());
+        return finish(false);
+    }
+    // LP-13 M-4 fail-closed: if owner-only perms could NOT be set by either
+    // mechanism, refuse to publish a possibly group/other-readable consensus key.
+    if (!permOk && !permOk2) {
+        std::cerr << "[Attestation] FATAL: could not set 0600 perms on key file; "
+                     "refusing to publish a possibly readable consensus key." << std::endl;
+        ::unlink(tmpPath.c_str());
+        return finish(false);
+    }
+
+    // H-2 test seam: simulate a crash between temp-write and rename.
+    if (g_seedKeySaveFailpoint && g_seedKeySaveFailpoint()) {
+        std::cerr << "[Attestation] (test) save failpoint fired before rename" << std::endl;
+        ::unlink(tmpPath.c_str());
+        return finish(false);
+    }
+
+    // LP-13 CL-2: NO plaintext .bak. The prior key staging copy was a second
+    // copy of the OLD key at rest — and for a v1 (or legacy plaintext) key that
+    // was a SECOND PLAINTEXT copy of the consensus signing key lingering on disk
+    // inside a crash window. The atomic temp+rename below already gives the
+    // no-key-loss guarantee (a failed/partial write touches only "<file>.tmp";
+    // the live "<file>" is byte-intact until the single atomic rename publishes a
+    // fully-written, fsync'd temp), so the .bak fallback was never load-bearing.
+    // We drop it entirely so no extra (possibly plaintext) seed key ever survives
+    // on disk. Defensive: remove any stale .bak a PRIOR (pre-CL-2) build left.
+    ::unlink(bakPath.c_str());
+
+    // Atomic publish: rename(2) over the target is atomic on POSIX.
+    if (::rename(tmpPath.c_str(), path.c_str()) != 0) {
+        std::cerr << "[Attestation] Key file atomic rename failed (errno " << errno
+                  << "); original key left intact at " << path << std::endl;
+        ::unlink(tmpPath.c_str());
+        return finish(false);
+    }
+    // perms ride with rename, but re-assert defensively. LP-13 (round-2 LOW): if
+    // the post-rename re-assert fails the key was still PUBLISHED (the rename
+    // succeeded — we do NOT fail the save and lose the key over a perms blip), but
+    // the on-disk file may carry wrong/looser perms than 0600. Warn so the operator
+    // can repair it rather than the failure passing silently.
+    if (!RestrictKeyFilePerms(path)) {
+        std::cerr << "[Attestation] WARNING: could not re-assert 0600 on the published key"
+                     " file " << path << " after the atomic rename; the key was SAVED but may"
+                     " carry incorrect permissions. Repair manually (chmod 0600)." << std::endl;
+    }
+
+    // fsync the directory so the rename metadata is durable across power loss.
+    {
+        size_t lastSlash = path.find_last_of("/\\");
+        std::string parentDir = (lastSlash == std::string::npos) ? "." : path.substr(0, lastSlash);
+        if (parentDir.empty()) parentDir = ".";
+        int dirfd = ::open(parentDir.c_str(), O_RDONLY);
+        if (dirfd >= 0) { ::fsync(dirfd); ::close(dirfd); }
+    }
+#endif
+#ifdef _WIN32
+    // Windows: write temp with a durable flush, then MoveFileEx atomic replace.
+    // LP-13 CL-2: NO plaintext .bak staging (see the POSIX rationale above).
+    //
+    // LP-13 B-1 (fail-closed durability, Windows): ofstream::flush()/close() only
+    // pushes bytes into the OS cache — NOT to stable storage. We must
+    // FlushFileBuffers() the temp BEFORE the MoveFileEx, matching the POSIX
+    // fsync-before-rename guarantee. If the durable flush cannot be confirmed we
+    // fail-closed (delete temp, leave canonical key untouched) rather than
+    // MoveFileEx un-flushed data over the irreplaceable consensus key.
+    {
+        std::wstring wTmpW(tmpPath.begin(), tmpPath.end());
+        HANDLE hTmp = CreateFileW(wTmpW.c_str(), GENERIC_WRITE, 0, nullptr,
+                                  CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (hTmp == INVALID_HANDLE_VALUE) {
+            std::cerr << "[Attestation] Failed to open temp key file for writing: " << tmpPath
+                      << " (GetLastError " << GetLastError() << ")" << std::endl;
+            return finish(false);
+        }
+        bool writeOk = true;
+        size_t written = 0;
+        while (written < out.size()) {
+            DWORD toWrite = static_cast<DWORD>(
+                std::min<size_t>(out.size() - written, 1u << 20));
+            DWORD wrote = 0;
+            if (!WriteFile(hTmp, out.data() + written, toWrite, &wrote, nullptr) || wrote == 0) {
+                writeOk = false;
+                break;
+            }
+            written += wrote;
+        }
+        // Durable flush to stable storage before the atomic replace.
+        bool flushOk = writeOk && (FlushFileBuffers(hTmp) != 0);
+        if (writeOk && !flushOk) {
+            std::cerr << "[Attestation] FATAL: FlushFileBuffers of temp key file failed "
+                         "(GetLastError " << GetLastError() << "); refusing to publish "
+                         "un-flushed consensus key. Canonical key at " << path
+                      << " left untouched." << std::endl;
+        }
+        // LP-13 B-1 TEST SEAM (Windows): force the "flush failed" branch.
+        if (writeOk && flushOk && g_seedKeyFsyncFailpoint && g_seedKeyFsyncFailpoint()) {
+            std::cerr << "[Attestation] (test) fsync failpoint fired — treating as FATAL flush failure" << std::endl;
+            flushOk = false;
+        }
+        CloseHandle(hTmp);
+        if (!writeOk) {
+            std::cerr << "[Attestation] Key file write error (temp)" << std::endl;
+            std::remove(tmpPath.c_str());
+            return finish(false);
+        }
+        if (!flushOk) {
+            std::remove(tmpPath.c_str());
+            return finish(false);
+        }
+    }
+
+    // H-2 test seam: simulate a crash between temp-write and rename.
+    if (g_seedKeySaveFailpoint && g_seedKeySaveFailpoint()) {
+        std::cerr << "[Attestation] (test) save failpoint fired before rename" << std::endl;
+        std::remove(tmpPath.c_str());
+        return finish(false);
+    }
+
+    // LP-13 CL-2: NO plaintext .bak. See the POSIX path for the rationale —
+    // MoveFileExW's atomic replace already guarantees no-key-loss without a
+    // second (possibly plaintext) copy on disk. Defensive: remove any stale .bak
+    // a PRIOR (pre-CL-2) build may have left behind.
+    std::remove(bakPath.c_str());
+
+    // Atomic publish via MoveFileExW (REPLACE_EXISTING | WRITE_THROUGH): either
+    // fully succeeds or fully fails — never a partial/corrupt live key file.
+    std::wstring wTmp(tmpPath.begin(), tmpPath.end());
+    std::wstring wDst(path.begin(), path.end());
+    if (!MoveFileExW(wTmp.c_str(), wDst.c_str(),
+                     MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+        std::cerr << "[Attestation] Key file atomic move failed; original key left intact at "
+                  << path << std::endl;
+        std::remove(tmpPath.c_str());
+        return finish(false);
+    }
+    // best-effort no-op on Windows (NTFS ACL governs); symmetric with POSIX warn.
+    if (!RestrictKeyFilePerms(path)) {
+        std::cerr << "[Attestation] WARNING: could not re-assert owner-only perms on the"
+                     " published key file " << path << " after the atomic move; the key was"
+                     " SAVED but may carry incorrect permissions." << std::endl;
+    }
+#endif
+
+    std::cout << "[Attestation] Saved seed attestation key to: " << path
+              << (encrypt ? " (v2 encrypted)" : " (v1 plaintext)") << std::endl;
+    return finish(true);
+}
+
+bool CSeedAttestationKey::LoadOrGenerate(const std::string& dataDir, bool allowGenerate,
+                                         bool allowPlaintext) {
+    if (Load(dataDir)) {
+        // LP-13 CL-1 (MIGRATION, default-on encryption): an existing v1 plaintext
+        // key still LOADS so a rolling upgrade never bricks a live seed. But the
+        // default is now mandatory encryption-at-rest, so we MIGRATE it in place:
+        // if a passphrase is available we re-save the already-loaded key as v2
+        // encrypted. The re-save is the audited atomic temp+rename — the original
+        // v1 file stays byte-intact until the encrypted write is confirmed (no
+        // window in which the only copy is lost). The in-memory private key is
+        // unchanged, so a failed migration re-save is non-fatal: we keep running
+        // on the loaded key and warn (the operator can retry). Only when plaintext
+        // is NOT explicitly allowed AND we cannot encrypt (no passphrase) do we
+        // refuse, because that operator demanded encryption-by-default but gave us
+        // no way to provide it.
+        if (LoadedPlaintext()) {
+            std::string passphrase = GetSeedKeyPassphrase();
+            if (!passphrase.empty()) {
+                memory_cleanse(&passphrase[0], passphrase.size());
+                std::cout << "[Attestation] Migrating plaintext (v1) seed key to encrypted"
+                             " (v2) at rest..." << std::endl;
+                if (Save(dataDir, /*allowPlaintext=*/false)) {
+                    m_loadedV1Plaintext = false;  // now persisted as v2
+                    std::cout << "[Attestation] Seed key migrated to v2 encrypted." << std::endl;
+                } else {
+                    // Save left the original v1 file byte-intact (atomic). The
+                    // in-memory key is still valid; keep running and let the
+                    // operator retry the migration. NOT fatal — failing here would
+                    // brick a live seed over a transient disk error.
+                    std::cerr << "[Attestation] WARNING: could not re-save the seed key"
+                                 " encrypted (v2); continuing on the loaded key. The"
+                                 " on-disk key remains UNENCRYPTED (v1) — investigate"
+                                 " (data dir perms / disk) and re-provision to encrypt"
+                                 " it at rest." << std::endl;
+                }
+                // The node is running on a usable, loaded key either way. A failed
+                // migration is non-fatal by design (MEDIUM-1).
+            } else if (!allowPlaintext) {
+                // Default-on encryption, but no passphrase to encrypt with and no
+                // explicit opt-out: refuse rather than run on a plaintext key the
+                // operator's policy says must be encrypted.
+                std::cerr << "[Attestation] FATAL: on-disk seed key is UNENCRYPTED (v1) and "
+                          << SEED_KEY_PASSPHRASE_ENV << " is unset, but encryption-at-rest is"
+                             " mandatory by default. Provision the passphrase to migrate it to"
+                             " v2 (recommended), or pass --allow-plaintext-seed-key to run on"
+                             " the plaintext key." << std::endl;
+                Clear();
+                return false;
+            }
+            // else: allowPlaintext && no passphrase => explicit legacy opt-out;
+            // run on the v1 key unchanged.
+        }
+        return true;
+    }
+
+    // Load() failed. A missing/unreadable key file must NOT silently mint a fresh
+    // consensus signing key on a production seed. CARDINAL no-key-loss guard: we
+    // only auto-mint when the file is genuinely ABSENT. If the file is PRESENT but
+    // could not be loaded (unreadable / corrupt / wrong passphrase), we NEVER
+    // overwrite it with a fresh mint — that would destroy a possibly-recoverable
+    // key. SeedKeyFilePresent() fails CLOSED (reports present on an indeterminate
+    // stat), so an unstattable-but-genuine key is also protected from overwrite.
+    const bool keyFilePresent = SeedKeyFilePresent(dataDir);
+    if (!allowGenerate || keyFilePresent) {
+        std::cerr << "[Attestation] FATAL: no usable seed attestation key at "
+                  << dataDir << "/" << SEED_KEY_FILENAME
+                  << (keyFilePresent
+                         ? " (file PRESENT but unreadable/corrupt/wrong-passphrase; NOT"
+                           " auto-minting over a present key)."
+                         : " and --generate-seed-key was NOT given.")
+                  << " Refusing to mint a new consensus signing key. If this is a"
+                     " first-time provision, restart with --generate-seed-key; if the"
+                     " key was expected to exist, investigate (wrong data dir,"
+                     " missing/encrypted file, or unset "
+                  << SEED_KEY_PASSPHRASE_ENV << ")." << std::endl;
+        return false;
+    }
+
+    std::cout << "[Attestation] No existing attestation key found, generating new keypair (--generate-seed-key)..." << std::endl;
     if (!Generate()) {
         std::cerr << "[Attestation] Failed to generate attestation keypair" << std::endl;
         return false;
     }
 
-    if (!Save(dataDir)) {
-        std::cerr << "[Attestation] WARNING: Generated key but failed to save to disk" << std::endl;
-        // Key is still valid in memory, so don't fail
+    // LP-13 M-2: a freshly minted key that cannot be PERSISTED is worthless — on
+    // the next restart the node would have a different (or no) key that does not
+    // match chainparams. Do NOT run on a non-persisted ephemeral key: fail loud.
+    // CL-1: a freshly minted key is saved under the default-on encryption policy
+    // (Save refuses plaintext unless allowPlaintext was explicitly passed).
+    if (!Save(dataDir, allowPlaintext)) {
+        std::cerr << "[Attestation] FATAL: generated a new seed key but failed to save it"
+                     " to disk. Refusing to run on a non-persisted (ephemeral) consensus"
+                     " signing key — fix the data dir / perms / passphrase and retry."
+                  << std::endl;
+        Clear();
+        return false;
     }
 
     std::cout << "[Attestation] Generated new seed attestation key: " << GetPubKeyHex().substr(0, 16) << "..." << std::endl;

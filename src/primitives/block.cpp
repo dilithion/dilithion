@@ -56,17 +56,14 @@ std::vector<uint8_t> CBlockHeader::SerializeHeader() const {
     buf.reserve(GetHeaderSize());
 
     // Legacy 80-byte portion: version(4) + prevBlock(32) + merkleRoot(32) + time(4) + bits(4) + nonce(4)
-    const uint8_t* p;
-    p = reinterpret_cast<const uint8_t*>(&nVersion);
-    buf.insert(buf.end(), p, p + 4);
+    // WF-1: explicit little-endian for the four 32-bit scalars (byte-identical to
+    // the previous host-endian copy on LE hosts; portable to any architecture).
+    AppendLE32(buf, static_cast<uint32_t>(nVersion));
     buf.insert(buf.end(), hashPrevBlock.begin(), hashPrevBlock.end());
     buf.insert(buf.end(), hashMerkleRoot.begin(), hashMerkleRoot.end());
-    p = reinterpret_cast<const uint8_t*>(&nTime);
-    buf.insert(buf.end(), p, p + 4);
-    p = reinterpret_cast<const uint8_t*>(&nBits);
-    buf.insert(buf.end(), p, p + 4);
-    p = reinterpret_cast<const uint8_t*>(&nNonce);
-    buf.insert(buf.end(), p, p + 4);
+    AppendLE32(buf, nTime);
+    AppendLE32(buf, nBits);
+    AppendLE32(buf, nNonce);
 
     // VDF extension (64 bytes, version >= 4 only)
     if (IsVDFBlock()) {

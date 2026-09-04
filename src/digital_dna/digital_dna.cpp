@@ -514,6 +514,15 @@ std::optional<DigitalDNA> DigitalDNACollector::get_dna() const {
     return dna;
 }
 
+std::optional<std::array<uint8_t, 20>> DigitalDNACollector::get_address_if_ready() const {
+    // Mirror get_dna()'s readiness guard, but return ONLY the cheap 20-byte address
+    // — no full-DNA build/deep-copy (see header: hot-path allocator-churn / OOM fix).
+    if (!latency_result_ || !timing_result_) {
+        return std::nullopt;
+    }
+    return address_;
+}
+
 void DigitalDNACollector::on_peer_connected(const std::array<uint8_t, 20>& peer_id) {
     perspective_collector_.on_peer_connected(peer_id);
 }
