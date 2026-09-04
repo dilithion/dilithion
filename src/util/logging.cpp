@@ -296,10 +296,20 @@ void CLogger::WriteToConsole(LogLevel level, const std::string& message) {
 std::string CLogger::FormatLogMsg(LogCategory category, LogLevel level, const std::string& message) {
     std::ostringstream oss;
 
-    // Timestamp
+    // Timestamp. localtime_r/_s into a LOCAL tm — std::localtime returns a
+    // shared static, and FormatLogMsg runs on the caller's thread BEFORE
+    // Log()'s mutex, so every logging thread raced on that static (TSan:
+    // 10 data races in integration_tests, ThreadMessageHandler vs
+    // ThreadSocketHandler, 2026-08-15). Garbled timestamps at best; UB in
+    // glibc's tm handling under concurrent use at worst.
     std::time_t now = std::time(nullptr);
-    std::tm* tm = std::localtime(&now);
-    oss << std::put_time(tm, "%Y-%m-%d %H:%M:%S");
+    std::tm tm_local{};
+#ifdef _WIN32
+    localtime_s(&tm_local, &now);
+#else
+    localtime_r(&now, &tm_local);
+#endif
+    oss << std::put_time(&tm_local, "%Y-%m-%d %H:%M:%S");
 
     // Log level
     const char* levelStr = "";

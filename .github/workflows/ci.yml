@@ -10,7 +10,10 @@ jobs:
   build-and-test:
     name: Build and Test (${{ matrix.compiler }}, ${{ matrix.build_type }})
     runs-on: ubuntu-24.04
-    timeout-minutes: 30  # Reduced after skipping slow wallet_hd_tests (BUG-77)
+    # 30 -> 45: the gcc/Release leg now also links and RUNS the standalone test
+    # suites (make tests-fast). Measured locally: ~8s to link 45 suite binaries
+    # on top of an already-built tree, ~55s to run the 31 live fast-tier suites.
+    timeout-minutes: 45
 
     strategy:
       fail-fast: false
@@ -88,6 +91,14 @@ jobs:
       run: |
         make genesis_gen -j$(nproc)
 
+    - name: Wallet-preservation guard regression
+      run: |
+        # An unreadable wallet.dat must never be overwritten by the
+        # create-new-wallet path. Builds both node binaries (both carried the
+        # bug) and drives them against a corrupt wallet. See
+        # scripts/wallet_load_guard_test.sh for the v4.5.0 incident this pins.
+        make wallet_load_guard_test -j$(nproc)
+
     - name: Build Boost Unit Tests
       run: |
         make test_dilithion -j$(nproc)
@@ -101,21 +112,57 @@ jobs:
           --run_test='!wallet_hd_tests:!rpc_hd_wallet_tests:!hd_wallet_standalone_tests'
         echo "✅ Boost unit tests completed (HD wallet tests skipped - BUG-77)"
 
-    # PR #129 MEDIUM-5: the block-index eviction / UAF regression suite is a
-    # standalone int main() binary with no BOOST_AUTO_TEST_SUITE, so it is NOT
-    # part of test_dilithion and every CI job here runs only test_dilithion.
-    # Until this step existed, all 11 eviction tests — the entire regression
-    # suite for a use-after-free that reached a release and got past five
-    # reviewers — ran only when a human remembered to type the make target.
-    # A regression suite outside CI is decoration.
+    # ------------------------------------------------------------------
+    # MERGE 2026-09-05 — this PR's own "Run block-index eviction / UAF
+    # regression suite" step was DROPPED here, and its intent is NOT lost.
     #
-    # Deliberately NOT suffixed with `|| true`: this must be able to fail the
-    # build. That is the whole point.
-    - name: Run block-index eviction / UAF regression suite
+    # That step existed because `headers_manager_to_chain_selector_wiring_tests`
+    # is a standalone int main() binary outside test_dilithion, so no CI job ran
+    # it -- "a regression suite outside CI is decoration", and it guards a
+    # use-after-free that reached a release past five reviewers.
+    #
+    # main's F4 work now runs it: it is on the roster at
+    # scripts/run_test_suites.sh (fast tier, 180s timeout), which `make
+    # tests-fast` below executes. Keeping both steps would build and run the
+    # same binary twice per CI run for no extra signal.
+    #
+    # ⚠️ THE ONE THING THAT CHANGED: this PR's step ran on ALL FOUR matrix legs;
+    # the roster step below runs on gcc/Release ONLY. main's comment gives the
+    # reason (these suites are compiler- and optimisation-agnostic), and it is
+    # consistent with matrix.build_type setting no compiler flags. If that ever
+    # stops being true, this suite loses three legs of coverage silently.
+    # ------------------------------------------------------------------
+    # ------------------------------------------------------------------
+    # F4: the standalone (non-Boost) test suites.
+    #
+    # Before F4, `make tests` had a one-line recipe that echoed "All tests
+    # built successfully" and executed nothing, and this workflow never
+    # invoked it at all — so ~46 test binaries had never been run by any
+    # automated process. Several no longer compiled; several were failing.
+    #
+    # Runs on ONE matrix leg only (gcc/Release): the suites are
+    # compiler-and-optimisation-agnostic and re-running them on all four legs
+    # would quadruple the cost for no extra signal. The core objects are
+    # already compiled by the "Build Dilithion Node" step above, so the
+    # marginal cost here is link + run, not a second full build.
+    #
+    # The roster, tiers, timeouts and quarantines live in
+    # scripts/run_test_suites.sh — that file is the single source of truth and
+    # every quarantine there carries a written reason.
+    # ------------------------------------------------------------------
+    - name: Run standalone test suites (fast tier)
+      if: matrix.compiler == 'gcc' && matrix.build_type == 'Release'
       run: |
-        make headers_manager_to_chain_selector_wiring_tests -j$(nproc)
-        ./headers_manager_to_chain_selector_wiring_tests
-        echo "✅ eviction/UAF regression suite passed"
+        make tests-fast -j$(nproc)
+
+    - name: Upload standalone suite logs
+      if: always() && matrix.compiler == 'gcc' && matrix.build_type == 'Release'
+      uses: actions/upload-artifact@v7
+      with:
+        name: standalone-suite-logs-fast
+        path: test-suite-logs/
+        retention-days: 14
+        if-no-files-found: ignore
 
   sanitizer-asan:
     name: AddressSanitizer (Memory Safety)

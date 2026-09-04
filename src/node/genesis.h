@@ -75,6 +75,25 @@ bool IsGenesisBlock(const CBlock& block);
 CBlock CreateDilVGenesisBlock();
 
 /**
+ * Create the genesis block appropriate for the CURRENTLY SELECTED chain.
+ *
+ * This is the single correct entry point for "give me this network's genesis
+ * block". It dispatches on ChainParams::IsVdfFromGenesis():
+ *   - VDF-from-genesis chains (DilV, testnet, regtest) -> CreateDilVGenesisBlock()
+ *   - legacy RandomX chains  (mainnet)                 -> CreateGenesisBlock()
+ *
+ * Callers must NOT pick a constructor themselves. Every historical instance of
+ * this bug (dilithion-node.cpp booting testnet/regtest, headers_manager.cpp
+ * keying mapHeaders) came from a call site hard-coding one constructor while
+ * IsGenesisBlock()/GetGenesisHash() dispatched on the chain's real VDF config,
+ * producing a genesis that failed the node's own verification, or a header
+ * stored under a hash it does not hash to.
+ *
+ * @return The genesis block for the current network
+ */
+CBlock CreateGenesisBlockForChain();
+
+/**
  * Mine the genesis block
  *
  * This function mines the genesis block by finding a valid nonce.

@@ -3,7 +3,9 @@
 
 #include <dfmp/dfmp.h>
 #include <dfmp/identity_db.h>
+#include <core/chainparams.h>
 #include <crypto/sha3.h>
+#include <util/deliberate_wrap.h>
 
 #include <cstring>
 #include <algorithm>
@@ -11,7 +13,21 @@
 #include <iostream>
 #include <sstream>
 #include <cmath>
+#include <filesystem>
 #include <fstream>
+#include <system_error>
+
+#ifdef _WIN32
+// K2-(3): MoveFileExW for the atomic heat-file replace. LEAN_AND_MEAN + NOMINMAX
+// so windows.h cannot shadow std::min/std::max, which this TU uses.
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
 
 namespace DFMP {
 
@@ -29,6 +45,18 @@ static_assert(sizeof(__uint128_t) == 16,
 CHeatTracker* g_heatTracker = nullptr;
 CHeatTracker* g_payoutHeatTracker = nullptr;
 CIdentityDB* g_identityDb = nullptr;
+
+// ============================================================================
+// C-3 ACTIVATION GATE (SINGLE SOURCE OF TRUTH) — see dfmp.h for the contract
+// ============================================================================
+
+bool DfmpSaturatingMathActive(int height) {
+    // NOTE: this expression is consensus-critical and is deliberately the ONLY
+    // read of dfmpOverflowFixActivationHeight outside chainparams itself.
+    // Do not copy it to a call site — call this function.
+    return Dilithion::g_chainParams &&
+           height >= Dilithion::g_chainParams->dfmpOverflowFixActivationHeight;
+}
 
 // ============================================================================
 // IDENTITY IMPLEMENTATION
@@ -213,37 +241,117 @@ std::map<Identity, int> CHeatTracker::GetAllHeat() const {
 static const uint32_t HEAT_FILE_MAGIC = 0x48454154;  // "HEAT"
 static const uint32_t HEAT_FILE_VERSION = 1;
 
+namespace {
+
+// K2-(3): atomically replace `dst` with `tmp`. Either the old complete file or
+// the new complete file is visible at `dst` at every instant -- never neither,
+// never a mixture. See the rationale above SaveToFile() for why
+// std::filesystem::rename() is NOT sufficient on Windows.
+bool AtomicReplaceFile(const std::filesystem::path& tmp,
+                       const std::filesystem::path& dst) {
+#ifdef _WIN32
+    const std::wstring wTmp = tmp.wstring();
+    const std::wstring wDst = dst.wstring();
+    return MoveFileExW(wTmp.c_str(), wDst.c_str(), MOVEFILE_REPLACE_EXISTING) != 0;
+#else
+    // POSIX rename(2) over an existing path is atomic by specification.
+    std::error_code ec;
+    std::filesystem::rename(tmp, dst, ec);
+    return !ec;
+#endif
+}
+
+}  // namespace
+
+// K2-(3): write via tmp+rename, NEVER in place.
+//
+// This runs inside the shutdown sequence, and the shutdown watchdog's deadline
+// is GLOBAL rather than per stage (src/util/shutdown_progress.h): a shutdown
+// that burns most of its budget in an earlier stage -- CConnman::Stop() is the
+// measured offender -- can reach this write with only moments left and be
+// _Exit()ed part-way through it. Truncating the real file first and then
+// streaming into it left a window where the on-disk file was neither the old
+// contents nor the new. LoadFromFile() detects the tear and rebuilds from
+// chain, so the cost was availability rather than silent corruption, but a
+// rebuild-from-chain on every forced shutdown is not a cost worth keeping when
+// the fix is the tmp+rename pattern already used by
+// src/dfmp/mik_registration_file.cpp and by mempool/fee persistence.
+//
+// The publish MUST be a genuine atomic replace, and on Windows that means
+// MoveFileExW(MOVEFILE_REPLACE_EXISTING) -- NOT std::filesystem::rename().
+// libstdc++ implements the latter with _wrename(), which FAILS when the
+// destination exists; the usual remove-then-rename fallback then leaves a real
+// window in which dfmp_heat.dat does not exist at all. Measured, not assumed:
+// a first cut of this function used the fallback and a kill-race probe caught
+// the file ABSENT on 15 of 15 killed writes. Absent is less bad than torn
+// (LoadFromFile treats it as first-run and rebuilds either way) but it is not
+// what "atomic" means, so it is not what this code does. src/attestation/
+// seed_attestation.cpp uses the same MoveFileExW pattern for the same reason.
+//
+// A forced exit therefore leaves EITHER the previous complete file or the new
+// complete file -- and at worst a stray .tmp, which nothing reads.
+//
+// Deliberately NOT fsync/FlushFileBuffers'd, unlike the attestation key: heat
+// is a cache that LoadFromFile() rebuilds from chain whenever it does not load.
+// The property being bought here is "never a half-file", not "survives power
+// loss" -- and the watchdog's _Exit is a process death, not a machine death.
 bool CHeatTracker::SaveToFile(const std::string& path, int tipHeight) const {
     std::lock_guard<std::mutex> lock(m_mutex);
 
-    std::ofstream file(path, std::ios::binary | std::ios::trunc);
-    if (!file.is_open()) {
-        std::cerr << "[DFMP] WARNING: Cannot open heat tracker file for writing: " << path << std::endl;
+    const std::filesystem::path finalPath(path);
+    std::filesystem::path tmpPath = finalPath;
+    tmpPath += ".tmp";
+
+    {
+        std::ofstream file(tmpPath, std::ios::binary | std::ios::trunc);
+        if (!file.is_open()) {
+            std::cerr << "[DFMP] WARNING: Cannot open heat tracker temp file for writing: "
+                      << tmpPath.string() << std::endl;
+            return false;
+        }
+
+        uint32_t magic = HEAT_FILE_MAGIC;
+        uint32_t version = HEAT_FILE_VERSION;
+        int32_t tip = static_cast<int32_t>(tipHeight);
+        uint32_t count = static_cast<uint32_t>(m_window.size());
+
+        file.write(reinterpret_cast<const char*>(&magic), 4);
+        file.write(reinterpret_cast<const char*>(&version), 4);
+        file.write(reinterpret_cast<const char*>(&tip), 4);
+        file.write(reinterpret_cast<const char*>(&count), 4);
+
+        for (const auto& entry : m_window) {
+            int32_t height = static_cast<int32_t>(entry.first);
+            file.write(reinterpret_cast<const char*>(&height), 4);
+            file.write(reinterpret_cast<const char*>(entry.second.data), sizeof(entry.second.data));
+        }
+
+        file.flush();
+        if (!file.good()) {
+            std::cerr << "[DFMP] WARNING: Error writing heat tracker file: "
+                      << tmpPath.string() << std::endl;
+            file.close();
+            std::error_code rm_ec;
+            std::filesystem::remove(tmpPath, rm_ec);
+            return false;
+        }
+        file.close();
+        if (file.fail()) {
+            std::cerr << "[DFMP] WARNING: Error closing heat tracker file: "
+                      << tmpPath.string() << std::endl;
+            std::error_code rm_ec;
+            std::filesystem::remove(tmpPath, rm_ec);
+            return false;
+        }
+    }
+
+    if (!AtomicReplaceFile(tmpPath, finalPath)) {
+        std::cerr << "[DFMP] WARNING: Cannot atomically install heat tracker file: "
+                  << finalPath.string() << " (previous file left intact)" << std::endl;
+        std::error_code rm_ec;
+        std::filesystem::remove(tmpPath, rm_ec);
         return false;
     }
-
-    uint32_t magic = HEAT_FILE_MAGIC;
-    uint32_t version = HEAT_FILE_VERSION;
-    int32_t tip = static_cast<int32_t>(tipHeight);
-    uint32_t count = static_cast<uint32_t>(m_window.size());
-
-    file.write(reinterpret_cast<const char*>(&magic), 4);
-    file.write(reinterpret_cast<const char*>(&version), 4);
-    file.write(reinterpret_cast<const char*>(&tip), 4);
-    file.write(reinterpret_cast<const char*>(&count), 4);
-
-    for (const auto& entry : m_window) {
-        int32_t height = static_cast<int32_t>(entry.first);
-        file.write(reinterpret_cast<const char*>(&height), 4);
-        file.write(reinterpret_cast<const char*>(entry.second.data), sizeof(entry.second.data));
-    }
-
-    if (!file.good()) {
-        std::cerr << "[DFMP] WARNING: Error writing heat tracker file: " << path << std::endl;
-        return false;
-    }
-
-    file.close();
     return true;
 }
 
@@ -328,6 +436,13 @@ int64_t CalculatePendingPenaltyFP(int currentHeight, int firstSeenHeight) {
     return FP_PENDING_END;           // 1.0x (mature)
 }
 
+// UBSan opt-out (instrumentation only, zero codegen effect). The heat exponential below
+// deliberately overflows int64_t past heat == effectiveFreeThreshold + 60; the wrapped
+// negative is caught by the floor in CalculateEffectiveTarget() and that IS the live
+// consensus rule below the C-3 gate. -fwrapv makes it defined; this attribute stops
+// -fsanitize=undefined from aborting on it WITHOUT disabling signed-overflow detection
+// anywhere else. See src/util/deliberate_wrap.h.
+DILITHION_DELIBERATE_SIGNED_WRAP
 int64_t CalculateHeatMultiplierFP(int heat, int uniqueMiners, bool saturate) {
     // DFMP v3.0 Heat Penalty with Dynamic Scaling:
     // Free tier scales by active miner count:
@@ -360,6 +475,11 @@ int64_t CalculateHeatMultiplierFP(int heat, int uniqueMiners, bool saturate) {
     return penalty;
 }
 
+// UBSan opt-out (instrumentation only, zero codegen effect). The saturate=false branch
+// below is the exact legacy int64 expression and multiplies a possibly-wrapped heat
+// multiplier by maturity -- deliberate, made defined by -fwrapv, and the live rule
+// below the C-3 gate. See src/util/deliberate_wrap.h.
+DILITHION_DELIBERATE_SIGNED_WRAP
 int64_t CalculateTotalMultiplierFP(int currentHeight, int firstSeenHeight, int heat, int uniqueMiners, bool saturate) {
     int64_t pendingFP = CalculatePendingPenaltyFP(currentHeight, firstSeenHeight);
     int64_t heatFP = CalculateHeatMultiplierFP(heat, uniqueMiners, saturate);
@@ -403,10 +523,24 @@ uint256 CalculateEffectiveTarget(const uint256& baseTarget, int64_t multiplierFP
     // effective_target = baseTarget / multiplier
     // In fixed-point: effective_target = baseTarget × FP_SCALE / multiplierFP
 
-    // Ensure multiplier is at least 1× (shouldn't happen but be safe)
-    // C-3: with the saturating cap upstream (saturate=true at/above the gate), every
-    // multiplierFP reaching here is in [FP_SCALE, FP_HEAT_MULTIPLIER_MAX] and never
-    // negative/wrapped, so this floor is now a true safety floor rather than a wrap-catcher.
+    // Ensure multiplier is at least 1×.
+    //
+    // This floor has TWO distinct roles depending on which side of the C-3 gate we are on:
+    //
+    //  - AT/ABOVE the gate (saturate=true): with the saturating cap upstream, every
+    //    multiplierFP reaching here is in [FP_SCALE, FP_HEAT_MULTIPLIER_MAX] and never
+    //    negative/wrapped, so the floor is a true safety floor.
+    //
+    //  - BELOW the gate (saturate=false) — the LIVE rule today, since
+    //    dfmpOverflowFixActivationHeight is 999999999 on all three chains — it is STILL a
+    //    WRAP-CATCHER, and load-bearing consensus. The legacy heat exponential overflows
+    //    int64 at heat == effectiveFreeThreshold + 60, and this floor is what converts the
+    //    resulting negative multiplier into the documented "penalty silently OFF" (1.0x)
+    //    behaviour. That only holds because the build passes -fwrapv, which makes the
+    //    overflow a defined two's-complement wrap instead of undefined behaviour. Without
+    //    -fwrapv a compiler may prove `multiplierFP > 0` and delete this branch entirely,
+    //    diverging from the other platforms' binaries. See the CONSENSUS-CRITICAL block in
+    //    the Makefile. Do NOT "simplify" this check away.
     if (multiplierFP < FP_SCALE) {
         multiplierFP = FP_SCALE;
     }
@@ -537,6 +671,13 @@ int64_t CalculatePendingPenaltyFP_V31(int currentHeight, int firstSeenHeight) {
     return FP_PENDING_END;           // 1.0x (mature)
 }
 
+// UBSan opt-out (instrumentation only, zero codegen effect). The heat exponential below
+// deliberately overflows int64_t past heat == effectiveFreeThreshold + 60; the wrapped
+// negative is caught by the floor in CalculateEffectiveTarget() and that IS the live
+// consensus rule below the C-3 gate. -fwrapv makes it defined; this attribute stops
+// -fsanitize=undefined from aborting on it WITHOUT disabling signed-overflow detection
+// anywhere else. See src/util/deliberate_wrap.h.
+DILITHION_DELIBERATE_SIGNED_WRAP
 int64_t CalculateHeatMultiplierFP_V31(int heat, int uniqueMiners, bool saturate) {
     // DFMP v3.1: Softened heat penalty
     // Free tier: 36 blocks (or dynamic if higher)
@@ -568,6 +709,11 @@ int64_t CalculateHeatMultiplierFP_V31(int heat, int uniqueMiners, bool saturate)
     return penalty;
 }
 
+// UBSan opt-out (instrumentation only, zero codegen effect). The saturate=false branch
+// below is the exact legacy int64 expression and multiplies a possibly-wrapped heat
+// multiplier by maturity -- deliberate, made defined by -fwrapv, and the live rule
+// below the C-3 gate. See src/util/deliberate_wrap.h.
+DILITHION_DELIBERATE_SIGNED_WRAP
 int64_t CalculateTotalMultiplierFP_V31(int currentHeight, int firstSeenHeight, int heat, int uniqueMiners, bool saturate) {
     int64_t pendingFP = CalculatePendingPenaltyFP_V31(currentHeight, firstSeenHeight);
     int64_t heatFP = CalculateHeatMultiplierFP_V31(heat, uniqueMiners, saturate);
@@ -608,6 +754,13 @@ int64_t CalculatePendingPenaltyFP_V32(int currentHeight, int firstSeenHeight) {
     return FP_PENDING_END;           // 1.0x (mature)
 }
 
+// UBSan opt-out (instrumentation only, zero codegen effect). The heat exponential below
+// deliberately overflows int64_t past heat == effectiveFreeThreshold + 60; the wrapped
+// negative is caught by the floor in CalculateEffectiveTarget() and that IS the live
+// consensus rule below the C-3 gate. -fwrapv makes it defined; this attribute stops
+// -fsanitize=undefined from aborting on it WITHOUT disabling signed-overflow detection
+// anywhere else. See src/util/deliberate_wrap.h.
+DILITHION_DELIBERATE_SIGNED_WRAP
 int64_t CalculateHeatMultiplierFP_V32(int heat, int uniqueMiners, bool saturate) {
     // DFMP v3.2: Aggressive heat penalty (same formula as v3.0)
     // Free tier: 12 blocks (or dynamic if higher)
@@ -639,6 +792,11 @@ int64_t CalculateHeatMultiplierFP_V32(int heat, int uniqueMiners, bool saturate)
     return penalty;
 }
 
+// UBSan opt-out (instrumentation only, zero codegen effect). The saturate=false branch
+// below is the exact legacy int64 expression and multiplies a possibly-wrapped heat
+// multiplier by maturity -- deliberate, made defined by -fwrapv, and the live rule
+// below the C-3 gate. See src/util/deliberate_wrap.h.
+DILITHION_DELIBERATE_SIGNED_WRAP
 int64_t CalculateTotalMultiplierFP_V32(int currentHeight, int firstSeenHeight, int heat, int uniqueMiners, bool saturate) {
     int64_t pendingFP = CalculatePendingPenaltyFP_V32(currentHeight, firstSeenHeight);
     int64_t heatFP = CalculateHeatMultiplierFP_V32(heat, uniqueMiners, saturate);
@@ -666,6 +824,13 @@ int64_t CalculatePendingPenaltyFP_V33(int currentHeight, int firstSeenHeight) {
     return CalculatePendingPenaltyFP_V32(currentHeight, firstSeenHeight);
 }
 
+// UBSan opt-out (instrumentation only, zero codegen effect). The heat exponential below
+// deliberately overflows int64_t past heat == effectiveFreeThreshold + 60; the wrapped
+// negative is caught by the floor in CalculateEffectiveTarget() and that IS the live
+// consensus rule below the C-3 gate. -fwrapv makes it defined; this attribute stops
+// -fsanitize=undefined from aborting on it WITHOUT disabling signed-overflow detection
+// anywhere else. See src/util/deliberate_wrap.h.
+DILITHION_DELIBERATE_SIGNED_WRAP
 int64_t CalculateHeatMultiplierFP_V33(int heat, bool saturate) {
     // DFMP v3.3: Three-zone penalty, NO dynamic scaling
     //   Zone 1 (Free):        0-12 blocks  → 1.0x
@@ -699,6 +864,11 @@ int64_t CalculateHeatMultiplierFP_V33(int heat, bool saturate) {
     return penalty;
 }
 
+// UBSan opt-out (instrumentation only, zero codegen effect). The saturate=false branch
+// below is the exact legacy int64 expression and multiplies a possibly-wrapped heat
+// multiplier by maturity -- deliberate, made defined by -fwrapv, and the live rule
+// below the C-3 gate. See src/util/deliberate_wrap.h.
+DILITHION_DELIBERATE_SIGNED_WRAP
 int64_t CalculateTotalMultiplierFP_V33(int currentHeight, int firstSeenHeight, int heat, bool saturate) {
     int64_t pendingFP = CalculatePendingPenaltyFP_V33(currentHeight, firstSeenHeight);
     int64_t heatFP = CalculateHeatMultiplierFP_V33(heat, saturate);
@@ -726,6 +896,13 @@ int64_t CalculatePendingPenaltyFP_V34(int currentHeight, int firstSeenHeight) {
     return CalculatePendingPenaltyFP_V32(currentHeight, firstSeenHeight);
 }
 
+// UBSan opt-out (instrumentation only, zero codegen effect). The heat exponential below
+// deliberately overflows int64_t past heat == effectiveFreeThreshold + 60; the wrapped
+// negative is caught by the floor in CalculateEffectiveTarget() and that IS the live
+// consensus rule below the C-3 gate. -fwrapv makes it defined; this attribute stops
+// -fsanitize=undefined from aborting on it WITHOUT disabling signed-overflow detection
+// anywhere else. See src/util/deliberate_wrap.h.
+DILITHION_DELIBERATE_SIGNED_WRAP
 int64_t CalculateHeatMultiplierFP_V34(int heat, bool isVerified, bool saturate) {
     // DFMP v3.4: Same three-zone curve as v3.3, but free tier depends on
     // DNA verification status:
@@ -769,6 +946,11 @@ int64_t CalculateHeatMultiplierFP_V34(int heat, bool isVerified, bool saturate) 
     return penalty;
 }
 
+// UBSan opt-out (instrumentation only, zero codegen effect). The saturate=false branch
+// below is the exact legacy int64 expression and multiplies a possibly-wrapped heat
+// multiplier by maturity -- deliberate, made defined by -fwrapv, and the live rule
+// below the C-3 gate. See src/util/deliberate_wrap.h.
+DILITHION_DELIBERATE_SIGNED_WRAP
 int64_t CalculateTotalMultiplierFP_V34(int currentHeight, int firstSeenHeight, int heat, bool isVerified, bool saturate) {
     int64_t pendingFP = CalculatePendingPenaltyFP_V34(currentHeight, firstSeenHeight);
     int64_t heatFP = CalculateHeatMultiplierFP_V34(heat, isVerified, saturate);

@@ -69,6 +69,8 @@
 #include <node/startup_checkpoint_validator.h>  // v4.1: mandatory upgrade Phase 1 + Phase 2
 #include <consensus/vdf_validation.h>
 #include <wallet/wallet.h>
+#include <wallet/wallet_preserve.h>  // PreserveUnreadableWallet (shared with dilithion-node)
+#include <wallet/wallet_load_guard.h>  // ClassifyWalletFileWithRetry (shared with dilithion-node)
 #include <wallet/passphrase_validator.h>
 #include <rpc/server.h>
 #include <rpc/auth.h>      // CVE-2026-RPC-AUTH: RPCAuth::InitializeAuth
@@ -122,6 +124,7 @@
 #include <sstream>  // For mnemonic display parsing
 #include <memory>
 #include <csignal>
+#include <util/shutdown_progress.h>
 #include <cstring>
 #include <cassert>
 #include <thread>
@@ -545,6 +548,11 @@ struct NodeConfig {
     std::string mining_address_override = "";  // --mining-address=Dxxx (empty = use wallet)
     bool rotate_mining_address = false;        // --rotate-mining-address (new HD address per block)
     std::string restore_mnemonic = "";        // --restore-mnemonic="word1 word2..." (restore wallet from seed)
+    bool force_new_wallet = false;            // --force-new-wallet: start a new wallet over an unloadable
+                                              // wallet.dat, AFTER preserving a copy of it. The escape hatch
+                                              // for a user with no recovery phrase and no keys to lose;
+                                              // without it the unreadable-wallet guard has no route out
+                                              // except deleting the file it tells you not to delete.
     std::vector<std::string> connect_nodes;  // --connect nodes (exclusive)
     std::vector<std::string> add_nodes;      // --addnode nodes (additional)
     bool reindex = false;           // Phase 4.2: Rebuild block index from blocks on disk
@@ -554,6 +562,12 @@ struct NodeConfig {
     bool coinstatsindex_enabled = false;   // --coinstatsindex / -coinstatsindex: enable UTXO-set stats index (PR-BA-2)
     bool persistmempool = true;     // --persistmempool=<0|1>: save/restore mempool across restarts (PR-MP-2; default ON)
     bool feeestimates  = true;      // --feeestimates=<0|1>: enable adaptive fee estimator + persistence (PR-EF-2; default ON)
+    // J1: hard bound on the graceful-shutdown sequence. If shutdown has not
+    // completed within this many seconds, the process logs the stage it is
+    // stuck in and force-exits rather than hanging forever (see
+    // src/util/shutdown_progress.h for why that is safe). 0 disables the
+    // watchdog. 120s is far above any observed clean shutdown.
+    int shutdown_timeout = 120;     // --shutdowntimeout=<seconds>
     bool yes_flag = false;          // --yes: bypass --reset-chain confirmation prompt
     bool verbose = false;           // Show debug output (hidden by default)
     bool quiet = false;             // Quiet mode: only block lifecycle, errors, and warnings
@@ -675,6 +689,9 @@ struct NodeConfig {
             else if (arg == "--rotate-mining-address") {
                 rotate_mining_address = true;
             }
+            else if (arg == "--force-new-wallet") {
+                force_new_wallet = true;
+            }
             else if (arg.find("--restore-mnemonic=") == 0) {
                 restore_mnemonic = arg.substr(19);
                 // Basic validation: should have 24 words
@@ -732,6 +749,15 @@ struct NodeConfig {
             else if (arg == "--reset-chain") {
                 // Wipe chain-derived state, preserve wallet.dat and mik_registration.dat.
                 reset_chain = true;
+            }
+            else if (arg.find("--shutdowntimeout=") == 0) {
+                try {
+                    shutdown_timeout = std::stoi(arg.substr(18));
+                    if (shutdown_timeout < 0) shutdown_timeout = 0;
+                } catch (const std::exception&) {
+                    std::cerr << "ERROR: --shutdowntimeout= requires an integer number of seconds" << std::endl;
+                    return false;
+                }
             }
             else if (arg == "--yes" || arg == "-y") {
                 yes_flag = true;
@@ -878,6 +904,8 @@ struct NodeConfig {
         std::cout << "  --mining-address=<addr> Send mining rewards to this address" << std::endl;
         std::cout << "  --rotate-mining-address Use a new HD address for each mined block" << std::endl;
         std::cout << "  --restore-mnemonic=\"words\" Restore wallet from 24-word recovery phrase" << std::endl;
+        std::cout << "  --force-new-wallet     Start a NEW wallet even if wallet.dat cannot be loaded" << std::endl;
+        std::cout << "                         (the old file is copied to wallet.dat.unreadable-<time> first)" << std::endl;
         std::cout << "  --verbose, -v         Show debug output (hidden by default)" << std::endl;
         std::cout << "  --quiet, -q           Quiet mode: only block events, errors, and warnings" << std::endl;
         std::cout << "  --reindex             Rebuild blockchain from scratch (use after crash)" << std::endl;
@@ -1707,9 +1735,8 @@ std::optional<CBlockTemplate> BuildMiningTemplate(CBlockchainDB& blockchain, CWa
         int dfmpV34ActivationHeight = Dilithion::g_chainParams ?
             Dilithion::g_chainParams->dfmpV34ActivationHeight : 999999999;
 
-        // C-3: saturating heat math gate (must match validator pow.cpp exactly).
-        bool dfmpSat = Dilithion::g_chainParams &&
-            static_cast<int>(nHeight) >= Dilithion::g_chainParams->dfmpOverflowFixActivationHeight;
+        // C-3: saturating heat math gate — single-sourced with the validator.
+        bool dfmpSat = DFMP::DfmpSaturatingMathActive(static_cast<int>(nHeight));
 
         int64_t multiplierFP;
         double payoutHeatMult = 1.0;
@@ -1956,6 +1983,17 @@ std::optional<CBlockTemplate> BuildMiningTemplate(CBlockchainDB& blockchain, CWa
 }
 
 int main(int argc, char* argv[]) {
+    // FIRST local in main, so it is the LAST thing destroyed on the way out.
+    // DilV is VDF-only and does not start FULL-mode init itself, so today this
+    // guard is a no-op here. It is present anyway because the hazard is a
+    // property of the RandomX module, not of one binary: anything DilV links
+    // that calls randomx_init_mining_mode_async() (CMiningController::Start
+    // does, on the regtest/mining paths) would otherwise leave a joinable
+    // namespace-scope std::thread and abort at static destruction, replacing
+    // this binary's exit code the same way it did dilithion-node's. Omitting
+    // the DilV half is exactly how the wallet-guard fix was missed before.
+    RandomXShutdownGuard randomx_shutdown_guard;
+
 #ifdef _WIN32
     // Register crash handler to log crash info before terminating
     SetUnhandledExceptionFilter(CrashHandler);
@@ -2500,7 +2538,10 @@ int main(int argc, char* argv[]) {
         // Load and verify genesis block
 load_genesis_block:  // Bug #29: Label for automatic retry after blockchain wipe
         std::cout << "[1/6] Loading DilV genesis block..." << std::flush;
-        CBlock genesis = Genesis::CreateDilVGenesisBlock();
+        // Both networks this binary serves (DilV, regtest) are VDF-from-genesis,
+        // so this resolves to CreateDilVGenesisBlock() exactly as before; routing
+        // through the shared dispatcher keeps it correct if that ever changes.
+        CBlock genesis = Genesis::CreateGenesisBlockForChain();
 
         if (!Genesis::IsGenesisBlock(genesis)) {
             ErrorMessage error = CErrorFormatter::ValidationError("genesis block", 
@@ -3054,6 +3095,43 @@ load_genesis_block:  // Bug #29: Label for automatic retry after blockchain wipe
             return 1;
         }
         std::cout << "  [OK] NodeContext initialized" << std::endl;
+
+        // Identical guard to dilithion-node.cpp, for the identical reason: every
+        // early `return` after this point otherwise leaves g_node_context's worker
+        // threads (CConnman, validation queue, headers manager) to be torn down at
+        // static-destruction time, after main has returned. Measured on DIL before
+        // this guard: the process either aborted via std::terminate or hung past a
+        // 120s timeout inside CConnman::Stop(). Declared here rather than at the top
+        // of main so it runs after the servers declared below and before the chain
+        // database declared above. Shutdown() is idempotent, so the explicit call on
+        // the normal shutdown path leaves this a no-op.
+        //
+        // K2-(2): the NORMAL shutdown sequence arms a deadline and names every
+        // stage it enters. Early returns and exception unwinds do not run that
+        // sequence -- they land here instead, and used to call
+        // g_node_context.Shutdown() (and through it CConnman::Stop(), the very
+        // call measured above hanging past a 120s timeout) with no bound and no
+        // stage logging. That traded a deterministic abort for a potentially
+        // unbounded, invisible hang on exactly the paths an operator is least
+        // able to diagnose. Arm the same instrumented bound here.
+        //
+        // ArmWatchdog() returns false -- so this stays a silent no-op -- when
+        // the normal sequence already ran (Disarmed) or is still in flight
+        // (Armed). Only a genuine unwind takes ownership.
+        struct NodeContextShutdownGuard {
+            int timeout_seconds;
+            ~NodeContextShutdownGuard() {
+                const bool owned = Dilithion::ShutdownProgress::ArmWatchdog(timeout_seconds);
+                if (owned) {
+                    Dilithion::ShutdownProgress::Stage(
+                        "NodeContext::Shutdown (early-return / unwind path)");
+                }
+                g_node_context.Shutdown();
+                // No Disarm even when owned: RandomXShutdownGuard destructs
+                // after this guard and owns the final Disarm, so the deadline
+                // also covers its randomx thread joins on the unwind path.
+            }
+        } node_context_shutdown_guard{config.shutdown_timeout};
 
         // Phase 2: Initialize async block validation queue for IBD performance
         std::cout << "Initializing async block validation queue..." << std::endl;
@@ -5269,7 +5347,19 @@ load_genesis_block:  // Bug #29: Label for automatic retry after blockchain wipe
                     std::cout << "  [OK] Wallet synced - balance: " << std::fixed << std::setprecision(8)
                               << (static_cast<double>(mature) / 100000000.0) << " DilV" << std::endl;
                 } else {
-                    std::cerr << "  WARNING: Failed to load wallet" << std::endl;
+                    // Relay-only deliberately does NOT abort: seed nodes run in this
+                    // mode and an unreadable wallet must not take the fleet down on a
+                    // rolling deploy. There is no overwrite risk here — SetWalletFile()
+                    // is only reached on the success path, so nothing will write back
+                    // to wallet_path — but preserve a copy and say so plainly.
+                    const std::string preserved = PreserveUnreadableWallet(wallet_path);
+                    std::cerr << "  WARNING: wallet.dat exists but could not be loaded."
+                              << " Continuing relay-only WITHOUT a wallet." << std::endl;
+                    std::cerr << "           The file has not been modified." << std::endl;
+                    if (!preserved.empty()) {
+                        std::cerr << "           Preserved copy: " << preserved << std::endl;
+                    }
+                    std::cerr.flush();
                 }
             } else {
                 std::cout << "Initializing wallet... SKIPPED (relay-only, no wallet.dat)" << std::endl;
@@ -5280,22 +5370,146 @@ load_genesis_block:  // Bug #29: Label for automatic retry after blockchain wipe
         // Build wallet file path
         std::cout << "  Wallet file: " << wallet_path << std::endl;
 
-        // Try to load existing wallet from disk
-        if (std::filesystem::exists(wallet_path)) {
-            std::cout << "[3/6] Loading wallet..." << std::flush;
-            std::cout.flush();
-            if (wallet.Load(wallet_path)) {
-                wallet_loaded = true;
-                std::cout << " ✓" << std::endl;
-                std::cout << "  [OK] Wallet loaded (" << wallet.GetAddresses().size() << " addresses)" << std::endl;
-                std::cout << "       Best block: height " << wallet.GetBestBlockHeight() << std::endl;
+        // Classify the file on disk BEFORE handing it to CWallet::Load().
+        // Load() returns one undifferentiated `false` for a 0-byte file, a file
+        // held open by an antivirus scanner, and a genuinely corrupt wallet —
+        // and only the last of those is worth refusing to start over. Treating
+        // all three as corruption bricked the node on EVERY subsequent start,
+        // with a message that told the user not to remove the blocking file.
+        // See wallet/wallet_load_guard.h.
+        std::string wallet_probe_detail;
+        const WalletFileState wallet_state =
+            ClassifyWalletFileWithRetry(wallet_path, &wallet_probe_detail);
+
+        // Fail-closed cases only. `wallet_locked` picks the wording: a lock is
+        // not corruption and must not be described as such.
+        bool wallet_unreadable = false;
+        bool wallet_locked = false;
+
+        switch (wallet_state) {
+            case WalletFileState::Absent:
+                std::cout << "  No existing wallet found." << std::endl;
+                break;
+            case WalletFileState::Empty:
+                // Shorter than the 8-byte magic, so it cannot contain a key in
+                // any wallet format this project has ever written. Nothing can
+                // be lost by proceeding. This is the installer-pre-creates-the-
+                // file / unhydrated-cloud-placeholder / interrupted-first-run
+                // case, which used to be permanently fatal.
+                std::cout << "  Existing wallet.dat is empty (no wallet header), "
+                          << "treating as no wallet found." << std::endl;
+                break;
+            case WalletFileState::Unopenable:
+                wallet_unreadable = true;
+                wallet_locked = true;
+                break;
+            case WalletFileState::Invalid:
+                wallet_unreadable = true;
+                break;
+            case WalletFileState::Present:
+                std::cout << "[3/6] Loading wallet..." << std::flush;
                 std::cout.flush();
-            } else {
-                std::cerr << "  WARNING: Failed to load wallet, creating new one" << std::endl;
+                if (wallet.Load(wallet_path)) {
+                    wallet_loaded = true;
+                    std::cout << " ✓" << std::endl;
+                    std::cout << "  [OK] Wallet loaded (" << wallet.GetAddresses().size() << " addresses)" << std::endl;
+                    std::cout << "       Best block: height " << wallet.GetBestBlockHeight() << std::endl;
+                    std::cout.flush();
+                } else {
+                    wallet_unreadable = true;
+                }
+                break;
+        }
+
+        if (wallet_unreadable) {
+            // An existing-but-unreadable wallet must NEVER fall through to
+            // creation: the create path ends in Save(wallet_path), which
+            // atomically renames over this file and destroys the keys.
+            // Preserve a copy, tell the user what to do, and stop.
+            const std::string preserved = PreserveUnreadableWallet(wallet_path);
+            // Both overrides are explicit, destructive-by-request instructions
+            // from the user, and both are honoured ONLY after a copy exists.
+            const bool user_override =
+                !config.restore_mnemonic.empty() || config.force_new_wallet;
+            if (user_override) {
+                // The user explicitly asked to restore from a phrase, or to
+                // start a new wallet anyway. Those are the remedies this guard
+                // advertises. Honour them: the path below will Save() over
+                // wallet_path, so this IS destructive — but it is destruction
+                // the user asked for, and only after a copy has been preserved.
+                // Refusing here would make the printed instructions impossible
+                // to follow.
+                if (preserved.empty()) {
+                    std::cerr << std::endl;
+                    std::cerr << "  ERROR: wallet.dat could not be loaded, and no backup copy" << std::endl;
+                    std::cerr << "         could be written. Refusing to write over it." << std::endl;
+                    std::cerr << "         Copy wallet.dat somewhere safe, then retry." << std::endl;
+                    std::cerr.flush();
+                    return 1;
+                }
+                std::cerr << std::endl;
+                std::cerr << "  NOTE: the existing wallet.dat could not be loaded." << std::endl;
+                std::cerr << "        A copy has been preserved at:" << std::endl;
+                std::cerr << "          " << preserved << std::endl;
+                if (!config.restore_mnemonic.empty()) {
+                    std::cerr << "        Continuing with the requested restore, which will replace" << std::endl;
+                    std::cerr << "        wallet.dat with a wallet derived from your recovery phrase." << std::endl;
+                } else {
+                    std::cerr << "        Continuing because --force-new-wallet was given, which will" << std::endl;
+                    std::cerr << "        replace wallet.dat with a NEW, EMPTY wallet. The old file is" << std::endl;
+                    std::cerr << "        kept only at the path above — keep it safe." << std::endl;
+                }
                 std::cerr.flush();
+            } else if (wallet_locked) {
+                // Nothing is known about the contents: the file could not be
+                // opened at all, after retries. That reads as a lock or a
+                // permissions problem, NOT as corruption, and saying "corrupt"
+                // here sends users to recovery procedures they do not need.
+                std::cerr << std::endl;
+                std::cerr << "  ERROR: wallet.dat exists but could not be OPENED." << std::endl;
+                if (!wallet_probe_detail.empty()) {
+                    std::cerr << "         Reason: " << wallet_probe_detail << std::endl;
+                }
+                std::cerr << "         This usually means another process is holding the file" << std::endl;
+                std::cerr << "         (a second node, antivirus, a backup or cloud-sync client)," << std::endl;
+                std::cerr << "         or that the file is not readable by this user." << std::endl;
+                std::cerr << "         It does NOT mean your wallet is damaged, and nothing was" << std::endl;
+                std::cerr << "         written to it. Retried several times before giving up." << std::endl;
+                std::cerr << "         Try: close any other Dilithion node, make sure the file has" << std::endl;
+                std::cerr << "         hydrated if it lives in OneDrive/Dropbox/iCloud, check the" << std::endl;
+                std::cerr << "         file's permissions, then start again." << std::endl;
+                std::cerr << "         Stopping now. This is a deliberate stop, not a crash —" << std::endl;
+                std::cerr << "         your wallet file was left exactly as it was." << std::endl;
+                std::cerr.flush();
+                return 1;
+            } else {
+                std::cerr << std::endl;
+                std::cerr << "  ERROR: wallet.dat exists but could not be loaded." << std::endl;
+                std::cerr << "         Refusing to start, because creating a new wallet here would" << std::endl;
+                std::cerr << "         overwrite this file and destroy the keys in it." << std::endl;
+                if (!preserved.empty()) {
+                    std::cerr << "         A copy has been preserved at:" << std::endl;
+                    std::cerr << "           " << preserved << std::endl;
+                } else {
+                    std::cerr << "         WARNING: a backup copy could NOT be written. Copy" << std::endl;
+                    std::cerr << "         wallet.dat somewhere safe before doing anything else." << std::endl;
+                }
+                std::cerr << "         Your coins live on the chain, not in this file." << std::endl;
+                std::cerr << "         If you HAVE your 24-word recovery phrase, rerun with:" << std::endl;
+                std::cerr << "           --restore-mnemonic=\"<your 24 words>\"" << std::endl;
+                std::cerr << "         which will restore over this file (the preserved copy is kept)." << std::endl;
+                std::cerr << "         If you never had a wallet here and just want to start with a" << std::endl;
+                std::cerr << "         fresh one, rerun with:" << std::endl;
+                std::cerr << "           --force-new-wallet" << std::endl;
+                std::cerr << "         which also keeps the preserved copy. Do NOT use it if this" << std::endl;
+                std::cerr << "         file might hold coins you have no recovery phrase for." << std::endl;
+                std::cerr << "         If you do NOT have the phrase, do not delete wallet.dat —" << std::endl;
+                std::cerr << "         keep it and report this with the version you upgraded from." << std::endl;
+                std::cerr << "         Stopping now. This is a deliberate stop, not a crash —" << std::endl;
+                std::cerr << "         your wallet file was left exactly as it was." << std::endl;
+                std::cerr.flush();
+                return 1;
             }
-        } else {
-            std::cout << "  No existing wallet found." << std::endl;
         }
 
         // Generate HD wallet if wallet is empty (new wallet creation) or restore from mnemonic
@@ -6485,6 +6699,21 @@ load_genesis_block:  // Bug #29: Label for automatic retry after blockchain wipe
         // Phase 5: Updated to use CConnman instead of CConnectionManager
         std::cerr.flush();
         std::thread p2p_maint_thread;
+        // Same joiner as dilithion-node.cpp, and present for the same reason: this
+        // std::thread is joined only at the bottom of main, so any early `return`
+        // after this point destroys it while joinable and std::terminate() replaces
+        // the intended exit code. DilV carries an identical maintenance thread and
+        // identical early returns; fixing only the DIL copy is how the previous
+        // wallet-guard fix left DilV broken.
+        struct MaintThreadJoiner {
+            std::thread& t;
+            ~MaintThreadJoiner() {
+                if (t.joinable()) {
+                    g_node_state.running = false;  // break the maintenance loop
+                    t.join();
+                }
+            }
+        } p2p_maint_joiner{p2p_maint_thread};
         try {
             p2p_maint_thread = std::thread([&feeler_manager]() {
             // Phase 1.1: Wrap thread entry point in try/catch to prevent silent crashes
@@ -6828,8 +7057,13 @@ load_genesis_block:  // Bug #29: Label for automatic retry after blockchain wipe
                     }
 #endif
 
-                    // Sleep for 30 seconds between maintenance cycles
-                    std::this_thread::sleep_for(std::chrono::seconds(30));
+                    // Sleep for 30 seconds between maintenance cycles, polled in
+                    // 1s steps. This thread is JOINED on the way out (see the
+                    // joiner where it is declared); an uninterruptible 30s sleep
+                    // would add up to 30s to every exit, error returns included.
+                    for (int maint_tick = 0; maint_tick < 30 && g_node_state.running; ++maint_tick) {
+                        std::this_thread::sleep_for(std::chrono::seconds(1));
+                    }
                 } catch (const std::system_error& e) {
                     std::cerr << "[P2P-Maint] System error in maintenance loop: " << e.what()
                               << " (code: " << e.code() << ")" << std::endl;
@@ -8222,6 +8456,13 @@ load_genesis_block:  // Bug #29: Label for automatic retry after blockchain wipe
         // Shutdown
         std::cout << std::endl;
         std::cout << "[Shutdown] Initiating graceful shutdown..." << std::endl;
+        // J1: from here on, every stage boundary is recorded and timed, and a
+        // deadline thread is armed. Before this, a stall anywhere below was
+        // invisible -- the process simply never exited and the operator had no
+        // way to tell which subsystem was holding it. See
+        // src/util/shutdown_progress.h.
+        Dilithion::ShutdownProgress::ArmWatchdog(config.shutdown_timeout);
+        Dilithion::ShutdownProgress::Stage("miners + VDF");
 
         // Clear ibd_coordinator pointer before local variable goes out of scope
         g_node_context.ibd_coordinator = nullptr;
@@ -8249,6 +8490,7 @@ load_genesis_block:  // Bug #29: Label for automatic retry after blockchain wipe
             g_resource_monitor = nullptr;
         }
 
+        Dilithion::ShutdownProgress::Stage("CConnman::Stop (P2P sockets + net threads)");
         std::cout << "[Shutdown] Stopping P2P server..." << std::flush;
         // Phase 5: Stop CConnman (handles all socket cleanup internally)
         if (g_node_context.connman) {
@@ -8261,6 +8503,7 @@ load_genesis_block:  // Bug #29: Label for automatic retry after blockchain wipe
         // via `sendrawtransaction` between the two cannot land in the
         // mempool but be missed by the dump. Mirrors Bitcoin Core's
         // shutdown sequence (init.cpp Shutdown()).
+        Dilithion::ShutdownProgress::Stage("CRPCServer::Stop (RPC + WebSocket threads)");
         std::cout << "[Shutdown] Stopping RPC server..." << std::flush;
         rpc_server.Stop();
         std::cout << " done" << std::endl;
@@ -8315,6 +8558,7 @@ load_genesis_block:  // Bug #29: Label for automatic retry after blockchain wipe
         }
 
         // Phase 3.2: Shutdown batch signature verifier
+        Dilithion::ShutdownProgress::Stage("batch signature verifier");
         std::cout << "[Shutdown] Stopping batch signature verifier..." << std::endl;
         ShutdownSignatureVerifier();
 
@@ -8328,11 +8572,13 @@ load_genesis_block:  // Bug #29: Label for automatic retry after blockchain wipe
         }
 
         // Phase 1.2: Shutdown NodeContext (Bitcoin Core pattern)
+        Dilithion::ShutdownProgress::Stage("NodeContext::Shutdown (validation queue, headers/blocks managers)");
         std::cout << "[Shutdown] NodeContext shutdown complete" << std::endl;
         g_node_context.Shutdown();
         
         // Phase 5: p2p_thread and p2p_recv_thread removed - handled by CConnman
         // Only join maintenance thread
+        Dilithion::ShutdownProgress::Stage("p2p maintenance thread join");
         if (p2p_maint_thread.joinable()) {
             p2p_maint_thread.join();
         }
@@ -8349,9 +8595,11 @@ load_genesis_block:  // Bug #29: Label for automatic retry after blockchain wipe
         // REMOVED: g_peer_manager cleanup - no longer used
 
         // DFMP: Shutdown Fair Mining Protocol subsystem (persist heat trackers)
+        Dilithion::ShutdownProgress::Stage("DFMP persist");
         std::cout << "  Shutting down DFMP..." << std::endl;
         DFMP::ShutdownDFMP(config.datadir, g_chainstate.GetHeight());
 
+        Dilithion::ShutdownProgress::Stage("UTXO database close");
         std::cout << "  Closing UTXO database..." << std::endl;
         utxo_set.Close();
 
@@ -8363,6 +8611,7 @@ load_genesis_block:  // Bug #29: Label for automatic retry after blockchain wipe
         // PR-BA-2: same teardown ordering as g_tx_index.
         g_coin_stats_index.reset();
 
+        Dilithion::ShutdownProgress::Stage("blockchain database close");
         std::cout << "  Closing blockchain database..." << std::endl;
         blockchain.Close();
 
@@ -8374,6 +8623,14 @@ load_genesis_block:  // Bug #29: Label for automatic retry after blockchain wipe
         Dilithion::g_chainParams = nullptr;
 
         std::cout << std::endl;
+        // Deliberately NO Disarm() here: RandomXShutdownGuard (first local of
+        // main, destructs last) joins the RandomX threads AFTER this line and
+        // owns the final Disarm, so the shutdown deadline covers those joins.
+        // Disarming here re-opens the unbounded-hang window at the last step.
+        // Name the newly-covered region so a hang in the try-scope local
+        // destructors is reported against the right stage, not the last
+        // database stage (fold: red-team M-1).
+        Dilithion::ShutdownProgress::Stage("main-scope teardown (locals)");
         std::cout << "Dilithion node stopped cleanly" << std::endl;
 
     } catch (const std::exception& e) {

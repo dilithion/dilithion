@@ -187,15 +187,59 @@ public:
 // Both miner/controller.cpp AND the WF-1 differential test call THIS function, so
 // the test drives the real production assembly (no hand-copied mirror).
 //
-// `dst` MUST point to at least 80 writable bytes. `nonce32` is written at offset
-// 76 (the field the hot loop mutates each iteration); h.nNonce is ignored.
+// `dst` MUST point to at least MINING_HEADER_SIZE (80) writable bytes. `nonce32` is
+// written at MINING_HEADER_NONCE_OFFSET (76) — the field the hot loop mutates each
+// iteration; h.nNonce is ignored.
+//
+// K1: every offset below is a named constant because the bare literals were hand-copied
+// into several unrelated files and only some of them got unified. Any new site that needs
+// the legacy 80-byte layout MUST call WriteMiningHeaderLE() / WriteMiningNonceLE() (or use
+// these constants), never re-type the numbers.
+
+/**
+ * Byte offset of the nonce field inside the 80-byte legacy PoW preimage.
+ *
+ * SINGLE SOURCE OF TRUTH. This constant used to be duplicated as a bare `76`
+ * literal in miner/controller.cpp's hot loop, which is written on EVERY nonce
+ * iteration while WriteMiningHeaderLE below only runs on a template change. A
+ * mutation run proved that duplicate was completely untested: changing the hot
+ * loop's `header + 76` to `header + 72` left the whole WF-1 suite green, and
+ * the real-world consequence is total — the miner would hash a buffer that
+ * disagrees with the header it submits, so every block it finds is rejected.
+ * Both writers now go through the offset below, so there is one place to get
+ * wrong and it is covered by miner_nonce_write_tests.
+ */
+static constexpr size_t MINING_HEADER_NONCE_OFFSET = 76;
+
+/**
+ * The remaining offsets of the legacy 80-byte PoW preimage, named for the same
+ * reason as MINING_HEADER_NONCE_OFFSET above: the bare literals were hand-copied
+ * into several unrelated files (net/blockencodings.cpp among them) and only some
+ * of the copies were ever unified. Any new site needing this layout MUST call
+ * WriteMiningHeaderLE() or use these constants — never re-type the numbers.
+ */
+static constexpr size_t MINING_HEADER_VERSION_OFFSET  = 0;
+static constexpr size_t MINING_HEADER_PREVHASH_OFFSET = 4;
+static constexpr size_t MINING_HEADER_MERKLE_OFFSET   = 36;
+static constexpr size_t MINING_HEADER_TIME_OFFSET     = 68;
+static constexpr size_t MINING_HEADER_BITS_OFFSET     = 72;
+static constexpr size_t MINING_HEADER_SIZE            = 80;
+
+/**
+ * Rewrite ONLY the nonce field of an already-assembled 80-byte mining header.
+ * This is the per-iteration write in the miner hot loop.
+ */
+inline void WriteMiningNonceLE(uint8_t* dst, uint32_t nonce32) {
+    WriteLE32(dst + MINING_HEADER_NONCE_OFFSET, nonce32);
+}
+
 inline void WriteMiningHeaderLE(uint8_t* dst, const CBlockHeader& h, uint32_t nonce32) {
-    WriteLE32(dst + 0, static_cast<uint32_t>(h.nVersion));
-    memcpy(dst + 4,  h.hashPrevBlock.begin(), 32);
-    memcpy(dst + 36, h.hashMerkleRoot.begin(), 32);
-    WriteLE32(dst + 68, h.nTime);
-    WriteLE32(dst + 72, h.nBits);
-    WriteLE32(dst + 76, nonce32);
+    WriteLE32(dst + MINING_HEADER_VERSION_OFFSET, static_cast<uint32_t>(h.nVersion));
+    memcpy(dst + MINING_HEADER_PREVHASH_OFFSET, h.hashPrevBlock.begin(), 32);
+    memcpy(dst + MINING_HEADER_MERKLE_OFFSET, h.hashMerkleRoot.begin(), 32);
+    WriteLE32(dst + MINING_HEADER_TIME_OFFSET, h.nTime);
+    WriteLE32(dst + MINING_HEADER_BITS_OFFSET, h.nBits);
+    WriteMiningNonceLE(dst, nonce32);
 }
 
 class CBlock : public CBlockHeader {

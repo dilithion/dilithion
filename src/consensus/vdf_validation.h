@@ -38,6 +38,61 @@ bool CheckVDFProof(
 );
 
 /**
+ * LP-10: Activation-gated VDF Wesolowski proof check for the production
+ * connect path (ConnectTip).
+ *
+ * This is the connect-path wrapper around CheckVDFProof. Behaviour:
+ *   - height < vdfProofEnforcementHeight  -> true  (grandfathered; the existing
+ *     chain is NEVER retroactively re-verified)
+ *   - !block.IsVDFBlock()                 -> true  (RandomX blocks unaffected)
+ *   - otherwise -> CheckVDFProof(block, height, prevHash,
+ *                                g_chainParams->vdfIterations, error)
+ *
+ * Structural check (no chain/identity state) — safe to run on ALL connect
+ * paths including skipValidation=true reorg reconnects.
+ *
+ * @param block    The candidate block
+ * @param height   Block height (pindex->nHeight)
+ * @param prevHash block.hashPrevBlock (for challenge derivation)
+ * @param error    Human-readable error on failure
+ * @return true if the proof is valid OR enforcement is not active for this block
+ */
+bool CheckVDFProofConnect(
+    const CBlock& block,
+    int height,
+    const uint256& prevHash,
+    std::string& error
+);
+
+/**
+ * LP-10 (subsumes LP-8): Activation-gated coinbase MIK-signature check for VDF
+ * blocks on the connect path.
+ *
+ * CheckProofOfWorkDFMP early-returns true for VDF blocks, so the MIK signature
+ * that it verifies for RandomX blocks (pow.cpp:311) is NEVER checked for VDF
+ * blocks. This restores that check for VDF blocks, mirroring the proven
+ * pow.cpp:245-322 logic (registration: embedded pubkey + identity-derivation
+ * check; reference: identity-DB pubkey lookup), and gates it on
+ * vdfProofEnforcementHeight.
+ *
+ * Reorg-safe: if a reference block's pubkey is not in the identity DB (e.g.
+ * during incomplete multi-block reorg undo), the check PASSES (cannot verify ->
+ * do not false-reject), the same posture as CheckDNAHashEquality and the DFMP
+ * assume-valid path.
+ *
+ * @param block    The candidate VDF block
+ * @param height   Block height (pindex->nHeight)
+ * @param error    Human-readable error on failure
+ * @return true if the MIK signature is valid OR enforcement is not active /
+ *         cannot be verified
+ */
+bool CheckVDFBlockMIKSignature(
+    const CBlock& block,
+    int height,
+    std::string& error
+);
+
+/**
  * Compute the per-miner VDF challenge.
  *
  * challenge = SHA3-256( prevHash || height_le32 || minerAddress )

@@ -106,8 +106,12 @@ CHeadersManager::CHeadersManager()
 
     // BUG FIX: Add genesis to mapHeaders so block 1 can accumulate chain work properly
     // Without this, block 1's pprev is nullptr and chainWork doesn't include genesis work
-    CBlock genesis = (Dilithion::g_chainParams && Dilithion::g_chainParams->IsDilV()) ?
-        Genesis::CreateDilVGenesisBlock() : Genesis::CreateGenesisBlock();
+    // Must use the SAME predicate as Genesis::GetGenesisHash(), which keys this
+    // map entry two lines down. Selecting on IsDilV() alone disagreed with it on
+    // TESTNET and REGTEST (both VDF-from-genesis but network != DILV): we stored
+    // a legacy (v1) genesis header under the VDF genesis hash, so mapHeaders'
+    // key did not hash to its value. Route through the shared dispatcher.
+    CBlock genesis = Genesis::CreateGenesisBlockForChain();
     // Single-source, integrity-validated genesis hash (see node/genesis.cpp
     // GetGenesisHash): keeps the headers-manager key consistent with the DB key
     // and the P2P-advertised hash, and never keys off a transient miscompute.
