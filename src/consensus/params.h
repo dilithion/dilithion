@@ -5,6 +5,12 @@
 #define DILITHION_CONSENSUS_PARAMS_H
 
 #include <amount.h>
+#include <cstddef>  // std::size_t / size_t — several constants below are size_t-typed.
+                    // Without this, params.h is not self-contained: any TU that
+                    // includes it before something that drags in <cstddef>
+                    // fails with "'size_t' does not name a type" on libstdc++.
+                    // Caught when the standalone suites were first actually
+                    // compiled on Linux/gcc (F4); <cstdint> does not guarantee it.
 #include <cstdint>
 
 /**
@@ -154,8 +160,17 @@ static const int DIFFICULTY_ADJUSTMENT_INTERVAL_V2 = 360;
 // Chain Security Parameters
 //==============================================================================
 
-/** Maximum allowed chain reorganization depth (similar to Bitcoin's practical limit) */
-static const int MAX_REORG_DEPTH = 100;
+/**
+ * Maximum allowed chain reorganization depth — the ROLLING reorg cap
+ * (Bitcoin-practical-limit lineage). SINGLE SOURCE OF TRUTH: every reorg-bound
+ * check references this constant; there must be no literal copies elsewhere.
+ *
+ * Value = 60 (tightened 2026-07-01 from the inherited 100).
+ * On a constant-VDF-work chain nChainWork ~= block-count, so this hard depth
+ * cap + attested-identity scarcity are the deep-reorg defense (not PoW
+ * cumulative-work cost).
+ */
+static const int MAX_REORG_DEPTH = 60;
 
 /** Maximum number of block headers to process in one message */
 static const unsigned int MAX_HEADERS_RESULTS = 2000;
@@ -239,6 +254,29 @@ static const int64_t MAX_FUTURE_BLOCK_TIME_V2 = 10 * 60;
 
 /** Maximum block timestamp drift (median time of past 11 blocks) */
 static const int MEDIAN_TIME_SPAN = 11;
+
+//==============================================================================
+// Compile-time safety invariants
+//==============================================================================
+
+/**
+ * F-08 safety invariant: a reorg must never be able to un-mature (and thus
+ * un-spend) a matured coinbase. The rolling reorg cap must therefore be no
+ * deeper than coinbase maturity, i.e. MAX_REORG_DEPTH <= COINBASE_MATURITY.
+ *
+ * SCOPE (do NOT over-read this): the static_assert below guards only the
+ * COMPILE-TIME constant (DIL: COINBASE_MATURITY = 100). The check that actually
+ * enforces maturity at runtime reads the PER-CHAIN value
+ * g_chainParams->coinbaseMaturity (e.g. DilV = 6, utxo_set.cpp), which this
+ * assert does NOT cover. On a chain whose runtime maturity is below
+ * MAX_REORG_DEPTH (DilV: 6 < 60), a reorg in the (maturity, cap] window can
+ * still un-spend a matured coinbase — a separate live-chain finding, not caught
+ * here. This assert protects DIL's compile-time invariant only.
+ * (See the DilV coinbase-maturity item.)
+ */
+static_assert(MAX_REORG_DEPTH <= COINBASE_MATURITY,
+              "F-08 violated: MAX_REORG_DEPTH must be <= COINBASE_MATURITY — "
+              "a reorg deeper than coinbase maturity can un-spend a matured coinbase");
 
 } // namespace Consensus
 

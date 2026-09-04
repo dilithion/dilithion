@@ -69,10 +69,13 @@
 #include <vdf/cooldown_tracker.h>
 #include <consensus/vdf_validation.h>
 #include <wallet/wallet.h>
+#include <wallet/wallet_preserve.h>  // PreserveUnreadableWallet (shared with dilv-node)
+#include <wallet/wallet_load_guard.h>  // ClassifyWalletFileWithRetry (shared with dilv-node)
 #include <wallet/passphrase_validator.h>
 #include <rpc/server.h>
 #include <rpc/auth.h>      // CVE-2026-RPC-AUTH: RPCAuth::InitializeAuth
 #include <rpc/rest_api.h>  // REST API for light wallet
+#include <rpc/ratelimiter.h>  // LP-12: per-IP rate limiter for the HTTP REST path
 #include <core/chainparams.h>
 #include <consensus/pow.h>
 #include <consensus/chain.h>
@@ -118,6 +121,7 @@
 #include <sstream>  // For mnemonic display parsing
 #include <memory>
 #include <csignal>
+#include <util/shutdown_progress.h>
 #include <cstring>
 #include <cassert>
 #include <thread>
@@ -548,6 +552,11 @@ struct NodeConfig {
     std::string mining_address_override = "";  // --mining-address=Dxxx (empty = use wallet)
     bool rotate_mining_address = false;        // --rotate-mining-address (new HD address per block)
     std::string restore_mnemonic = "";        // --restore-mnemonic="word1 word2..." (restore wallet from seed)
+    bool force_new_wallet = false;            // --force-new-wallet: start a new wallet over an unloadable
+                                              // wallet.dat, AFTER preserving a copy of it. The escape hatch
+                                              // for a user with no recovery phrase and no keys to lose;
+                                              // without it the unreadable-wallet guard has no route out
+                                              // except deleting the file it tells you not to delete.
     std::vector<std::string> connect_nodes;  // --connect nodes (exclusive)
     std::vector<std::string> add_nodes;      // --addnode nodes (additional)
     bool reindex = false;           // Phase 4.2: Rebuild block index from blocks on disk
@@ -557,6 +566,12 @@ struct NodeConfig {
     bool coinstatsindex_enabled = false;   // --coinstatsindex / -coinstatsindex: enable UTXO-set stats index (PR-BA-2)
     bool persistmempool = true;     // --persistmempool=<0|1>: save/restore mempool across restarts (PR-MP-2; default ON)
     bool feeestimates  = true;      // --feeestimates=<0|1>: enable adaptive fee estimator + persistence (PR-EF-2; default ON)
+    // J1: hard bound on the graceful-shutdown sequence. If shutdown has not
+    // completed within this many seconds, the process logs the stage it is
+    // stuck in and force-exits rather than hanging forever (see
+    // src/util/shutdown_progress.h for why that is safe). 0 disables the
+    // watchdog. 120s is far above any observed clean shutdown.
+    int shutdown_timeout = 120;     // --shutdowntimeout=<seconds>
     bool yes_flag = false;          // --yes: bypass --reset-chain confirmation prompt
     bool verbose = false;           // Show debug output (hidden by default)
     bool quiet = false;             // Quiet mode: only block lifecycle, errors, and warnings
@@ -565,6 +580,17 @@ struct NodeConfig {
     bool upnp_prompted = false;     // True if user was already prompted or used explicit flag
     std::string external_ip = "";   // --externalip: Manual external IP (for manual port forwarding)
     bool public_api = false;        // --public-api: Enable public REST API for light wallets (seed nodes only)
+    bool require_seed_migration = false;  // LP-7 L1 (opt-in): when set, refuse mining/spending while the
+                                          // wallet's HD seed is still plaintext-at-rest (NeedsSeedMigration()).
+                                          // DEFAULT OFF preserves warn-only behavior (operator is surfaced but
+                                          // not blocked); SET requires unlocking once to migrate before mining.
+    bool generate_seed_key = false; // --generate-seed-key: LP-13 — explicitly permit minting a NEW seed attestation consensus key when none exists (first-time provision only; otherwise fail loud)
+    // LP-13 CL-1: seed-key encryption-at-rest is now MANDATORY BY DEFAULT
+    // (DILITHION_SEED_KEY_PASSPHRASE provisioned at deploy). --allow-plaintext-seed-key
+    // is the explicit opt-out that permits writing/running a plaintext (v1) key
+    // with no passphrase. --require-seed-key-encryption is kept as a no-op alias
+    // (it now matches the default) so existing deploy scripts don't break.
+    bool allow_plaintext_seed_key = false; // --allow-plaintext-seed-key: LP-13 CL-1 opt-out of default-on encryption
     int max_connections = 0;         // --maxconnections: Maximum peer connections (0 = default 125)
     int max_connections_per_ip = 2;  // --max-connections-per-ip: Max inbound per IP (default 2, range 1-64)
     int attestation_rate_limit = 1;  // --attestation-rate-limit: Max attestations per /24 subnet per day
@@ -672,6 +698,9 @@ struct NodeConfig {
             else if (arg == "--rotate-mining-address") {
                 rotate_mining_address = true;
             }
+            else if (arg == "--force-new-wallet") {
+                force_new_wallet = true;
+            }
             else if (arg.find("--restore-mnemonic=") == 0) {
                 restore_mnemonic = arg.substr(19);
                 // Basic validation: should have 24 words
@@ -733,6 +762,15 @@ struct NodeConfig {
                 // preserve wallet.dat and mik_registration.dat. Exits after reset.
                 reset_chain = true;
             }
+            else if (arg.find("--shutdowntimeout=") == 0) {
+                try {
+                    shutdown_timeout = std::stoi(arg.substr(18));
+                    if (shutdown_timeout < 0) shutdown_timeout = 0;
+                } catch (const std::exception&) {
+                    std::cerr << "ERROR: --shutdowntimeout= requires an integer number of seconds" << std::endl;
+                    return false;
+                }
+            }
             else if (arg == "--yes" || arg == "-y") {
                 // Bypass interactive confirmation (currently only used by --reset-chain)
                 yes_flag = true;
@@ -758,6 +796,35 @@ struct NodeConfig {
             else if (arg == "--public-api") {
                 // Public REST API: bind to 0.0.0.0 for light wallet access (seed nodes only)
                 public_api = true;
+            }
+            else if (arg == "--require-seed-migration") {
+                // LP-7 L1 (opt-in, default OFF): refuse mining/spending while the HD
+                // seed is still plaintext-at-rest. Default behavior is warn-only.
+                require_seed_migration = true;
+            }
+            else if (arg == "--generate-seed-key") {
+                // LP-13: explicit opt-in to mint a NEW seed attestation consensus
+                // key if none exists. Without this flag a missing key fails loud
+                // instead of silently minting an unrecognized signing key.
+                generate_seed_key = true;
+            }
+            else if (arg == "--require-seed-key-encryption") {
+                // LP-13 CL-1: encryption-at-rest is now the DEFAULT, so this flag
+                // is a no-op accepted for backward compatibility with existing
+                // deploy scripts. (It used to be the opt-IN; the default inverted.)
+                // LP-13 (round-2 LOW): emit a one-line DEPRECATION warning so
+                // operators/scripts learn it is now redundant and can drop it.
+                std::cerr << "[WARN] --require-seed-key-encryption is DEPRECATED and now a no-op: "
+                             "seed-key encryption-at-rest is mandatory by DEFAULT. You can remove "
+                             "this flag. (Use --allow-plaintext-seed-key to explicitly opt OUT.)"
+                          << std::endl;
+            }
+            else if (arg == "--allow-plaintext-seed-key") {
+                // LP-13 CL-1: explicit opt-out of default-on seed-key encryption.
+                // Permits writing/running a plaintext (v1) key when no passphrase
+                // is set. Without this flag a missing passphrase is FATAL — the
+                // node refuses to persist or run on an unencrypted consensus key.
+                allow_plaintext_seed_key = true;
             }
             else if (arg.find("--rpcallowhost=") == 0) {
                 // wallet-rpc-login-restore: add an allowed Host header to the
@@ -872,6 +939,8 @@ struct NodeConfig {
         std::cout << "  --mining-address=<addr> Send mining rewards to this address" << std::endl;
         std::cout << "  --rotate-mining-address Use a new HD address for each mined block" << std::endl;
         std::cout << "  --restore-mnemonic=\"words\" Restore wallet from 24-word recovery phrase" << std::endl;
+        std::cout << "  --force-new-wallet     Start a NEW wallet even if wallet.dat cannot be loaded" << std::endl;
+        std::cout << "                         (the old file is copied to wallet.dat.unreadable-<time> first)" << std::endl;
         std::cout << "  --verbose, -v         Show debug output (hidden by default)" << std::endl;
         std::cout << "  --quiet, -q           Quiet mode: only block events, errors, and warnings" << std::endl;
         std::cout << "  --reindex             Rebuild blockchain from scratch (use after crash)" << std::endl;
@@ -885,6 +954,19 @@ struct NodeConfig {
         std::cout << "                          Add --yes to skip the confirmation prompt." << std::endl;
         std::cout << "  --relay-only          Relay-only mode: skip wallet (for seed nodes)" << std::endl;
         std::cout << "  --public-api          Enable public REST API for light wallets (seed nodes)" << std::endl;
+        std::cout << "  --require-seed-migration  Refuse to mine/spend while the wallet's HD seed is" << std::endl;
+        std::cout << "                          still stored UNENCRYPTED at rest (fixed bug LP-7)." << std::endl;
+        std::cout << "                          Default is warn-only; this opt-in flag hard-gates the" << std::endl;
+        std::cout << "                          node until you unlock once to complete the upgrade." << std::endl;
+        std::cout << "  --generate-seed-key   Permit minting a NEW seed attestation key if none exists" << std::endl;
+        std::cout << "                          (first-time provision only; otherwise the node fails loud)." << std::endl;
+        std::cout << "                          Set " << Attestation::SEED_KEY_PASSPHRASE_ENV << " to encrypt it at rest." << std::endl;
+        std::cout << "  --allow-plaintext-seed-key" << std::endl;
+        std::cout << "                          Opt out of default-on seed-key encryption: permit a" << std::endl;
+        std::cout << "                          plaintext (v1) key when " << Attestation::SEED_KEY_PASSPHRASE_ENV << " is unset." << std::endl;
+        std::cout << "                          Default: encryption is MANDATORY (no passphrase => fail loud)." << std::endl;
+        std::cout << "  --require-seed-key-encryption" << std::endl;
+        std::cout << "                          Deprecated no-op (encryption is now the default)." << std::endl;
         std::cout << "  --rpcallowhost=<host> Allow this Host header on the RPC/HTTP server" << std::endl;
         std::cout << "                          (anti-DNS-rebinding allowlist; repeatable)." << std::endl;
         std::cout << "                          Loopback (127.0.0.1/::1/localhost) is always" << std::endl;
@@ -1712,6 +1794,9 @@ std::optional<CBlockTemplate> BuildMiningTemplate(CBlockchainDB& blockchain, CWa
         int dfmpV34ActivationHeight = Dilithion::g_chainParams ?
             Dilithion::g_chainParams->dfmpV34ActivationHeight : 999999999;
 
+        // C-3: saturating heat math gate — single-sourced with the validator.
+        bool dfmpSat = DFMP::DfmpSaturatingMathActive(static_cast<int>(nHeight));
+
         int64_t multiplierFP;
         double payoutHeatMult = 1.0;
 
@@ -1719,17 +1804,23 @@ std::optional<CBlockTemplate> BuildMiningTemplate(CBlockchainDB& blockchain, CWa
             // DFMP v3.4: Verification-aware free tier
             // Verified MIKs: 12 free blocks, Unverified: 3 free blocks
 
-            // Determine verification status of this MIK
-            bool isVerified = true;  // Default: verified (safe fallback during IBD)
-            if (g_node_context.dna_registry) {
-                std::array<uint8_t, 20> mikArr;
-                std::memcpy(mikArr.data(), mikIdentity.data, 20);
-                auto status = g_node_context.dna_registry->get_verification_status(mikArr);
-                isVerified = (status == digital_dna::verification::VerificationStatus::VERIFIED);
-            }
+            // Simplified Option C (D-7): blind verification status — isVerified is forced false
+            // so Q1=STRICT (everyone gets the unverified free-tier=3). The get_verification_status
+            // read is dropped entirely.
+            //
+            // Safety premise: isVerified has ZERO live consensus effect outside this V34 gate.
+            // Every CONSENSUS reader of isVerified / get_verification_status is enumerated here
+            // (pow.cpp, dilithion-node.cpp, dilv-node.cpp — all inside `height >= dfmpV34ActivationHeight`
+            // guards). The only other reader is NON-consensus: an RPC reporter at src/rpc/server.cpp:5623
+            // (getdfmpstatus display) — it still reads real status, so if v3.4 is ever activated its
+            // reported penalty must also be blinded to match consensus (tracked pre-activation item).
+            // dfmpV34ActivationHeight=999999999 on all chains (src/core/chainparams.cpp:96 DIL,
+            // :315 testnet, :468 DilV) — this branch is dead code today. Blinding in place is not a live
+            // consensus change; it is safe-by-construction if v3.4 ever activates.
+            bool isVerified = false;
 
             // MIK identity heat penalty (v3.4 - verification-aware)
-            int64_t mikHeatPenalty = DFMP::CalculateHeatMultiplierFP_V34(heat, isVerified);
+            int64_t mikHeatPenalty = DFMP::CalculateHeatMultiplierFP_V34(heat, isVerified, dfmpSat);
 
             // Payout address heat penalty (uses same verification status as the MIK)
             int64_t payoutHeatPenalty = DFMP::FP_SCALE;  // 1.0x default
@@ -1737,7 +1828,7 @@ std::optional<CBlockTemplate> BuildMiningTemplate(CBlockchainDB& blockchain, CWa
                 DFMP::Identity payoutIdentity = DFMP::DeriveIdentityFromScript(
                     coinbaseTx.vout[0].scriptPubKey);
                 int payoutHeat = DFMP::g_payoutHeatTracker->GetHeat(payoutIdentity);
-                payoutHeatPenalty = DFMP::CalculateHeatMultiplierFP_V34(payoutHeat, isVerified);
+                payoutHeatPenalty = DFMP::CalculateHeatMultiplierFP_V34(payoutHeat, isVerified, dfmpSat);
                 payoutHeatMult = static_cast<double>(payoutHeatPenalty) / DFMP::FP_SCALE;
             }
 
@@ -1748,11 +1839,11 @@ std::optional<CBlockTemplate> BuildMiningTemplate(CBlockchainDB& blockchain, CWa
             int64_t maturityPenalty = DFMP::CalculatePendingPenaltyFP_V34(nHeight, firstSeen);
 
             // Total = maturity x heat
-            multiplierFP = (maturityPenalty * effectiveHeatPenalty) / DFMP::FP_SCALE;
+            multiplierFP = DFMP::CombineMaturityHeatFP(maturityPenalty, effectiveHeatPenalty, dfmpSat);
 
         } else if (static_cast<int>(nHeight) >= dfmpV33ActivationHeight) {
             // DFMP v3.3: No dynamic scaling, linear+exponential penalty (must match validator exactly)
-            int64_t mikHeatPenalty = DFMP::CalculateHeatMultiplierFP_V33(heat);
+            int64_t mikHeatPenalty = DFMP::CalculateHeatMultiplierFP_V33(heat, dfmpSat);
 
             // Payout address heat penalty (v3.3, no dynamic scaling)
             int64_t payoutHeatPenalty = DFMP::FP_SCALE;  // 1.0x default
@@ -1760,7 +1851,7 @@ std::optional<CBlockTemplate> BuildMiningTemplate(CBlockchainDB& blockchain, CWa
                 DFMP::Identity payoutIdentity = DFMP::DeriveIdentityFromScript(
                     coinbaseTx.vout[0].scriptPubKey);
                 int payoutHeat = DFMP::g_payoutHeatTracker->GetHeat(payoutIdentity);
-                payoutHeatPenalty = DFMP::CalculateHeatMultiplierFP_V33(payoutHeat);
+                payoutHeatPenalty = DFMP::CalculateHeatMultiplierFP_V33(payoutHeat, dfmpSat);
                 payoutHeatMult = static_cast<double>(payoutHeatPenalty) / DFMP::FP_SCALE;
             }
 
@@ -1771,11 +1862,11 @@ std::optional<CBlockTemplate> BuildMiningTemplate(CBlockchainDB& blockchain, CWa
             int64_t maturityPenalty = DFMP::CalculatePendingPenaltyFP_V33(nHeight, firstSeen);
 
             // Total = maturity × effective heat
-            multiplierFP = (maturityPenalty * effectiveHeatPenalty) / DFMP::FP_SCALE;
+            multiplierFP = DFMP::CombineMaturityHeatFP(maturityPenalty, effectiveHeatPenalty, dfmpSat);
 
         } else if (static_cast<int>(nHeight) >= dfmpV32ActivationHeight) {
             // DFMP v3.2: Tightened anti-whale (must match validator exactly)
-            int64_t mikHeatPenalty = DFMP::CalculateHeatMultiplierFP_V32(heat, uniqueMiners);
+            int64_t mikHeatPenalty = DFMP::CalculateHeatMultiplierFP_V32(heat, uniqueMiners, dfmpSat);
 
             // Payout address heat penalty (v3.2 aggressive)
             int64_t payoutHeatPenalty = DFMP::FP_SCALE;  // 1.0x default
@@ -1787,7 +1878,7 @@ std::optional<CBlockTemplate> BuildMiningTemplate(CBlockchainDB& blockchain, CWa
                 if (static_cast<int>(nHeight) >= dfmpDynamicScalingHeight) {
                     payoutUniqueMiners = DFMP::g_payoutHeatTracker->GetUniqueMinerCount();
                 }
-                payoutHeatPenalty = DFMP::CalculateHeatMultiplierFP_V32(payoutHeat, payoutUniqueMiners);
+                payoutHeatPenalty = DFMP::CalculateHeatMultiplierFP_V32(payoutHeat, payoutUniqueMiners, dfmpSat);
                 payoutHeatMult = static_cast<double>(payoutHeatPenalty) / DFMP::FP_SCALE;
             }
 
@@ -1798,11 +1889,11 @@ std::optional<CBlockTemplate> BuildMiningTemplate(CBlockchainDB& blockchain, CWa
             int64_t maturityPenalty = DFMP::CalculatePendingPenaltyFP_V32(nHeight, firstSeen);
 
             // Total = maturity × effective heat
-            multiplierFP = (maturityPenalty * effectiveHeatPenalty) / DFMP::FP_SCALE;
+            multiplierFP = DFMP::CombineMaturityHeatFP(maturityPenalty, effectiveHeatPenalty, dfmpSat);
 
         } else if (static_cast<int>(nHeight) >= dfmpV31ActivationHeight) {
             // DFMP v3.1: Softened parameters (must match validator exactly)
-            int64_t mikHeatPenalty = DFMP::CalculateHeatMultiplierFP_V31(heat, uniqueMiners);
+            int64_t mikHeatPenalty = DFMP::CalculateHeatMultiplierFP_V31(heat, uniqueMiners, dfmpSat);
 
             // Payout address heat penalty (v3.1 softened)
             int64_t payoutHeatPenalty = DFMP::FP_SCALE;  // 1.0x default
@@ -1814,7 +1905,7 @@ std::optional<CBlockTemplate> BuildMiningTemplate(CBlockchainDB& blockchain, CWa
                 if (static_cast<int>(nHeight) >= dfmpDynamicScalingHeight) {
                     payoutUniqueMiners = DFMP::g_payoutHeatTracker->GetUniqueMinerCount();
                 }
-                payoutHeatPenalty = DFMP::CalculateHeatMultiplierFP_V31(payoutHeat, payoutUniqueMiners);
+                payoutHeatPenalty = DFMP::CalculateHeatMultiplierFP_V31(payoutHeat, payoutUniqueMiners, dfmpSat);
                 payoutHeatMult = static_cast<double>(payoutHeatPenalty) / DFMP::FP_SCALE;
             }
 
@@ -1825,11 +1916,11 @@ std::optional<CBlockTemplate> BuildMiningTemplate(CBlockchainDB& blockchain, CWa
             int64_t maturityPenalty = DFMP::CalculatePendingPenaltyFP_V31(nHeight, firstSeen);
 
             // Total = maturity × effective heat
-            multiplierFP = (maturityPenalty * effectiveHeatPenalty) / DFMP::FP_SCALE;
+            multiplierFP = DFMP::CombineMaturityHeatFP(maturityPenalty, effectiveHeatPenalty, dfmpSat);
 
         } else if (static_cast<int>(nHeight) >= dfmpV3ActivationHeight) {
             // DFMP v3.0: Multi-layer penalty (must match validator exactly)
-            int64_t mikHeatPenalty = DFMP::CalculateHeatMultiplierFP(heat, uniqueMiners);
+            int64_t mikHeatPenalty = DFMP::CalculateHeatMultiplierFP(heat, uniqueMiners, dfmpSat);
 
             // Payout address heat penalty
             int64_t payoutHeatPenalty = DFMP::FP_SCALE;  // 1.0x default
@@ -1841,7 +1932,7 @@ std::optional<CBlockTemplate> BuildMiningTemplate(CBlockchainDB& blockchain, CWa
                 if (static_cast<int>(nHeight) >= dfmpDynamicScalingHeight) {
                     payoutUniqueMiners = DFMP::g_payoutHeatTracker->GetUniqueMinerCount();
                 }
-                payoutHeatPenalty = DFMP::CalculateHeatMultiplierFP(payoutHeat, payoutUniqueMiners);
+                payoutHeatPenalty = DFMP::CalculateHeatMultiplierFP(payoutHeat, payoutUniqueMiners, dfmpSat);
                 payoutHeatMult = static_cast<double>(payoutHeatPenalty) / DFMP::FP_SCALE;
             }
 
@@ -1852,7 +1943,7 @@ std::optional<CBlockTemplate> BuildMiningTemplate(CBlockchainDB& blockchain, CWa
             int64_t maturityPenalty = DFMP::CalculatePendingPenaltyFP(nHeight, firstSeen);
 
             // Total = maturity × effective heat
-            multiplierFP = (maturityPenalty * effectiveHeatPenalty) / DFMP::FP_SCALE;
+            multiplierFP = DFMP::CombineMaturityHeatFP(maturityPenalty, effectiveHeatPenalty, dfmpSat);
         } else {
             // DFMP v2.0: Standard penalty
             multiplierFP = DFMP::CalculateTotalMultiplierFP(nHeight, firstSeen, heat, uniqueMiners);
@@ -1866,17 +1957,12 @@ std::optional<CBlockTemplate> BuildMiningTemplate(CBlockchainDB& blockchain, CWa
         if (multiplier > 1.01) {
             const char* versionTag;
             double maturityMult, heatMult;
-            bool logIsVerified = true;
+            // Simplified Option C (D-7): log-path mirrors dispatch — logIsVerified forced false
+            // (see dispatch-site comment above for full safety premise).
+            bool logIsVerified = false;
             if (static_cast<int>(nHeight) >= dfmpV34ActivationHeight) {
                 versionTag = "v3.4";
                 maturityMult = DFMP::GetPendingPenalty_V34(nHeight, firstSeen);
-                // Determine verification status for logging
-                if (g_node_context.dna_registry) {
-                    std::array<uint8_t, 20> mikArr;
-                    std::memcpy(mikArr.data(), mikIdentity.data, 20);
-                    auto status = g_node_context.dna_registry->get_verification_status(mikArr);
-                    logIsVerified = (status == digital_dna::verification::VerificationStatus::VERIFIED);
-                }
                 heatMult = DFMP::GetHeatMultiplier_V34(heat, logIsVerified);
             } else if (static_cast<int>(nHeight) >= dfmpV33ActivationHeight) {
                 versionTag = "v3.3";
@@ -1957,6 +2043,16 @@ std::optional<CBlockTemplate> BuildMiningTemplate(CBlockchainDB& blockchain, CWa
 }
 
 int main(int argc, char* argv[]) {
+    // FIRST local in main, so it is the LAST thing destroyed on the way out.
+    // This node starts RandomX FULL-mode init in a background thread on any host
+    // with >=8GB RAM (see the IBD-speedup branch below) whether or not it mines,
+    // and that thread lives in a namespace-scope std::thread. Left joinable, its
+    // destructor runs at static-destruction time and calls std::terminate() --
+    // after main has returned, so the process aborts (exit 3 on Windows, 134 on
+    // Linux) instead of exiting with the code the code below chose. The wallet
+    // guard's `return 1` was one of the casualties.
+    RandomXShutdownGuard randomx_shutdown_guard;
+
 #ifdef _WIN32
     // Register crash handler to log crash info before terminating
     SetUnhandledExceptionFilter(CrashHandler);
@@ -2567,6 +2663,10 @@ int main(int argc, char* argv[]) {
         // Step 3: For 8GB+ systems, start FULL mode init NOW for faster IBD verification
         // This makes IBD ~20x faster since FULL mode verifies at ~100 H/s vs ~5 H/s
         if (total_ram_mb >= 8192) {
+            // Large pages only if this node actually mines. This branch also fires on
+            // relay-only nodes, which would otherwise pin ~2GB of non-swappable memory
+            // for an IBD speedup they do not need.
+            randomx_set_large_pages_allowed(config.start_mining ? 1 : 0);
             std::cout << "  Starting FULL mode init for faster IBD (8GB+ RAM detected)..." << std::endl;
             randomx_init_mining_mode_async(rx_key, strlen(rx_key));
         }
@@ -2576,7 +2676,12 @@ int main(int argc, char* argv[]) {
         // Load and verify genesis block
 load_genesis_block:  // Bug #29: Label for automatic retry after blockchain wipe
         std::cout << "[1/6] Loading genesis block..." << std::flush;
-        CBlock genesis = Genesis::CreateGenesisBlock();
+        // Dispatch on the chain's real VDF configuration rather than hard-coding
+        // the legacy constructor. Hard-coding CreateGenesisBlock() here made
+        // `--testnet` and `--regtest` unbootable: both are VDF-from-genesis
+        // chains, so IsGenesisBlock() below expected a VDF (v4) genesis and was
+        // handed a legacy (v1) one -> "Genesis block verification failed".
+        CBlock genesis = Genesis::CreateGenesisBlockForChain();
 
         if (!Genesis::IsGenesisBlock(genesis)) {
             ErrorMessage error = CErrorFormatter::ValidationError("genesis block", 
@@ -2595,13 +2700,19 @@ load_genesis_block:  // Bug #29: Label for automatic retry after blockchain wipe
         }
 
         std::cout << "  Network: " << Dilithion::g_chainParams->GetNetworkName() << std::endl;
-        std::cout << "  Genesis hash: " << genesis.GetHash().GetHex() << std::endl;
+        std::cout << "  Genesis hash: " << Genesis::GetGenesisHash().GetHex() << std::endl;
         std::cout << "  Genesis time: " << genesis.nTime << std::endl;
         std::cout << " ✓" << std::endl;
         std::cout << "  [OK] Genesis block verified" << std::endl;
 
-        // Initialize blockchain with genesis block if needed
-        uint256 genesisHash = genesis.GetHash();
+        // Initialize blockchain with genesis block if needed.
+        // Use the single-source, integrity-validated accessor (Genesis::GetGenesisHash)
+        // instead of recomputing genesis.GetHash() here: it self-corrects a transient
+        // genesis miscompute to the chainparams-pinned value, so the DB key can never
+        // be a wrong genesis (which would strand the node on a private chain peers
+        // ban for `invalid_genesis`). See node/genesis.cpp GetGenesisHash().
+        uint256 genesisHash = Genesis::GetGenesisHash();
+
         if (!blockchain.BlockExists(genesisHash)) {
             std::cout << "Initializing blockchain with genesis block..." << std::endl;
 
@@ -3105,6 +3216,51 @@ load_genesis_block:  // Bug #29: Label for automatic retry after blockchain wipe
             return 1;
         }
         std::cout << "  [OK] NodeContext initialized" << std::endl;
+
+        // g_node_context is a namespace-scope global that OWNS worker threads
+        // (CConnman's socket/message/open-connections/headers/blocks threads, the
+        // validation queue, the headers manager). NodeContext::Shutdown() is called
+        // exactly once, on the normal shutdown path at the bottom of main. Every
+        // early `return` after this point therefore left those threads to be torn
+        // down at STATIC-destruction time, after main had already returned — the
+        // same shape as the RandomX init threads, one level of indirection down.
+        //
+        // Declared HERE, not at the top of main, and that placement is the point:
+        // destruction is reverse of declaration, so this runs AFTER everything
+        // declared below it (the RPC/HTTP servers, the maintenance thread) and
+        // BEFORE the chain database and UTXO set declared above it — which is
+        // exactly the order the threads' references require. A guard at the top of
+        // main would shut the network down after its database had been closed.
+        //
+        // Shutdown() is idempotent (every step is null-guarded and resets its
+        // pointer), so the explicit call on the normal path leaves this a no-op.
+        //
+        // K2-(2): the NORMAL shutdown sequence arms a deadline and names every
+        // stage it enters. Early returns and exception unwinds do not run that
+        // sequence -- they land here instead, and used to call
+        // g_node_context.Shutdown() (and through it CConnman::Stop(), the very
+        // call measured hanging past 120s) with no bound and no stage logging.
+        // That traded a deterministic abort for a potentially unbounded,
+        // invisible hang on exactly the paths an operator is least able to
+        // diagnose. Arm the same instrumented bound here.
+        //
+        // ArmWatchdog() returns false -- so this stays a silent no-op -- when
+        // the normal sequence already ran (Disarmed) or is still in flight
+        // (Armed). Only a genuine unwind takes ownership.
+        struct NodeContextShutdownGuard {
+            int timeout_seconds;
+            ~NodeContextShutdownGuard() {
+                const bool owned = Dilithion::ShutdownProgress::ArmWatchdog(timeout_seconds);
+                if (owned) {
+                    Dilithion::ShutdownProgress::Stage(
+                        "NodeContext::Shutdown (early-return / unwind path)");
+                }
+                g_node_context.Shutdown();
+                // No Disarm even when owned: RandomXShutdownGuard destructs
+                // after this guard and owns the final Disarm, so the deadline
+                // also covers its randomx thread joins on the unwind path.
+            }
+        } node_context_shutdown_guard{config.shutdown_timeout};
 
         // Phase 2: Initialize async block validation queue for IBD performance
         std::cout << "Initializing async block validation queue..." << std::endl;
@@ -3842,7 +3998,24 @@ load_genesis_block:  // Bug #29: Label for automatic retry after blockchain wipe
         rest_api.RegisterUTXOSet(&utxo_set);
         rest_api.RegisterChainState(&g_chainstate);
         rest_api.SetTestnet(config.testnet);
-        // Note: Rate limiter is optional for HTTP server (RPC server has its own)
+        // LP-12: wire a per-IP rate limiter onto the standalone HTTP server's
+        // REST instance. Previously this was left null ("optional"), so the
+        // public REST broadcast endpoint (ENDPOINT_BROADCAST) returned "allow"
+        // for every request on a --public-api node. The CHttpServer now plumbs
+        // the real peer IP (see http_server.cpp), so this limiter keys per-IP.
+        static CRateLimiter http_rest_rate_limiter;
+        rest_api.RegisterRateLimiter(&http_rest_rate_limiter);
+        // LP-12 (M-01): also hand the limiter to the HTTP server so it runs the
+        // periodic CleanupOldRecords() maintenance (mirrors the RPC server's
+        // cleanup thread). Without this the per-IP record map grows unbounded as
+        // source IPs rotate (slow memory-DoS) on a --public-api node.
+        http_server.SetRateLimiter(&http_rest_rate_limiter);
+
+        // LP-12 (H-01): configure the anti-DNS-rebinding Host allowlist on the
+        // HTTP server's REST surface, reusing the SAME source as the RPC server
+        // (config.rpc_allow_hosts / --rpcallowhost; loopback always allowed).
+        // Must run before Start() so worker threads see a ready, fail-closed gate.
+        http_server.ConfigureHostAllowlist(config.rpc_allow_hosts);
 
         http_server.SetRestApiHandler([](const std::string& method,
                                          const std::string& path,
@@ -5077,6 +5250,9 @@ load_genesis_block:  // Bug #29: Label for automatic retry after blockchain wipe
         // BUG #56 FIX: Full wallet persistence with Bitcoin Core pattern
         CWallet wallet;
         g_node_state.wallet = &wallet;
+        // LP-7 L1 (opt-in, default OFF): when --require-seed-migration is set, the
+        // wallet refuses to sign spends while the HD seed is still plaintext-at-rest.
+        wallet.SetRequireSeedMigration(config.require_seed_migration);
         // Phase 1.5: also wire the wallet into NodeContext so BroadcastDNASample
         // can find the MIK private key for signing. Without this, signed-DNA
         // broadcasts are silently skipped and Phase 1.5 has no effect on the wire.
@@ -5117,7 +5293,19 @@ load_genesis_block:  // Bug #29: Label for automatic retry after blockchain wipe
                     std::cout << "  [OK] Wallet synced - balance: " << std::fixed << std::setprecision(8)
                               << (static_cast<double>(mature) / 100000000.0) << " DIL" << std::endl;
                 } else {
-                    std::cerr << "  WARNING: Failed to load wallet" << std::endl;
+                    // Relay-only deliberately does NOT abort: seed nodes run in this
+                    // mode and an unreadable wallet must not take the fleet down on a
+                    // rolling deploy. There is no overwrite risk here — SetWalletFile()
+                    // is only reached on the success path, so nothing will write back
+                    // to wallet_path — but preserve a copy and say so plainly.
+                    const std::string preserved = PreserveUnreadableWallet(wallet_path);
+                    std::cerr << "  WARNING: wallet.dat exists but could not be loaded."
+                              << " Continuing relay-only WITHOUT a wallet." << std::endl;
+                    std::cerr << "           The file has not been modified." << std::endl;
+                    if (!preserved.empty()) {
+                        std::cerr << "           Preserved copy: " << preserved << std::endl;
+                    }
+                    std::cerr.flush();
                 }
             } else {
                 std::cout << "Initializing wallet... SKIPPED (relay-only, no wallet.dat)" << std::endl;
@@ -5128,22 +5316,146 @@ load_genesis_block:  // Bug #29: Label for automatic retry after blockchain wipe
         // Build wallet file path
         std::cout << "  Wallet file: " << wallet_path << std::endl;
 
-        // Try to load existing wallet from disk
-        if (std::filesystem::exists(wallet_path)) {
-            std::cout << "[3/6] Loading wallet..." << std::flush;
-            std::cout.flush();
-            if (wallet.Load(wallet_path)) {
-                wallet_loaded = true;
-                std::cout << " ✓" << std::endl;
-                std::cout << "  [OK] Wallet loaded (" << wallet.GetAddresses().size() << " addresses)" << std::endl;
-                std::cout << "       Best block: height " << wallet.GetBestBlockHeight() << std::endl;
+        // Classify the file on disk BEFORE handing it to CWallet::Load().
+        // Load() returns one undifferentiated `false` for a 0-byte file, a file
+        // held open by an antivirus scanner, and a genuinely corrupt wallet —
+        // and only the last of those is worth refusing to start over. Treating
+        // all three as corruption bricked the node on EVERY subsequent start,
+        // with a message that told the user not to remove the blocking file.
+        // See wallet/wallet_load_guard.h.
+        std::string wallet_probe_detail;
+        const WalletFileState wallet_state =
+            ClassifyWalletFileWithRetry(wallet_path, &wallet_probe_detail);
+
+        // Fail-closed cases only. `wallet_locked` picks the wording: a lock is
+        // not corruption and must not be described as such.
+        bool wallet_unreadable = false;
+        bool wallet_locked = false;
+
+        switch (wallet_state) {
+            case WalletFileState::Absent:
+                std::cout << "  No existing wallet found." << std::endl;
+                break;
+            case WalletFileState::Empty:
+                // Shorter than the 8-byte magic, so it cannot contain a key in
+                // any wallet format this project has ever written. Nothing can
+                // be lost by proceeding. This is the installer-pre-creates-the-
+                // file / unhydrated-cloud-placeholder / interrupted-first-run
+                // case, which used to be permanently fatal.
+                std::cout << "  Existing wallet.dat is empty (no wallet header), "
+                          << "treating as no wallet found." << std::endl;
+                break;
+            case WalletFileState::Unopenable:
+                wallet_unreadable = true;
+                wallet_locked = true;
+                break;
+            case WalletFileState::Invalid:
+                wallet_unreadable = true;
+                break;
+            case WalletFileState::Present:
+                std::cout << "[3/6] Loading wallet..." << std::flush;
                 std::cout.flush();
-            } else {
-                std::cerr << "  WARNING: Failed to load wallet, creating new one" << std::endl;
+                if (wallet.Load(wallet_path)) {
+                    wallet_loaded = true;
+                    std::cout << " ✓" << std::endl;
+                    std::cout << "  [OK] Wallet loaded (" << wallet.GetAddresses().size() << " addresses)" << std::endl;
+                    std::cout << "       Best block: height " << wallet.GetBestBlockHeight() << std::endl;
+                    std::cout.flush();
+                } else {
+                    wallet_unreadable = true;
+                }
+                break;
+        }
+
+        if (wallet_unreadable) {
+            // An existing-but-unreadable wallet must NEVER fall through to
+            // creation: the create path ends in Save(wallet_path), which
+            // atomically renames over this file and destroys the keys.
+            // Preserve a copy, tell the user what to do, and stop.
+            const std::string preserved = PreserveUnreadableWallet(wallet_path);
+            // Both overrides are explicit, destructive-by-request instructions
+            // from the user, and both are honoured ONLY after a copy exists.
+            const bool user_override =
+                !config.restore_mnemonic.empty() || config.force_new_wallet;
+            if (user_override) {
+                // The user explicitly asked to restore from a phrase, or to
+                // start a new wallet anyway. Those are the remedies this guard
+                // advertises. Honour them: the path below will Save() over
+                // wallet_path, so this IS destructive — but it is destruction
+                // the user asked for, and only after a copy has been preserved.
+                // Refusing here would make the printed instructions impossible
+                // to follow.
+                if (preserved.empty()) {
+                    std::cerr << std::endl;
+                    std::cerr << "  ERROR: wallet.dat could not be loaded, and no backup copy" << std::endl;
+                    std::cerr << "         could be written. Refusing to write over it." << std::endl;
+                    std::cerr << "         Copy wallet.dat somewhere safe, then retry." << std::endl;
+                    std::cerr.flush();
+                    return 1;
+                }
+                std::cerr << std::endl;
+                std::cerr << "  NOTE: the existing wallet.dat could not be loaded." << std::endl;
+                std::cerr << "        A copy has been preserved at:" << std::endl;
+                std::cerr << "          " << preserved << std::endl;
+                if (!config.restore_mnemonic.empty()) {
+                    std::cerr << "        Continuing with the requested restore, which will replace" << std::endl;
+                    std::cerr << "        wallet.dat with a wallet derived from your recovery phrase." << std::endl;
+                } else {
+                    std::cerr << "        Continuing because --force-new-wallet was given, which will" << std::endl;
+                    std::cerr << "        replace wallet.dat with a NEW, EMPTY wallet. The old file is" << std::endl;
+                    std::cerr << "        kept only at the path above — keep it safe." << std::endl;
+                }
                 std::cerr.flush();
+            } else if (wallet_locked) {
+                // Nothing is known about the contents: the file could not be
+                // opened at all, after retries. That reads as a lock or a
+                // permissions problem, NOT as corruption, and saying "corrupt"
+                // here sends users to recovery procedures they do not need.
+                std::cerr << std::endl;
+                std::cerr << "  ERROR: wallet.dat exists but could not be OPENED." << std::endl;
+                if (!wallet_probe_detail.empty()) {
+                    std::cerr << "         Reason: " << wallet_probe_detail << std::endl;
+                }
+                std::cerr << "         This usually means another process is holding the file" << std::endl;
+                std::cerr << "         (a second node, antivirus, a backup or cloud-sync client)," << std::endl;
+                std::cerr << "         or that the file is not readable by this user." << std::endl;
+                std::cerr << "         It does NOT mean your wallet is damaged, and nothing was" << std::endl;
+                std::cerr << "         written to it. Retried several times before giving up." << std::endl;
+                std::cerr << "         Try: close any other Dilithion node, make sure the file has" << std::endl;
+                std::cerr << "         hydrated if it lives in OneDrive/Dropbox/iCloud, check the" << std::endl;
+                std::cerr << "         file's permissions, then start again." << std::endl;
+                std::cerr << "         Stopping now. This is a deliberate stop, not a crash —" << std::endl;
+                std::cerr << "         your wallet file was left exactly as it was." << std::endl;
+                std::cerr.flush();
+                return 1;
+            } else {
+                std::cerr << std::endl;
+                std::cerr << "  ERROR: wallet.dat exists but could not be loaded." << std::endl;
+                std::cerr << "         Refusing to start, because creating a new wallet here would" << std::endl;
+                std::cerr << "         overwrite this file and destroy the keys in it." << std::endl;
+                if (!preserved.empty()) {
+                    std::cerr << "         A copy has been preserved at:" << std::endl;
+                    std::cerr << "           " << preserved << std::endl;
+                } else {
+                    std::cerr << "         WARNING: a backup copy could NOT be written. Copy" << std::endl;
+                    std::cerr << "         wallet.dat somewhere safe before doing anything else." << std::endl;
+                }
+                std::cerr << "         Your coins live on the chain, not in this file." << std::endl;
+                std::cerr << "         If you HAVE your 24-word recovery phrase, rerun with:" << std::endl;
+                std::cerr << "           --restore-mnemonic=\"<your 24 words>\"" << std::endl;
+                std::cerr << "         which will restore over this file (the preserved copy is kept)." << std::endl;
+                std::cerr << "         If you never had a wallet here and just want to start with a" << std::endl;
+                std::cerr << "         fresh one, rerun with:" << std::endl;
+                std::cerr << "           --force-new-wallet" << std::endl;
+                std::cerr << "         which also keeps the preserved copy. Do NOT use it if this" << std::endl;
+                std::cerr << "         file might hold coins you have no recovery phrase for." << std::endl;
+                std::cerr << "         If you do NOT have the phrase, do not delete wallet.dat —" << std::endl;
+                std::cerr << "         keep it and report this with the version you upgraded from." << std::endl;
+                std::cerr << "         Stopping now. This is a deliberate stop, not a crash —" << std::endl;
+                std::cerr << "         your wallet file was left exactly as it was." << std::endl;
+                std::cerr.flush();
+                return 1;
             }
-        } else {
-            std::cout << "  No existing wallet found." << std::endl;
         }
 
         // Generate HD wallet if wallet is empty (new wallet creation) or restore from mnemonic
@@ -5686,6 +5998,25 @@ load_genesis_block:  // Bug #29: Label for automatic retry after blockchain wipe
             }
         }
 
+        // LP-7 L1 (opt-in --require-seed-migration, default OFF): when the operator
+        // has opted in, REFUSE to mine while the HD seed is still plaintext-at-rest.
+        // (Unlocking above normally drives the one-time v7 migration and clears this;
+        // we still gate here for the case it did not complete — e.g. unlock failed, or
+        // migration could not persist.) Default OFF preserves the warn-only behavior:
+        // the operator is surfaced the state but not blocked.
+        if (config.require_seed_migration && config.start_mining && wallet.NeedsSeedMigration()) {
+            std::cerr << std::endl;
+            std::cerr << "  ERROR (--require-seed-migration): wallet HD seed is still stored" << std::endl;
+            std::cerr << "  UNENCRYPTED at rest (fixed bug LP-7). Refusing to mine." << std::endl;
+            std::cerr << "  Unlock the wallet ONCE to complete the one-time security upgrade:" << std::endl;
+            std::cerr << "    walletpassphrase <password> <timeout>" << std::endl;
+            std::cerr << "  Then restart with --mine. (Omit --require-seed-migration to run" << std::endl;
+            std::cerr << "  in warn-only mode.)" << std::endl;
+            std::cerr << std::endl;
+            config.start_mining = false;
+            g_node_state.mining_enabled = false;
+        }
+
         }  // end else (!relay_only)
 
         // =========================================================================
@@ -5896,12 +6227,15 @@ load_genesis_block:  // Bug #29: Label for automatic retry after blockchain wipe
                         minerAddr, static_cast<uint32_t>(height));
                 }
 
-                // Block relay credit for our own registered identity
+                // Block relay credit for our own registered identity.
+                // Cheap address-only accessor — NOT the full get_dna() (~440KB deep-copy).
+                // Same hot-path allocator-churn fix as dilv-node (DIL churns slower, but
+                // the waste — copying 440KB to read a 20-byte address — is identical).
                 if (collector) {
-                    auto my_dna = collector->get_dna();
-                    if (my_dna && g_node_context.dna_registry->is_registered(my_dna->address)) {
+                    auto my_addr = collector->get_address_if_ready();
+                    if (my_addr && g_node_context.dna_registry->is_registered(*my_addr)) {
                         g_node_context.trust_manager->on_block_relayed(
-                            my_dna->address, static_cast<uint32_t>(height));
+                            *my_addr, static_cast<uint32_t>(height));
                     }
                 }
             }
@@ -6515,6 +6849,25 @@ load_genesis_block:  // Bug #29: Label for automatic retry after blockchain wipe
         // Phase 5: Updated to use CConnman instead of CConnectionManager
         std::cerr.flush();
         std::thread p2p_maint_thread;
+        // SAME DEFECT CLASS AS THE RANDOMX INIT THREADS, one scope down: this
+        // std::thread is joined exactly once, at the bottom of main on the normal
+        // shutdown path. Every `return` between here and there — the seed-attestation
+        // FATAL a few hundred lines below is a live example, and it fires on any
+        // relay whose seed key is plaintext — destroys it while still joinable, and
+        // a joinable std::thread destructor calls std::terminate(). Observed: exit 3
+        // and "terminate called without an active exception" in place of the
+        // intended exit 1. A joiner declared immediately after the thread runs on
+        // every path out of this scope; on the normal path the explicit join below
+        // has already run and this is a no-op.
+        struct MaintThreadJoiner {
+            std::thread& t;
+            ~MaintThreadJoiner() {
+                if (t.joinable()) {
+                    g_node_state.running = false;  // break the maintenance loop
+                    t.join();
+                }
+            }
+        } p2p_maint_joiner{p2p_maint_thread};
         try {
             p2p_maint_thread = std::thread([&feeler_manager]() {
             // Phase 1.1: Wrap thread entry point in try/catch to prevent silent crashes
@@ -6862,8 +7215,13 @@ load_genesis_block:  // Bug #29: Label for automatic retry after blockchain wipe
                     }
 #endif
 
-                    // Sleep for 30 seconds between maintenance cycles
-                    std::this_thread::sleep_for(std::chrono::seconds(30));
+                    // Sleep for 30 seconds between maintenance cycles, polled in
+                    // 1s steps. This thread is JOINED on the way out (see the
+                    // joiner where it is declared); an uninterruptible 30s sleep
+                    // would add up to 30s to every exit, error returns included.
+                    for (int maint_tick = 0; maint_tick < 30 && g_node_state.running; ++maint_tick) {
+                        std::this_thread::sleep_for(std::chrono::seconds(1));
+                    }
                 } catch (const std::system_error& e) {
                     std::cerr << "[P2P-Maint] System error in maintenance loop: " << e.what()
                               << " (code: " << e.code() << ")" << std::endl;
@@ -6928,12 +7286,26 @@ load_genesis_block:  // Bug #29: Label for automatic retry after blockchain wipe
                 CRPCServer::NotifyBlockTipChanged();
             });
 
-        // Phase 2+3: Seed attestation initialization (relay-only seed nodes only)
+        // Phase 2+3: Seed attestation initialization (DIL seed-capable nodes)
         // Loads ASN database and attestation signing key so seeds can serve
         // getmikattestation RPC requests from miners.
+        //
+        // LP-13 (DIL parity with the dilv-node H-3 fix): gate on
+        // `relay_only || public_api`, NOT bare `relay_only`. Verified live
+        // 2026-06-14: NYC's DIL node runs `--public-api` WITHOUT `--relay-only`
+        // (it is the bridge host), so under the prior bare-relay_only gate NYC's
+        // seed_attestation_key.dat existed on disk but was never loaded —
+        // getmikattestation returned "only available on seed nodes" — leaving DIL
+        // at exactly 3-of-4 functional attestation (MIN_ATTESTATIONS=3) with ZERO
+        // margin. This is the SAME failure mode the DilV v4.3 fix (2026-05-04)
+        // addressed for DilV but which was never applied to DIL. Every DIL seed
+        // runs --public-api (NYC included) to serve light wallets; a plain miner
+        // runs neither flag. Bridge ops are unaffected: init only registers an RPC
+        // handler + loads keys.
+        const bool seedCapable = config.relay_only || config.public_api;
         static Attestation::CSeedAttestationKey seedAttestKey;
         static CASNDatabase asnDatabase;
-        if (config.relay_only && Dilithion::g_chainParams) {
+        if (seedCapable && Dilithion::g_chainParams) {
             std::string dataDir = Dilithion::g_chainParams->dataDir;
 
             // Load ASN database from data directory (or project root)
@@ -6948,6 +7320,17 @@ load_genesis_block:  // Bug #29: Label for automatic retry after blockchain wipe
             }
 
             if (asnDatabase.IsLoaded()) {
+                // Finding B + Fix 1 (extreview PR#121): the datacenter ASN list is a
+                // SEPARATE defense from attestation capacity — it powers the
+                // datacenter-IP Sybil ban via IsDatacenterIP(). An EMPTY datacenter
+                // set makes IsDatacenterIP() fail OPEN (always false). On a
+                // datacenter-ban chain a seed would then sign attestations for
+                // datacenter miners it must reject; the gate folded into
+                // ResolveSeedIdentity below DEGRADES that case instead. DIL is a
+                // NON-ban chain (attestationDatacenterBan==false), so the datacenter
+                // list is not a consensus input here and a missing list is inert —
+                // the gate never demotes a DIL seed. We load the list (no-op effect
+                // on DIL) and let ResolveSeedIdentity decide.
                 std::string dcPath = dataDir + "/datacenter-asns.txt";
                 if (!asnDatabase.LoadDatacenterList(dcPath)) {
                     asnDatabase.LoadDatacenterList("datacenter-asns.txt");
@@ -6957,27 +7340,150 @@ load_genesis_block:  // Bug #29: Label for automatic retry after blockchain wipe
                           << " datacenter ASNs)" << std::endl;
             }
 
-            // Load or generate attestation key
-            if (seedAttestKey.LoadOrGenerate(dataDir)) {
-                int seedId = -1;
-                const auto& seedIPs = Dilithion::g_chainParams->seedAttestationIPs;
-                if (!config.external_ip.empty()) {
-                    for (size_t i = 0; i < seedIPs.size(); i++) {
-                        if (seedIPs[i] == config.external_ip) {
-                            seedId = static_cast<int>(i);
-                            break;
-                        }
-                    }
+            // Load or generate attestation key (LP-13: minting gated behind
+            // --generate-seed-key so a reprovisioned seed fails loud).
+            //
+            // LP-13 M-1 (fail-stop on GENUINE failure): a key file PRESENT but
+            // unusable (corrupt / decrypt-or-parse failure / wrong-or-missing
+            // passphrase / plaintext-when-encryption-required), OR a requested
+            // mint that could not be persisted, is a real attestation outage. On
+            // a seed-capable node we ABORT startup rather than run silently
+            // without attestation. The ONLY benign (non-fatal) case is: NO key
+            // file AND no --generate-seed-key — the relay simply doesn't attest
+            // (status-quo missing-key path: boot non-attesting, no fatal).
+            //
+            // LP-13 CL-1: LoadOrGenerate enforces default-on encryption — a loaded
+            // v1 plaintext key is migrated to v2 when the passphrase is set, and
+            // refused (fatal) when no passphrase + no --allow-plaintext-seed-key.
+            //
+            // LP-13 (extreview HIGH): PRESENCE test (stat), not ifstream::good()
+            // readability — a present-but-unreadable key must still be treated as
+            // present so genuineFailure fires (fail loud, M-1). See SeedKeyFilePresent.
+            bool keyFileExists = Attestation::SeedKeyFilePresent(dataDir);
+            bool attestOk = seedAttestKey.LoadOrGenerate(
+                dataDir, config.generate_seed_key, config.allow_plaintext_seed_key);
+            if (!attestOk) {
+                bool genuineFailure = keyFileExists || config.generate_seed_key;
+                if (genuineFailure) {
+                    std::cerr << "[Attestation] FATAL: seed attestation key initialization FAILED "
+                                 "(key file present but unreadable/corrupt, decrypt/parse failure, "
+                                 "wrong/missing " << Attestation::SEED_KEY_PASSPHRASE_ENV
+                              << ", plaintext key without --allow-plaintext-seed-key, or a "
+                                 "requested mint that could not be persisted). A seed must not run "
+                                 "without a usable consensus signing key. Aborting startup." << std::endl;
+                    return 1;
                 }
-                if (seedId < 0) {
-                    seedId = 0;
-                    std::cerr << "[Attestation] WARNING: Could not determine seed ID. "
-                              << "Use --externalip=<IP> to set. Defaulting to seed_id=0" << std::endl;
+                std::cerr << "[Attestation] No seed attestation key and minting not requested; "
+                             "this relay will not serve attestations." << std::endl;
+            } else {
+                // M-1/M-2 (seed key-identity validation, fail-LOUD) + HIGH-1/HIGH-2
+                // fold. Resolve our --externalip to a seed_id and decide the
+                // disposition. seedAttestationIPs[i] and seedAttestationPubkeys[i]
+                // are index-aligned (NYC/London/Singapore/Sydney), so a resolved
+                // index is also the index into the consensus pubkey set. The
+                // resolve+validate decision is a pure, unit-tested helper
+                // (ResolveSeedIdentity) so the FATAL/SKIP/REGISTER glue is covered
+                // by tests, not only the pubkey-equality primitive.
+                const auto& seedIPs = Dilithion::g_chainParams->seedAttestationIPs;
+                const auto& seedPubkeys = Dilithion::g_chainParams->seedAttestationPubkeys;
+                // Fix 1: pass the datacenter-ban chain flag and whether the
+                // datacenter ASN list actually loaded. On DIL (non-ban) the flag is
+                // false, so this is inert and a DIL seed REGISTERs on identity match
+                // exactly as before.
+                Attestation::SeedIdentityResult ident = Attestation::ResolveSeedIdentity(
+                    seedIPs, seedPubkeys, config.external_ip, seedAttestKey.GetPubKey(),
+                    asnDatabase.IsLoaded(),
+                    Dilithion::g_chainParams->attestationDatacenterBan,
+                    asnDatabase.DatacenterASNCount() > 0);
+
+                bool registerSeed = false;
+                switch (ident.decision) {
+                    case Attestation::SeedIdentityDecision::FATAL_MISMATCH:
+                        // Genuine misconfig: externalip resolved to a real seed slot
+                        // but the loaded/minted key's pubkey does NOT match
+                        // seedAttestationPubkeys[seed_id]. This key cannot produce
+                        // attestations consensus accepts for this seed_id. Fail loud.
+                        std::cerr << "[Attestation] FATAL: loaded/minted seed key pubkey does NOT "
+                                     "match seedAttestationPubkeys[" << ident.seedId << "] for the "
+                                     "resolved seed_id. This key cannot produce attestations consensus "
+                                     "accepts for this seed_id (wrong key file, wrong seed_id, or a "
+                                     "minted key not registered in chainparams). Aborting startup."
+                                  << std::endl;
+                        return 1;
+                    case Attestation::SeedIdentityDecision::SKIP_NOT_A_SEED:
+                        // HIGH-1 fix: a configured seed set is present but this node's
+                        // --externalip matches no configured seed slot. This node is
+                        // NOT one of the seeds (e.g. a third-party --public-api
+                        // explorer/exchange/former-seed that merely carries a key
+                        // file). Do NOT register and do NOT abort — a non-seed's
+                        // attestations are rejected by consensus anyway, so skipping
+                        // is correct and keeps the node available (zero security loss).
+                        std::cerr << "[Attestation] WARNING: this node's --externalip does not match a "
+                                     "configured seed; not registering as an attestation seed "
+                                     "(continuing to run normally). Set --externalip=<this seed's "
+                                     "configured public IP> only if this node IS one of the seeds."
+                                  << std::endl;
+                        break;
+                    case Attestation::SeedIdentityDecision::DEGRADED_NO_ASN:
+                        // H-3 (consolidated): identity is VALID for this seed, but the
+                        // ASN database failed to load -> zero attestation capacity.
+                        // Do NOT abort (that would take relay/P2P/--public-api offline
+                        // for an attestation-only fault — the rejected over-correction,
+                        // fatal on the known ASN-file-lost-on-rotation incident). Do NOT
+                        // silently skip (the original H-3 bug — a "healthy"-looking seed
+                        // with zero capacity). Instead: log a LOUD persistent ERROR with
+                        // operator guidance, keep the node ONLINE, leave attestation
+                        // UNregistered, and register a degraded marker so
+                        // getmikattestation returns a DISTINCT diagnosable error.
+                        std::cerr << "[Attestation] ERROR: seed identity is valid (seed_id="
+                                  << ident.seedId << ") but the ASN database FAILED to load "
+                                     "(missing/unparseable " << dataDir << "/ip2asn-v4.tsv or "
+                                     "./ip2asn-v4.tsv). Attestation is DISABLED — this seed has zero "
+                                     "attestation capacity and getmikattestation will report "
+                                     "\"ASN database not loaded\". The node continues to run for "
+                                     "relay/P2P. Fix ip2asn-v4.tsv (e.g. restore after a data-dir "
+                                     "rotation) and restart to restore attestation." << std::endl;
+                        rpc_server.RegisterSeedAttestationDegraded(
+                            ident.seedId, CRPCServer::SeedDegradedReason::NO_ASN);
+                        break;
+                    case Attestation::SeedIdentityDecision::DEGRADED_NO_DATACENTER_LIST:
+                        // Fix 1 (extreview PR#121): valid identity, ASN DB loaded,
+                        // but a datacenter-ban chain with an EMPTY datacenter ASN list
+                        // (IsDatacenterIP would fail OPEN). Mirror DEGRADED_NO_ASN: do
+                        // NOT abort, do NOT register attestation, loud ERROR, distinct
+                        // diagnosable marker. INERT on DIL (non-ban) — this case is
+                        // unreachable there because ResolveSeedIdentity never returns
+                        // it when attestationDatacenterBan==false; present for parity
+                        // with dilv-node so the two glues stay identical.
+                        std::cerr << "[Attestation] ERROR: seed identity is valid (seed_id="
+                                  << ident.seedId << ") and ip2asn loaded, but the datacenter "
+                                     "ASN list is EMPTY on a datacenter-ban chain "
+                                     "(missing/unparseable " << dataDir << "/datacenter-asns.txt "
+                                     "or ./datacenter-asns.txt). IsDatacenterIP() would fail OPEN, "
+                                     "so attestation is DISABLED rather than sign attestations for "
+                                     "datacenter miners that the datacenter Sybil ban must reject. "
+                                     "getmikattestation will report \"datacenter ASN list not "
+                                     "loaded\". The node continues to run for relay/P2P. Restore "
+                                     "datacenter-asns.txt (e.g. after a data-dir rotation) and "
+                                     "restart to restore attestation." << std::endl;
+                        rpc_server.RegisterSeedAttestationDegraded(
+                            ident.seedId, CRPCServer::SeedDegradedReason::NO_DATACENTER_LIST);
+                        break;
+                    case Attestation::SeedIdentityDecision::REGISTER:
+                        if (ident.usedTestnetDefault) {
+                            std::cerr << "[Attestation] WARNING: Could not determine seed ID "
+                                         "(no configured seed set). Defaulting to seed_id=0" << std::endl;
+                        }
+                        registerSeed = true;
+                        break;
                 }
 
-                if (asnDatabase.IsLoaded()) {
-                    rpc_server.RegisterSeedAttestation(&seedAttestKey, &asnDatabase, seedId);
-                    std::cout << "  [OK] Seed attestation ready (seed_id=" << seedId
+                // REGISTER already implies asnDatabase.IsLoaded() — the helper folds
+                // the ASN-DB state into the decision, routing a valid identity with a
+                // failed ASN DB to DEGRADED_NO_ASN above. So no extra IsLoaded() guard.
+                if (registerSeed) {
+                    rpc_server.RegisterSeedAttestation(&seedAttestKey, &asnDatabase, ident.seedId);
+                    std::cout << "  [OK] Seed attestation ready (seed_id=" << ident.seedId
                               << ", key=" << seedAttestKey.GetPubKeyHex().substr(0, 16) << "...)"
                               << std::endl;
                 }
@@ -7443,6 +7949,7 @@ load_genesis_block:  // Bug #29: Label for automatic retry after blockchain wipe
                     // BUG #98 FIX: Must INITIALIZE FULL mode before waiting for it!
                     // The "already synced" path was waiting but never calling init_mining_mode_async
                     std::cout << "  Initializing RandomX mining mode (FULL)..." << std::endl;
+                    randomx_set_large_pages_allowed(1);  // this path only runs when mining
                     randomx_init_mining_mode_async(rx_key, strlen(rx_key));
                     std::cout << "  [WAIT] Waiting for RandomX FULL mode..." << std::endl;
                     auto wait_start = std::chrono::steady_clock::now();
@@ -7679,6 +8186,7 @@ load_genesis_block:  // Bug #29: Label for automatic retry after blockchain wipe
                     // This prevents "[MINING] Initializing dataset..." messages during wallet setup
                     if (!randomx_is_mining_mode_ready()) {
                         std::cout << "  Initializing RandomX mining mode (FULL)..." << std::endl;
+                        randomx_set_large_pages_allowed(1);  // this path only runs when mining
                         randomx_init_mining_mode_async(rx_key, strlen(rx_key));
                         std::cout << "  [WAIT] Waiting for dataset initialization..." << std::endl;
                         auto wait_start = std::chrono::steady_clock::now();
@@ -8298,6 +8806,13 @@ load_genesis_block:  // Bug #29: Label for automatic retry after blockchain wipe
         // Shutdown
         std::cout << std::endl;
         std::cout << "[Shutdown] Initiating graceful shutdown..." << std::endl;
+        // J1: from here on, every stage boundary is recorded and timed, and a
+        // deadline thread is armed. Before this, a stall anywhere below was
+        // invisible -- the process simply never exited and the operator had no
+        // way to tell which subsystem was holding it. See
+        // src/util/shutdown_progress.h.
+        Dilithion::ShutdownProgress::ArmWatchdog(config.shutdown_timeout);
+        Dilithion::ShutdownProgress::Stage("miners + VDF");
 
         // Clear ibd_coordinator pointer before local variable goes out of scope
         g_node_context.ibd_coordinator = nullptr;
@@ -8329,6 +8844,7 @@ load_genesis_block:  // Bug #29: Label for automatic retry after blockchain wipe
             g_resource_monitor = nullptr;
         }
 
+        Dilithion::ShutdownProgress::Stage("CConnman::Stop (P2P sockets + net threads)");
         std::cout << "[Shutdown] Stopping P2P server..." << std::flush;
         // Phase 5: Stop CConnman (handles all socket cleanup internally)
         if (g_node_context.connman) {
@@ -8341,6 +8857,7 @@ load_genesis_block:  // Bug #29: Label for automatic retry after blockchain wipe
         // via `sendrawtransaction` between the two cannot land in the
         // mempool but be missed by the dump. Mirrors Bitcoin Core's
         // shutdown sequence (init.cpp Shutdown()).
+        Dilithion::ShutdownProgress::Stage("CRPCServer::Stop (RPC + WebSocket threads)");
         std::cout << "[Shutdown] Stopping RPC server..." << std::flush;
         rpc_server.Stop();
         std::cout << " done" << std::endl;
@@ -8422,6 +8939,7 @@ load_genesis_block:  // Bug #29: Label for automatic retry after blockchain wipe
         }
 
         // Phase 3.2: Shutdown batch signature verifier
+        Dilithion::ShutdownProgress::Stage("batch signature verifier");
         std::cout << "[Shutdown] Stopping batch signature verifier..." << std::endl;
         ShutdownSignatureVerifier();
 
@@ -8435,11 +8953,13 @@ load_genesis_block:  // Bug #29: Label for automatic retry after blockchain wipe
         }
 
         // Phase 1.2: Shutdown NodeContext (Bitcoin Core pattern)
+        Dilithion::ShutdownProgress::Stage("NodeContext::Shutdown (validation queue, headers/blocks managers)");
         std::cout << "[Shutdown] NodeContext shutdown complete" << std::endl;
         g_node_context.Shutdown();
         
         // Phase 5: p2p_thread and p2p_recv_thread removed - handled by CConnman
         // Only join maintenance thread
+        Dilithion::ShutdownProgress::Stage("p2p maintenance thread join");
         if (p2p_maint_thread.joinable()) {
             p2p_maint_thread.join();
         }
@@ -8456,9 +8976,11 @@ load_genesis_block:  // Bug #29: Label for automatic retry after blockchain wipe
         // REMOVED: g_peer_manager cleanup - no longer used
 
         // DFMP: Shutdown Fair Mining Protocol subsystem (persist heat trackers)
+        Dilithion::ShutdownProgress::Stage("DFMP persist");
         std::cout << "  Shutting down DFMP..." << std::endl;
         DFMP::ShutdownDFMP(config.datadir, g_chainstate.GetHeight());
 
+        Dilithion::ShutdownProgress::Stage("UTXO database close");
         std::cout << "  Closing UTXO database..." << std::endl;
         utxo_set.Close();
 
@@ -8472,6 +8994,7 @@ load_genesis_block:  // Bug #29: Label for automatic retry after blockchain wipe
         // CBlockchainDB* / CUTXOSet* across blockchain teardown.
         g_coin_stats_index.reset();
 
+        Dilithion::ShutdownProgress::Stage("blockchain database close");
         std::cout << "  Closing blockchain database..." << std::endl;
         blockchain.Close();
 
@@ -8483,6 +9006,14 @@ load_genesis_block:  // Bug #29: Label for automatic retry after blockchain wipe
         Dilithion::g_chainParams = nullptr;
 
         std::cout << std::endl;
+        // Deliberately NO Disarm() here: RandomXShutdownGuard (first local of
+        // main, destructs last) joins the RandomX threads AFTER this line and
+        // owns the final Disarm, so the shutdown deadline covers those joins.
+        // Disarming here re-opens the unbounded-hang window at the last step.
+        // Name the newly-covered region so a hang in the try-scope local
+        // destructors is reported against the right stage, not the last
+        // database stage (fold: red-team M-1).
+        Dilithion::ShutdownProgress::Stage("main-scope teardown (locals)");
         std::cout << "Dilithion node stopped cleanly" << std::endl;
 
     } catch (const std::exception& e) {

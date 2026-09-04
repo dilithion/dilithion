@@ -1,10 +1,50 @@
 # evaluate — Dilithion project overlay
 
-Loaded by the generic evaluate skill when present. Holds Dilithion-specific known-bug patterns and vulnerability classes to hunt during pre-commit review. Absent in non-Dilithion repos → generic criteria only.
+Loaded by the generic evaluate skill when present. Holds Dilithion-specific known-bug patterns and vulnerability classes to hunt during pre-commit review, PLUS Dilithion's own names/questions for the categories that the generic `evaluate/SKILL.md` template genericized (2026-07-12, so the same skill body is reusable in non-blockchain repos). Absent in non-Dilithion repos → generic criteria only.
+
+## Category overrides (use these instead of the generic A/C/E/F/G)
+
+The generic skill's Step 2 categories are written to apply to any codebase. For Dilithion, apply these
+domain-specific versions in place of the generic text for the letters listed — same letters, same
+weights, same position in the verdict table; only the name/questions differ. Categories B and D are
+unchanged from the generic template (already correct for Dilithion) and are not restated here.
+
+### A. Consensus Safety (Weight: CRITICAL) — overrides generic "Core Invariant Safety"
+- Can this change cause two nodes to disagree on block validity?
+- Is there any non-deterministic behavior (floating point, platform-dependent sizes, undefined behavior)?
+- Does it change what blocks are accepted/rejected? If so, is there a height-gated activation?
+- Are there new validation rules that could reject previously-valid blocks?
+- Could this cause a chain split during upgrade rollout (some nodes on old version, some on new)?
+
+### C. P2P & DoS Resistance (Weight: HIGH) — overrides generic "External Input & DoS Resistance"
+- Can a peer trigger expensive computation with cheap messages?
+- Are there rate limits on all peer-initiated operations?
+- Can this be used to ban legitimate peers (misbehavior score manipulation)?
+- Does it handle peer disconnection mid-operation gracefully?
+
+### E. UTXO & State Integrity (Weight: HIGH) — overrides generic "State Integrity & Error Handling"
+(Questions unchanged from generic — only the display name differs, kept here for continuity with
+Dilithion's bug history below.)
+- Does the code assume state/database lookups always succeed?
+- Are there any new paths that permanently mark valid input as invalid? (Dangerous - hard to recover)
+- Could a temporary state error cause permanent damage?
+- Is there proper error propagation vs. silent failure?
+
+### F. Build & Deployment Safety (Weight: MEDIUM) — overrides generic wording with the header-file specifics
+- Does this change any struct layouts in header files?
+- If headers changed, will a partial/incremental build produce correct binaries?
+- Are there any new dependencies or includes that could create circular deps?
+
+### G. Edge Cases & Boundary Conditions (Weight: MEDIUM) — overrides generic wording with blockchain-specific boundaries
+- What happens at height 0 (genesis)?
+- What happens at activation heights?
+- What happens with empty inputs, zero values, max values?
+- What happens during IBD vs steady-state?
+- What happens during a reorg?
 
 ## Per-category known failure patterns
 
-These attach to the generic evaluation categories (B–G) and are drawn from Dilithion's actual bug history. When evaluating each category, ALSO apply the Dilithion-specific failure pattern and bullets below.
+These attach to the categories above (B–G) and are drawn from Dilithion's actual bug history. When evaluating each category, ALSO apply the Dilithion-specific failure pattern and bullets below.
 
 ### B. Memory & Resource Safety
 Known failure pattern: BUG #275 killed all 4 DilV seed nodes via OOM.
