@@ -3127,7 +3127,9 @@ load_genesis_block:  // Bug #29: Label for automatic retry after blockchain wipe
                         "NodeContext::Shutdown (early-return / unwind path)");
                 }
                 g_node_context.Shutdown();
-                if (owned) Dilithion::ShutdownProgress::Disarm();
+                // No Disarm even when owned: RandomXShutdownGuard destructs
+                // after this guard and owns the final Disarm, so the deadline
+                // also covers its randomx thread joins on the unwind path.
             }
         } node_context_shutdown_guard{config.shutdown_timeout};
 
@@ -8599,7 +8601,14 @@ load_genesis_block:  // Bug #29: Label for automatic retry after blockchain wipe
         Dilithion::g_chainParams = nullptr;
 
         std::cout << std::endl;
-        Dilithion::ShutdownProgress::Disarm();
+        // Deliberately NO Disarm() here: RandomXShutdownGuard (first local of
+        // main, destructs last) joins the RandomX threads AFTER this line and
+        // owns the final Disarm, so the shutdown deadline covers those joins.
+        // Disarming here re-opens the unbounded-hang window at the last step.
+        // Name the newly-covered region so a hang in the try-scope local
+        // destructors is reported against the right stage, not the last
+        // database stage (fold: red-team M-1).
+        Dilithion::ShutdownProgress::Stage("main-scope teardown (locals)");
         std::cout << "Dilithion node stopped cleanly" << std::endl;
 
     } catch (const std::exception& e) {

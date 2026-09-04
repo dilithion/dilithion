@@ -252,6 +252,50 @@ void test_m5_latch_emits_once_per_episode_and_rearms()
 }
 
 // ---------------------------------------------------------------------------
+// M7 — v4.6 fold (A/HIGH-2): a LATCH-ONLY episode drives the signal. The
+// legacy activation path rejects a too-deep reorg without flagging a rebuild,
+// so its depth-rejection site emits the latch transition alone. The signal
+// must go off-canonical on the latch, stay off for the episode, and clear on
+// recovery — with the emit counter proving the edge-trigger still holds.
+// Before this fold the latch did NOT feed OffCanonicalReason and this exact
+// sequence reported on_canonical == true throughout: the green-by-construction
+// defect, pinned here so it cannot return.
+// ---------------------------------------------------------------------------
+void test_m7_latch_only_episode_drives_signal()
+{
+    std::cout << "  test_m7_latch_only_episode_drives_signal..." << std::flush;
+    CChainState cs;
+    BuildActiveChain(cs, /*chain_id=*/0x70, /*length=*/5);
+
+    assert(cs.IsOnCanonical());
+    assert(cs.OffCanonicalReason().empty());
+
+    // Legacy-path episode: emitter fires with NO rebuild flag.
+    cs.LogOffCanonicalTransition("depth-rejection", /*best_known_ht=*/104);
+    assert(!cs.IsOnCanonical());
+    assert(cs.OffCanonicalReason() == "depth-rejection");
+    assert(cs.OffCanonicalEmitCount() == 1);
+
+    // Repeat emit inside the episode: signal stays off, no double emit.
+    cs.LogOffCanonicalTransition("depth-rejection", /*best_known_ht=*/105);
+    assert(!cs.IsOnCanonical());
+    assert(cs.OffCanonicalEmitCount() == 1);
+
+    // Recovery re-arms and clears the signal.
+    cs.ClearChainRebuildFlag();
+    assert(cs.IsOnCanonical());
+    assert(cs.OffCanonicalReason().empty());
+    assert(cs.OffCanonicalEmitCount() == 1);
+
+    // A second episode fires again (latch re-armed).
+    cs.LogOffCanonicalTransition("depth-rejection", /*best_known_ht=*/110);
+    assert(!cs.IsOnCanonical());
+    assert(cs.OffCanonicalEmitCount() == 2);
+
+    std::cout << " OK\n";
+}
+
+// ---------------------------------------------------------------------------
 // M6 — MED-1 guard: a node holding a strictly-heavier candidate leaf (as a
 // correctly-rejected fork would be after RecomputeCandidates re-adds it on
 // restart) but NOT in a depth-rejection rebuild reports on_canonical == true.
@@ -302,6 +346,7 @@ int main()
     test_m3_non_depth_rebuild_stays_on_canonical();
     test_m4_heavier_candidate_without_depth_rejection_stays_on_canonical();
     test_m5_latch_emits_once_per_episode_and_rearms();
+    test_m7_latch_only_episode_drives_signal();
     test_m6_med1_heavier_rejected_fork_on_restart_stays_on_canonical();
 
     std::cout << "\n=== All 6 magnet v1a tests passed ===\n";
