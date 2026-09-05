@@ -15,6 +15,7 @@
 #include <node/block_index.h>
 #include <node/utxo_set.h>
 #include <filesystem>
+#include <chrono>
 #include <random>
 #include <sstream>
 #include <iostream>
@@ -716,8 +717,7 @@ static bool ForgeMIKSignatureInPlace(CBlock& block)
     // Layout: [0xDF][0x01][pubkey MIK_PUBKEY_SIZE][signature MIK_SIGNATURE_SIZE].
     const size_t sigStart = at + 2 + DFMP::MIK_PUBKEY_SIZE;
     const size_t flipAt   = sigStart + 50;
-    if (sigStart + DFMP::MIK_SIGNATURE_SIZE > block.vtx.size() ||
-        flipAt >= sigStart + DFMP::MIK_SIGNATURE_SIZE) {
+    if (sigStart + DFMP::MIK_SIGNATURE_SIZE > block.vtx.size()) {
         std::cout << "(MIK signature does not fit where the layout says) ";
         return false;
     }
@@ -789,7 +789,7 @@ static void test_connecttip_forged_proof_rejected_normal_path()
 // THE CLAIM THE COMMENT MAKES AND NOTHING TESTED. ConnectTip's LP-10 comment
 // states the checks "run for ALL connect paths INCLUDING skipValidation=true
 // reorg reconnects", on the reasoning that VDF block selection is effectively
-// a reorg every block. Three of ConnectTip's production call sites pass
+// a reorg every block. FOUR of ConnectTip's production call sites pass
 // skipValidation=true. If the LP-10 block were ever moved inside the
 // !skipValidation gate -- where the attestation and DNA checks used to live,
 // and from which BUG #281 had to rescue them -- a forged block would reach the
@@ -1112,9 +1112,15 @@ static void test_connecttip_forged_block_never_reaches_the_utxo_set()
     const uint64_t iters = 1000;
     InstallConnectTipChainParams(iters, /*enforcement=*/100, /*assumeValid=*/0);
 
+    // PID + clock as well as random_device: std::random_device is a
+    // DETERMINISTIC fallback on some MinGW builds, which would make sequential
+    // runs reuse one directory and concurrent runs collide on the leveldb LOCK.
     std::random_device rd;
     std::ostringstream oss;
-    oss << "dilithion-lp10-connecttip-utxo-" << rd();
+    oss << "dilithion-lp10-connecttip-utxo-"
+        << static_cast<unsigned long long>(
+               std::chrono::steady_clock::now().time_since_epoch().count())
+        << "-" << rd();
     std::filesystem::path dir = std::filesystem::temp_directory_path() / oss.str();
     std::error_code ec;
     std::filesystem::create_directories(dir, ec);
@@ -1165,6 +1171,12 @@ static void test_connecttip_forged_block_never_reaches_the_utxo_set()
 
         bool flagged = false;
         bool ok = RunConnectTip(forged, kCTHeight, false, &flagged, &utxo);
+        if (!ok && !flagged) {
+            std::cout << "FAIL: forged block rejected but NOT marked BLOCK_FAILED_VALID -- "
+                         "the rejection did not come from the LP-10 branch\n";
+            ++failed;
+            utxo.Close(); std::filesystem::remove_all(dir, ec); return;
+        }
         if (ok) {
             std::cout << "FAIL: forged block accepted with a real UTXO set attached\n";
             ++failed;
@@ -1310,7 +1322,7 @@ static void test_connecttip_shipped_defaults_are_not_enforcing()
 // the assertions deliver is the defect this whole file exists to catch.
 //
 // 1. THE CALLERS. These drive ConnectTip DIRECTLY. They say nothing about
-//    ActivateBestChain's eight call sites (chain.cpp:672, 700, 761, 1096,
+//    ActivateBestChain's SEVEN call sites (chain.cpp:672, 700, 761, 1096,
 //    1182, 1206, 1255) or the port path's ActivateBestChainStep (:3352). A
 //    change that stopped calling ConnectTip, or called it with the wrong
 //    block, is invisible here.

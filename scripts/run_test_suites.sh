@@ -73,9 +73,9 @@ set -u
 # make target and no workflow, so `make tests` had never run either. The whole
 # DilV VDF test surface was unrun. Registration proved live by a discriminating
 # check, not by absence of error: `make -n tests-build` mentioned neither suite
-# before their sources were touched and both after. This makes the fast tier 34
-# rows, so the "32/32 in 72s" figure above is the 2026-08-10 measurement and no
-# longer the current count.
+# before their sources were touched and both after. COUNTED, not derived: the
+# fast tier is now 41 rows, 37 of them live (4 quarantined). The "32/32 in 72s"
+# figure above is the 2026-08-10 measurement and is no longer the current count.
 ROSTER='
 fast|rpc_auth_tests|120|
 fast|rpc_host_header_tests|60|
