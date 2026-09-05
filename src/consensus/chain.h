@@ -919,7 +919,7 @@ private:
     // whose mapBlockIndex has grown to 161K+ entries — explorer polls
     // this RPC frequently). Cache the result and invalidate it only
     // when mapBlockIndex membership or pprev topology actually changes:
-    // AddBlockIndex (insert or merge-adopt-pprev), EvictLowestWorkNotOnBestChain
+    // AddBlockIndex (insert or merge-adopt-pprev), EvictLowestWorkLeafNotPinned
     // (erase), and Cleanup (clear) all flip this dirty. GetChainTips()
     // itself is the only reader/recomputer, always called under cs_main,
     // so no separate cache mutex is needed.
