@@ -85,7 +85,14 @@ int64_t EncodeCounter(long double ld) {
     if (ld <= 0.0L) return 0;
     const long double scaled = ld * Q32_SCALE;
     if (scaled >= static_cast<long double>(INT64_MAX)) return INT64_MAX;
-    return static_cast<int64_t>(static_cast<double>(scaled));
+    // Round the long double directly rather than truncating through a narrower
+    // double cast. The intermediate (double) cast discarded ~21 bits of the
+    // long-double mantissa (long double holds ~64 significant bits, double 53),
+    // injecting a ~1e-10 round-trip perturbation that could flip a boundary
+    // bucket downstream in estimateMedianFee. Mirror EncodeBucket's explicit
+    // round (counters are non-negative here, guarded above).
+    const long double rounded = std::floor(scaled + 0.5L);
+    return static_cast<int64_t>(rounded);
 }
 
 long double DecodeCounter(int64_t v) {
