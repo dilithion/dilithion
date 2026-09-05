@@ -492,9 +492,35 @@ ChainParams ChainParams::DilV() {
     params.nOutboundFullRelayTarget = 8;
     params.nOutboundBlockRelayTarget = 4;
 
-    // Phase 6 PR6.1: mapBlockIndex cap — DilV is 5M (10× DIL) because
-    // its 60s blocks produce headers ~4× faster than DIL's 240s.
-    params.nMapBlockIndexCap = 5000000;
+    // Phase 6 PR6.1: mapBlockIndex cap. Lowered 5M -> 500K.
+    // 5M permitted ~2 GB of attacker-controlled CBlockIndex memory before
+    // eviction engaged; 500K caps that surface at ~210 MB. DilV's 45s blocks
+    // (params.blockTime = 45) hit saturation faster than DIL's 240s blocks
+    // (~8.7 months of honest headers vs ~3.8 years), after which a bounded
+    // eviction scan runs per over-cap header insert.
+    //
+    // NOT justified by "matching DIL's 500K". DIL has 240s blocks, so its
+    // identical 500K cap saturates in ~3.8 years — same number, very different
+    // honest-path behaviour. The justification here is the attack-headroom
+    // (~210 MB) and eviction-scan-cost grounds above, on their own merits.
+    //
+    // PERF WATCH-ITEM: past saturation this node runs the eviction scan once
+    // per connected block as steady state, so the cap is NOT "inert for years"
+    // the way 5M would be. That cost is accepted, not a regression — but
+    // confirm the post-saturation per-block eviction-scan wall-time against a
+    // live chain near the cap before relying on this in the >8mo regime.
+    //
+    // Eviction safety (see EvictLowestWorkLeafNotPinned, consensus/chain.cpp):
+    // eviction frees ONLY unpinned leaf entries (in-degree 0 in the pprev
+    // graph) — never an interior node that a surviving fork descendant still
+    // references via pprev. Pinned set = active-chain ancestors +
+    // m_setBlockIndexCandidates and all their pprev ancestors. This is NOT a
+    // consensus rule and does not cause divergence: an evicted leaf header is
+    // re-obtainable via PEER RE-ANNOUNCEMENT — if that fork ever becomes the
+    // most-work chain, peers re-feed its headers/blocks and the node re-derives
+    // the index (matching chain.h EvictLowestWorkLeafNotPinned). The cap bounds
+    // memory; it never changes which chain is valid.
+    params.nMapBlockIndexCap = 500000;
 
     // VDF: active from genesis — DilV is a VDF-only chain
     params.vdfActivationHeight = 0;

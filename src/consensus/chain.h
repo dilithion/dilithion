@@ -278,6 +278,24 @@ private:
     std::vector<BlockConnectCallback> m_blockConnectCallbacks;
     std::vector<BlockDisconnectCallback> m_blockDisconnectCallbacks;
 
+    // PR #129 MEDIUM-2 (cascade-eviction liveness): pending-block-hash provider.
+    // The async validation queue (CBlockValidationQueue) registers a provider
+    // here that returns the set of block hashes it is currently responsible for
+    // — every queued block AND the one in-flight in its worker (popped from the
+    // queue but mid-ProcessBlock, with cs_main released between ops). Eviction
+    // (EvictLowestWorkLeafNotPinned) consults this provider while holding cs_main
+    // and pins each such block AND its pprev-ancestor chain, so a cascade cannot
+    // free a queued block's parent out from under the worker's create path. The
+    // provider returns HASHES only (a pure read of queue state under the queue's
+    // own mutex); eviction does the mapBlockIndex lookup and pprev walk under the
+    // cs_main it already holds. This keeps the lock order cs_main -> queue mutex
+    // (never the reverse) and never re-enters a queue method that calls back into
+    // CChainState. This is ADDITIVE liveness defense — it does NOT supersede the
+    // queue worker's by-hash re-resolve, which remains the authoritative
+    // eviction-/merge-safe correctness path for BLOCKER-1.
+    using PendingBlockHashProvider = std::function<std::set<uint256>()>;
+    PendingBlockHashProvider m_pendingBlockHashProvider;
+
 public:
     // VDF Distribution: Track when the first VDF block at the current tip height was accepted.
     // Used to enforce the grace period — replacements only allowed within this window.
@@ -599,8 +617,100 @@ public:
     bool AddBlockIndex(const uint256& hash, std::unique_ptr<CBlockIndex> pindex);
 
     /**
+     * PR #129 HIGH-1: scoped hold of cs_main, for the ONE pattern that needs it.
+     *
+     * THE BUG THIS EXISTS TO CLOSE. Every CChainState method acquires and
+     * RELEASES cs_main individually, so a caller that does
+     *
+     *     pprev = GetBlockIndex(prevHash);   // lock taken AND released
+     *     ... build a CBlockIndex from pprev ...
+     *     AddBlockIndex(hash, std::move(pindex));   // lock re-taken
+     *
+     * is holding a raw CBlockIndex* on its own stack across a lock release.
+     * A concurrent EvictLowestWorkLeafNotPinned on another thread can free
+     * `pprev` in that window: it is a leaf (the child is not inserted yet, so
+     * in-degree 0), header-only entries are never candidates, and the lowest-work
+     * unpinned leaf is exactly what eviction selects. The caller then dereferences
+     * freed memory and — worse — STORES the dangling pointer permanently into
+     * mapBlockIndex as the new entry's pprev. That is the identical end state to
+     * the v4.5.0 interior-node dangle, reached through a different door.
+     *
+     * The eviction-safety argument in EvictLowestWorkLeafNotPinned reasons about
+     * pointers held INSIDE mapBlockIndex plus the enumerated cached-member holders
+     * in the landmine ledger. It does not cover STACK-LOCAL holders across a lock
+     * release, and cannot: they are invisible to it.
+     *
+     * THE CRITICAL SECTION IS EXACTLY [resolve pprev, insert the child]. Once the
+     * child is in the map pointing at pprev, pprev has in-degree >= 1, is no longer
+     * a leaf, and is ineligible for eviction. Before that instant it is naked.
+     * Holding cs_main across those two calls is the whole fix.
+     *
+     * WHY A GUARD RATHER THAN A NEW ATOMIC METHOD. The two call sites build
+     * materially different CBlockIndex objects (a header-only entry with
+     * BLOCK_VALID_HEADER and a sequence id, vs. a received block with
+     * MarkBlockReceived and a LevelDB write), and both run caller-specific checks
+     * against pprev in between. Folding them into one CChainState method would
+     * either need a callback invoked under the lock or duplicate the divergent
+     * logic. A guard keeps each call site's semantics byte-identical and makes the
+     * change reviewable as "the lock is now held across this region", nothing else.
+     *
+     * SELF-DEADLOCK IS SAFE. cs_main is a recursive_mutex (BUG #200), so the
+     * acquisitions inside GetBlockIndex / AddBlockIndex / EvictLowestWorkLeafNotPinned
+     * nest as no-ops while this guard is held.
+     *
+     * LOCK ORDER — read this before adding a third use site.
+     *
+     * vs. m_queue_mutex: CLEAN. The documented order is cs_main -> queue mutex
+     * (eviction holds cs_main and calls GetPendingBlockHashes, which takes
+     * m_queue_mutex). CBlockValidationQueue::ProcessBlock is invoked at
+     * block_validation_queue.cpp:307, AFTER the worker's m_queue_mutex scope closes
+     * at :299, and nothing under either guard takes m_queue_mutex, m_stats_mutex or
+     * a watchdog lock. Taking m_queue_mutex first and then cs_main WOULD invert the
+     * order — do NOT use this guard anywhere that already holds the queue mutex.
+     *
+     * vs. cs_headers: NOT CLEAN, and this guard sits on the wrong side of it.
+     *
+     * An earlier version of this comment claimed both call sites "hold no other
+     * lock when they enter". That is FALSE and was corrected after a fresh-context
+     * review caught it. CHeadersManager::ProcessHeaders takes cs_headers at
+     * headers_manager.cpp:218 and calls ProcessNewHeader at :365 INSIDE that scope
+     * (likewise :542 and :685 from their own cs_headers holders). So on those paths
+     * the order is cs_headers -> cs_main.
+     *
+     * The opposing edge is live and documented in-repo at headers_manager.cpp:1082-1085:
+     * "OnBlockActivated holds cs_main and wants cs_headers". That is cs_main ->
+     * cs_headers. Both directions exist: a textbook ABBA.
+     *
+     * THIS GUARD DOES NOT CREATE THAT INVERSION — before it, ProcessNewHeader
+     * already called GetBlockIndex and AddBlockIndex, each taking cs_main
+     * internally, so cs_headers -> cs_main was already on this path. What the guard
+     * does is WIDEN the hold, which enlarges the window in which the ABBA can be
+     * hit. That is a real increase in deadlock exposure traded for closing a real
+     * UAF, and it must not be described as "lock order preserved". The underlying
+     * ABBA is pre-existing and is tracked separately; it is not fixed here.
+     *
+     * SCOPE IT TIGHTLY. Widening a cs_main hold is a real cost: it is the lock
+     * block processing, ActivateBestChain and the RPC tip-cache all contend on.
+     * Hold it across the resolve->insert region and nothing more.
+     */
+    class MainLockGuard {
+    public:
+        explicit MainLockGuard(CChainState& chainstate)
+            : m_lock(chainstate.cs_main) {}
+        MainLockGuard(const MainLockGuard&) = delete;
+        MainLockGuard& operator=(const MainLockGuard&) = delete;
+    private:
+        std::lock_guard<std::recursive_mutex> m_lock;
+    };
+
+    /**
      * Get block index by hash
      * Returns nullptr if not found
+     *
+     * PR #129 HIGH-1: the returned raw pointer is only guaranteed valid while
+     * cs_main is held. If you intend to dereference it, or store it, after any
+     * other CChainState call returns, you MUST hold a MainLockGuard across the
+     * whole region — a concurrent evictor can free it otherwise. See MainLockGuard.
      */
     CBlockIndex* GetBlockIndex(const uint256& hash);
 
@@ -619,23 +729,67 @@ public:
     size_t GetBlockIndexSize() const { return mapBlockIndex.size(); }
 
     /**
-     * Phase 6 PR6.1 (v1.5 §3.2 + Cursor v1.5+ A1): evict lowest-work
-     * entry NOT on the active chain. Called by ChainSelectorAdapter when
-     * mapBlockIndex hits chainparams.nMapBlockIndexCap to make room for
-     * a new pre-validation header.
+     * Phase 6 PR6.1 (v1.5 §3.2 + Cursor v1.5+ A1): evict the lowest-work
+     * UNPINNED LEAF to make room for a new pre-validation header. Called by
+     * ChainSelectorAdapter when mapBlockIndex hits nMapBlockIndexCap.
      *
-     * Eviction policy: walk mapBlockIndex, find the entry with minimum
-     * nChainWork that is NOT an ancestor of pindexTip; remove from
-     * m_setBlockIndexCandidates if present, then erase from
-     * mapBlockIndex. Holds cs_main for the duration to avoid use-after-
-     * free against chain_selector pointers in m_setBlockIndexCandidates.
+     * LEAF-ONLY INVARIANT (the v4.5.0-pull fix). mapBlockIndex owns its
+     * CBlockIndex via unique_ptr, but surviving entries reference their
+     * parent by a RAW pprev pointer (dereferenced in ~50 places across
+     * chain.cpp: FindMostWorkChain, MarkBlockAsFailed, GetChainTips, FindFork,
+     * etc.). The prior implementation evicted the lowest-work entry not on the
+     * active chain — which can be an INTERIOR fork node whose higher-work
+     * child still points at it via pprev. Freeing it dangled the child's pprev
+     * → use-after-free on the next chain walk. This version frees ONLY a leaf:
+     * an entry with in-degree 0 in the pprev graph (no surviving entry names
+     * it as pprev) that is also not in the pinned set.
      *
-     * Returns true on successful eviction. Returns false if the only
-     * remaining entries are on the active chain (caller should fall back
-     * to fail-closed, but this case is essentially unreachable at
-     * production cap sizes — DIL=500K cap vs ~24K active chain height).
+     * PINNED SET (never evicted, even if it is a leaf):
+     *   - every ancestor of pindexTip (the active chain);
+     *   - every entry in m_setBlockIndexCandidates AND all their pprev
+     *     ancestors (the chain selector's reorg-candidate reachable set —
+     *     this also covers the best-header tip whenever it has a block-index
+     *     entry, since such a tip is a candidate). Note: pindexBestHeader does
+     *     NOT exist on CChainState; best-header tracking lives in the separate
+     *     CHeadersManager, so it is pinned transitively via the candidate set
+     *     rather than by direct reference.
+     *
+     * ALGORITHM: build an in-degree map over mapBlockIndex (how many entries
+     * name each node as pprev), build the pinned set, then evict eligible
+     * leaves (in-degree 0, unpinned) lowest-nChainWork first. After erasing a
+     * leaf, decrement its parent's in-degree so the parent may become an
+     * eligible leaf in a later pass. Multi-pass until under cap or no eligible
+     * leaf remains. nChainWork comparisons use ChainWorkGreaterThan (chainWork
+     * is NOT memcmp-comparable). Holds cs_main throughout.
+     *
+     * NOT consensus-affecting: an evicted leaf is a non-active-chain tip — never
+     * the active chain, a reorg candidate, an ancestor of either, or an in-flight
+     * (HAVE_DATA-not-VALID_TRANSACTIONS) block (all pinned). Recovery-safety does
+     * NOT rest on "mapHeaders is unbounded" (it is not — mapHeaders is itself
+     * capped and PruneOrphanedHeaders erases non-best-chain headers more than
+     * ORPHAN_HEADER_EXPIRY_BLOCKS behind tip). The real basis: an evicted fork
+     * tip's header is re-obtainable via PEER RE-ANNOUNCEMENT — if that fork ever
+     * becomes the most-work chain, peers re-feed its headers and blocks and the
+     * node re-derives the index. This matches Bitcoin Core's behaviour (a bounded
+     * index converges on peer re-feed; it is not a hard split). Eviction therefore
+     * never changes which chain a node ultimately accepts — it only bounds memory.
+     *
+     * @param target_max stop once mapBlockIndex.size() <= target_max (the
+     *        caller passes cap-1 to make room for exactly one new header).
+     *        target_max == 0 means "drain EVERY eligible leaf" — TEST/DIAGNOSTIC
+     *        USE ONLY. LOW-c (PR #129 re-red-team): the prior signature gave this
+     *        a DEFAULT ARGUMENT of 0, so a production caller that omitted the
+     *        argument would silently drain the whole index. The default arg has
+     *        been REMOVED — every caller must now pass an explicit target_max, so
+     *        the destructive "drain all" path can only be reached by explicitly
+     *        writing 0 (self-documenting). Production code always passes cap-1.
+     *
+     * Returns true if at least one entry was evicted; false if no eligible
+     * unpinned leaf exists while still over target (caller falls back to
+     * fail-closed reject). The false case is unreachable at production cap
+     * sizes.
      */
-    bool EvictLowestWorkNotOnBestChain();
+    bool EvictLowestWorkLeafNotPinned(size_t target_max);
 
     /**
      * Find the last common ancestor between two chains
@@ -765,7 +919,7 @@ private:
     // whose mapBlockIndex has grown to 161K+ entries — explorer polls
     // this RPC frequently). Cache the result and invalidate it only
     // when mapBlockIndex membership or pprev topology actually changes:
-    // AddBlockIndex (insert or merge-adopt-pprev), EvictLowestWorkNotOnBestChain
+    // AddBlockIndex (insert or merge-adopt-pprev), EvictLowestWorkLeafNotPinned
     // (erase), and Cleanup (clear) all flip this dirty. GetChainTips()
     // itself is the only reader/recomputer, always called under cs_main,
     // so no separate cache mutex is needed.
@@ -802,6 +956,19 @@ public:
      * @param callback Function to call with block data and height
      */
     void RegisterBlockDisconnectCallback(BlockDisconnectCallback callback);
+
+    /**
+     * PR #129 MEDIUM-2: register the async validation queue's pending-block-hash
+     * provider (see PendingBlockHashProvider above). At most one provider is
+     * expected (the single CBlockValidationQueue); a second registration
+     * replaces the first. Eviction calls it under cs_main to pin queued/in-flight
+     * blocks and their ancestors. Pass an empty std::function to clear.
+     *
+     * @param provider returns the set of hashes the queue currently owns
+     *        (queued + in-flight). Returning hashes (not raw pointers) keeps the
+     *        lock order cs_main -> queue mutex clean.
+     */
+    void RegisterPendingBlockHashProvider(PendingBlockHashProvider provider);
 
     // ============================================================
     // Phase 5: chain-selection helpers (PR5.1 declarations only)

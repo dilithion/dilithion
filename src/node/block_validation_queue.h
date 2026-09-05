@@ -151,6 +151,28 @@ public:
      */
     bool IsHeightQueued(int height) const;
 
+    /**
+     * @brief PR #129 MEDIUM-2: hashes the queue is currently responsible for.
+     *
+     * Returns every QUEUED block hash plus the single block currently IN-FLIGHT
+     * in the worker (popped from the queue but mid-ProcessBlock, with cs_main
+     * released between ops). CChainState registers this as its
+     * PendingBlockHashProvider and consults it during cap eviction (under
+     * cs_main) to pin these blocks AND their pprev ancestors, so a multi-pass
+     * cascade cannot free a queued block's parent out from under the worker's
+     * create path (a liveness hole under adversarial cap pressure).
+     *
+     * Pure read of queue state under m_queue_mutex; returns HASHES (not raw
+     * CBlockIndex*), which keeps the lock order cs_main -> m_queue_mutex clean
+     * (eviction holds cs_main and calls this; this never calls into CChainState).
+     *
+     * NOTE — this is ADDITIVE liveness defense; it does NOT replace the worker's
+     * by-hash re-resolve in ProcessBlock, which is the authoritative correctness
+     * path for BLOCKER-1 (pinning guards eviction, not the AddBlockIndex
+     * flag-merge that can still re-home the canonical pointer for a hash).
+     */
+    std::set<uint256> GetPendingBlockHashes() const;
+
 private:
     /**
      * @brief Validation worker thread main loop
@@ -182,6 +204,17 @@ private:
     // Priority queue for blocks (min-heap by height)
     std::priority_queue<QueuedBlock> m_queue;
     std::set<int> m_queued_heights;  // O(1) lookup for IsHeightQueued - tracks heights in queue
+    // PR #129 MEDIUM-2: hashes of blocks currently QUEUED (kept in sync with
+    // m_queue) plus the single block IN-FLIGHT in the worker. Both are guarded
+    // by m_queue_mutex. GetPendingBlockHashes() returns their union so eviction
+    // can pin them and their ancestors. The in-flight slot is essential: between
+    // the worker popping a block (removing it from m_queue / m_queued_hashes) and
+    // ProcessBlock finishing, cs_main is released across ops — exactly the
+    // BLOCKER-1 / cascade window — and the block is no longer in m_queue, so a
+    // queue-contents-only set would miss it precisely when it is most exposed.
+    std::set<uint256> m_queued_hashes;          // hashes currently in m_queue
+    uint256 m_inflight_hash;                     // hash mid-ProcessBlock (or null)
+    bool m_has_inflight{false};                  // whether m_inflight_hash is valid
     mutable std::mutex m_queue_mutex;
     std::condition_variable m_queue_cv;
 

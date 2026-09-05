@@ -128,6 +128,26 @@ jobs:
         echo "✅ Boost unit tests completed (HD wallet tests skipped - BUG-77)"
 
     # ------------------------------------------------------------------
+    # MERGE 2026-09-05 — this PR's own "Run block-index eviction / UAF
+    # regression suite" step was DROPPED here, and its intent is NOT lost.
+    #
+    # That step existed because `headers_manager_to_chain_selector_wiring_tests`
+    # is a standalone int main() binary outside test_dilithion, so no CI job ran
+    # it -- "a regression suite outside CI is decoration", and it guards a
+    # use-after-free that reached a release past five reviewers.
+    #
+    # main's F4 work now runs it: it is on the roster at
+    # scripts/run_test_suites.sh (fast tier, 180s timeout), which `make
+    # tests-fast` below executes. Keeping both steps would build and run the
+    # same binary twice per CI run for no extra signal.
+    #
+    # ⚠️ THE ONE THING THAT CHANGED: this PR's step ran on ALL FOUR matrix legs;
+    # the roster step below runs on gcc/Release ONLY. main's comment gives the
+    # reason (these suites are compiler- and optimisation-agnostic), and it is
+    # consistent with matrix.build_type setting no compiler flags. If that ever
+    # stops being true, this suite loses three legs of coverage silently.
+    # ------------------------------------------------------------------
+    # ------------------------------------------------------------------
     # F4: the standalone (non-Boost) test suites.
     #
     # Before F4, `make tests` had a one-line recipe that echoed "All tests
@@ -232,6 +252,22 @@ jobs:
         echo "Running tests with AddressSanitizer..."
         ./test_dilithion --log_level=test_suite --report_level=short --run_test='!wallet_hd_tests:!rpc_hd_wallet_tests:!hd_wallet_standalone_tests' || true
         echo "✅ ASan tests completed (check output above for memory errors)"
+
+    # PR #129 MEDIUM-5: run the eviction/UAF suite under ASan specifically.
+    # Tests 6 and 7b contain use-after-free probes that are inert without
+    # -fsanitize=address — the plain build cannot detect the very defect class
+    # this suite exists for, so a green run outside ASan proves little.
+    #
+    # NO `|| true` here, unlike the step above. This suite is the regression net
+    # for a UAF that shipped in v4.5.0; if ASan trips in it, CI must go red
+    # rather than print a tick and move on. (The `|| true` on test_dilithion
+    # above is pre-existing and deliberately left alone — changing it is a
+    # separate decision about the whole suite, not this PR's to make.)
+    - name: Run eviction/UAF regression suite under ASan
+      run: |
+        make headers_manager_to_chain_selector_wiring_tests -j$(nproc)
+        ASAN_OPTIONS=detect_leaks=0 ./headers_manager_to_chain_selector_wiring_tests
+        echo "✅ eviction/UAF regression suite passed under ASan"
 
   sanitizer-ubsan:
     name: UndefinedBehaviorSanitizer

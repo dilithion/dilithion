@@ -10,6 +10,7 @@
 #include <net/block_tracker.h>  // IBD Redesign: Single source of truth
 #include <net/blockencodings.h>  // BIP 152: For PartiallyDownloadedBlock destructor
 #include <node/block_validation_queue.h>  // Phase 2: Async block validation
+#include <consensus/chain.h>  // PR #129: CChainState for provider deregistration on queue teardown
 #include <digital_dna/dna_registry_db.h>  // Digital DNA: LevelDB-backed registry
 #include <digital_dna/verification_manager.h>  // Phase 2: DNA Verification & Attestation
 #include <consensus/ichain_selector.h>             // Phase 5: frozen interface
@@ -23,6 +24,11 @@
 
 // Global node context instance
 NodeContext g_node_context;
+
+// PR #129: the async validation queue's PendingBlockHashProvider is registered
+// on this global (see dilithion-node.cpp). It must be cleared before the queue
+// is destroyed, since the provider lambda captures a raw queue pointer.
+extern CChainState g_chainstate;
 
 // Destructor defined here (not in header) because unique_ptr<DNARegistryDB>
 // requires the complete type for default_delete.
@@ -252,6 +258,9 @@ void NodeContext::Shutdown() {
     // Phase 2: Stop validation queue before IBD managers
     if (validation_queue) {
         validation_queue->Stop();
+        // PR #129: clear the provider (captures a raw queue pointer) BEFORE the
+        // queue is destroyed, so the callback can never outlive the queue.
+        g_chainstate.RegisterPendingBlockHashProvider(nullptr);
         validation_queue.reset();
     }
 
@@ -306,6 +315,8 @@ void NodeContext::Reset() {
     orphan_manager.reset();
     block_fetcher.reset();
     block_tracker.reset();  // IBD Redesign
+    // PR #129: clear the provider before destroying the queue (see Shutdown()).
+    g_chainstate.RegisterPendingBlockHashProvider(nullptr);
     validation_queue.reset();  // Phase 2: Reset validation queue
     dna_registry.reset();  // Digital DNA
     trust_manager.reset();
