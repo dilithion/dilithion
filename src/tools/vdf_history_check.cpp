@@ -146,6 +146,11 @@ struct ScanResult {
     // for it.
     long long mikEnforced  = 0;   // corrupting the signature flipped the verdict
     long long mikFailOpen  = 0;   // corrupted signature STILL accepted
+    // WHICH identities fail open, and how many blocks each accounts for. The
+    // shape of this distribution decides whether the fail-open is a small
+    // population problem with a targeted fix or a systemic one.
+    std::map<std::string, long long> failOpenByIdentity;
+    std::map<std::string, long long> verifiedByIdentity;
     bool      regControl   = false;
     bool      refControl   = false;
     bool      regProbe     = false;
@@ -181,6 +186,27 @@ struct ScanResult {
 //
 //   registration: [0xDF][0x01][pubkey 1952][signature 3309]
 //   reference:    [0xDF][0x02][identity  20][signature 3309]
+// Read-only: the 20-byte identity of a REFERENCE MIK blob, as hex. Registration
+// blobs carry a pubkey rather than a stored identity, and they verify inline,
+// so the fail-open population is reference-type by construction.
+std::string ReferenceIdentityHex(const CBlock& block)
+{
+    static const char* H = "0123456789abcdef";
+    for (size_t i = 0; i + 1 < block.vtx.size(); ++i) {
+        if (block.vtx[i] != DFMP::MIK_MARKER) continue;
+        if (block.vtx[i + 1] != DFMP::MIK_TYPE_REFERENCE) continue;
+        if (i + 2 + 20 > block.vtx.size()) return std::string();
+        std::string out;
+        out.reserve(40);
+        for (size_t k = i + 2; k < i + 22; ++k) {
+            out.push_back(H[(block.vtx[k] >> 4) & 0xF]);
+            out.push_back(H[block.vtx[k] & 0xF]);
+        }
+        return out;
+    }
+    return std::string();
+}
+
 // Read-only: which MIK blob, if any, does this coinbase carry?
 int DetectMIKType(const CBlock& block)
 {
@@ -327,8 +353,13 @@ ScanResult ScanChain(const std::string& blocksDir, int fromHeight, int toHeight,
             int pt = -1;
             if (ForgeMIKSignatureBytes(probe, &pt)) {
                 std::string ep;
-                if (CheckVDFBlockMIKSignature(probe, h, ep)) ++res.mikFailOpen;
-                else                                          ++res.mikEnforced;
+                const bool failOpen = CheckVDFBlockMIKSignature(probe, h, ep);
+                if (failOpen) ++res.mikFailOpen; else ++res.mikEnforced;
+                const std::string id = ReferenceIdentityHex(block);
+                if (!id.empty()) {
+                    if (failOpen) ++res.failOpenByIdentity[id];
+                    else          ++res.verifiedByIdentity[id];
+                }
             }
         }
 
@@ -714,6 +745,32 @@ int main(int argc, char* argv[])
     if (!r.mikControl && !r.mikMutApplied)
         untrusted.push_back("no MIK blob could be located in the probe block, so the MIK control was never "
             "applied — this is a TOOL limitation, not evidence about the chain. Do not read it either way.");
+
+    if (!r.failOpenByIdentity.empty() || !r.verifiedByIdentity.empty()) {
+        std::vector<std::pair<long long, std::string>> top;
+        for (const auto& kv : r.failOpenByIdentity) top.push_back({kv.second, kv.first});
+        std::sort(top.rbegin(), top.rend());
+        std::cout << "\nFAIL-OPEN IDENTITIES  " << r.failOpenByIdentity.size()
+                  << " distinct, out of " << r.verifiedByIdentity.size()
+                  << " that verified at least once\n";
+        for (size_t i = 0; i < top.size() && i < 12; ++i) {
+            auto it = r.verifiedByIdentity.find(top[i].second);
+            const long long ver = (it == r.verifiedByIdentity.end() ? 0 : it->second);
+            std::cout << "   " << top[i].second << "  " << top[i].first
+                      << " fail-open" << (ver ? "  (+" + std::to_string(ver) + " verified — MIXED)"
+                                              : "  (never verified)") << "\n";
+        }
+        if (top.size() > 12) std::cout << "   ... and " << (top.size() - 12) << " more\n";
+    }
+
+    // Failure DETAIL is printed even on an untrusted run. Suppressing it meant a
+    // 4-hour census reported "3 failure entries" and no heights, which made the
+    // failures undiagnosable without re-running.
+    if (!r.failures.empty()) {
+        std::cout << "\nconsensus failures (" << r.failures.size() << "):\n";
+        for (const auto& f : r.failures)
+            std::cout << "   h=" << f.height << "  " << f.what << "  " << f.detail << "\n";
+    }
 
     if (!untrusted.empty()) {
         std::cout << "\n⛔ RESULT: UNTRUSTWORTHY. This run cannot support a fork-height decision:\n";
