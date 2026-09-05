@@ -3,38 +3,38 @@
 //
 // vdf-history-check — replay the LP-10 VDF consensus checks over stored blocks.
 //
-// WHY THIS EXISTS. `vdfProofEnforcementHeight` activates a consensus check that
-// every DilV block must then satisfy: a verifying Wesolowski proof AND a valid
-// coinbase MIK signature. Every DilV block is a VDF block (vdfActivationHeight
-// = 0), so if blocks being mined today would NOT pass, pinning any height HALTS
-// the chain at that height. Nobody can answer that from RPC: `getblock` returns
-// no vdfOutput, no vdfProofHash, no raw hex and no coinbase scriptSig at any
-// verbosity, and the proof lives in the scriptSig. It has to be replayed
-// against stored blocks, on a binary that contains the checkers.
+// WHY THIS EXISTS. `vdfProofEnforcementHeight` activates a consensus check every
+// DilV block must then satisfy: a verifying Wesolowski proof AND a valid
+// coinbase MIK signature. Every DilV block is a VDF block, so if blocks being
+// mined today would NOT pass, pinning any height HALTS the chain there. RPC
+// cannot answer it — `getblock` exposes no vdfOutput, no vdfProofHash, no raw
+// hex and no coinbase scriptSig, and the proof lives in the scriptSig. It must
+// be replayed against stored blocks on a binary containing the checkers.
 //
-// The precedent cited across the fleet for this is `tool/nbits-history-check`,
-// whose lesson was that an un-measured connect-time belt would have stuck every
-// fresh DIL sync at height 7,034. NOTE, measured 2026-09-05: that tool exists on
-// NO remote branch of this repository. If you came looking for it as a
-// template, it is not here.
+// ⚠️ THIS IS A DECISION INSTRUMENT FOR A HARD FORK. A wrong answer either halts
+// a live chain or waves through a broken activation. It is therefore built to
+// refuse rather than to guess, and every claim it prints is gated on evidence
+// produced in the same run. Each of the following exists because the FIRST
+// version of this tool got it wrong:
 //
-// WHAT IT REPORTS. For every block in range it runs the two production checkers
-// with the activation gate FORCED OPEN, so the answer is "would this block pass
-// if enforcement were live", not "does it pass today" — today nothing is
-// enforced, the sentinel being 999999999 on all four networks. It then prints
-// the highest failing height, because a fork height must not be set at or below
-// it.
+//   * TWO INDEPENDENT MUTATION CONTROLS, one per checker. Two checkers with a
+//     single control is how v1 reported the MIK arm "passing" when that arm had
+//     silently fail-opened on every reference-MIK block.
+//   * THE PROBE IS A BLOCK THAT PASSED CLEAN. A control firing on a block that
+//     was already failing proves nothing — v1 sampled genesis, which fails for
+//     an unrelated reason, so its control would have fired with the verifier
+//     stubbed out.
+//   * WALK COMPLETENESS IS ASSERTED, not eyeballed. v1 printed the chain length
+//     and the tip height adjacently and compared them nowhere, so a silent
+//     mid-walk break could still print ALL PASS and exit 0.
+//   * THE NETWORK IS BOUND TO THE DATA by genesis hash: a wrong `--network`
+//     changes vdfIterations, fails every block, and looks exactly like a
+//     genuine consensus break.
 //
-// ⚠️ IT REFUSES TO REPORT A CLEAN RUN IT CANNOT PROVE. A replay that silently
-// stopped checking looks exactly like a replay that found nothing wrong. So
-// every run ends with a MUTATION CONTROL: a real block from the very data just
-// scanned is corrupted in memory and re-checked, and the run is declared
-// UNTRUSTWORTHY if the checker still accepts it. "All pass" is never printed
-// without positive evidence that the checker was live against this data.
-//
-// ⚠️ AND THE BINARY CAN PROVE ITSELF: `--selftest` builds a real VDF chain with
-// a single planted forgery and requires the scan to find exactly it. Run that
-// before trusting any real run.
+// Genesis is EXEMPT by construction, not a failure: its coinbase output is a
+// bare OP_RETURN, so no miner address can be extracted and no VDF challenge can
+// be reconstructed. v1 reported it as a consensus failure — a cry-wolf on the
+// one instrument whose alarm has to be believed.
 
 #include <consensus/vdf_validation.h>
 #include <core/chainparams.h>
@@ -43,6 +43,7 @@
 #include <dfmp/mik.h>
 #include <node/blockchain_storage.h>
 #include <node/block_index.h>
+#include <node/genesis.h>
 #include <primitives/block.h>
 #include <vdf/coinbase_vdf.h>
 #include <vdf/vdf.h>
@@ -50,11 +51,13 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cstdint>
 #include <cstring>
 #include <filesystem>
 #include <iostream>
 #include <map>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -64,15 +67,28 @@ void Usage()
 {
     std::cout <<
         "vdf-history-check — replay LP-10 VDF checks over stored blocks\n\n"
-        "  --datadir <path>     block database directory (required unless --selftest)\n"
+        "  --datadir <path>     NODE datadir (contains blocks/ and dfmp_identity/)\n"
+        "  --blocksdir <path>   block DB directly, when only blocks/ is available\n"
+        "  --identitydb <path>  datadir holding dfmp_identity/ (default: --datadir)\n"
         "  --network <n>        dilv | mainnet | testnet | regtest   (default dilv)\n"
-        "  --from <height>      first height to check (default 0)\n"
+        "  --from <height>      first height to check (default 1; genesis is exempt)\n"
         "  --to <height>        last height to check (default: chain tip)\n"
-        "  --verbose            print every failing height, not just a summary\n"
-        "  --selftest           prove this binary detects a forged proof, then exit\n\n"
-        "Exit: 0 all checked blocks pass; 1 one or more fail; 2 the run could\n"
-        "      not be trusted (no data, or the mutation control did not fire).\n";
+        "  --verbose            print every failing height\n"
+        "  --selftest           prove this binary detects forgeries, then exit\n\n"
+        "WITHOUT an identity DB the MIK-signature checker FAILS OPEN on every\n"
+        "reference-MIK block, so that half is reported UNMEASURED rather than as\n"
+        "passing. Point --datadir at a real node datadir to measure it.\n\n"
+        "The node using the datadir must be STOPPED: leveldb holds an exclusive\n"
+        "lock, and a copy taken from a running node is torn.\n\n"
+        "Exit: 0 every checked block passed AND both controls fired AND the walk\n"
+        "        was complete; 1 failures found; 2 the run cannot be trusted.\n";
 }
+
+struct Ctx {
+    std::string network = "dilv";
+    bool identityDbOpen = false;
+    bool checkGenesis   = true;   // false for the synthetic self-test fixture
+};
 
 bool InstallParams(const std::string& network)
 {
@@ -84,17 +100,12 @@ bool InstallParams(const std::string& network)
     else if (network == "regtest") p = ChainParams::Regtest();
     else return false;
 
-    if (Dilithion::g_chainParams == nullptr) {
-        Dilithion::g_chainParams = new ChainParams(p);
-    } else {
-        *Dilithion::g_chainParams = p;
-    }
+    if (Dilithion::g_chainParams == nullptr) Dilithion::g_chainParams = new ChainParams(p);
+    else                                     *Dilithion::g_chainParams = p;
 
-    // FORCE THE ACTIVATION GATE OPEN. Both checkers begin
-    // `if (height < vdfProofEnforcementHeight) return true;` and every network
-    // ships the 999999999 sentinel, so with real params this tool would report
-    // a flawless chain while verifying nothing at all — exactly the vacuous
-    // green it exists to prevent. Setting 0 makes every block truly checked.
+    // FORCE THE ACTIVATION GATE OPEN so every block is truly checked. With the
+    // shipped 999999999 sentinel this tool would report a flawless chain while
+    // verifying nothing — the vacuous green it exists to prevent.
     Dilithion::g_chainParams->vdfProofEnforcementHeight = 0;
     return true;
 }
@@ -106,26 +117,94 @@ struct Failure {
 };
 
 struct ScanResult {
-    bool                 opened      = false;
-    bool                 trustworthy = false;  // the mutation control fired
-    long long            scanned     = 0;
-    long long            vdfBlocks   = 0;
-    long long            unreadable  = 0;
-    int                  tipHeight   = -1;
+    bool      opened       = false;
+    bool      walkComplete = false;   // contiguous genesis..tip, ASSERTED
+    bool      genesisMatch = false;   // the data really is this --network
+    bool      proofControl = false;   // corrupting vdfOutput was rejected
+    bool      mikControl   = false;   // corrupting the MIK signature was rejected
+    // A control that cannot fire is not the same as a checker that is not live.
+    // Conflating them is how a probe "passes vacuously": assert the mutation was
+    // APPLIED as well as REACHED.
+    bool      mikMutApplied = false;  // the signature byte was actually flipped
+    int       probeMikType  = -1;     // 0x01 registration, 0x02 reference, -1 none found
+    bool      haveProbe    = false;
+    int       probeHeight  = -1;
+    // PER-MIK-TYPE controls. One probe proves only the branch its own type
+    // takes: a registration block verifies a signature, a reference block can
+    // fail open. A single control that happened to sample a registration block
+    // would therefore certify a run in which every reference block silently
+    // fail-opened — the v1 defect returning in a subtler form.
+    long long regBlocks    = 0;   // blocks whose MIK blob is registration-type
+    long long refBlocks    = 0;   // ... reference-type
+    long long noMikBlocks  = 0;   // ... no MIK blob located
+    bool      regControl   = false;
+    bool      refControl   = false;
+    bool      regProbe     = false;
+    bool      refProbe     = false;
+    int       regProbeH    = -1;
+    int       refProbeH    = -1;
+    long long scanned      = 0;
+    long long vdfBlocks    = 0;
+    long long unreadable   = 0;
+    int       tipHeight    = -1;
+    int       walkedLow    = -1;
     std::vector<Failure> failures;
 };
 
-// The one scan path. `--selftest` drives THIS function, not a copy of it, so a
-// passing self-test is evidence about real runs rather than about a parallel
-// implementation that happens to agree.
-ScanResult ScanChain(const std::string& datadir, int fromHeight, int toHeight, bool verbose)
+// Flip one byte INSIDE the Dilithium signature of the coinbase MIK blob,
+// leaving every length and structure field intact.
+//
+// Deliberate and load-bearing. Corrupting arbitrary coinbase bytes would make
+// the checker reject at PARSE time, and a control that fires on a parse failure
+// proves only that the parser ran. The entire purpose of this control is to
+// detect the fail-open branch that returns true BEFORE any signature is
+// examined, so the mutation must reach the signature and nothing else.
+//
+//   registration: [0xDF][0x01][pubkey 1952][signature 3309]
+//   reference:    [0xDF][0x02][identity  20][signature 3309]
+// Read-only: which MIK blob, if any, does this coinbase carry?
+int DetectMIKType(const CBlock& block)
+{
+    for (size_t i = 0; i + 1 < block.vtx.size(); ++i) {
+        if (block.vtx[i] != DFMP::MIK_MARKER) continue;
+        const uint8_t t = block.vtx[i + 1];
+        if (t == DFMP::MIK_TYPE_REGISTRATION || t == DFMP::MIK_TYPE_REFERENCE)
+            return static_cast<int>(t);
+    }
+    return -1;
+}
+
+bool ForgeMIKSignatureBytes(CBlock& block, int* outType)
+{
+    for (size_t i = 0; i + 1 < block.vtx.size(); ++i) {
+        if (block.vtx[i] != DFMP::MIK_MARKER) continue;
+        const uint8_t type = block.vtx[i + 1];
+        size_t body;
+        if      (type == DFMP::MIK_TYPE_REGISTRATION) body = DFMP::MIK_PUBKEY_SIZE;
+        else if (type == DFMP::MIK_TYPE_REFERENCE)    body = 20;
+        else continue;
+
+        const size_t sigStart = i + 2 + body;
+        if (sigStart + DFMP::MIK_SIGNATURE_SIZE > block.vtx.size()) continue;
+        block.vtx[sigStart + 100] ^= 0xFF;
+        if (outType) *outType = static_cast<int>(type);
+        return true;
+    }
+    return false;
+}
+
+// The one scan path. --selftest drives THIS function, not a copy, so a passing
+// self-test is evidence about real runs.
+ScanResult ScanChain(const std::string& blocksDir, int fromHeight, int toHeight,
+                     bool verbose, const Ctx& ctx)
 {
     ScanResult res;
 
     CBlockchainDB db;
-    if (!db.Open(datadir, /*create_if_missing=*/false)) {
-        std::cerr << "ERROR: could not open the block database at " << datadir << "\n"
-                  << "       (this tool never creates one — point it at an existing datadir)\n";
+    if (!db.Open(blocksDir, /*create_if_missing=*/false)) {
+        std::cerr << "ERROR: could not open the block database at " << blocksDir << "\n"
+                  << "       (never created here — point this at an existing blocks/ dir,\n"
+                  << "        and stop any node using it: leveldb holds an exclusive lock)\n";
         return res;
     }
     res.opened = true;
@@ -136,78 +215,153 @@ ScanResult ScanChain(const std::string& datadir, int fromHeight, int toHeight, b
         return res;
     }
 
-    // Walk the CANONICAL chain backwards from the tip via pprev-by-hash rather
-    // than enumerating every stored hash: the database also holds orphans and
-    // stale branch blocks, whose heights are not chain positions. Replaying
-    // those would report failures that never mattered to consensus.
-    std::vector<std::pair<int, uint256>> chain;   // tip-first
+    // Walk the CANONICAL chain back from the tip. The database also holds
+    // orphans and stale branch blocks whose heights are not chain positions.
+    std::vector<std::pair<int, uint256>> chain;
+    bool brokeEarly = false;
     {
         uint256 cursor = tipHash;
         while (!cursor.IsNull()) {
             CBlockIndex idx;
-            if (!db.ReadBlockIndex(cursor, idx)) break;
+            if (!db.ReadBlockIndex(cursor, idx)) { brokeEarly = true; break; }
             chain.emplace_back(idx.nHeight, cursor);
             if (idx.nHeight == 0) break;
             cursor = idx.header.hashPrevBlock;
         }
     }
-    if (chain.empty()) {
-        std::cerr << "ERROR: could not read a single block index\n";
-        return res;
-    }
-    std::reverse(chain.begin(), chain.end());     // genesis-first
+    if (chain.empty()) { std::cerr << "ERROR: could not read a single block index\n"; return res; }
+    std::reverse(chain.begin(), chain.end());
 
     res.tipHeight = chain.back().first;
+    res.walkedLow = chain.front().first;
+
+    // ASSERT completeness rather than printing two numbers and hoping a human
+    // compares them. A silent mid-chain break loses the OLDEST blocks, so a
+    // truncated walk can otherwise still look clean.
+    res.walkComplete = (!brokeEarly && res.walkedLow == 0 &&
+                        static_cast<long long>(chain.size()) ==
+                        static_cast<long long>(res.tipHeight) + 1);
+
+    // Bind the network to the data.
+    res.genesisMatch = ctx.checkGenesis ? (chain.front().second == Genesis::GetGenesisHash())
+                                        : true;
+
     if (toHeight < 0 || toHeight > res.tipHeight) toHeight = res.tipHeight;
 
-    std::cout << "canonical blocks   " << chain.size() << " (tip height " << res.tipHeight << ")\n"
-              << "range checked      " << fromHeight << " .. " << toHeight << "\n"
-              << "enforcement gate   FORCED OPEN (asking 'would this pass', not 'does it today')\n\n";
+    std::cout << "chain walked       heights " << res.walkedLow << ".." << res.tipHeight
+              << " (" << chain.size() << " blocks)"
+              << (res.walkComplete ? "  COMPLETE" : "  INCOMPLETE") << "\n";
+    if (ctx.checkGenesis)
+        std::cout << "genesis matches    "
+                  << (res.genesisMatch ? "YES" : "NO — wrong --network or wrong data") << "\n";
+    std::cout << "vdfIterations      " << Dilithion::g_chainParams->vdfIterations
+              << "   (from --network " << ctx.network << ")\n"
+              << "identity DB        " << (ctx.identityDbOpen
+                    ? "OPEN — MIK signatures really verified"
+                    : "ABSENT — MIK checker FAILS OPEN on reference blocks") << "\n";
 
-    uint256 sampleHash;
-    int     sampleHeight = -1;
-    bool    haveSample   = false;
+    if (fromHeight > toHeight) {
+        std::cout << "\nEMPTY RANGE: --from " << fromHeight << " is above the last height "
+                  << toHeight << ". Nothing was checked.\n";
+        return res;
+    }
+    std::cout << "range checked      " << fromHeight << ".." << toHeight
+              << "   (gate FORCED OPEN: 'would this pass', not 'does it today')\n\n";
+
+    uint256 probeHash, regProbeHash, refProbeHash;
 
     for (const auto& entry : chain) {
         const int h = entry.first;
         if (h < fromHeight || h > toHeight) continue;
+        if (h == 0) continue;   // genesis exempt by construction (see header)
 
         CBlock block;
         if (!db.ReadBlock(entry.second, block)) {
             ++res.unreadable;
-            res.failures.push_back({h, "unreadable", "index exists but the block body could not be read"});
+            // NOT a consensus failure — a local storage fault. Deliberately
+            // kept out of `failures` so it can never drive the fork-height
+            // number: attributing a disk fault to consensus is the wrong
+            // answer on the one sentence this tool exists to produce.
+            if (verbose) std::cout << "  UNREADABLE h=" << h << "\n";
             continue;
         }
         ++res.scanned;
         if (!block.IsVDFBlock()) continue;
         ++res.vdfBlocks;
 
-        if (!haveSample) { sampleHash = entry.second; sampleHeight = h; haveSample = true; }
-
-        std::string err;
-        if (!CheckVDFProofConnect(block, h, block.hashPrevBlock, err)) {
-            res.failures.push_back({h, "vdf-proof", err});
-            if (verbose) std::cout << "  FAIL h=" << h << " vdf-proof: " << err << "\n";
+        std::string e1;
+        const bool okProof = CheckVDFProofConnect(block, h, block.hashPrevBlock, e1);
+        if (!okProof) {
+            res.failures.push_back({h, "vdf-proof", e1});
+            if (verbose) std::cout << "  FAIL h=" << h << " vdf-proof: " << e1 << "\n";
         }
-        err.clear();
-        if (!CheckVDFBlockMIKSignature(block, h, err)) {
-            res.failures.push_back({h, "mik-signature", err});
-            if (verbose) std::cout << "  FAIL h=" << h << " mik-signature: " << err << "\n";
+        std::string e2;
+        const bool okMik = CheckVDFBlockMIKSignature(block, h, e2);
+        if (!okMik) {
+            res.failures.push_back({h, "mik-signature", e2});
+            if (verbose) std::cout << "  FAIL h=" << h << " mik-signature: " << e2 << "\n";
+        }
+
+        const int mt = DetectMIKType(block);
+        if      (mt == DFMP::MIK_TYPE_REGISTRATION) ++res.regBlocks;
+        else if (mt == DFMP::MIK_TYPE_REFERENCE)    ++res.refBlocks;
+        else                                        ++res.noMikBlocks;
+
+        // THE PROBE MUST BE A BLOCK THAT PASSED BOTH CHECKS — and we keep one
+        // per MIK type, because the two types take different branches.
+        if (okProof && okMik) {
+            if (!res.haveProbe) {
+                res.haveProbe = true; probeHash = entry.second; res.probeHeight = h;
+            }
+            if (mt == DFMP::MIK_TYPE_REGISTRATION && !res.regProbe) {
+                res.regProbe = true; regProbeHash = entry.second; res.regProbeH = h;
+            }
+            if (mt == DFMP::MIK_TYPE_REFERENCE && !res.refProbe) {
+                res.refProbe = true; refProbeHash = entry.second; res.refProbeH = h;
+            }
         }
 
         if (res.scanned % 10000 == 0) std::cout << "  ... " << res.scanned << " blocks\n";
     }
 
-    // MUTATION CONTROL — the run is not trustworthy without it. Corrupt a REAL
-    // block from the data just scanned and require the checker to reject it.
-    // This proves the checker was live against THIS database, rather than
-    // merely that no failure happened to be printed.
-    if (haveSample) {
-        CBlock probe;
-        if (db.ReadBlock(sampleHash, probe)) {
-            probe.vdfOutput.data[0] ^= 0x01;
-            std::string err;
-            res.trustworthy = !CheckVDFProofConnect(probe, sampleHeight, probe.hashPrevBlock, err);
+    // TWO INDEPENDENT MUTATION CONTROLS, one per checker, both on a block known
+    // to pass clean. Each proves its own checker was live on this data.
+    if (res.haveProbe) {
+        CBlock clean;
+        if (db.ReadBlock(probeHash, clean)) {
+            std::string e;
+            const bool cleanProof = CheckVDFProofConnect(clean, res.probeHeight, clean.hashPrevBlock, e);
+            std::string e2;
+            const bool cleanMik   = CheckVDFBlockMIKSignature(clean, res.probeHeight, e2);
+
+            CBlock mp = clean;
+            mp.vdfOutput.data[0] ^= 0x01;
+            std::string e3;
+            res.proofControl = cleanProof &&
+                               !CheckVDFProofConnect(mp, res.probeHeight, mp.hashPrevBlock, e3);
+
+            CBlock mm = clean;
+            if (cleanMik && ForgeMIKSignatureBytes(mm, &res.probeMikType)) {
+                res.mikMutApplied = true;
+                std::string e4;
+                res.mikControl = !CheckVDFBlockMIKSignature(mm, res.probeHeight, e4);
+            }
+        }
+        // One control per MIK type actually present in the range.
+        auto runTypeControl = [&](const uint256& hash, int height, bool& out) {
+            CBlock c;
+            if (!db.ReadBlock(hash, c)) return;
+            std::string ea;
+            if (!CheckVDFBlockMIKSignature(c, height, ea)) return;   // must pass clean
+            int t = -1;
+            CBlock m = c;
+            if (!ForgeMIKSignatureBytes(m, &t)) return;
+            std::string eb;
+            out = !CheckVDFBlockMIKSignature(m, height, eb);
+        };
+        if (res.regProbe) runTypeControl(regProbeHash, res.regProbeH, res.regControl);
+        if (res.refProbe) runTypeControl(refProbeHash, res.refProbeH, res.refControl);
+        {
         }
     }
     return res;
@@ -217,11 +371,6 @@ ScanResult ScanChain(const std::string& datadir, int fromHeight, int toHeight, b
 // SELF-TEST
 // ---------------------------------------------------------------------------
 
-// Build a VDF block carrying a real Wesolowski proof and a real registration-MIK
-// signature. Deliberately self-contained rather than shared with
-// src/vdf/vdf_consensus_test.cpp: that file is a converged, thrice-reviewed
-// suite and this tool must not be able to break it. If a third consumer
-// appears, factor these out then.
 CBlock BuildSignedVDFBlock(const uint256& prevHash, int height,
                            DFMP::CMiningIdentityKey& mik, uint64_t iterations)
 {
@@ -300,24 +449,19 @@ CBlock BuildSignedVDFBlock(const uint256& prevHash, int height,
 int RunSelfTest()
 {
     const uint64_t iters     = 1000;
-    const int      kChainLen = 6;
-    const int      kForgedAt = 4;    // the single planted forgery
+    const int      kChainLen = 8;
+    const int      kForgedAt = 5;
 
-    std::cout << "vdf-history-check SELF-TEST\n"
-              << "===========================\n"
+    std::cout << "vdf-history-check SELF-TEST\n===========================\n"
               << "Building a " << kChainLen << "-block VDF chain with real proofs and real MIK\n"
-              << "signatures, planting ONE forged proof at height " << kForgedAt << ", then scanning\n"
-              << "it with the SAME ScanChain() a real run uses.\n\n";
+              << "signatures, planting ONE forged proof at height " << kForgedAt << ", then scanning it\n"
+              << "with the SAME ScanChain() a real run uses.\n\n";
 
-    // The fixture must be built at the SAME iteration count the checker will
-    // verify against. CheckVDFProof reads g_chainParams->vdfIterations, which
-    // for DilV is 500,000 — computing a 1,000-iteration proof and verifying it
-    // against 500,000 fails every block, honest ones included. The first run of
-    // this self-test did exactly that and reported 6 failures instead of 1,
-    // which is the self-test doing its job on its own fixture.
-    //
-    // A REAL run must NOT do this: there the shipped vdfIterations is the
-    // authority, because it is what the chain was mined against.
+    // The fixture must be built at the iteration count the checker verifies
+    // against. A REAL run must NOT do this: there the shipped count is the
+    // authority, being what the chain was mined against. The first version of
+    // this self-test omitted it and reported 6 failures instead of 1 — the
+    // self-test catching its own fixture rather than the code.
     Dilithion::g_chainParams->vdfIterations = iters;
 
     DFMP::CMiningIdentityKey mik;
@@ -335,42 +479,32 @@ int RunSelfTest()
         CBlockchainDB db;
         if (!db.Open(dir.string(), true)) {
             std::cerr << "SELF-TEST ERROR: could not create a temp database\n";
-            std::filesystem::remove_all(dir, ec);
-            return 2;
+            std::filesystem::remove_all(dir, ec); return 2;
         }
         uint256 prev, tip;
         for (int h = 0; h < kChainLen && built; ++h) {
             CBlock b = BuildSignedVDFBlock(prev, h, mik, iters);
-            if (b.vtx.empty()) { std::cerr << "SELF-TEST ERROR: build failed at h=" << h << "\n"; built = false; break; }
+            if (b.vtx.empty()) { built = false; break; }
             if (h == kForgedAt) b.vdfOutput.data[0] ^= 0x01;
-
             uint256 hash = b.GetHash();
             CBlockIndex idx;
-            idx.header     = b;
-            idx.nHeight    = h;
-            idx.nTime      = b.nTime;
-            idx.nBits      = b.nBits;
-            idx.nVersion   = b.nVersion;
-            idx.phashBlock = hash;
-
-            if (!db.WriteBlock(hash, b) || !db.WriteBlockIndex(hash, idx)) {
-                std::cerr << "SELF-TEST ERROR: write failed at h=" << h << "\n"; built = false; break;
-            }
-            prev = hash;
-            tip  = hash;
+            idx.header = b; idx.nHeight = h; idx.nTime = b.nTime;
+            idx.nBits = b.nBits; idx.nVersion = b.nVersion; idx.phashBlock = hash;
+            if (!db.WriteBlock(hash, b) || !db.WriteBlockIndex(hash, idx)) { built = false; break; }
+            prev = hash; tip = hash;
         }
         if (built) db.WriteBestBlock(tip);
         db.Close();
     }
-    if (!built) { std::filesystem::remove_all(dir, ec); return 2; }
+    if (!built) { std::cerr << "SELF-TEST ERROR: fixture build failed\n";
+                  std::filesystem::remove_all(dir, ec); return 2; }
 
-    ScanResult r = ScanChain(dir.string(), 0, -1, /*verbose=*/false);
+    Ctx ctx;
+    ctx.network        = "selftest-fixture";
+    ctx.identityDbOpen = false;
+    ctx.checkGenesis   = false;   // synthetic fixture has its own genesis
 
-    if (r.failures.size() != 1) {
-        std::cout << "\nfailures reported (" << r.failures.size() << "), expected exactly 1:\n";
-        for (const auto& f : r.failures)
-            std::cout << "    h=" << f.height << "  " << f.what << "  " << f.detail << "\n";
-    }
+    ScanResult r = ScanChain(dir.string(), 1, -1, /*verbose=*/false, ctx);
 
     std::cout << "\n--- SELF-TEST VERDICT ---\n";
     bool ok = true;
@@ -379,20 +513,26 @@ int RunSelfTest()
         if (!cond) ok = false;
     };
 
-    require(r.opened,                  "the temp database opened and a chain was walked");
-    require(r.vdfBlocks == kChainLen,  "every block was recognised as a VDF block");
-    require(r.trustworthy,             "the mutation control FIRED (the checker was live)");
-    require(r.failures.size() == 1,    "exactly ONE failure was reported");
+    require(r.opened,       "the fixture database opened and a chain was walked");
+    require(r.walkComplete, "the walk was ASSERTED complete (contiguous genesis..tip)");
+    require(r.vdfBlocks == kChainLen - 1,
+            "every non-genesis block was recognised as a VDF block");
+    require(r.proofControl, "the PROOF control fired on a block that passed CLEAN");
+    require(r.mikControl,   "the MIK control fired on a block that passed CLEAN");
+    require(r.failures.size() == 1, "exactly ONE failure was reported");
     require(!r.failures.empty() && r.failures[0].height == kForgedAt,
             "the failure is at the planted height " + std::to_string(kForgedAt));
-    // The decisive one: a scan reporting nothing on a chain that provably
-    // contains a forgery is the vacuous green this tool exists to make
-    // impossible.
-    require(!r.failures.empty(),       "a planted forgery could NOT be silently missed");
+
+    if (r.failures.size() != 1) {
+        std::cout << "\n  reported failures:\n";
+        for (const auto& f : r.failures)
+            std::cout << "    h=" << f.height << "  " << f.what << "  " << f.detail << "\n";
+    }
 
     std::cout << (ok
-        ? "\nSELF-TEST PASSED — this binary detects a forged proof in stored blocks,\n"
-          "and refuses to call a run clean unless its checker was live.\n"
+        ? "\nSELF-TEST PASSED — forged proofs are detected, BOTH checkers are proven\n"
+          "live by independent controls on a clean-passing block, and the tool\n"
+          "asserts its own chain walk was complete.\n"
         : "\n⛔ SELF-TEST FAILED — do NOT trust this binary's output.\n");
 
     std::filesystem::remove_all(dir, ec);
@@ -403,85 +543,181 @@ int RunSelfTest()
 
 int main(int argc, char* argv[])
 {
-    std::string datadir, network = "dilv";
-    int  fromHeight = 0, toHeight = -1;
+    std::string datadir, blocksdir, identitydb;
+    Ctx  ctx;
+    int  fromHeight = 1, toHeight = -1;   // genesis exempt by default
     bool verbose = false, selftest = false;
 
-    for (int i = 1; i < argc; ++i) {
-        std::string a = argv[i];
-        auto next = [&](const char* what) -> std::string {
-            if (i + 1 >= argc) { std::cerr << "ERROR: " << what << " needs a value\n"; std::exit(2); }
-            return argv[++i];
-        };
-        if      (a == "--datadir")  datadir    = next("--datadir");
-        else if (a == "--network")  network    = next("--network");
-        else if (a == "--from")     fromHeight = std::stoi(next("--from"));
-        else if (a == "--to")       toHeight   = std::stoi(next("--to"));
-        else if (a == "--verbose")  verbose    = true;
-        else if (a == "--selftest") selftest   = true;
-        else if (a == "--help" || a == "-h") { Usage(); return 0; }
-        else { std::cerr << "ERROR: unknown argument " << a << "\n\n"; Usage(); return 2; }
+    try {
+        for (int i = 1; i < argc; ++i) {
+            std::string a = argv[i];
+            auto next = [&](const char* what) -> std::string {
+                if (i + 1 >= argc) { std::cerr << "ERROR: " << what << " needs a value\n"; std::exit(2); }
+                return argv[++i];
+            };
+            if      (a == "--datadir")    datadir     = next("--datadir");
+            else if (a == "--blocksdir")  blocksdir   = next("--blocksdir");
+            else if (a == "--identitydb") identitydb  = next("--identitydb");
+            else if (a == "--network")    ctx.network = next("--network");
+            else if (a == "--from")       fromHeight  = std::stoi(next("--from"));
+            else if (a == "--to")         toHeight    = std::stoi(next("--to"));
+            else if (a == "--verbose")    verbose     = true;
+            else if (a == "--selftest")   selftest    = true;
+            else if (a == "--help" || a == "-h") { Usage(); return 0; }
+            else { std::cerr << "ERROR: unknown argument " << a << "\n\n"; Usage(); return 2; }
+        }
+    } catch (const std::exception& e) {
+        std::cerr << "ERROR: bad numeric argument (" << e.what() << ")\n";
+        return 2;
     }
 
-    if (!selftest && datadir.empty()) { Usage(); return 2; }
-    if (!InstallParams(network)) { std::cerr << "ERROR: unknown --network " << network << "\n"; return 2; }
+    if (selftest && (!datadir.empty() || !blocksdir.empty())) {
+        std::cerr << "ERROR: --selftest exercises a synthetic fixture and ignores your data.\n"
+                     "       Refusing to run it alongside --datadir/--blocksdir, because exit 0\n"
+                     "       would then mean 'the binary self-checked', not 'the chain is clean'.\n";
+        return 2;
+    }
+    if (!selftest && datadir.empty() && blocksdir.empty()) { Usage(); return 2; }
+    if (!InstallParams(ctx.network)) {
+        if (!selftest) { std::cerr << "ERROR: unknown --network " << ctx.network << "\n"; return 2; }
+        InstallParams("dilv");
+    }
     if (!vdf::init()) { std::cerr << "ERROR: failed to initialise the VDF library\n"; return 2; }
 
-    if (selftest) { int rc = RunSelfTest(); vdf::shutdown(); return rc; }
+    if (selftest) { const int rc = RunSelfTest(); vdf::shutdown(); return rc; }
 
-    std::cout << "network            " << network << "\n"
-              << "datadir            " << datadir << "\n";
+    if (blocksdir.empty()) blocksdir = datadir + "/blocks";
 
-    ScanResult r = ScanChain(datadir, fromHeight, toHeight, verbose);
+    // Open the identity DB if we can. Without it CheckVDFBlockMIKSignature
+    // fail-opens on every reference-MIK block, and that half of the answer is
+    // worthless — so the tool reports it UNMEASURED rather than passing.
+    const std::string idPath = !identitydb.empty() ? identitydb : datadir;
+    if (!idPath.empty()) {
+        ctx.identityDbOpen = DFMP::InitializeDFMP(idPath) && DFMP::g_identityDb != nullptr;
+    }
+
+    std::cout << "network            " << ctx.network << "\n"
+              << "blocks             " << blocksdir << "\n";
+
+    ScanResult r = ScanChain(blocksdir, fromHeight, toHeight, verbose, ctx);
     if (!r.opened) { vdf::shutdown(); return 2; }
 
     std::cout << "\n---------------------------------------------------------------\n"
               << "blocks read        " << r.scanned << "\n"
               << "VDF blocks checked " << r.vdfBlocks << "\n"
-              << "unreadable bodies  " << r.unreadable << "\n"
-              << "failures           " << r.failures.size() << "\n";
+              << "unreadable bodies  " << r.unreadable << "   (storage faults, NOT consensus failures)\n"
+              << "failure entries    " << r.failures.size()
+              << "   (a block failing both checks contributes two)\n"
+              << "proof control      " << (r.proofControl ? "FIRED" : "DID NOT FIRE") << "\n"
+              << "MIK control        " << (r.mikControl ? "FIRED"
+                    : (r.mikMutApplied ? "DID NOT FIRE (mutation WAS applied)"
+                                       : "NOT APPLIED (no MIK blob located in the probe)")) << "\n"
+              << "probe block        height " << r.probeHeight << ", MIK type "
+              << (r.probeMikType == 0x01 ? "REGISTRATION"
+                 : r.probeMikType == 0x02 ? "REFERENCE" : "none located") << "\n"
+              << "MIK blob census    registration " << r.regBlocks
+              << " | reference " << r.refBlocks
+              << " | none " << r.noMikBlocks << "\n"
+              << "  registration arm " << (r.regBlocks == 0 ? "n/a (none in range)"
+                    : r.regControl ? "PROVEN LIVE (control fired)"
+                                   : "NOT PROVEN — signatures may be unverified") << "\n"
+              << "  reference arm    " << (r.refBlocks == 0 ? "n/a (none in range)"
+                    : r.refControl ? "PROVEN LIVE (control fired)"
+                                   : "NOT PROVEN — FAILS OPEN, signatures unverified") << "\n";
 
-    if (r.vdfBlocks == 0) {
-        std::cout << "\nRESULT: UNTRUSTWORTHY — no VDF block was checked in this range, so\n"
-                     "nothing was verified and the mutation control could not run.\n";
+    // Every reason the run cannot be trusted, reported together rather than one
+    // at a time, so an operator sees the whole picture in a single pass.
+    std::vector<std::string> untrusted;
+    if (!r.walkComplete)
+        untrusted.push_back("the chain walk was INCOMPLETE — heights " + std::to_string(r.walkedLow)
+            + ".." + std::to_string(r.tipHeight) + " is not a contiguous genesis..tip span, so blocks exist that were never scanned");
+    if (!r.genesisMatch)
+        untrusted.push_back("genesis does NOT match --network " + ctx.network
+            + " — wrong network or wrong data; every block would fail for that reason alone");
+    if (r.vdfBlocks == 0)
+        untrusted.push_back("no VDF block was checked, so nothing was verified");
+    if (!r.haveProbe)
+        untrusted.push_back("no block passed both checks, so neither control could run");
+    if (!r.proofControl)
+        untrusted.push_back("the PROOF control did not fire — the proof checker was not live on this data");
+    if (r.regBlocks > 0 && !r.regControl)
+        untrusted.push_back("REGISTRATION-MIK blocks were present (" + std::to_string(r.regBlocks)
+            + ") but no control proved that branch live — their signatures may be unverified");
+    if (r.refBlocks > 0 && !r.refControl)
+        untrusted.push_back("REFERENCE-MIK blocks were present (" + std::to_string(r.refBlocks)
+            + ") and the control on that branch DID NOT FIRE — CheckVDFBlockMIKSignature FAILS OPEN "
+              "for them (identity not resolvable from the identity DB), so their signatures were "
+              "never examined. Any 'pass' for those blocks is worthless.");
+    if (!r.mikControl && r.mikMutApplied)
+        untrusted.push_back("the MIK signature WAS corrupted and the checker STILL ACCEPTED the block — "
+            "so CheckVDFBlockMIKSignature is not verifying signatures on this data. With the identity DB "
+            "open this means the probe's MIK identity is not resolvable from it, so the checker takes its "
+            "fail-open branch. The MIK half of any 'pass' here is worth nothing.");
+    if (!r.mikControl && !r.mikMutApplied)
+        untrusted.push_back("no MIK blob could be located in the probe block, so the MIK control was never "
+            "applied — this is a TOOL limitation, not evidence about the chain. Do not read it either way.");
+
+    if (!untrusted.empty()) {
+        std::cout << "\n⛔ RESULT: UNTRUSTWORTHY. This run cannot support a fork-height decision:\n";
+        for (const auto& u : untrusted) std::cout << "   * " << u << "\n";
+        if (!ctx.identityDbOpen)
+            std::cout << "\n   The MIK half is UNMEASURED. Re-run with --datadir pointing at a node\n"
+                         "   datadir that contains dfmp_identity/ to measure it.\n";
+        if (!r.failures.empty())
+            std::cout << "\n   " << r.failures.size() << " failure entries were also seen. Do not act on\n"
+                         "   them until the above is resolved.\n";
         vdf::shutdown();
         return 2;
     }
-    if (!r.trustworthy) {
-        std::cout << "\n⛔ RESULT: UNTRUSTWORTHY — the mutation control DID NOT FIRE.\n"
-                     "A deliberately corrupted block from this very database was still\n"
-                     "ACCEPTED, so the checker was not live and every 'pass' above is\n"
-                     "meaningless. Do not pin a height on this run.\n";
-        vdf::shutdown();
-        return 2;
-    }
-    std::cout << "mutation control   FIRED (a corrupted block from this data was rejected)\n";
 
     if (r.failures.empty()) {
-        std::cout << "\nRESULT: ALL " << r.vdfBlocks << " VDF blocks checked PASS, and the checker is\n"
-                     "proven live. A fork height in this range would not have halted the chain.\n";
+        std::cout << "\nRESULT: all " << r.vdfBlocks << " VDF blocks in " << fromHeight << ".."
+                  << (toHeight < 0 ? r.tipHeight : toHeight) << " PASS.\n"
+                  << "Both checkers proven live by independent controls, walk proven complete,\n"
+                  << "network bound to the data by genesis hash.\n"
+                  << "A fork height inside this range would not have halted the chain.\n"
+                  << "This says NOTHING about heights above " << r.tipHeight << ".\n";
         vdf::shutdown();
         return 0;
     }
 
-    int worst = 0;
+    int worst = 0, lowest = INT32_MAX;
     std::map<std::string, int> byKind;
-    for (const auto& f : r.failures) { worst = std::max(worst, f.height); byKind[f.what]++; }
+    for (const auto& f : r.failures) {
+        worst  = std::max(worst, f.height);
+        lowest = std::min(lowest, f.height);
+        byKind[f.what]++;
+    }
+    const int scanTop      = (toHeight < 0 ? r.tipHeight : toHeight);
+    const int recentWindow = 1000;
+    const bool recent      = (worst > scanTop - recentWindow);
 
     std::cout << "\nfailures by kind:\n";
     for (const auto& kv : byKind) std::cout << "  " << kv.first << ": " << kv.second << "\n";
-
-    std::cout << "\nfailing heights: ";
+    std::cout << "failing heights: ";
     for (size_t i = 0; i < r.failures.size() && (verbose || i < 10); ++i)
         std::cout << r.failures[i].height << " ";
     if (!verbose && r.failures.size() > 10) std::cout << "... (--verbose for all)";
-    std::cout << "\n";
+    std::cout << "\nspan " << lowest << ".." << worst << ", in a scan ending at " << scanTop << "\n";
 
-    std::cout << "\n⛔ RESULT: " << r.failures.size() << " failures, the highest at height " << worst << ".\n"
-              << "PINNING A FORK HEIGHT AT OR BELOW " << worst << " WOULD HALT THE CHAIN THERE.\n"
-              << "The first height with nothing failing above it is " << (worst + 1) << " — a floor from\n"
-              << "THIS data only, not a recommendation. Re-run against a fresh tip before\n"
-              << "pinning, and add margin for miner upgrade.\n";
+    if (recent) {
+        // The case that actually decides the fork, and where handing over a
+        // floor is dangerous: blocks near the tip failing means miners running
+        // NOW emit blocks that would be rejected. There is no safe height.
+        std::cout << "\n⛔ RESULT: FAILURES REACH THE TOP OF THE SCANNED RANGE (highest " << worst
+                  << ", within " << recentWindow << " of " << scanTop << ").\n"
+                  << "DO NOT PIN ANY HEIGHT. This is the signature of blocks being produced right now\n"
+                  << "that would be REJECTED under enforcement — activating at any height would halt\n"
+                  << "the chain almost immediately. Find the cause first. No floor is offered here\n"
+                  << "because there is not a safe one.\n";
+    } else {
+        std::cout << "\n⛔ RESULT: " << r.failures.size() << " failure entries, all at or below height "
+                  << worst << ",\nwhich is more than " << recentWindow << " blocks below the top of the scanned range.\n"
+                  << "That is consistent with an OLD regime that later changed, not with a live fault.\n"
+                  << "A fork height must be above " << worst << ". That is a FLOOR from THIS data only:\n"
+                  << "it says nothing about heights above " << r.tipHeight << ", and margin for miner\n"
+                  << "upgrade is a separate question this tool does not answer.\n";
+    }
 
     vdf::shutdown();
     return 1;
