@@ -1,10 +1,15 @@
 # Disable restrictive CSP for dashboard functionality
 <IfModule mod_headers.c>
     # Allow inline scripts and external resources for dashboard
+    # MERGE 2026-09-05: took main's LP-9 hardening (no 'unsafe-eval', keep
+    # 'wasm-unsafe-eval') AND this PR's added node http://134.199.159.83:8334.
+    # Union, not a pick: dropping the hardening would re-open JS eval(); dropping
+    # the node would break connectivity to it. ⚠️ VERIFY the four node IPs against
+    # the CURRENT seed list before deploy -- this one was added 2026-06-07.
     # LP-9 (MEDIUM-1): dropped 'unsafe-eval' — no wallet/dashboard code uses eval()/new Function().
     # Kept 'wasm-unsafe-eval' so the Dilithium WASM module still compiles on browsers that
     # gate WebAssembly behind a CSP directive (without re-opening JS eval()).
-    Header always set Content-Security-Policy "default-src 'self'; script-src 'self' 'unsafe-inline' 'wasm-unsafe-eval' https://cdn.jsdelivr.net; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com; img-src 'self' data: https:; connect-src 'self' https://explorer.dilithion.org http://138.197.68.128:8334 http://167.172.56.119:8334 http://165.22.103.114:8334 https://mainnet.base.org https://api.coingecko.com"
+    Header always set Content-Security-Policy "default-src 'self'; script-src 'self' 'unsafe-inline' 'wasm-unsafe-eval' https://cdn.jsdelivr.net; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com; img-src 'self' data: https:; connect-src 'self' https://explorer.dilithion.org http://138.197.68.128:8334 http://167.172.56.119:8334 http://165.22.103.114:8334 http://134.199.159.83:8334 https://mainnet.base.org https://api.coingecko.com"
 
     # Serve WASM files with correct MIME type
     AddType application/wasm .wasm
