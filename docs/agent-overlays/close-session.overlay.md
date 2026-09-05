@@ -4,19 +4,59 @@ Loaded by the generic close-session skill when present. Holds Dilithion's concre
 
 ---
 
-## Concrete repo paths (the canonical clone-root triplet)
+## Concrete repo paths (the canonical clone-root SET)
 
-The three canonical clone roots (always include these, even if "I didn't touch them" — verify-before-assert):
+The six canonical clone roots (always include these, even if "I didn't touch them" — verify-before-assert):
 - `c:/Users/will/dilithion`
-- `c:/Users/will/dilithion-private`
+- `c:/Users/will/agent-comms`  *(was `c:/Users/will/dilithion-private` — that path NO LONGER EXISTS; the hub moved 2026-08-21, corrected 2026-08-31 when a close-session run fetched it and found nothing there)*
 - `c:/Users/will/dilithion-strategy`
+- `C:/Users/will/.claude/projects/c--Users-will-dilithion/memory`
+- `C:/Users/will/ion-strategy`
+- `C:/Users/will/core-test`
 
-Plus a fourth repo (worktree under `c:/tmp/`, a separate `agent-comms` clone, anything else) if it is in the worktree-list output but not in the canonical three — INCLUDE it.
+> **Why this list must be EXHAUSTIVE — 2026-09-04.** A close ceremony can only fail on a repo it
+> was told about. Stores were missing from this list, and every close passed its §7.2 "no unpushed
+> commits" hard check *by not having them in scope* — **clean by luck, not by ceremony.** Measured
+> when one was finally checked: months of local-only work that looked durable because its contents
+> were loaded every session.
+>
+> **The shape to hunt for is a persistent store that is NOT a worktree of the working repo** — a
+> separate clone, an agent-memory directory, a scratch corpus, a local notes tree. §1.1's
+> "include anything in `git worktree list`" fallback is **structurally blind to every one of them**,
+> so it cannot be the safety net. A separate clone never appears in that output at all.
+>
+> When you add a persistent store to this project, add it to this list **in the same change**.
+> Measured detail belongs in the strategy repo's mission notes, not here.
+>
+> *(Kept deliberately free of remote names, repo purposes and file names: this repo is **public**.
+> Verify a destination's visibility before adding any identifying detail to a tracked file — this
+> file reads like private operator tooling and is not.)*
+
+Plus any FURTHER repo (a worktree under `c:/tmp/`, a separate `agent-comms` clone, anything else) if it is in the worktree-list output but not in the canonical six — INCLUDE it. **Note the asymmetry this cannot fix:** that rule only reaches things the worktree list can see, which is why the six above must be maintained by hand.
 
 Generic-skill placeholder mapping for this project:
 - `<working-repo>` → `c:/Users/will/dilithion`
-- `<agent-comms-hub>` → `c:/Users/will/dilithion-private`
+- `<agent-comms-hub>` → `c:/Users/will/agent-comms`  *(corrected 2026-08-31; the old `dilithion-private` path does not exist)*
 - `<strategy/state-repo>` → `c:/Users/will/dilithion-strategy`
+- `<memory-store>` → `C:/Users/will/.claude/projects/c--Users-will-dilithion/memory`
+
+### Memory-store commit + push (Steps 6.2 and 7.2)
+
+The memory store is a **working repo** for ordering purposes — push it in Step 6.2, before the strategy repo, and include it in the Step 7.2 `git log @{u}..HEAD` sweep.
+
+```
+cd C:/Users/will/.claude/projects/c--Users-will-dilithion/memory
+git add -A -- . ':!project_ion_launch_liquidity.md'
+git commit -m "memory: <session slug> — <what was learned>"
+git push origin HEAD
+git log @{u}..HEAD   # must be empty
+```
+
+Two standing exclusions, both deliberate:
+- **`project_ion_launch_liquidity.md`** — `MEMORY.md` marks it *"LOCAL only, never quote the figure"*. The remote is private so backing it up is probably intended, but reversing an explicit confidentiality annotation is Will's call. Leave it untracked until he says otherwise.
+- Empty scratch files (e.g. a zero-byte `close-readiness`) — cruft, not memory.
+
+Use an explicit pathspec with exclusions, never a bare `git add -A`, per the standing rule about sweeping agent-memory directories (`feedback_git_add_scope_agent_memory.md`). If the store is clean, say so in the Step 8 report rather than skipping it silently — "nothing to commit" is a result, an unexamined repo is not.
 
 ### Strategy-repo pull (Step 1.3)
 
