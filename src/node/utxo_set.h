@@ -67,6 +67,44 @@ struct UndoIntegrityFailure {
 void ClassifyUndoFetchStatus(const leveldb::Status& st, UndoIntegrityFailure& failure_out);
 
 /**
+ * #120 startup-path follow-up: pure decision for what a STARTUP integrity-check
+ * failure should do AFTER the bounded retry loop has exhausted its attempts.
+ *
+ * This mirrors the runtime ChainstateIntegrityMonitor's transient-vs-corruption
+ * contract at boot. Before this helper the startup callers were transient-BLIND:
+ * ANY VerifyUndoDataInRange failure (including a recoverable IsIOError storage
+ * blip) wrote the auto_rebuild marker and returned the WIPE exit code, so a
+ * transient boot-time fault triggered a DESTRUCTIVE full resync. The monitor
+ * already routes transient faults to tolerate-never-wipe; this brings the
+ * single-shot startup path to the same standard.
+ *
+ * Extracted as a free, side-effect-free function (operating only on the already-
+ * classified `failure.transient`) so the safety-critical wipe-vs-stop branch is
+ * unit-testable without standing up a full node, sleeping through real backoff,
+ * or writing real LevelDB corruption to disk.
+ *
+ *   transient == true  -> StopNoWipe   (recoverable storage fault that did NOT
+ *                                        clear across retries: fail LOUD, do NOT
+ *                                        write the marker, abort for operator
+ *                                        inspection — a rebuild cannot fix a
+ *                                        failing disk and would destroy a healthy
+ *                                        chain over a transient blip).
+ *   transient == false -> WipeRebuild  (confirmed corruption / missing undo:
+ *                                        reproducible on-disk damage — write the
+ *                                        marker + wipe-and-resync, the existing
+ *                                        v4.4 behavior, deliberately UNCHANGED).
+ */
+enum class StartupIntegrityAction {
+    WipeRebuild,  // confirmed corruption: write auto_rebuild marker, return 2 (wrapper wipes)
+    StopNoWipe,   // persistent transient fault: NO marker, return 1 (stop for inspection)
+};
+
+inline StartupIntegrityAction DecideStartupIntegrityAction(const UndoIntegrityFailure& failure) {
+    return failure.transient ? StartupIntegrityAction::StopNoWipe
+                             : StartupIntegrityAction::WipeRebuild;
+}
+
+/**
  * v4.4 test-only fault injection for the undo-fetch seam.
  *
  * When g_undo_fetch_fault_injector is non-null, FetchAndVerifyUndo consults it

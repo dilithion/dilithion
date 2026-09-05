@@ -2964,8 +2964,74 @@ load_genesis_block:  // Bug #29: Label for automatic retry after blockchain wipe
                         std::cout << "  [v4.4] Startup integrity check: verifying undo data "
                                   << "for blocks [" << fromHeight << ".." << toHeight
                                   << "] via pprev walk..." << std::endl;
+                        // #120 startup-path follow-up: mirror the runtime
+                        // ChainstateIntegrityMonitor's self-heal contract at boot.
+                        // A single failed walk must NEVER be sufficient to WIPE.
+                        // Re-verify up to kRevalidateAttempts with backoff — a
+                        // transient storage-layer fault (flaky disk, fsync lag, AV
+                        // file lock on Windows, a momentary LevelDB IsIOError)
+                        // clears across retries; genuine corruption (missing key /
+                        // checksum / size / IsCorruption) reproduces every attempt.
+                        // We reuse the monitor's constants so the two paths can't
+                        // drift. This boot path is single-threaded and pre-monitor-
+                        // thread, so the backoff is a plain sleep (no Stop()/
+                        // InterruptibleWait seam exists yet).
                         UndoIntegrityFailure failure;
-                        if (!utxo_set.VerifyUndoDataInRange(pindexTip, fromHeight, toHeight, failure)) {
+                        bool walkPass = false;
+                        using IM = Dilithion::ChainstateIntegrityMonitor;
+                        for (int attempt = 1; attempt <= IM::kRevalidateAttempts; ++attempt) {
+                            failure = UndoIntegrityFailure{};  // reset between attempts
+                            walkPass = utxo_set.VerifyUndoDataInRange(pindexTip, fromHeight, toHeight, failure);
+                            if (walkPass) {
+                                if (attempt > 1) {
+                                    std::cerr << "  [v4.4] Startup integrity check passed on retry attempt "
+                                              << attempt << "/" << IM::kRevalidateAttempts
+                                              << " — earlier failure was transient." << std::endl;
+                                }
+                                break;
+                            }
+                            if (attempt < IM::kRevalidateAttempts) {
+                                std::cerr << "  [v4.4] Startup integrity walk attempt " << attempt << "/"
+                                          << IM::kRevalidateAttempts << " failed (cause=" << failure.cause
+                                          << ", transient=" << (failure.transient ? "yes" : "no")
+                                          << ") at height " << failure.height
+                                          << " — re-verifying after backoff before acting." << std::endl;
+                                std::this_thread::sleep_for(IM::kRevalidateBackoff);
+                            }
+                        }
+                        if (!walkPass) {
+                            // All retries exhausted. Branch on the classification —
+                            // identical contract to the runtime monitor.
+                            if (DecideStartupIntegrityAction(failure) == StartupIntegrityAction::StopNoWipe) {
+                                // Persistent TRANSIENT storage fault (IsIOError that
+                                // did not clear). FAIL LOUD, do NOT wipe: a rebuild
+                                // cannot fix failing hardware and would destroy a
+                                // healthy chain over a transient blip. Abort with a
+                                // NON-WIPE exit code for operator inspection — no
+                                // auto_rebuild marker is written.
+                                std::cerr << "\n==========================================================" << std::endl;
+                                std::cerr << "[ERROR] Startup integrity check: persistent TRANSIENT read fault "
+                                          << "(cause=" << failure.cause << ") at height " << failure.height
+                                          << " hash=" << failure.blockHash.GetHex() << " after "
+                                          << IM::kRevalidateAttempts << " attempts." << std::endl;
+                                std::cerr << "This indicates a storage-layer problem (failing disk, fsync lag, "
+                                          << "or a file lock — e.g. antivirus on Windows), NOT chainstate "
+                                          << "corruption." << std::endl;
+                                std::cerr << "The node will STOP and will NOT auto-rebuild (a rebuild cannot fix "
+                                          << "failing hardware and would destroy a healthy chain). No auto_rebuild "
+                                          << "marker written." << std::endl;
+                                std::cerr << "ACTION REQUIRED: inspect the disk (SMART), close any process locking "
+                                          << "the data directory, move the data directory off the failing volume, "
+                                          << "or restore from a known-good backup — then restart." << std::endl;
+                                std::cerr << "==========================================================" << std::endl;
+
+                                delete Dilithion::g_chainParams;
+                                return 1;  // Non-wipe exit: stop for inspection, do NOT trigger a resync
+                            }
+
+                            // Confirmed corruption / missing undo (non-transient,
+                            // reproducible on-disk damage). Existing v4.4 behavior,
+                            // deliberately UNCHANGED: write marker + wipe-and-resync.
                             std::cerr << "\n==========================================================" << std::endl;
                             std::cerr << "[CRITICAL] Startup integrity check FAILED at height "
                                       << failure.height << " hash=" << failure.blockHash.GetHex()
