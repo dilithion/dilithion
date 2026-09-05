@@ -617,11 +617,24 @@ bool CRPCServer::Start() {
 }
 
 void CRPCServer::Stop() {
-    if (!m_running) {
+    // EXCHANGE, not check-then-act. `if (!m_running) return; m_running = false;`
+    // is two separate operations on the atomic, so two threads can BOTH observe
+    // true and BOTH proceed through the whole of Stop().
+    //
+    // That is not a theoretical interleaving -- it is the ordinary Ctrl+C path:
+    //   node/dilithion-node.cpp:529   g_node_state.rpc_server->Stop()
+    //   node/dilithion-node.cpp:8862  rpc_server.Stop()
+    // and node/dilithion-node.cpp:2386 installs a Windows SetConsoleCtrlHandler,
+    // which the OS runs on an INJECTED thread. So on Windows a Ctrl+C gives two
+    // threads inside Stop() by construction, every time, not by bad luck.
+    //
+    // Whoever wins the exchange owns the teardown; everyone else returns
+    // immediately. This is what makes the socket close below exactly-once, and
+    // it is also what keeps the join()/m_workerThreads teardown further down
+    // from being executed concurrently with itself.
+    if (!m_running.exchange(false)) {
         return;
     }
-
-    m_running = false;
 
     // PR #38 red-team C5: wake any RPC worker parked in a wait-* long-poll
     // (waitfornewblock / waitforblock / waitforblockheight). Without this,
@@ -647,17 +660,36 @@ void CRPCServer::Stop() {
         m_ssl_connections.clear();
     }
 
-    // Shutdown and close server socket
-    if (m_serverSocket != INVALID_SOCKET) {
+    // Shutdown and close server socket.
+    //
+    // ONE operation, then operate on the local. Reading the atomic separately
+    // for the guard, the shutdown and the close would be three independent
+    // loads not guaranteed to observe the same value. m_running was already
+    // exchanged to false above, so ServerThread breaks out rather than
+    // retrying once accept() returns.
+    //
+    // EXCHANGE, not load-then-store. A load/close/store trio is not an
+    // exclusive close: two callers can both read fd 42 and both closesocket(42).
+    // Between those two closes any thread opening a descriptor can be handed 42,
+    // and the second close then destroys an unrelated subsystem's socket --
+    // during shutdown, while P2P is still live (dilithion-node.cpp closes the
+    // P2P socket after this call, not before). The exchange above makes only one
+    // caller reach here at all, and this exchange is the second, independent
+    // guarantee that the fd is claimed exactly once.
+    const int serverSock = m_serverSocket.exchange(INVALID_SOCKET, std::memory_order_acq_rel);
+    if (serverSock != INVALID_SOCKET) {
         // Shutdown the socket to unblock accept() call
         #ifdef _WIN32
-        shutdown(m_serverSocket, SD_BOTH);
+        shutdown(serverSock, SD_BOTH);
         #else
-        shutdown(m_serverSocket, SHUT_RDWR);
+        shutdown(serverSock, SHUT_RDWR);
         #endif
 
-        closesocket(m_serverSocket);
-        m_serverSocket = INVALID_SOCKET;
+        closesocket(serverSock);
+        // No store here: the exchange above already published INVALID_SOCKET,
+        // and it did so BEFORE the close rather than after. That ordering is
+        // deliberate -- it closes the window in which ServerThread could still
+        // load a live fd that this thread is about to destroy.
     }
 
     // RPC-002: Wake up all worker threads so they can exit
@@ -717,7 +749,11 @@ void CRPCServer::ServerThread() {
         // Accept client connection
         struct sockaddr_in clientAddr;
         socklen_t clientLen = sizeof(clientAddr);
-        int clientSocket = accept(m_serverSocket, (struct sockaddr*)&clientAddr, &clientLen);
+        // ONE acquire-load, then use the local. Pairs with Stop()'s
+        // release-store of INVALID_SOCKET. Loading inside the accept() call
+        // argument list would be a second, independent read.
+        const int listenSock = m_serverSocket.load(std::memory_order_acquire);
+        int clientSocket = accept(listenSock, (struct sockaddr*)&clientAddr, &clientLen);
 
         if (clientSocket == INVALID_SOCKET) {
             if (m_running) {

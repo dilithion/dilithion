@@ -263,8 +263,34 @@ private:
     std::map<std::string, SubnetAttestationState> m_attestationRateLimit;
     int m_attestationMaxPerDay{1};  // configurable via --attestation-rate-limit
 
-    // Server socket
-    int m_serverSocket;
+    /** Server socket.
+     *
+     *  ATOMIC because Stop() and ServerThread() touch it concurrently:
+     *  Stop() writes INVALID_SOCKET (server.cpp, after closesocket) while
+     *  ServerThread() reads it as the accept() argument. As a plain `int`
+     *  that pairing is a data race and therefore undefined behaviour --
+     *  TSan reported it 7 times in one CI run, every report from a fixture
+     *  teardown. Atomic matches m_running above, which is already
+     *  std::atomic<bool> for the same reason.
+     *
+     *  ⚠️ WHAT THIS DOES NOT FIX -- do not read the removed race as a
+     *  correct shutdown protocol:
+     *   1. A file-descriptor REUSE window remains. ServerThread can load a
+     *      still-valid fd, Stop() can then close it, and if any other thread
+     *      opens a socket that is handed the same fd number, the accept()
+     *      lands on an unrelated socket. Closing the fd before joining the
+     *      server thread is what leaves that window open, and the ordering
+     *      is deliberate: on Windows closesocket() is what unblocks a
+     *      blocked accept(), so joining first would deadlock there.
+     *      Closing it properly needs an interruptible-accept mechanism
+     *      (self-pipe / eventfd, or a non-blocking listener + poll), which
+     *      is a larger change than this one.
+     *   2. ServerThread's `if (m_running) continue;` on accept() failure has
+     *      no backoff, so a PERSISTENT error (EMFILE, say) becomes a 100%
+     *      CPU spin rather than a bounded retry.
+     *  Both are recorded rather than silently inherited.
+     */
+    std::atomic<int> m_serverSocket;
 
     /**
      * Server thread function
