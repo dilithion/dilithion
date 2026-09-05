@@ -686,4 +686,46 @@ BOOST_AUTO_TEST_CASE(pbkdf2_binary_input) {
     BOOST_CHECK_EQUAL_COLLECTIONS(output, output + 64, output2, output2 + 64);
 }
 
+/**
+ * Known-answer tests for the empty-input edge cases (UBSan nonnull-attribute
+ * finding, PR #165 / CI-1). A NULL salt with salt_len == 0 is an accepted
+ * input that used to reach memcpy(salt_block, nullptr, 0) in pbkdf2_f, and a
+ * NULL password flows into the guarded HMAC_SHA3_512 key copy. The guards must
+ * not change any output byte, so each case is pinned to a vector computed
+ * INDEPENDENTLY of this code with Python 3:
+ *
+ *   hashlib.pbkdf2_hmac("sha3_512", password, salt, 1, 64).hex()
+ *
+ * (Python's hashlib over OpenSSL; nothing here is derived from the
+ * implementation under test.)
+ */
+BOOST_AUTO_TEST_CASE(pbkdf2_empty_password_empty_salt_kat) {
+    uint8_t output[64];
+    PBKDF2_SHA3_512(nullptr, 0, nullptr, 0, 1, output, 64);
+    const std::vector<uint8_t> expected = hex_to_bytes(
+        "665409f49b9b46e3f4cb15476ed41d562f4ba27068be4c324d95f25755c37edf"
+        "23d64a31e4a35a344326da324ccee72cf45e5896f9bd261ba622e43b7a1a5204");
+    BOOST_CHECK_EQUAL_COLLECTIONS(output, output + 64, expected.begin(), expected.end());
+}
+
+BOOST_AUTO_TEST_CASE(pbkdf2_empty_salt_kat) {
+    const uint8_t password[] = "password";
+    uint8_t output[64];
+    PBKDF2_SHA3_512(password, sizeof(password) - 1, nullptr, 0, 1, output, 64);
+    const std::vector<uint8_t> expected = hex_to_bytes(
+        "fd09c0022a125751e40735a877ab46fed5c0e2657ecbc4371330f578a8211fa2"
+        "d4f527e5d455cb43945c6dc7d5c10d8c32bb9834b6bd367b7624bb6dbab27f16");
+    BOOST_CHECK_EQUAL_COLLECTIONS(output, output + 64, expected.begin(), expected.end());
+}
+
+BOOST_AUTO_TEST_CASE(pbkdf2_empty_password_kat) {
+    const uint8_t salt[] = "salt";
+    uint8_t output[64];
+    PBKDF2_SHA3_512(nullptr, 0, salt, sizeof(salt) - 1, 1, output, 64);
+    const std::vector<uint8_t> expected = hex_to_bytes(
+        "6c63809f5dc2c6c9bc4e1267267ddd471a34b16534eda6e6eb750f3d1436e1e6"
+        "abaf45f73de334dce8e863c06a820612ad0ccbf74b837b3555eb5142dfd0807a");
+    BOOST_CHECK_EQUAL_COLLECTIONS(output, output + 64, expected.begin(), expected.end());
+}
+
 BOOST_AUTO_TEST_SUITE_END() // pbkdf2_tests
