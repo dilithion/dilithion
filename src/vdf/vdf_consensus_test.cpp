@@ -13,6 +13,10 @@
 #include <dfmp/dfmp.h>
 #include <consensus/chain.h>
 #include <node/block_index.h>
+#include <node/utxo_set.h>
+#include <filesystem>
+#include <random>
+#include <sstream>
 #include <iostream>
 #include <cassert>
 #include <cstring>
@@ -628,13 +632,19 @@ static void InstallConnectTipChainParams(uint64_t vdfIters, int enforcementHeigh
 // UTXO and mempool step inside ConnectTip is guarded on those being non-null,
 // so this exercises the validation spine and nothing else.
 static bool RunConnectTip(const CBlock& block, int height, bool skipValidation,
-                          bool* outMarkedFailedValid)
+                          bool* outMarkedFailedValid, CUTXOSet* utxo = nullptr)
 {
     CChainState chain;
+    if (utxo != nullptr) {
+        chain.SetUTXOSet(utxo);
+    }
     CBlockIndex idx;
     idx.nHeight  = height;
     idx.nTime    = block.nTime;
     idx.nBits    = block.nBits;
+    // nVersion is set for realism only. ConnectTip branches on
+    // block.IsVDFBlock(), never on pindex->nVersion -- do not read this field
+    // as the mechanism under test in the non-VDF case below.
     idx.nVersion = block.nVersion;
     // GetBlockHash() does not compute -- it logs an error and returns a null
     // hash unless phashBlock was set explicitly. ConnectTip calls it on entry.
@@ -657,6 +667,15 @@ static uint256 CTPrevHash()
     return h;
 }
 
+// NOTE, load-bearing: every ConnectTip case here uses a REGISTRATION MIK.
+// CheckVDFBlockMIKSignature fails OPEN for a REFERENCE MIK whose pubkey cannot
+// be resolved (vdf_validation.cpp:309-315 -- g_identityDb is always null in
+// this binary), so a reference-MIK block would be ACCEPTED however corrupt its
+// signature. If you add a ConnectTip case built on a reference MIK, the
+// forged-signature assertions below go vacuous rather than failing loudly.
+// That fail-open branch is the one that runs during multi-block reorg undo and
+// it has NO coverage here -- see the scope note at the bottom of this file.
+//
 // Corrupt the Dilithium signature inside the coinbase registration-MIK blob,
 // then RE-COMMIT the merkle root. ConnectTip runs LP-4's merkle recompute
 // before it reaches LP-10, so a forgery that left the header root stale would
@@ -665,20 +684,39 @@ static uint256 CTPrevHash()
 // header root is theirs to set.
 static bool ForgeMIKSignatureInPlace(CBlock& block)
 {
+    // The scan takes the FIRST [0xDF][0x01] pair in the raw coinbase bytes.
+    // That is safe by construction here rather than by check, so assert the
+    // construction actually holds: if the pair ever occurs more than once, the
+    // byte flipped below might land outside the signature and the forgery
+    // would silently become a no-op -- a corrupted block that still verifies,
+    // i.e. a test that passes while asserting nothing.
+    size_t found = 0, at = 0;
     for (size_t i = 0; i + 1 < block.vtx.size(); ++i) {
         if (block.vtx[i] == DFMP::MIK_MARKER &&
             block.vtx[i + 1] == DFMP::MIK_TYPE_REGISTRATION) {
-            size_t sigStart = i + 2 + DFMP::MIK_PUBKEY_SIZE;
-            if (sigStart + 100 < block.vtx.size()) {
-                block.vtx[sigStart + 50] ^= 0xFF;
-                SHA3_256(block.vtx.data() + 1, block.vtx.size() - 1,
-                         block.hashMerkleRoot.data);
-                return true;
-            }
-            return false;
+            if (found == 0) at = i;
+            ++found;
         }
     }
-    return false;
+    if (found != 1) {
+        std::cout << "(MIK marker occurs " << found << " times, expected exactly 1) ";
+        return false;
+    }
+    // Layout: [0xDF][0x01][pubkey MIK_PUBKEY_SIZE][signature MIK_SIGNATURE_SIZE].
+    const size_t sigStart = at + 2 + DFMP::MIK_PUBKEY_SIZE;
+    const size_t flipAt   = sigStart + 50;
+    if (sigStart + DFMP::MIK_SIGNATURE_SIZE > block.vtx.size() ||
+        flipAt >= sigStart + DFMP::MIK_SIGNATURE_SIZE) {
+        std::cout << "(MIK signature does not fit where the layout says) ";
+        return false;
+    }
+    block.vtx[flipAt] ^= 0xFF;
+    // Re-commit: LP-4's merkle recompute runs BEFORE LP-10 in ConnectTip, so a
+    // forgery that left the header root stale would be rejected by the merkle
+    // check and the test would pass for entirely the wrong reason. A real
+    // attacker re-commits too -- the header root is theirs to set.
+    SHA3_256(block.vtx.data() + 1, block.vtx.size() - 1, block.hashMerkleRoot.data);
+    return true;
 }
 
 // POSITIVE CONTROL. An honest VDF block must be ACCEPTED through the entire of
@@ -919,11 +957,18 @@ static void test_connecttip_forged_mik_signature_rejected_both_paths()
     PASS();
 }
 
-// The guard's own gate. A non-VDF block (nVersion < VDF_VERSION) must not be
-// subjected to the VDF checks at all, however broken its VDF header fields
-// are. This pins IsVDFBlock() as the entry condition, so a future change that
-// widened the gate to every block would be caught here rather than on a
-// mainnet chain of legacy blocks.
+// A non-VDF block (nVersion < VDF_VERSION) must not be subjected to the VDF
+// checks at all, however broken its VDF header fields are -- otherwise a chain
+// of legacy blocks would be rejected wholesale.
+//
+// ⚠️ WHAT THIS CASE DOES **NOT** DO, corrected after review: it does not pin
+// IsVDFBlock() as the entry condition, and cannot. The gate is duplicated at
+// THREE sites -- the caller (chain.cpp:1834) and both callees
+// (vdf_validation.cpp:224 and :258, each `if (!block.IsVDFBlock()) return
+// true;`). Widening the caller gate to `if (true)` leaves this case GREEN,
+// because the callees still exempt the block. The exemption is defended in
+// depth and this case asserts the OUTCOME of all three together, not any one
+// of them. Do not cite it as mutation coverage of the caller's gate.
 //
 // dfmpActivationHeight is moved out of range for this case ONLY: DilV ships it
 // at 0, and CheckProofOfWorkDFMP's early return for VDF blocks no longer
@@ -953,6 +998,188 @@ static void test_connecttip_non_vdf_block_not_subject_to_vdf_checks()
     PASS();
 }
 
+// ⛔ MEDIUM-3 (red-team, folded): THE ACTIVATION BOUNDARY ITSELF.
+//
+// The gate is `if (height < enforcementHeight) return true;` -- vdf_validation.cpp:218
+// for the proof and :252 for the MIK signature. Every other case in this file
+// sits STRICTLY above or STRICTLY below the enforcement height, so the exact
+// fork edge was untested on both checkers: flipping `<` to `<=` is a ONE-BLOCK
+// consensus split between upgraded and non-upgraded nodes, and it left this
+// entire suite green.
+//
+// vdfProofEnforcementHeight is a scheduled hard fork whose number is still
+// unpinned. An off-by-one at the activation edge is exactly the class of defect
+// that cannot be found once it is live. ONE block is used for both halves, with
+// only the enforcement height moved across it, so the two verdicts differ in
+// nothing but the comparison under test.
+static void test_connecttip_enforcement_boundary_is_exact()
+{
+    TEST(connecttip_enforcement_boundary_is_exact);
+    const uint64_t iters = 1000;
+
+    DFMP::CMiningIdentityKey mik;
+    if (!mik.Generate()) { std::cout << "FAIL: MIK generate\n"; ++failed; return; }
+    CBlock forged = MakeVDFBlockWithSignedMIK(CTPrevHash(), kCTHeight, mik, iters);
+    if (forged.vtx.empty()) { std::cout << "FAIL: block build/sign\n"; ++failed; return; }
+    forged.vdfOutput.data[0] ^= 0x01;
+
+    // height == enforcement - 1  ->  strictly below  ->  GRANDFATHERED.
+    InstallConnectTipChainParams(iters, /*enforcement=*/kCTHeight + 1, /*assumeValid=*/0);
+    bool flagged = true;
+    if (!RunConnectTip(forged, kCTHeight, false, &flagged)) {
+        std::cout << "FAIL: rejected at height == enforcement-1; the gate is too eager "
+                     "by one block (`<` may have become `<=`)\n";
+        ++failed; return;
+    }
+    CHECK(!flagged);
+
+    // height == enforcement  ->  the FIRST enforced block  ->  REJECTED.
+    InstallConnectTipChainParams(iters, /*enforcement=*/kCTHeight, /*assumeValid=*/0);
+    flagged = false;
+    bool ok = RunConnectTip(forged, kCTHeight, false, &flagged);
+    if (ok) {
+        std::cout << "FAIL: accepted at height == enforcement; the fork's FIRST block is "
+                     "unenforced (`<` may have become `<=`)\n";
+        ++failed; return;
+    }
+    CHECK(!ok);
+    CHECK(flagged);
+
+    // Same boundary, same block, on the reorg path.
+    flagged = false;
+    ok = RunConnectTip(forged, kCTHeight, true, &flagged);
+    CHECK(!ok);
+    CHECK(flagged);
+
+    // And the MIK-signature checker has its own copy of the same comparison
+    // (vdf_validation.cpp:252), so it needs its own boundary case.
+    CBlock mikForged = MakeVDFBlockWithSignedMIK(CTPrevHash(), kCTHeight, mik, iters);
+    if (mikForged.vtx.empty()) { std::cout << "FAIL: block build/sign\n"; ++failed; return; }
+    if (!ForgeMIKSignatureInPlace(mikForged)) {
+        std::cout << "FAIL: could not locate the MIK signature to corrupt\n";
+        ++failed; return;
+    }
+
+    InstallConnectTipChainParams(iters, /*enforcement=*/kCTHeight + 1, /*assumeValid=*/0);
+    flagged = true;
+    if (!RunConnectTip(mikForged, kCTHeight, false, &flagged)) {
+        std::cout << "FAIL: MIK gate rejected at height == enforcement-1\n";
+        ++failed; return;
+    }
+    CHECK(!flagged);
+
+    InstallConnectTipChainParams(iters, /*enforcement=*/kCTHeight, /*assumeValid=*/0);
+    flagged = false;
+    ok = RunConnectTip(mikForged, kCTHeight, false, &flagged);
+    if (ok) {
+        std::cout << "FAIL: MIK gate accepted at height == enforcement\n";
+        ++failed; return;
+    }
+    CHECK(!ok);
+    CHECK(flagged);
+    PASS();
+}
+
+// ⛔ MEDIUM-2 (red-team, folded): "Runs BEFORE ApplyBlock so a forged block
+// never mutates the UTXO set" -- chain.cpp:1832-1833.
+//
+// That ordering IS the security content of where LP-10 sits. Rejecting late
+// still returns false, but a forged block would already have hit the UTXO set.
+// Every other case here runs with pUTXOSet == nullptr, so ApplyBlock is a
+// no-op and the ordering is invisible: moving the whole LP-10 block BELOW
+// ApplyBlock leaves them all green, because order is not observable through a
+// return value.
+//
+// This case gives the harness a REAL CUTXOSet on a temp directory so the
+// ordering becomes observable. The honest half is not decoration -- it is what
+// stops the forged assertion being vacuous: if ApplyBlock never worked in this
+// harness at all, "the UTXO set did not grow" would be trivially true and
+// would prove nothing.
+static void test_connecttip_forged_block_never_reaches_the_utxo_set()
+{
+    TEST(connecttip_forged_block_never_reaches_the_utxo_set);
+    const uint64_t iters = 1000;
+    InstallConnectTipChainParams(iters, /*enforcement=*/100, /*assumeValid=*/0);
+
+    std::random_device rd;
+    std::ostringstream oss;
+    oss << "dilithion-lp10-connecttip-utxo-" << rd();
+    std::filesystem::path dir = std::filesystem::temp_directory_path() / oss.str();
+    std::error_code ec;
+    std::filesystem::create_directories(dir, ec);
+
+    {
+        CUTXOSet utxo;
+        if (!utxo.Open(dir.string(), true)) {
+            std::cout << "FAIL: could not open a temp UTXO set\n";
+            ++failed;
+            std::filesystem::remove_all(dir, ec);
+            return;
+        }
+
+        DFMP::CMiningIdentityKey mik;
+        if (!mik.Generate()) {
+            std::cout << "FAIL: MIK generate\n"; ++failed;
+            utxo.Close(); std::filesystem::remove_all(dir, ec); return;
+        }
+
+        // POSITIVE CONTROL -- proves the observable actually moves.
+        CBlock honest = MakeVDFBlockWithSignedMIK(CTPrevHash(), kCTHeight, mik, iters);
+        if (honest.vtx.empty()) {
+            std::cout << "FAIL: block build/sign\n"; ++failed;
+            utxo.Close(); std::filesystem::remove_all(dir, ec); return;
+        }
+        const uint64_t before = utxo.GetUTXOCount();
+        if (!RunConnectTip(honest, kCTHeight, false, nullptr, &utxo)) {
+            std::cout << "FAIL: honest block rejected with a real UTXO set attached\n";
+            ++failed;
+            utxo.Close(); std::filesystem::remove_all(dir, ec); return;
+        }
+        const uint64_t afterHonest = utxo.GetUTXOCount();
+        if (afterHonest <= before) {
+            std::cout << "FAIL: the honest block did not grow the UTXO set -- this "
+                         "observable is inert, so the forged assertion below would be "
+                         "vacuous\n";
+            ++failed;
+            utxo.Close(); std::filesystem::remove_all(dir, ec); return;
+        }
+
+        // THE ASSERTION: a forged block is rejected AND leaves the set untouched.
+        CBlock forged = MakeVDFBlockWithSignedMIK(CTPrevHash(), kCTHeight, mik, iters);
+        if (forged.vtx.empty()) {
+            std::cout << "FAIL: block build/sign\n"; ++failed;
+            utxo.Close(); std::filesystem::remove_all(dir, ec); return;
+        }
+        forged.vdfOutput.data[0] ^= 0x01;
+
+        bool flagged = false;
+        bool ok = RunConnectTip(forged, kCTHeight, false, &flagged, &utxo);
+        if (ok) {
+            std::cout << "FAIL: forged block accepted with a real UTXO set attached\n";
+            ++failed;
+            utxo.Close(); std::filesystem::remove_all(dir, ec); return;
+        }
+        if (utxo.GetUTXOCount() != afterHonest) {
+            std::cout << "FAIL: a REJECTED forged block still mutated the UTXO set -- "
+                         "the LP-10 checks are running AFTER ApplyBlock\n";
+            ++failed;
+            utxo.Close(); std::filesystem::remove_all(dir, ec); return;
+        }
+
+        // Same, on the reorg path.
+        ok = RunConnectTip(forged, kCTHeight, true, &flagged, &utxo);
+        if (ok || utxo.GetUTXOCount() != afterHonest) {
+            std::cout << "FAIL: forged block mutated the UTXO set on the reorg path\n";
+            ++failed;
+            utxo.Close(); std::filesystem::remove_all(dir, ec); return;
+        }
+
+        utxo.Close();
+    }
+    std::filesystem::remove_all(dir, ec);
+    PASS();
+}
+
 // MERGE GUARD — the fail-open hazard, made loud.
 //
 // Two lineages currently carry two DIFFERENT implementations of this same
@@ -973,11 +1200,20 @@ static void test_connecttip_non_vdf_block_not_subject_to_vdf_checks()
 // activation height, which is precisely the assertion that would keep passing
 // while enforcement disappeared.
 //
-// This case is the differential assertion. It pins the SHIPPED default on
-// every network, and the runtime behaviour that follows from it, so that the
-// enforcement state of the chain is something a test asserts rather than a
-// constant nobody reads. It is deliberately GREEN today and RED the moment
-// enforcement becomes live.
+// This case pins the SHIPPED default on every network, and the runtime
+// behaviour that follows from it, so that the enforcement state of the chain
+// is something a test asserts rather than a constant nobody reads.
+//
+// ⚠️ IT IS ONE-DIRECTIONAL, corrected after review. It goes RED when
+// enforcement APPEARS. It does NOT catch the fail-open direction named above:
+// if the sentinel wins the merge and cb38afa7's always-on verification is
+// dropped, the resulting state is identical to today and this case stays
+// GREEN -- as does the whole suite, which is written to main's gate. Do not
+// treat this as a safety net for the merge itself. **The fail-open direction
+// is covered by human review at merge time and by nothing else in this file.**
+// Catching it mechanically needs the assertion run against the MERGED tree,
+// where "a forged DilV v4 block must not connect at shipped defaults" is the
+// property, and that is the inverse of what is asserted below.
 //
 // ⚠️ IF THIS TEST GOES RED: you have changed DilV consensus enforcement. That
 // may be exactly right — activating it is a planned hard fork — but it must be
@@ -990,13 +1226,11 @@ static void InstallShippedDilVChainParams()
     if (!Dilithion::g_chainParams) {
         Dilithion::g_chainParams = new Dilithion::ChainParams(shipped);
     }
-    // Restore exactly the fields the ConnectTip fixture above overrides, to
-    // their SHIPPED DilV values, so this case runs against production
-    // parameters rather than against a previous case's leftovers.
-    Dilithion::g_chainParams->vdfIterations             = shipped.vdfIterations;
-    Dilithion::g_chainParams->vdfProofEnforcementHeight = shipped.vdfProofEnforcementHeight;
-    Dilithion::g_chainParams->dfmpAssumeValidHeight     = shipped.dfmpAssumeValidHeight;
-    Dilithion::g_chainParams->dfmpActivationHeight      = shipped.dfmpActivationHeight;
+    // Wholesale restore, deliberately NOT a list of named fields: an
+    // enumerated restore silently goes stale the day a case overrides a fifth
+    // field, and this case's whole point is that it runs against SHIPPED
+    // parameters rather than a previous case's leftovers.
+    *Dilithion::g_chainParams = shipped;
 }
 
 static void test_connecttip_shipped_defaults_are_not_enforcing()
@@ -1058,6 +1292,35 @@ static void test_connecttip_shipped_defaults_are_not_enforcing()
     PASS();
 }
 
+// ===========================================================================
+// SCOPE OF THE ConnectTip CASES — what they do NOT cover
+//
+// Written down rather than left implied, because prose that claims more than
+// the assertions deliver is the defect this whole file exists to catch.
+//
+// 1. THE CALLERS. These drive ConnectTip DIRECTLY. They say nothing about
+//    ActivateBestChain's eight call sites (chain.cpp:672, 700, 761, 1096,
+//    1182, 1206, 1255) or the port path's ActivateBestChainStep (:3352). A
+//    change that stopped calling ConnectTip, or called it with the wrong
+//    block, is invisible here.
+// 2. THE REFERENCE-MIK FAIL-OPEN BRANCH. CheckVDFBlockMIKSignature returns
+//    TRUE for a REFERENCE MIK whose pubkey cannot be resolved
+//    (vdf_validation.cpp:309-315). DFMP::g_identityDb is always null in this
+//    binary and every fixture is a REGISTRATION MIK, so that branch is never
+//    entered -- and it is precisely the branch that runs during multi-block
+//    reorg undo, which is the stated justification for running LP-10 on the
+//    skipValidation=true path. The pass-on-missing posture is UNVERIFIED.
+// 3. LOCK DISCIPLINE. ConnectTip takes no lock of its own and relies on
+//    callers holding cs_main. Single-threaded here by construction, so a
+//    lock-ordering regression on that path cannot be seen.
+// 4. THE FAIL-OPEN MERGE DIRECTION. See the merge-guard note above: this
+//    suite trips when enforcement APPEARS, not when it silently disappears.
+// 5. REAL BLOCKS. Every block here is synthetic and coinbase-only, built at
+//    1000 VDF iterations. Nothing here says whether blocks being mined on
+//    DilV today would pass enforcement -- that needs a history replay over
+//    stored mainnet blocks, which is a separate, still-unbuilt tool.
+// ===========================================================================
+
 int main()
 {
     std::cout << "\nVDF Consensus Validation Tests\n";
@@ -1096,6 +1359,8 @@ int main()
     test_connecttip_forged_proof_rejected_despite_assume_valid();
     test_connecttip_forged_mik_signature_rejected_both_paths();
     test_connecttip_non_vdf_block_not_subject_to_vdf_checks();
+    test_connecttip_enforcement_boundary_is_exact();
+    test_connecttip_forged_block_never_reaches_the_utxo_set();
     test_connecttip_shipped_defaults_are_not_enforcing();
 
     vdf::shutdown();

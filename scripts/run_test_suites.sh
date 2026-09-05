@@ -66,6 +66,16 @@ set -u
 # build list would otherwise have silently stopped building it. The gate was
 # confirmed discriminating by injecting a deliberately-failing suite: the runner
 # exited 1 and `make tests-fast` exited 2; both returned to 0 on its removal.
+#
+# ADDED 2026-09-05 (Windows/MSYS2, measured by executing both binaries):
+# vdf_consensus_test (25/25 pass, 0.9s) and vdf_lottery_test (11/11 pass). Both
+# were ORPHANED -- built by the Makefile, named by no roster row, no aggregate
+# make target and no workflow, so `make tests` had never run either. The whole
+# DilV VDF test surface was unrun. Registration proved live by a discriminating
+# check, not by absence of error: `make -n tests-build` mentioned neither suite
+# before their sources were touched and both after. This makes the fast tier 34
+# rows, so the "32/32 in 72s" figure above is the 2026-08-10 measurement and no
+# longer the current count.
 ROSTER='
 fast|rpc_auth_tests|120|
 fast|rpc_host_header_tests|60|
