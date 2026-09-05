@@ -684,22 +684,33 @@ static uint256 CTPrevHash()
 // header root is theirs to set.
 static bool ForgeMIKSignatureInPlace(CBlock& block)
 {
-    // The scan takes the FIRST [0xDF][0x01] pair in the raw coinbase bytes.
-    // That is safe by construction here rather than by check, so assert the
-    // construction actually holds: if the pair ever occurs more than once, the
-    // byte flipped below might land outside the signature and the forgery
-    // would silently become a no-op -- a corrupted block that still verifies,
-    // i.e. a test that passes while asserting nothing.
-    size_t found = 0, at = 0;
-    for (size_t i = 0; i + 1 < block.vtx.size(); ++i) {
-        if (block.vtx[i] == DFMP::MIK_MARKER &&
-            block.vtx[i + 1] == DFMP::MIK_TYPE_REGISTRATION) {
-            if (found == 0) at = i;
-            ++found;
-        }
-    }
-    if (found != 1) {
-        std::cout << "(MIK marker occurs " << found << " times, expected exactly 1) ";
+    // Locate the MIK blob by LAYOUT, not by scanning for a byte pair.
+    //
+    // A scan was tried and measured FLAKY at ~10% (4 failures in 40 runs): the
+    // 1952-byte Dilithium pubkey and 3309-byte signature are effectively random,
+    // so a second [0xDF][0x01] pair occurs inside them with probability
+    // ~5261/65536 per block. Requiring exactly one occurrence therefore failed
+    // at random across keypairs; taking the first occurrence is correct but
+    // rests on an unstated assumption. Deriving the offset from the coinbase
+    // layout is both deterministic and a stronger assertion -- it pins the
+    // layout itself, so a change to the coinbase shape fails here loudly rather
+    // than silently moving the byte this function corrupts.
+    //
+    // vtx layout, from MakeVDFBlockWithSignedMIK above:
+    //   [0]      transaction count      (1)
+    //   [1..4]   nVersion               (4)
+    //   [5]      vin count              (1)
+    //   [6..37]  prevout hash           (32)
+    //   [38..41] prevout index          (4)
+    //   [42..44] scriptSig length       (3: 0xFD + u16, the proof makes it >253)
+    //   [45..48] BIP34 height push      (4: 0x03 + 3 height bytes)
+    //   [49]     MIK marker             <- here
+    const size_t at = 1 + 4 + 1 + 32 + 4 + 3 + 4;
+    if (at + 1 >= block.vtx.size() ||
+        block.vtx[at] != DFMP::MIK_MARKER ||
+        block.vtx[at + 1] != DFMP::MIK_TYPE_REGISTRATION) {
+        std::cout << "(no MIK registration marker at the layout offset " << at
+                  << " -- the coinbase layout changed) ";
         return false;
     }
     // Layout: [0xDF][0x01][pubkey MIK_PUBKEY_SIZE][signature MIK_SIGNATURE_SIZE].
