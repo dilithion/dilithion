@@ -1112,9 +1112,11 @@ static void test_connecttip_forged_block_never_reaches_the_utxo_set()
     const uint64_t iters = 1000;
     InstallConnectTipChainParams(iters, /*enforcement=*/100, /*assumeValid=*/0);
 
-    // PID + clock as well as random_device: std::random_device is a
-    // DETERMINISTIC fallback on some MinGW builds, which would make sequential
-    // runs reuse one directory and concurrent runs collide on the leveldb LOCK.
+    // A monotonic clock component as well as random_device, because
+    // std::random_device is a DETERMINISTIC fallback on some MinGW builds --
+    // which alone would make sequential runs reuse one directory and
+    // concurrent runs collide on the leveldb LOCK. steady_clock is used only
+    // for distinctness, never as a time; its epoch is unspecified.
     std::random_device rd;
     std::ostringstream oss;
     oss << "dilithion-lp10-connecttip-utxo-"
