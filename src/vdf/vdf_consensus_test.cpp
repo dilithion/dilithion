@@ -953,6 +953,111 @@ static void test_connecttip_non_vdf_block_not_subject_to_vdf_checks()
     PASS();
 }
 
+// MERGE GUARD — the fail-open hazard, made loud.
+//
+// Two lineages currently carry two DIFFERENT implementations of this same
+// consensus check, with OPPOSITE defaults:
+//
+//   * this one (LP-10, on main): the checks are wired into ConnectTip but
+//     gated by vdfProofEnforcementHeight, shipped OFF at the 999999999
+//     sentinel on all four networks — so nothing is enforced today;
+//   * an earlier one (cb38afa7, shipped in v4.5.1/v4.5.2, and NOT an ancestor
+//     of main): verifies unconditionally by default — so it IS enforcing on
+//     the branches that carry it.
+//
+// Reconciling those two branches means choosing which gate survives. If the
+// sentinel wins, a live CRITICAL fix is silently disabled: the merge is
+// textually clean, the semantics invert, and it fails OPEN. Neither lineage's
+// own suite can catch that, because each is written to its own gate's
+// contract — main's tests assert that a forged block IS accepted below the
+// activation height, which is precisely the assertion that would keep passing
+// while enforcement disappeared.
+//
+// This case is the differential assertion. It pins the SHIPPED default on
+// every network, and the runtime behaviour that follows from it, so that the
+// enforcement state of the chain is something a test asserts rather than a
+// constant nobody reads. It is deliberately GREEN today and RED the moment
+// enforcement becomes live.
+//
+// ⚠️ IF THIS TEST GOES RED: you have changed DilV consensus enforcement. That
+// may be exactly right — activating it is a planned hard fork — but it must be
+// a STATED decision in your PR, not a side-effect of a merge. Do not "fix" it
+// by restoring the sentinel without first checking whether you have just
+// disabled the always-on path inherited from cb38afa7.
+static void InstallShippedDilVChainParams()
+{
+    Dilithion::ChainParams shipped = Dilithion::ChainParams::DilV();
+    if (!Dilithion::g_chainParams) {
+        Dilithion::g_chainParams = new Dilithion::ChainParams(shipped);
+    }
+    // Restore exactly the fields the ConnectTip fixture above overrides, to
+    // their SHIPPED DilV values, so this case runs against production
+    // parameters rather than against a previous case's leftovers.
+    Dilithion::g_chainParams->vdfIterations             = shipped.vdfIterations;
+    Dilithion::g_chainParams->vdfProofEnforcementHeight = shipped.vdfProofEnforcementHeight;
+    Dilithion::g_chainParams->dfmpAssumeValidHeight     = shipped.dfmpAssumeValidHeight;
+    Dilithion::g_chainParams->dfmpActivationHeight      = shipped.dfmpActivationHeight;
+}
+
+static void test_connecttip_shipped_defaults_are_not_enforcing()
+{
+    TEST(connecttip_shipped_defaults_are_not_enforcing);
+    const int kSentinel = 999999999;
+
+    // (1) The constant itself, on all four networks.
+    if (Dilithion::ChainParams::Mainnet().vdfProofEnforcementHeight != kSentinel) {
+        std::cout << "FAIL: Mainnet vdfProofEnforcementHeight is no longer the sentinel\n";
+        ++failed; return;
+    }
+    if (Dilithion::ChainParams::Testnet().vdfProofEnforcementHeight != kSentinel) {
+        std::cout << "FAIL: Testnet vdfProofEnforcementHeight is no longer the sentinel\n";
+        ++failed; return;
+    }
+    if (Dilithion::ChainParams::DilV().vdfProofEnforcementHeight != kSentinel) {
+        std::cout << "FAIL: DilV vdfProofEnforcementHeight is no longer the sentinel -- "
+                     "DilV VDF enforcement state has CHANGED, see the merge-guard note\n";
+        ++failed; return;
+    }
+    if (Dilithion::ChainParams::Regtest().vdfProofEnforcementHeight != kSentinel) {
+        std::cout << "FAIL: Regtest vdfProofEnforcementHeight is no longer the sentinel\n";
+        ++failed; return;
+    }
+
+    // (2) The behaviour that follows from it, through the real ConnectTip, at
+    //     SHIPPED DilV parameters with nothing overridden. A forged proof is
+    //     accepted on both paths today. This half is what catches an
+    //     always-on implementation arriving via merge while the sentinel stays
+    //     in place — the constant would still read 999999999, but the block
+    //     would no longer connect.
+    InstallShippedDilVChainParams();
+
+    DFMP::CMiningIdentityKey mik;
+    if (!mik.Generate()) { std::cout << "FAIL: MIK generate\n"; ++failed; return; }
+    // iterations here only govern how this test builds its own proof; the
+    // checker never reads them, because at the sentinel it returns before
+    // verifying anything.
+    CBlock block = MakeVDFBlockWithSignedMIK(CTPrevHash(), kCTHeight, mik, 1000);
+    if (block.vtx.empty()) { std::cout << "FAIL: block build/sign\n"; ++failed; return; }
+    block.vdfOutput.data[0] ^= 0x01;
+
+    bool flagged = true;
+    if (!RunConnectTip(block, kCTHeight, false, &flagged)) {
+        std::cout << "FAIL: a forged VDF block was REJECTED at shipped DilV defaults -- "
+                     "DilV IS now enforcing. See the merge-guard note above this test.\n";
+        ++failed; return;
+    }
+    CHECK(!flagged);
+
+    flagged = true;
+    if (!RunConnectTip(block, kCTHeight, true, &flagged)) {
+        std::cout << "FAIL: a forged VDF block was REJECTED at shipped DilV defaults "
+                     "on the reorg path -- DilV IS now enforcing.\n";
+        ++failed; return;
+    }
+    CHECK(!flagged);
+    PASS();
+}
+
 int main()
 {
     std::cout << "\nVDF Consensus Validation Tests\n";
@@ -991,6 +1096,7 @@ int main()
     test_connecttip_forged_proof_rejected_despite_assume_valid();
     test_connecttip_forged_mik_signature_rejected_both_paths();
     test_connecttip_non_vdf_block_not_subject_to_vdf_checks();
+    test_connecttip_shipped_defaults_are_not_enforcing();
 
     vdf::shutdown();
 
