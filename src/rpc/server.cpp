@@ -647,17 +647,25 @@ void CRPCServer::Stop() {
         m_ssl_connections.clear();
     }
 
-    // Shutdown and close server socket
-    if (m_serverSocket != INVALID_SOCKET) {
+    // Shutdown and close server socket.
+    //
+    // ONE load into a local, then operate on the local. Reading the atomic
+    // separately for the guard, the shutdown and the close would be three
+    // independent loads that are not guaranteed to observe the same value,
+    // which would reintroduce a TOCTOU on top of the fix. m_running was
+    // already set false above, so ServerThread breaks out rather than
+    // retrying once accept() returns.
+    const int serverSock = m_serverSocket.load(std::memory_order_acquire);
+    if (serverSock != INVALID_SOCKET) {
         // Shutdown the socket to unblock accept() call
         #ifdef _WIN32
-        shutdown(m_serverSocket, SD_BOTH);
+        shutdown(serverSock, SD_BOTH);
         #else
-        shutdown(m_serverSocket, SHUT_RDWR);
+        shutdown(serverSock, SHUT_RDWR);
         #endif
 
-        closesocket(m_serverSocket);
-        m_serverSocket = INVALID_SOCKET;
+        closesocket(serverSock);
+        m_serverSocket.store(INVALID_SOCKET, std::memory_order_release);
     }
 
     // RPC-002: Wake up all worker threads so they can exit
@@ -717,7 +725,11 @@ void CRPCServer::ServerThread() {
         // Accept client connection
         struct sockaddr_in clientAddr;
         socklen_t clientLen = sizeof(clientAddr);
-        int clientSocket = accept(m_serverSocket, (struct sockaddr*)&clientAddr, &clientLen);
+        // ONE acquire-load, then use the local. Pairs with Stop()'s
+        // release-store of INVALID_SOCKET. Loading inside the accept() call
+        // argument list would be a second, independent read.
+        const int listenSock = m_serverSocket.load(std::memory_order_acquire);
+        int clientSocket = accept(listenSock, (struct sockaddr*)&clientAddr, &clientLen);
 
         if (clientSocket == INVALID_SOCKET) {
             if (m_running) {
