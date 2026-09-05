@@ -137,12 +137,31 @@ struct ScanResult {
     long long regBlocks    = 0;   // blocks whose MIK blob is registration-type
     long long refBlocks    = 0;   // ... reference-type
     long long noMikBlocks  = 0;   // ... no MIK blob located
+    // PER-BLOCK enforcement census. Sampling proved liveness varies BLOCK BY
+    // BLOCK, not by height: h83,000 fails open while h83,500 verifies, same
+    // binary, same identity DB. So the only honest answer to "would the MIK
+    // signature actually be enforced" is measured for every block: corrupt its
+    // signature and re-check. If the corrupted block is still ACCEPTED, that
+    // block's signature was never examined and enforcement would be a no-op
+    // for it.
+    long long mikEnforced  = 0;   // corrupting the signature flipped the verdict
+    long long mikFailOpen  = 0;   // corrupted signature STILL accepted
     bool      regControl   = false;
     bool      refControl   = false;
     bool      regProbe     = false;
     bool      refProbe     = false;
     int       regProbeH    = -1;
     int       refProbeH    = -1;
+    // ...and the LAST passing block of each type. A control on one sample
+    // certifies that sample's height, not the range: measured 2026-09-05, the
+    // reference-MIK arm verifies signatures at low heights and FAILS OPEN at
+    // h83,000 on the same data with the same identity DB. Sampling only the
+    // first passing block would print "reference arm PROVEN LIVE" for a range
+    // in which most reference blocks were never actually checked.
+    bool      regControlHi = false;
+    bool      refControlHi = false;
+    int       regProbeHiH  = -1;
+    int       refProbeHiH  = -1;
     long long scanned      = 0;
     long long vdfBlocks    = 0;
     long long unreadable   = 0;
@@ -268,7 +287,7 @@ ScanResult ScanChain(const std::string& blocksDir, int fromHeight, int toHeight,
     std::cout << "range checked      " << fromHeight << ".." << toHeight
               << "   (gate FORCED OPEN: 'would this pass', not 'does it today')\n\n";
 
-    uint256 probeHash, regProbeHash, refProbeHash;
+    uint256 probeHash, regProbeHash, refProbeHash, regProbeHiHash, refProbeHiHash;
 
     for (const auto& entry : chain) {
         const int h = entry.first;
@@ -302,6 +321,17 @@ ScanResult ScanChain(const std::string& blocksDir, int fromHeight, int toHeight,
             if (verbose) std::cout << "  FAIL h=" << h << " mik-signature: " << e2 << "\n";
         }
 
+        // Per-block enforcement probe, on blocks that passed the MIK check.
+        if (okMik) {
+            CBlock probe = block;
+            int pt = -1;
+            if (ForgeMIKSignatureBytes(probe, &pt)) {
+                std::string ep;
+                if (CheckVDFBlockMIKSignature(probe, h, ep)) ++res.mikFailOpen;
+                else                                          ++res.mikEnforced;
+            }
+        }
+
         const int mt = DetectMIKType(block);
         if      (mt == DFMP::MIK_TYPE_REGISTRATION) ++res.regBlocks;
         else if (mt == DFMP::MIK_TYPE_REFERENCE)    ++res.refBlocks;
@@ -313,11 +343,13 @@ ScanResult ScanChain(const std::string& blocksDir, int fromHeight, int toHeight,
             if (!res.haveProbe) {
                 res.haveProbe = true; probeHash = entry.second; res.probeHeight = h;
             }
-            if (mt == DFMP::MIK_TYPE_REGISTRATION && !res.regProbe) {
-                res.regProbe = true; regProbeHash = entry.second; res.regProbeH = h;
+            if (mt == DFMP::MIK_TYPE_REGISTRATION) {
+                if (!res.regProbe) { res.regProbe = true; regProbeHash = entry.second; res.regProbeH = h; }
+                regProbeHiHash = entry.second; res.regProbeHiH = h;   // keep overwriting: ends up last
             }
-            if (mt == DFMP::MIK_TYPE_REFERENCE && !res.refProbe) {
-                res.refProbe = true; refProbeHash = entry.second; res.refProbeH = h;
+            if (mt == DFMP::MIK_TYPE_REFERENCE) {
+                if (!res.refProbe) { res.refProbe = true; refProbeHash = entry.second; res.refProbeH = h; }
+                refProbeHiHash = entry.second; res.refProbeHiH = h;
             }
         }
 
@@ -361,6 +393,8 @@ ScanResult ScanChain(const std::string& blocksDir, int fromHeight, int toHeight,
         };
         if (res.regProbe) runTypeControl(regProbeHash, res.regProbeH, res.regControl);
         if (res.refProbe) runTypeControl(refProbeHash, res.refProbeH, res.refControl);
+        if (res.regProbeHiH >= 0) runTypeControl(regProbeHiHash, res.regProbeHiH, res.regControlHi);
+        if (res.refProbeHiH >= 0) runTypeControl(refProbeHiHash, res.refProbeHiH, res.refControlHi);
         {
         }
     }
@@ -615,15 +649,23 @@ int main(int argc, char* argv[])
               << "probe block        height " << r.probeHeight << ", MIK type "
               << (r.probeMikType == 0x01 ? "REGISTRATION"
                  : r.probeMikType == 0x02 ? "REFERENCE" : "none located") << "\n"
+              << "MIK ENFORCEMENT    " << r.mikEnforced << " blocks really verified | "
+              << r.mikFailOpen << " FAIL OPEN (signature never examined)";
+    if (r.mikEnforced + r.mikFailOpen > 0)
+        std::cout << "  = " << (100.0 * r.mikFailOpen / (r.mikEnforced + r.mikFailOpen))
+                  << "% unenforced";
+    std::cout << "\n"
               << "MIK blob census    registration " << r.regBlocks
               << " | reference " << r.refBlocks
               << " | none " << r.noMikBlocks << "\n"
-              << "  registration arm " << (r.regBlocks == 0 ? "n/a (none in range)"
-                    : r.regControl ? "PROVEN LIVE (control fired)"
-                                   : "NOT PROVEN — signatures may be unverified") << "\n"
-              << "  reference arm    " << (r.refBlocks == 0 ? "n/a (none in range)"
-                    : r.refControl ? "PROVEN LIVE (control fired)"
-                                   : "NOT PROVEN — FAILS OPEN, signatures unverified") << "\n";
+              << "  registration arm low h" << r.regProbeH << " "
+                    << (r.regBlocks == 0 ? "n/a" : r.regControl ? "LIVE" : "NOT LIVE")
+                    << "   high h" << r.regProbeHiH << " "
+                    << (r.regBlocks == 0 ? "n/a" : r.regControlHi ? "LIVE" : "NOT LIVE") << "\n"
+              << "  reference arm    low h" << r.refProbeH << " "
+                    << (r.refBlocks == 0 ? "n/a" : r.refControl ? "LIVE" : "NOT LIVE")
+                    << "   high h" << r.refProbeHiH << " "
+                    << (r.refBlocks == 0 ? "n/a" : r.refControlHi ? "LIVE" : "NOT LIVE") << "\n";
 
     // Every reason the run cannot be trusted, reported together rather than one
     // at a time, so an operator sees the whole picture in a single pass.
@@ -643,6 +685,22 @@ int main(int argc, char* argv[])
     if (r.regBlocks > 0 && !r.regControl)
         untrusted.push_back("REGISTRATION-MIK blocks were present (" + std::to_string(r.regBlocks)
             + ") but no control proved that branch live — their signatures may be unverified");
+    if (r.mikFailOpen > 0)
+        untrusted.push_back(std::to_string(r.mikFailOpen) + " of "
+            + std::to_string(r.mikEnforced + r.mikFailOpen)
+            + " blocks FAIL OPEN on the MIK signature — their signatures were never examined, so "
+              "activating enforcement would NOT enforce the MIK half for them. This is measured "
+              "per block, not sampled.");
+    if (r.regBlocks > 0 && r.regControl && !r.regControlHi)
+        untrusted.push_back("the REGISTRATION-MIK arm is live at the BOTTOM of the range (h"
+            + std::to_string(r.regProbeH) + ") but NOT at the top (h" + std::to_string(r.regProbeHiH)
+            + ") — signature checking stops somewhere inside this range, so an absence of failures "
+              "above that point is not evidence");
+    if (r.refBlocks > 0 && r.refControl && !r.refControlHi)
+        untrusted.push_back("the REFERENCE-MIK arm is live at the BOTTOM of the range (h"
+            + std::to_string(r.refProbeH) + ") but FAILS OPEN at the top (h" + std::to_string(r.refProbeHiH)
+            + ") — signatures stop being examined somewhere inside this range, so an absence of "
+              "MIK failures above that point proves NOTHING. Bisect to find where.");
     if (r.refBlocks > 0 && !r.refControl)
         untrusted.push_back("REFERENCE-MIK blocks were present (" + std::to_string(r.refBlocks)
             + ") and the control on that branch DID NOT FIRE — CheckVDFBlockMIKSignature FAILS OPEN "
