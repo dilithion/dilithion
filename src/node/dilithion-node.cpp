@@ -4879,9 +4879,18 @@ load_genesis_block:  // Bug #29: Label for automatic retry after blockchain wipe
             // Check by MIK (not address) to match how discovery decides what to request.
             auto existing = g_node_context.dna_registry->get_identity_by_mik(mik);
             if (!existing) {
-                // First time seeing this MIK — accept without rate-limiting, as the
-                // miner's initial-registration broadcast establishes the peer_id→MIK
-                // mapping that subsequent samples rely on for plausibility.
+                // H-1 DoS fix: rate-cap unsolicited new-MIK registrations per peer.
+                // The first-seen path otherwise returns before the existing-MIK
+                // pipeline's per-peer token bucket, letting one peer flood distinct
+                // MIKs (each = a permanent registry write + Sybil-compare work). A
+                // legitimate miner broadcasting its own single registration consumes
+                // one token; a flood is throttled to the bucket rate.
+                if (!g_dna_sample_limiter.consume_peer_bucket(peer_id, now_sec)) {
+                    return;
+                }
+                // First-seen registration is now rate-capped by the per-peer token
+                // bucket above (H-1), but still accepted: it establishes the
+                // peer_id→MIK mapping that subsequent samples rely on for plausibility.
                 //
                 // Signed trailer is intentionally ignored on first-registration:
                 // the pubkey may not be in our identity DB yet (if the chain hasn't

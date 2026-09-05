@@ -248,22 +248,33 @@ double LatencyFingerprint::wasserstein_distance(const std::vector<double>& a, co
 }
 
 double LatencyFingerprint::distance(const LatencyFingerprint& a, const LatencyFingerprint& b) {
-    // Compare seeds that both fingerprints have in common (by name)
+    // Compare per-seed median latency, matched POSITIONALLY.
+    //
+    // serialize() (digital_dna.cpp) persists only seed_stats[i].median_ms — neither
+    // seed_name nor the raw measurements vector survive the wire/registry round-trip.
+    // The previous implementation matched seeds by seed_name and ran Wasserstein over
+    // the raw measurements; on any deserialized DNA both are empty, so every stored
+    // identity collapsed to the 1000.0 "no data" sentinel and latency contributed
+    // nothing to clustering. Seeds are probed in a deterministic, network-fixed order,
+    // so positional median comparison is well-defined and round-trips correctly.
+    //
+    // A median_ms of 0.0 is the "no measurement" sentinel: LatencyStats default-
+    // initializes its doubles to 0.0, and measure_seed only populates median_ms for a
+    // reachable seed (real RTT medians are always > 0). Skip any positional pair where
+    // either side is 0.0 — comparing a real median against a 0.0 default would yield a
+    // spurious large distance and mis-cluster otherwise-similar nodes.
+    size_t n = std::min(a.seed_stats.size(), b.seed_stats.size());
     double total_distance = 0.0;
     size_t matched = 0;
-
-    for (const auto& sa : a.seed_stats) {
-        for (const auto& sb : b.seed_stats) {
-            if (sa.seed_name == sb.seed_name) {
-                total_distance += wasserstein_distance(sa.measurements, sb.measurements);
-                matched++;
-                break;
-            }
-        }
+    for (size_t i = 0; i < n; i++) {
+        double ma = a.seed_stats[i].median_ms;
+        double mb = b.seed_stats[i].median_ms;
+        if (ma == 0.0 || mb == 0.0) continue;  // 0.0 = no measurement for this seed
+        total_distance += std::abs(ma - mb);
+        matched++;
     }
-
-    if (matched == 0) return 1000.0;  // No common seeds = maximum distance
-    return total_distance / matched;
+    if (matched == 0) return 1000.0;  // No comparable seeds = maximum distance
+    return total_distance / static_cast<double>(matched);
 }
 
 std::string LatencyFingerprint::to_json() const {

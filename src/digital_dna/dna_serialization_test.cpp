@@ -685,6 +685,47 @@ static void test_dna_commitment_absent() {
     CHECK(!parsed.has_dna_hash, "has_dna_hash is false when no commitment present");
 }
 
+// ============ Test 18: serialize->deserialize->distance round-trip ============
+// Pins the exact failure mode PR #116 repaired: serialize() persists only
+// seed_stats[i].median_ms (not seed_name / raw measurements), and the previous
+// distance() matched seeds by name over raw measurements — so every DESERIALIZED
+// DNA collapsed to the 1000.0 "no data" sentinel and latency was silently dead.
+// No prior test round-trips through serialize -> deserialize -> distance, so the
+// dead comparator passed CI. This asserts distance() over two DESERIALIZED DNAs
+// reflects the median deltas and is NOT the sentinel.
+static void test_latency_distance_roundtrip() {
+    std::cout << "\n=== Test 18: serialize->deserialize->distance round-trip ===\n";
+
+    // make_core_dna seeds 4 medians: base, base+10, base+20, base+30 (all positive).
+    auto dna_a = make_core_dna(0x01, 45.0, 500000.0, 100);  // medians 45,55,65,75
+    auto dna_b = make_core_dna(0x02, 45.0, 500000.0, 101);  // medians 45,55,65,75 (identical)
+    auto dna_c = make_core_dna(0x03, 65.0, 500000.0, 102);  // medians 65,75,85,95 (+20 each)
+
+    // Round-trip all three through the wire format.
+    auto ra = DigitalDNA::deserialize(dna_a.serialize());
+    auto rb = DigitalDNA::deserialize(dna_b.serialize());
+    auto rc = DigitalDNA::deserialize(dna_c.serialize());
+    CHECK(ra.has_value() && rb.has_value() && rc.has_value(),
+          "All three DNAs deserialize");
+
+    // Sanity: medians actually survived the round-trip as positive values.
+    CHECK(ra->latency.seed_stats.size() == 4, "Deserialized A has 4 seed medians");
+    CHECK(std::abs(ra->latency.seed_stats[0].median_ms - 45.0) < 0.001,
+          "Deserialized median[0] preserved");
+
+    // Identical medians -> distance ~= 0 (and crucially NOT the 1000.0 sentinel).
+    double d_same = LatencyFingerprint::distance(ra->latency, rb->latency);
+    CHECK(d_same < 0.001, "Identical deserialized medians -> distance ~= 0");
+    CHECK(std::abs(d_same - 1000.0) > 1.0,
+          "Identical medians -> NOT the 1000.0 no-data sentinel (comparator alive)");
+
+    // Medians offset by 20ms at every position -> mean abs delta == 20.
+    double d_off = LatencyFingerprint::distance(ra->latency, rc->latency);
+    CHECK(std::abs(d_off - 20.0) < 0.001, "Medians +20ms -> distance ~= 20");
+    CHECK(std::abs(d_off - 1000.0) > 1.0,
+          "Offset medians -> NOT the 1000.0 no-data sentinel");
+}
+
 int main() {
     std::cout << "Digital DNA Serialization & Persistence Tests\n";
     std::cout << "=============================================\n";
@@ -706,6 +747,7 @@ int main() {
     test_dna_commitment_roundtrip();
     test_dna_commitment_in_scriptsig();
     test_dna_commitment_absent();
+    test_latency_distance_roundtrip();
 
     std::cout << "\n=============================================\n";
     std::cout << "Results: " << tests_passed << " passed, " << tests_failed << " failed\n";
