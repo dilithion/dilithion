@@ -1,10 +1,25 @@
 name: Dilithion CI
 
+# TRIGGERS — read the note before narrowing these again.
+#
+# Until 2026-09-02 this workflow fired ONLY on main/master and had no
+# workflow_dispatch. The consequence, found during the v4.6.0 audit: the release
+# candidate sat 58 commits ahead of main on `release/v4.6.0-assembled`, was never
+# PR'd into main, and therefore NEVER RAN THROUGH CI AT ALL — no Linux build, no
+# macOS build, no sanitizer job, on any of it. The first Linux compile of that
+# code would have happened at tag push, in the public release pipeline.
+#
+# A release branch is the LAST thing that should bypass CI, so:
+#   * `release/**` and `rc*/**` now trigger on push, so a release candidate is
+#     built and tested continuously as it is assembled.
+#   * `workflow_dispatch` allows CI to be run on ANY branch on demand — including
+#     on the private mirror, where security releases are built before disclosure.
 on:
   push:
-    branches: [ main, master ]
+    branches: [ main, master, 'release/**', 'rc*/**' ]
   pull_request:
     branches: [ main, master ]
+  workflow_dispatch:
 
 jobs:
   build-and-test:
