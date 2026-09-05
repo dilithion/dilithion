@@ -11,6 +11,8 @@
 #include <core/chainparams.h>
 #include <dfmp/mik.h>
 #include <dfmp/dfmp.h>
+#include <consensus/chain.h>
+#include <node/block_index.h>
 #include <iostream>
 #include <cassert>
 #include <cstring>
@@ -553,6 +555,404 @@ static void test_lp10_forged_mik_signature_rejected_above_accepted_below()
     PASS();
 }
 
+// ===========================================================================
+// LP-10 ConnectTip INTEGRATION tests
+//
+// WHY THESE EXIST, stated precisely. The six LP-10 tests above call
+// CheckVDFProofConnect / CheckVDFBlockMIKSignature DIRECTLY. They prove the
+// CHECKERS work. They do not prove that anything CALLS them -- and that gap is
+// the exact shape of the defect LP-10 was written to fix. Before LP-10 the VDF
+// verifier existed and was correct; several comments on the production connect
+// path deferred to it; and its only caller was CBlockValidator::CheckBlock,
+// which the source itself labels dead code with zero callers. A correct
+// checker that nothing invokes is, from the chain's point of view,
+// indistinguishable from no checker at all.
+//
+// So these tests call the REAL production CChainState::ConnectTip and assert
+// on its return value -- on BOTH the normal path and the skipValidation=true
+// reorg-reconnect path that ConnectTip's LP-10 comment claims to cover. That
+// comment is treated here as an unverified claim, not as documentation.
+//
+// ATTRIBUTION -- how these avoid passing for the wrong reason. ConnectTip runs
+// roughly ten other rejection sites before it reaches the LP-10 block, so a
+// test that merely asserted "forged block rejected" would be over-determined:
+// any of them could be the one rejecting, and the test would stay green if the
+// LP-10 wiring were deleted tomorrow. Three devices close that:
+//
+//   (a) A DISCRIMINATING control (connecttip_forged_proof_accepted_below_
+//       enforcement). The SAME forged block runs through the SAME fixture, at
+//       the SAME height, on the SAME path, with ONLY vdfProofEnforcementHeight
+//       moved above the block -- and must be ACCEPTED. No other check in
+//       ConnectTip reads that field. If any of them were doing the rejecting,
+//       this control would fail.
+//   (b) A POSITIVE control (connecttip_honest_vdf_block_accepted_both_paths):
+//       an honest block must be ACCEPTED through the whole of ConnectTip,
+//       proving the forged cases reach the LP-10 block rather than dying early.
+//   (c) BLOCK_FAILED_VALID, asserted set on rejection and clear on acceptance.
+//
+// EVERY case uses MakeVDFBlockWithSignedMIK, never MakeVDFBlock. ConnectTip
+// runs BOTH LP-10 checks, and a MakeVDFBlock coinbase carries no MIK data at
+// all, so it fails CheckVDFBlockMIKSignature's parse whenever enforcement is
+// active. Building the proof cases on the bare helper would have made the
+// honest positive control fail and every negative case pass for the wrong
+// reason.
+// ===========================================================================
+
+// Height used by every ConnectTip case. 200 sits below DilV's
+// seedAttestationActivationHeight (2000), so CheckMIKAttestations is inert.
+static const int kCTHeight = 200;
+
+// Install DilV-shaped chainparams for the ConnectTip cases.
+//
+// Deliberately NOT a neutralised fixture: dfmpActivationHeight defaults to
+// DilV's shipped 0, so CheckProofOfWorkDFMP really does run on the
+// !skipValidation path (it early-returns true for VDF blocks at/above
+// vdfActivationHeight, which DilV also ships as 0). The only cases that move
+// it are the ones that must present a NON-VDF block, where that early return
+// no longer applies. Every field this fixture depends on is set explicitly on
+// every call, so no case can inherit another case's overrides.
+static void InstallConnectTipChainParams(uint64_t vdfIters, int enforcementHeight,
+                                         int assumeValidHeight, int dfmpActivationHeight = 0)
+{
+    if (!Dilithion::g_chainParams) {
+        Dilithion::g_chainParams = new Dilithion::ChainParams(Dilithion::ChainParams::DilV());
+    }
+    Dilithion::g_chainParams->vdfIterations             = vdfIters;
+    Dilithion::g_chainParams->vdfProofEnforcementHeight = enforcementHeight;
+    Dilithion::g_chainParams->dfmpAssumeValidHeight     = assumeValidHeight;
+    Dilithion::g_chainParams->dfmpActivationHeight      = dfmpActivationHeight;
+}
+
+// Run the REAL production CChainState::ConnectTip. A default-constructed
+// CChainState leaves pdb / pUTXOSet / pMemPool all nullptr, and every DB,
+// UTXO and mempool step inside ConnectTip is guarded on those being non-null,
+// so this exercises the validation spine and nothing else.
+static bool RunConnectTip(const CBlock& block, int height, bool skipValidation,
+                          bool* outMarkedFailedValid)
+{
+    CChainState chain;
+    CBlockIndex idx;
+    idx.nHeight  = height;
+    idx.nTime    = block.nTime;
+    idx.nBits    = block.nBits;
+    idx.nVersion = block.nVersion;
+    // GetBlockHash() does not compute -- it logs an error and returns a null
+    // hash unless phashBlock was set explicitly. ConnectTip calls it on entry.
+    idx.phashBlock.data[0]  = 0xC0;
+    idx.phashBlock.data[1]  = static_cast<uint8_t>(height & 0xFF);
+    idx.phashBlock.data[31] = 0x01;
+
+    bool ok = chain.ConnectTip(&idx, block, skipValidation);
+    if (outMarkedFailedValid != nullptr) {
+        *outMarkedFailedValid = (idx.nStatus & CBlockIndex::BLOCK_FAILED_VALID) != 0;
+    }
+    return ok;
+}
+
+static uint256 CTPrevHash()
+{
+    uint256 h;
+    h.data[0] = 0xBE;
+    h.data[1] = 0xEF;
+    return h;
+}
+
+// Corrupt the Dilithium signature inside the coinbase registration-MIK blob,
+// then RE-COMMIT the merkle root. ConnectTip runs LP-4's merkle recompute
+// before it reaches LP-10, so a forgery that left the header root stale would
+// be rejected by the merkle check and the test would pass for the wrong
+// reason. A real attacker forging a signature would re-commit too -- the
+// header root is theirs to set.
+static bool ForgeMIKSignatureInPlace(CBlock& block)
+{
+    for (size_t i = 0; i + 1 < block.vtx.size(); ++i) {
+        if (block.vtx[i] == DFMP::MIK_MARKER &&
+            block.vtx[i + 1] == DFMP::MIK_TYPE_REGISTRATION) {
+            size_t sigStart = i + 2 + DFMP::MIK_PUBKEY_SIZE;
+            if (sigStart + 100 < block.vtx.size()) {
+                block.vtx[sigStart + 50] ^= 0xFF;
+                SHA3_256(block.vtx.data() + 1, block.vtx.size() - 1,
+                         block.hashMerkleRoot.data);
+                return true;
+            }
+            return false;
+        }
+    }
+    return false;
+}
+
+// POSITIVE CONTROL. An honest VDF block must be ACCEPTED through the entire of
+// ConnectTip, on both paths, at a height at/above the enforcement height.
+// Without this, every negative case below could be green merely because
+// ConnectTip rejects everything handed to it.
+static void test_connecttip_honest_vdf_block_accepted_both_paths()
+{
+    TEST(connecttip_honest_vdf_block_accepted_both_paths);
+    const uint64_t iters = 1000;
+    InstallConnectTipChainParams(iters, /*enforcement=*/100, /*assumeValid=*/0);
+
+    DFMP::CMiningIdentityKey mik;
+    if (!mik.Generate()) { std::cout << "FAIL: MIK generate\n"; ++failed; return; }
+    CBlock block = MakeVDFBlockWithSignedMIK(CTPrevHash(), kCTHeight, mik, iters);
+    if (block.vtx.empty()) { std::cout << "FAIL: block build/sign\n"; ++failed; return; }
+
+    bool flagged = true;
+    if (!RunConnectTip(block, kCTHeight, /*skipValidation=*/false, &flagged)) {
+        std::cout << "FAIL: honest block REJECTED by ConnectTip (skipValidation=false)\n";
+        ++failed; return;
+    }
+    CHECK(!flagged);
+
+    flagged = true;
+    if (!RunConnectTip(block, kCTHeight, /*skipValidation=*/true, &flagged)) {
+        std::cout << "FAIL: honest block REJECTED by ConnectTip (skipValidation=true)\n";
+        ++failed; return;
+    }
+    CHECK(!flagged);
+    PASS();
+}
+
+// THE REGRESSION TEST. A forged VDF proof must be rejected BY ConnectTip
+// itself on the normal connect path, and the block marked BLOCK_FAILED_VALID.
+static void test_connecttip_forged_proof_rejected_normal_path()
+{
+    TEST(connecttip_forged_proof_rejected_normal_path);
+    const uint64_t iters = 1000;
+    InstallConnectTipChainParams(iters, /*enforcement=*/100, /*assumeValid=*/0);
+
+    DFMP::CMiningIdentityKey mik;
+    if (!mik.Generate()) { std::cout << "FAIL: MIK generate\n"; ++failed; return; }
+    CBlock block = MakeVDFBlockWithSignedMIK(CTPrevHash(), kCTHeight, mik, iters);
+    if (block.vtx.empty()) { std::cout << "FAIL: block build/sign\n"; ++failed; return; }
+
+    // Attacker-ground output: the header no longer matches the proof. A header
+    // field, so the merkle commitment is untouched and LP-4 cannot be the one
+    // rejecting this block.
+    block.vdfOutput.data[0] ^= 0x01;
+
+    bool flagged = false;
+    bool ok = RunConnectTip(block, kCTHeight, /*skipValidation=*/false, &flagged);
+    CHECK(!ok);
+    CHECK(flagged);   // the LP-10 branch marks the index BLOCK_FAILED_VALID
+    PASS();
+}
+
+// THE CLAIM THE COMMENT MAKES AND NOTHING TESTED. ConnectTip's LP-10 comment
+// states the checks "run for ALL connect paths INCLUDING skipValidation=true
+// reorg reconnects", on the reasoning that VDF block selection is effectively
+// a reorg every block. Three of ConnectTip's production call sites pass
+// skipValidation=true. If the LP-10 block were ever moved inside the
+// !skipValidation gate -- where the attestation and DNA checks used to live,
+// and from which BUG #281 had to rescue them -- a forged block would reach the
+// UTXO set through the reorg path. This is the test for that.
+static void test_connecttip_forged_proof_rejected_on_reorg_path()
+{
+    TEST(connecttip_forged_proof_rejected_on_reorg_path);
+    const uint64_t iters = 1000;
+    InstallConnectTipChainParams(iters, /*enforcement=*/100, /*assumeValid=*/0);
+
+    DFMP::CMiningIdentityKey mik;
+    if (!mik.Generate()) { std::cout << "FAIL: MIK generate\n"; ++failed; return; }
+    CBlock block = MakeVDFBlockWithSignedMIK(CTPrevHash(), kCTHeight, mik, iters);
+    if (block.vtx.empty()) { std::cout << "FAIL: block build/sign\n"; ++failed; return; }
+    block.vdfOutput.data[0] ^= 0x01;
+
+    bool flagged = false;
+    bool ok = RunConnectTip(block, kCTHeight, /*skipValidation=*/true, &flagged);
+    CHECK(!ok);
+    CHECK(flagged);
+    PASS();
+}
+
+// THE DISCRIMINATING CONTROL. Byte-for-byte the same forged block, the same
+// height, both the same paths -- with ONLY vdfProofEnforcementHeight moved
+// above the block. It must be ACCEPTED. No other check in ConnectTip reads
+// that field, so this is what makes the two rejections above attributable to
+// the LP-10 wiring rather than to any of the ~10 earlier rejection sites.
+static void test_connecttip_forged_proof_accepted_below_enforcement()
+{
+    TEST(connecttip_forged_proof_accepted_below_enforcement);
+    const uint64_t iters = 1000;
+    InstallConnectTipChainParams(iters, /*enforcement=*/1000, /*assumeValid=*/0);
+
+    DFMP::CMiningIdentityKey mik;
+    if (!mik.Generate()) { std::cout << "FAIL: MIK generate\n"; ++failed; return; }
+    CBlock block = MakeVDFBlockWithSignedMIK(CTPrevHash(), kCTHeight, mik, iters);
+    if (block.vtx.empty()) { std::cout << "FAIL: block build/sign\n"; ++failed; return; }
+    block.vdfOutput.data[0] ^= 0x01;   // identical forgery to the two cases above
+
+    bool flagged = true;
+    if (!RunConnectTip(block, kCTHeight, /*skipValidation=*/false, &flagged)) {
+        std::cout << "FAIL: forged block rejected BELOW enforcement -- the rejections "
+                     "above are NOT attributable to the LP-10 gate\n";
+        ++failed; return;
+    }
+    CHECK(!flagged);
+
+    flagged = true;
+    if (!RunConnectTip(block, kCTHeight, /*skipValidation=*/true, &flagged)) {
+        std::cout << "FAIL: forged block rejected BELOW enforcement on reorg path\n";
+        ++failed; return;
+    }
+    CHECK(!flagged);
+    PASS();
+}
+
+// TODAY'S PRODUCTION STATE. With the shipped sentinel (999999999) nothing is
+// enforced on either path. This pins the deployed behaviour, so that the day
+// someone sets a real height, the diff to this test is the visible record of
+// what changed.
+static void test_connecttip_sentinel_accepts_forged_both_paths()
+{
+    TEST(connecttip_sentinel_accepts_forged_both_paths);
+    const uint64_t iters = 1000;
+    InstallConnectTipChainParams(iters, /*enforcement=*/999999999, /*assumeValid=*/0);
+
+    DFMP::CMiningIdentityKey mik;
+    if (!mik.Generate()) { std::cout << "FAIL: MIK generate\n"; ++failed; return; }
+    CBlock block = MakeVDFBlockWithSignedMIK(CTPrevHash(), kCTHeight, mik, iters);
+    if (block.vtx.empty()) { std::cout << "FAIL: block build/sign\n"; ++failed; return; }
+    block.vdfOutput.data[0] ^= 0x01;
+
+    bool flagged = true;
+    if (!RunConnectTip(block, kCTHeight, false, &flagged)) {
+        std::cout << "FAIL: sentinel build rejected a forged block (normal path)\n";
+        ++failed; return;
+    }
+    CHECK(!flagged);
+
+    flagged = true;
+    if (!RunConnectTip(block, kCTHeight, true, &flagged)) {
+        std::cout << "FAIL: sentinel build rejected a forged block (reorg path)\n";
+        ++failed; return;
+    }
+    CHECK(!flagged);
+    PASS();
+}
+
+// NO ASSUME-VALID EXEMPTION. The LP-10 block sits below ConnectTip's
+// assumeValid computation and deliberately does not consult it -- unlike
+// attestation, DNA and the cooldown checks, which all skip when assumeValid is
+// true. DilV ships dfmpAssumeValidHeight = 44233, so a block at height 200 is
+// assume-valid in production shape. A forged proof must STILL be rejected.
+static void test_connecttip_forged_proof_rejected_despite_assume_valid()
+{
+    TEST(connecttip_forged_proof_rejected_despite_assume_valid);
+    const uint64_t iters = 1000;
+    // 44233 is DilV's shipped dfmpAssumeValidHeight; kCTHeight (200) is at or
+    // below it, so assumeValid is TRUE for this block.
+    InstallConnectTipChainParams(iters, /*enforcement=*/100, /*assumeValid=*/44233);
+
+    DFMP::CMiningIdentityKey mik;
+    if (!mik.Generate()) { std::cout << "FAIL: MIK generate\n"; ++failed; return; }
+    CBlock honest = MakeVDFBlockWithSignedMIK(CTPrevHash(), kCTHeight, mik, iters);
+    if (honest.vtx.empty()) { std::cout << "FAIL: block build/sign\n"; ++failed; return; }
+
+    // Positive control under the SAME assume-valid fixture.
+    bool flagged = true;
+    if (!RunConnectTip(honest, kCTHeight, false, &flagged)) {
+        std::cout << "FAIL: honest block rejected under the assume-valid fixture\n";
+        ++failed; return;
+    }
+
+    CBlock forged = honest;
+    forged.vdfOutput.data[0] ^= 0x01;
+
+    flagged = false;
+    bool ok = RunConnectTip(forged, kCTHeight, false, &flagged);
+    CHECK(!ok);
+    CHECK(flagged);
+
+    flagged = false;
+    ok = RunConnectTip(forged, kCTHeight, true, &flagged);
+    CHECK(!ok);
+    CHECK(flagged);
+    PASS();
+}
+
+// The MIK-signature half of the LP-10 wiring, through ConnectTip, on both
+// paths, with its own discriminating control.
+static void test_connecttip_forged_mik_signature_rejected_both_paths()
+{
+    TEST(connecttip_forged_mik_signature_rejected_both_paths);
+    const uint64_t iters = 1000;
+    InstallConnectTipChainParams(iters, /*enforcement=*/100, /*assumeValid=*/0);
+
+    DFMP::CMiningIdentityKey mik;
+    if (!mik.Generate()) { std::cout << "FAIL: MIK generate\n"; ++failed; return; }
+    CBlock block = MakeVDFBlockWithSignedMIK(CTPrevHash(), kCTHeight, mik, iters);
+    if (block.vtx.empty()) { std::cout << "FAIL: block build/sign\n"; ++failed; return; }
+
+    // Positive control: the honestly-signed block must connect.
+    bool flagged = true;
+    if (!RunConnectTip(block, kCTHeight, false, &flagged)) {
+        std::cout << "FAIL: honestly-signed MIK block rejected by ConnectTip\n";
+        ++failed; return;
+    }
+
+    if (!ForgeMIKSignatureInPlace(block)) {
+        std::cout << "FAIL: could not locate the MIK signature to corrupt\n";
+        ++failed; return;
+    }
+
+    flagged = false;
+    bool ok = RunConnectTip(block, kCTHeight, false, &flagged);
+    CHECK(!ok);
+    CHECK(flagged);
+
+    flagged = false;
+    ok = RunConnectTip(block, kCTHeight, true, &flagged);
+    CHECK(!ok);
+    CHECK(flagged);
+
+    // Discriminating control: same corrupted block, enforcement moved above it.
+    // If the merkle re-commit above were wrong, or any earlier check were the
+    // one rejecting, this would fail rather than silently validating nothing.
+    InstallConnectTipChainParams(iters, /*enforcement=*/1000, /*assumeValid=*/0);
+    flagged = true;
+    if (!RunConnectTip(block, kCTHeight, false, &flagged)) {
+        std::cout << "FAIL: corrupted-MIK block rejected BELOW enforcement -- the "
+                     "rejection is not attributable to the LP-10 gate\n";
+        ++failed; return;
+    }
+    CHECK(!flagged);
+    PASS();
+}
+
+// The guard's own gate. A non-VDF block (nVersion < VDF_VERSION) must not be
+// subjected to the VDF checks at all, however broken its VDF header fields
+// are. This pins IsVDFBlock() as the entry condition, so a future change that
+// widened the gate to every block would be caught here rather than on a
+// mainnet chain of legacy blocks.
+//
+// dfmpActivationHeight is moved out of range for this case ONLY: DilV ships it
+// at 0, and CheckProofOfWorkDFMP's early return for VDF blocks no longer
+// applies once nVersion drops below VDF_VERSION, so it would otherwise reject
+// this block for a reason that has nothing to do with the gate under test.
+static void test_connecttip_non_vdf_block_not_subject_to_vdf_checks()
+{
+    TEST(connecttip_non_vdf_block_not_subject_to_vdf_checks);
+    const uint64_t iters = 1000;
+    InstallConnectTipChainParams(iters, /*enforcement=*/100, /*assumeValid=*/0,
+                                 /*dfmpActivationHeight=*/1000000);
+
+    DFMP::CMiningIdentityKey mik;
+    if (!mik.Generate()) { std::cout << "FAIL: MIK generate\n"; ++failed; return; }
+    CBlock block = MakeVDFBlockWithSignedMIK(CTPrevHash(), kCTHeight, mik, iters);
+    if (block.vtx.empty()) { std::cout << "FAIL: block build/sign\n"; ++failed; return; }
+
+    block.vdfOutput.data[0] ^= 0x01;                    // would fail if checked
+    block.nVersion = CBlockHeader::VDF_VERSION - 1;     // ...but it is not a VDF block
+
+    bool flagged = true;
+    if (!RunConnectTip(block, kCTHeight, false, &flagged)) {
+        std::cout << "FAIL: non-VDF block rejected by the VDF wiring\n";
+        ++failed; return;
+    }
+    CHECK(!flagged);
+    PASS();
+}
+
 int main()
 {
     std::cout << "\nVDF Consensus Validation Tests\n";
@@ -580,6 +980,17 @@ int main()
     test_lp10_disabled_sentinel_accepts_forged();
     test_lp10_honest_mik_signature_accepted_above_activation();
     test_lp10_forged_mik_signature_rejected_above_accepted_below();
+
+    // LP-10 ConnectTip INTEGRATION tests (the checks above go through the REAL
+    // CChainState::ConnectTip, on both the normal and the reorg-reconnect path)
+    test_connecttip_honest_vdf_block_accepted_both_paths();
+    test_connecttip_forged_proof_rejected_normal_path();
+    test_connecttip_forged_proof_rejected_on_reorg_path();
+    test_connecttip_forged_proof_accepted_below_enforcement();
+    test_connecttip_sentinel_accepts_forged_both_paths();
+    test_connecttip_forged_proof_rejected_despite_assume_valid();
+    test_connecttip_forged_mik_signature_rejected_both_paths();
+    test_connecttip_non_vdf_block_not_subject_to_vdf_checks();
 
     vdf::shutdown();
 
