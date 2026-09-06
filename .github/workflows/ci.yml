@@ -123,7 +123,7 @@ jobs:
         # Skip HD wallet tests temporarily - GetNewHDAddress() hangs in CI (BUG-77)
         # Likely blocking on /dev/random or deadlock issue
         # Affected: wallet_hd_tests, rpc_hd_wallet_tests, hd_wallet_standalone_tests
-        ./test_dilithion --log_level=test_suite --report_level=short \
+        scripts/run_boost_tests.sh --timeout 1800 --log_level=test_suite --report_level=short \
           --run_test='!wallet_hd_tests:!rpc_hd_wallet_tests:!hd_wallet_standalone_tests'
         echo "✅ Boost unit tests completed (HD wallet tests skipped - BUG-77)"
 
@@ -230,7 +230,7 @@ jobs:
         # Phase 8: Run tests with ASan to detect memory errors
         # Skip HD wallet tests - BUG-77 (GetNewHDAddress hangs)
         echo "Running tests with AddressSanitizer..."
-        ./test_dilithion --log_level=test_suite --report_level=short --run_test='!wallet_hd_tests:!rpc_hd_wallet_tests:!hd_wallet_standalone_tests' || true
+        scripts/run_boost_tests.sh --swallow-failures --timeout 3600 --log_level=test_suite --report_level=short --run_test='!wallet_hd_tests:!rpc_hd_wallet_tests:!hd_wallet_standalone_tests'
         echo "✅ ASan tests completed (check output above for memory errors)"
 
   sanitizer-ubsan:
@@ -304,7 +304,7 @@ jobs:
         # Phase 8: Run tests with UBSan to detect undefined behavior
         # Skip HD wallet tests - BUG-77 (GetNewHDAddress hangs)
         echo "Running tests with UndefinedBehaviorSanitizer..."
-        ./test_dilithion --log_level=test_suite --report_level=short --run_test='!wallet_hd_tests:!rpc_hd_wallet_tests:!hd_wallet_standalone_tests' || true
+        scripts/run_boost_tests.sh --swallow-failures --timeout 3600 --log_level=test_suite --report_level=short --run_test='!wallet_hd_tests:!rpc_hd_wallet_tests:!hd_wallet_standalone_tests'
         echo "✅ UBSan tests completed (check output above for undefined behavior)"
 
   sanitizer-tsan:
@@ -378,7 +378,7 @@ jobs:
         # Phase 8: Run tests with TSan to detect data races
         # Skip HD wallet tests - BUG-77 (GetNewHDAddress hangs)
         echo "Running tests with ThreadSanitizer..."
-        ./test_dilithion --log_level=test_suite --report_level=short --run_test='!wallet_hd_tests:!rpc_hd_wallet_tests:!hd_wallet_standalone_tests' || true
+        scripts/run_boost_tests.sh --swallow-failures --timeout 3600 --log_level=test_suite --report_level=short --run_test='!wallet_hd_tests:!rpc_hd_wallet_tests:!hd_wallet_standalone_tests'
         echo "✅ TSan tests completed (check output above for data races)"
 
   static-analysis:
@@ -514,7 +514,7 @@ jobs:
       run: |
         # Run Boost unit tests to generate coverage data
         # Skip HD wallet tests - BUG-77 (GetNewHDAddress hangs)
-        ./test_dilithion --log_level=test_suite --report_level=short --run_test='!wallet_hd_tests:!rpc_hd_wallet_tests:!hd_wallet_standalone_tests' || true
+        scripts/run_boost_tests.sh --swallow-failures --timeout 3600 --log_level=test_suite --report_level=short --run_test='!wallet_hd_tests:!rpc_hd_wallet_tests:!hd_wallet_standalone_tests'
 
         # Verify .gcda files were generated
         echo "Checking for .gcda files..."
