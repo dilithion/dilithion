@@ -632,9 +632,11 @@ void CRPCServer::Stop() {
     // immediately. This is what makes the socket close below exactly-once, and
     // it is also what keeps the join()/m_workerThreads teardown further down
     // from being executed concurrently with itself.
-    if (!m_running.exchange(false)) {
+    if (!m_running) {
         return;
     }
+
+    m_running = false;
 
     // PR #38 red-team C5: wake any RPC worker parked in a wait-* long-poll
     // (waitfornewblock / waitforblock / waitforblockheight). Without this,
