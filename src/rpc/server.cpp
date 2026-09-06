@@ -616,7 +616,7 @@ bool CRPCServer::Start() {
     return true;
 }
 
-void CRPCServer::Stop() {
+bool CRPCServer::Stop() {
     // EXCHANGE, not check-then-act. `if (!m_running) return; m_running = false;`
     // is two separate operations on the atomic, so two threads can BOTH observe
     // true and BOTH proceed through the whole of Stop().
@@ -633,7 +633,7 @@ void CRPCServer::Stop() {
     // it is also what keeps the join()/m_workerThreads teardown further down
     // from being executed concurrently with itself.
     if (!m_running.exchange(false)) {
-        return;
+        return false;  // another caller owns the teardown
     }
 
     // PR #38 red-team C5: wake any RPC worker parked in a wait-* long-poll
@@ -716,6 +716,8 @@ void CRPCServer::Stop() {
 #ifdef _WIN32
     WSACleanup();
 #endif
+
+    return true;  // this caller performed the teardown
 }
 
 bool CRPCServer::InitializePermissions(const std::string& configPath,

@@ -144,7 +144,7 @@ BOOST_AUTO_TEST_CASE(concurrent_stop_is_exactly_once)
     std::atomic<bool> go{false};
     std::atomic<int> ready{0};
     std::atomic<int> threw{0};
-    std::atomic<int> returned{0};
+    std::atomic<int> performed_teardown{0};
 
     std::vector<std::thread> callers;
     callers.reserve(kThreads);
@@ -155,12 +155,12 @@ BOOST_AUTO_TEST_CASE(concurrent_stop_is_exactly_once)
                 std::this_thread::yield();
             }
             try {
-                s.server->Stop();
-                returned.fetch_add(1, std::memory_order_relaxed);
+                // THE assertion of this suite. Stop() returns true only for
+                // the caller that won the exchange and ran the teardown.
+                if (s.server->Stop()) {
+                    performed_teardown.fetch_add(1, std::memory_order_relaxed);
+                }
             } catch (const std::exception&) {
-                // A double join() surfaces here as std::system_error. Counted
-                // rather than rethrown so the failure is reported as a failed
-                // assertion with a count, not as an opaque terminate().
                 threw.fetch_add(1, std::memory_order_relaxed);
             }
         });
@@ -173,16 +173,25 @@ BOOST_AUTO_TEST_CASE(concurrent_stop_is_exactly_once)
 
     for (auto& t : callers) t.join();
 
+    // EXACTLY ONE. This is the whole test.
+    //
+    // Do NOT weaken this to "threw == 0" or to a liveness check. An earlier
+    // revision of this case did exactly that and PASSED against deliberately
+    // broken code: every teardown step is separately guarded
+    // (`if (m_serverThread.joinable())`), so a re-entrant Stop() fails
+    // QUIETLY rather than throwing. Counting winners is the only assertion
+    // here that can tell a correct Stop() from a re-entrant one.
+    BOOST_CHECK_MESSAGE(performed_teardown.load() == 1,
+        performed_teardown.load() << " of " << kThreads
+        << " concurrent Stop() callers performed the teardown; exactly 1 may. "
+           ">1 means the guard is check-then-act rather than an exchange, so "
+           "the listening fd is closed more than once (with an fd-reuse window "
+           "between the closes, while P2P is still live) and m_workerThreads is "
+           "iterated by one caller while another clears it.");
+
     BOOST_CHECK_MESSAGE(threw.load() == 0,
         "Stop() threw from " << threw.load() << " of " << kThreads
-        << " concurrent callers. With an exactly-once guard only one caller "
-           "performs the teardown and the rest return immediately; every "
-           "caller running it means a double join() on m_serverThread and a "
-           "double close() of the listening fd.");
-
-    BOOST_CHECK_MESSAGE(returned.load() == kThreads,
-        "only " << returned.load() << " of " << kThreads
-        << " Stop() calls returned normally");
+        << " concurrent callers");
 
     BOOST_CHECK_MESSAGE(!s.server->IsRunning(),
         "server still reports running after " << kThreads << " Stop() calls");
@@ -197,12 +206,16 @@ BOOST_AUTO_TEST_CASE(repeated_sequential_stop_is_safe)
 {
     StartedServer s;
 
-    BOOST_REQUIRE_NO_THROW(s.server->Stop());
+    BOOST_CHECK_MESSAGE(s.server->Stop(),
+        "the first Stop() on a started server must perform the teardown");
     BOOST_CHECK(!s.server->IsRunning());
 
-    // Second and third calls hit the guard's early return.
-    BOOST_REQUIRE_NO_THROW(s.server->Stop());
-    BOOST_REQUIRE_NO_THROW(s.server->Stop());
+    // Second and third calls hit the guard's early return and must report
+    // that they did NOT perform a teardown.
+    BOOST_CHECK_MESSAGE(!s.server->Stop(),
+        "a second Stop() reported performing the teardown again");
+    BOOST_CHECK_MESSAGE(!s.server->Stop(),
+        "a third Stop() reported performing the teardown again");
     BOOST_CHECK(!s.server->IsRunning());
 }
 

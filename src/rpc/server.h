@@ -728,7 +728,21 @@ public:
     /**
      * Stop RPC server
      */
-    void Stop();
+    /** Stop the server. Idempotent and safe to call concurrently.
+     *
+     *  @return true if THIS caller performed the teardown; false if another
+     *          caller had already claimed it and this call was a no-op.
+     *
+     *  The return value exists so the exactly-once property is OBSERVABLE and
+     *  therefore testable. It is not decoration: without it, a re-entrant
+     *  Stop() is externally indistinguishable from a correct one, because the
+     *  teardown's internal steps are each independently guarded
+     *  (`if (m_serverThread.joinable())` and friends) and so fail quietly
+     *  rather than loudly. A first attempt at a concurrency test for this
+     *  asserted that re-entrant Stop() throws; it does not, the test passed
+     *  against deliberately broken code, and the property went unpinned.
+     *  Callers may ignore the result; the test suite may not. */
+    bool Stop();
 
     /**
      * FIX-014: Initialize permission system
