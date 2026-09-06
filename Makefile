@@ -1135,6 +1135,7 @@ BOOST_TEST_OBJECTS := $(OBJ_DIR)/test/test_dilithion.o \
 	$(OBJ_DIR)/test/fork_detection_tests.o \
 	$(OBJ_DIR)/test/tx_index_tests.o \
 	$(OBJ_DIR)/test/tx_index_integration_tests.o \
+	$(OBJ_DIR)/test/rpc_concurrent_stop_tests.o \
 	$(OBJ_DIR)/test/coinstatsindex_tests.o \
 	$(OBJ_DIR)/test/coinstatsindex_integration_tests.o \
 	$(OBJ_DIR)/test/mempool_persist_tests.o \
