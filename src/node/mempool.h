@@ -82,9 +82,22 @@ private:
     // Transactions older than 14 days are automatically removed
     static const int64_t MEMPOOL_EXPIRY_SECONDS = 14 * 24 * 60 * 60;  // 14 days
     std::thread expiration_thread;
+    // SHUTDOWN LOST-WAKEUP FIX -- LOCKING RULE: stop_expiration_thread is
+    // atomic so the expiration thread's outer loop can read it unlocked as a
+    // fast path, but every WRITE must happen while holding expiration_mutex
+    // (StopExpirationThread is the only writer). Writing it outside that mutex
+    // reintroduces a lost wakeup that stalls shutdown for a full hour ahead of
+    // every database close. Regression test: mempool_shutdown_wakeup_tests.
     std::atomic<bool> stop_expiration_thread;
     std::condition_variable expiration_cv;
     std::mutex expiration_mutex;
+
+    // Test seam, production-inert: no production code names this type. The
+    // shutdown lost-wakeup regression test needs to hold expiration_mutex
+    // while a second thread calls StopExpirationThread(), which is the only
+    // way to observe -- deterministically, without racing -- whether the stop
+    // flag is written under that mutex.
+    friend struct MempoolShutdownWakeupTestAccess;
 
     // MEMPOOL-018 FIX: Metrics tracking for monitoring and debugging
     // Atomic counters to track mempool operations without lock contention

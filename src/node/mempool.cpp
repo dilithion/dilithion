@@ -160,17 +160,43 @@ CTxMemPool::~CTxMemPool() {
 }
 
 void CTxMemPool::StopExpirationThread() {
-    // PR-EF-2 fixup F#1: idempotent. stop_expiration_thread is std::atomic;
-    // exchange returns the previous value so we only signal/join once.
-    bool was_running = stop_expiration_thread.exchange(true);
-    if (was_running) {
-        // Already stopped (e.g. dtor running after main() called this).
-        // Still ensure the thread is joined if somehow not yet -- joinable()
-        // is false after a successful join, so this is also a no-op then.
-        if (expiration_thread.joinable()) {
-            expiration_thread.join();
-        }
-        return;
+    // PR-EF-2 fixup F#1: idempotent. Reached twice on the real shutdown path
+    // (explicitly from main(), then again from ~CTxMemPool), so a repeat call
+    // must be a cheap no-op: storing true over true changes nothing,
+    // notify_all() on a CV with no waiter is free, and joinable() is false
+    // after a successful join.
+    //
+    // SHUTDOWN LOST-WAKEUP FIX: the stop flag MUST be written while holding
+    // expiration_mutex -- the same mutex the waiter holds while evaluating
+    // its wait_for predicate in ExpirationThreadFunc().
+    //
+    // Without the lock the following interleaving loses the notification
+    // outright:
+    //   T_waiter : lock(expiration_mutex)
+    //   T_waiter : wait_for evaluates the predicate -> false   (still holding the lock)
+    //   T_stop   : stop_expiration_thread = true               (no lock -- races in here)
+    //   T_stop   : expiration_cv.notify_all()                  (no waiter is blocked yet)
+    //   T_waiter : wait_for atomically releases the lock and blocks
+    //   -> the notify landed on nobody; the waiter sleeps the full
+    //      std::chrono::hours(1) timeout, and join() below blocks for that
+    //      same hour AT SHUTDOWN, ahead of every LevelDB close. Operators
+    //      then kill -9 a "hung" shutdown, which is how the UTXO and block
+    //      databases get truncated mid-write.
+    //
+    // Taking expiration_mutex closes the window: the waiter holds that mutex
+    // continuously from before it evaluates the predicate until wait_for
+    // atomically releases it and blocks, so the store cannot be interleaved
+    // into that region. Either the store lands before the waiter takes the
+    // lock (predicate sees it, no wait at all) or after the waiter is
+    // genuinely blocked on the CV (notify_all below wakes it). There is no
+    // third case.
+    //
+    // notify_all() is deliberately called AFTER releasing the mutex: the
+    // state change is what must be serialised, and notifying unlocked avoids
+    // waking the waiter straight into a contended lock.
+    {
+        std::lock_guard<std::mutex> lock(expiration_mutex);
+        stop_expiration_thread.store(true);
     }
     expiration_cv.notify_all();
     if (expiration_thread.joinable()) {
@@ -402,6 +428,13 @@ void CTxMemPool::ExpirationThreadFunc() {
     // Background thread that runs every hour to clean up expired transactions
     // This prevents indefinite accumulation of old transactions
 
+    // SHUTDOWN LOST-WAKEUP FIX -- INVARIANT: stop_expiration_thread is
+    // written ONLY under expiration_mutex (see StopExpirationThread). That is
+    // what makes the wait below un-missable: the predicate is evaluated while
+    // this thread holds expiration_mutex, and wait_for releases that mutex and
+    // blocks atomically, so no store+notify can slip between the two.
+    // The unlocked read in the outer loop condition is a fast-path only -- the
+    // authoritative check is the predicate/post-wait check under the lock.
     while (!stop_expiration_thread) {
         {
             // Wait for 1 hour or until stop signal
