@@ -47,6 +47,16 @@ import sys
 EXPECT_TIP = 54000          # DIL's most recent checkpoint height
 EXPECT_ROWS = EXPECT_TIP + 1
 
+# Consensus anchors, both from src/core/chainparams.cpp Mainnet(). A sha256 of
+# the dump proves only that the bytes have not changed since we read them -- it
+# says NOTHING about whether those bytes are DIL's real history. These two
+# hashes are what tie the census to consensus: the genesis the chain starts
+# from, and the checkpoint the threshold is measured at. Without them a dump
+# from the wrong chain, the wrong network, or a fork would sail through every
+# structural check and produce an authoritative-looking wrong constant.
+EXPECT_GENESIS_HASH = "0000009eaa5e7781ba6d14525c3f75c35444045b21ddafbbea61090db99b0bc3"
+EXPECT_TIP_HASH = "0000000bb44c964b4e3c6fec8c15941738cd74b434bafbfe4aadce898140b993"
+
 
 def die(msg):
     sys.stderr.write("CENSUS ABORTED (nothing written): %s\n" % msg)
@@ -68,6 +78,7 @@ def main():
 
     saw_done = False
     seen = {}
+    hashes = {}
     for lineno, line in enumerate(lines, 1):
         line = line.strip()
         if not line or line.startswith("#"):
@@ -97,6 +108,8 @@ def main():
         if height in seen:
             die("duplicate row for height %d" % height)
         seen[height] = nbits
+        if len(parts) >= 3:
+            hashes[height] = parts[1].lower()
 
     # ---- WRITE GATE -----------------------------------------------------
     if not saw_done:
@@ -110,6 +123,18 @@ def main():
     if missing:
         die("heights are not contiguous 0..%d; %d missing, first few: %s"
             % (EXPECT_TIP, len(missing), missing[:5]))
+
+    # Consensus anchors. Structural checks above prove the table is well-formed;
+    # these prove it is the RIGHT CHAIN. A dump from a fork or the wrong network
+    # passes every other gate and yields an authoritative-looking wrong number.
+    for h, want in ((0, EXPECT_GENESIS_HASH), (EXPECT_TIP, EXPECT_TIP_HASH)):
+        got = hashes.get(h)
+        if got is None:
+            die("row at height %d carries no block hash; cannot anchor the census "
+                "to consensus. Re-dump with the hash column." % h)
+        if got != want:
+            die("height %d hash does not match chainparams: got %s, want %s. "
+                "This dump is not DIL mainnet history." % (h, got, want))
 
     agg = collections.Counter(seen[h] for h in range(0, EXPECT_ROWS))
     if sum(agg.values()) != EXPECT_ROWS:
@@ -126,11 +151,14 @@ def main():
 // GENERATED FILE -- do not edit by hand.
 //   generator: scripts/gen_dil_nbits_census.py
 //   source:    a read-only DIL seed dump of <height> <hash> <nBits>
-//   sha256:    %s
-//   coverage:  heights 0..%d inclusive (%d blocks), verified contiguous,
+//   sha256:    %(sha)s
+//   coverage:  heights 0..%(tip)d inclusive (%(rows)d blocks), verified contiguous,
 //              no duplicates, no zero nBits, producer DONE marker present
+//   anchored:  height 0 and height %(tip)d hashes matched against chainparams
+//              Mainnet() genesisHash and its highest checkpoint -- the sha256
+//              proves the bytes are unchanged, these prove they are DIL
 //
-// DIL retargets on roughly half of all blocks (%d distinct nBits over %d),
+// DIL retargets on roughly half of all blocks (%(distinct)d distinct nBits over %(rows)d),
 // so its nMinimumChainWork cannot be re-derived from a closed form the way
 // DilV's can. This census is the per-block evidence, aggregated by nBits --
 // chain work is a SUM, so grouping equal nBits together is exact.
@@ -154,12 +182,12 @@ struct DilNBitsCensusRow {
 };
 
 // Highest height covered, inclusive.
-static const int DIL_CENSUS_TIP_HEIGHT = %d;
+static const int DIL_CENSUS_TIP_HEIGHT = %(tip)d;
 // Total blocks censused; must equal DIL_CENSUS_TIP_HEIGHT + 1.
-static const long long DIL_CENSUS_TOTAL_BLOCKS = %d;
+static const long long DIL_CENSUS_TOTAL_BLOCKS = %(rows)d;
 
 static const DilNBitsCensusRow DIL_NBITS_CENSUS[] = {
-%s
+%(body)s
 };
 
 static const size_t DIL_NBITS_CENSUS_LEN =
@@ -169,8 +197,8 @@ static const size_t DIL_NBITS_CENSUS_LEN =
 }  // namespace dilithion
 
 #endif  // DILITHION_TEST_DIL_NBITS_CENSUS_H
-""" % (sha, EXPECT_TIP, EXPECT_ROWS, len(agg), EXPECT_ROWS,
-       EXPECT_TIP, EXPECT_ROWS, "\n".join(body_lines))
+""" % {"sha": sha, "tip": EXPECT_TIP, "rows": EXPECT_ROWS,
+       "distinct": len(agg), "body": "\n".join(body_lines)}
 
     if "Traceback" in header:
         die("output contains a traceback -- refusing to write")

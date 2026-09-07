@@ -7,6 +7,9 @@
 //   sha256:    da6f27bd44ea200db0f0b2a27fe3cd095cd364caa89f0f2e5d3d4f9085a049d2
 //   coverage:  heights 0..54000 inclusive (54001 blocks), verified contiguous,
 //              no duplicates, no zero nBits, producer DONE marker present
+//   anchored:  height 0 and height 54000 hashes matched against chainparams
+//              Mainnet() genesisHash and its highest checkpoint -- the sha256
+//              proves the bytes are unchanged, these prove they are DIL
 //
 // DIL retargets on roughly half of all blocks (25992 distinct nBits over 54001),
 // so its nMinimumChainWork cannot be re-derived from a closed form the way
