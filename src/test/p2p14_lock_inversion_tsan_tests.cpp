@@ -117,8 +117,10 @@ int main(int argc, char* argv[])
 {
     const std::string arm = (argc > 1) ? argv[1] : "registered";
     const bool register_callback = (arm == "registered");
-    if (arm != "registered" && arm != "unregistered") {
-        std::cerr << "usage: " << argv[0] << " registered|unregistered\n";
+    const bool accessor_arm = (arm == "accessor-unsafe" || arm == "accessor-safe");
+    if (arm != "registered" && arm != "unregistered" && !accessor_arm) {
+        std::cerr << "usage: " << argv[0]
+                  << " registered|unregistered|accessor-unsafe|accessor-safe\n";
         return 2;
     }
 
@@ -147,6 +149,110 @@ int main(int argc, char* argv[])
     }
 
     CChainState chainstate;
+
+    // ================================================================
+    // P2P-14/15 §0.3-POST — VALUE-ACCESSOR ARMS (a8, 2026-09-07)
+    // ================================================================
+    // Separate question from the lock-order arms above, needing its own
+    // control: NOT "do two locks invert" but "does a pointer escape its lock".
+    //
+    // GetBlockIndex acquires cs_main, RELEASES it, and returns a raw
+    // CBlockIndex*. Any caller that then dereferences it is reading an object
+    // another thread may be writing under the lock — LP10's measured shape at
+    // 6353bc33 ("a mutex on one side buys nothing"). OnBlockActivated did
+    // exactly this and was safe ONLY because its caller still held cs_main;
+    // the P2P-14/15 fix fires that callback with cs_main released, which
+    // deleted the guarantee. GetBlockHeightByHash reads and dereferences
+    // inside one lock scope and copies the value out.
+    //
+    // The writer: AddBlockIndex on an EXISTING hash takes cs_main and merges
+    // into the live entry (`existing->nStatus |= incoming`). cs_main is
+    // private, so a test cannot hold it directly — this is the available way
+    // to get a lock-held write to the same object.
+    //
+    // ⚠️ CONFOUND, STATED RATHER THAN HIDDEN: the unsafe arm reads nStatus
+    // (the field the writer touches) while the safe arm reads nHeight via the
+    // value accessor, because the accessor added by this fix returns height.
+    // The arms therefore differ in field as well as in mechanism. That makes
+    // this a demonstration that POINTER ESCAPE races and VALUE RETURN does
+    // not — it is NOT a same-field A/B. A same-field control would need a
+    // value accessor for nStatus, which this contract does not add. Read the
+    // result with that limit in mind.
+    if (accessor_arm) {
+        const bool unsafe = (arm == "accessor-unsafe");
+        std::cout << "[p2p1415-accessor] arm=" << arm << "  pattern="
+                  << (unsafe ? "GetBlockIndex + deref AFTER release (pre-fix)"
+                             : "GetBlockHeightByHash (value, under lock)")
+                  << std::endl;
+
+        // The key MUST be the header's own computed hash — AddBlockIndex trips
+        // `INVARIANT VIOLATION: pindex->GetBlockHash() == hash` (chain.cpp:98)
+        // otherwise. An invented key aborts the process before either thread
+        // runs, which reads as EXIT=134 with zero races: a fixture failure
+        // wearing the costume of a clean result.
+        uint256 prev;
+        std::memset(prev.data, 0, 32);
+        const CBlockHeader targetHeader = MakeVDFHeader(prev, 1700000042);
+        const uint256 target = targetHeader.GetHash();
+        {
+            auto idx = std::make_unique<CBlockIndex>();
+            idx->header = targetHeader;
+            idx->phashBlock = target;   // GetBlockHash() aborts without this
+            idx->nHeight = 0;   // null hashPrevBlock => genesis-shaped; AddBlockIndex requires 0
+            idx->nStatus = 0;
+            chainstate.AddBlockIndex(target, std::move(idx));
+        }
+
+        std::atomic<bool> stop{false};
+        std::atomic<uint64_t> reads{0}, writes{0};
+
+        std::thread reader([&]() {
+            while (!stop.load(std::memory_order_relaxed)) {
+                if (unsafe) {
+                    // PRE-FIX PATTERN — the pointer outlives the lock.
+                    CBlockIndex* p = chainstate.GetBlockIndex(target);
+                    if (p) {
+                        volatile uint32_t observed = p->nStatus;  // unlocked read
+                        (void)observed;
+                    }
+                } else {
+                    // POST-FIX PATTERN — nothing escapes the lock scope.
+                    int h = 0;
+                    (void)chainstate.GetBlockHeightByHash(target, h);
+                }
+                reads.fetch_add(1, std::memory_order_relaxed);
+            }
+        });
+
+        std::thread writer([&]() {
+            for (int i = 0; i < 4000 && !stop.load(std::memory_order_relaxed); ++i) {
+                auto dup = std::make_unique<CBlockIndex>();
+                dup->header = targetHeader;       // same hash → merge path, invariant holds
+                dup->phashBlock = target;         // GetBlockHash() aborts without this
+                dup->nHeight = 0;                 // same topology → no disagreement trip
+                dup->nStatus = (i & 1) ? 0x2 : 0x4;
+                chainstate.AddBlockIndex(target, std::move(dup));  // writes under cs_main
+                writes.fetch_add(1, std::memory_order_relaxed);
+            }
+            stop.store(true, std::memory_order_relaxed);
+        });
+
+        writer.join();
+        stop.store(true, std::memory_order_relaxed);
+        reader.join();
+
+        std::cout << "[p2p1415-accessor] reads=" << reads.load()
+                  << " writes=" << writes.load() << std::endl;
+        // Both counters must be non-zero or the arm proved nothing: a zero
+        // means one thread never ran and the result is about scheduling, not
+        // about the pattern.
+        if (reads.load() == 0 || writes.load() == 0) {
+            std::cerr << "[p2p1415-accessor] HARNESS DEFECT: a thread did no work; "
+                         "any race count from this run is meaningless" << std::endl;
+            return 3;
+        }
+        return 0;
+    }
 
     // Bypass the DB/UTXO work of the real ConnectTip. This does NOT bypass the
     // lock: ActivateBestChain still holds cs_main across the override and still
