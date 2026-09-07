@@ -35,8 +35,16 @@ using namespace std;
 static const char* kTestRpcUser = "testuser";
 static const char* kTestRpcPass = "testpassword123";
 
+// Header controls exist so the suite can PIN the two security gates, not just
+// satisfy them. Before this, no test anywhere asserted that a request WITHOUT
+// the CSRF header or with bad credentials is REJECTED -- so deleting the CSRF
+// check in server.cpp, or inverting the auth gate, left every suite green.
+enum class Csrf { Send, Omit };
+enum class Creds { Good, Bad, Omit };
+
 // Helper: Send JSON-RPC request over HTTP
-string SendRPCRequest(uint16_t port, const string& method, const string& params = "[]", const string& id = "1") {
+string SendRPCRequest(uint16_t port, const string& method, const string& params = "[]", const string& id = "1",
+                      Csrf csrf = Csrf::Send, Creds creds = Creds::Good) {
     // Create socket and connect to localhost
     struct sockaddr_storage ss;
     socklen_t ss_len;
@@ -74,16 +82,17 @@ string SendRPCRequest(uint16_t port, const string& method, const string& params 
     // it, but the omission was invisible for as long as the server refused to
     // start at all -- fixing the auth/permissions init is what surfaced it.
     // Every RPC caller must send it; it is part of the documented contract.
-    httpReq << "X-Dilithion-RPC: 1\r\n";
+    if (csrf == Csrf::Send) httpReq << "X-Dilithion-RPC: 1\r\n";
     // Auth is configured now (it was not before), so the server also requires
     // HTTP Basic credentials: "Unauthorized - Invalid or missing credentials".
     // Third layer down -- the server refusing to start hid the CSRF gap, which
     // in turn hid this one. Each fix revealed the next real requirement.
-    {
-        const std::string creds = std::string(kTestRpcUser) + ":" + kTestRpcPass;
+    if (creds != Creds::Omit) {
+        const std::string pass = (creds == Creds::Good) ? kTestRpcPass : "wrong-password";
+        const std::string pair = std::string(kTestRpcUser) + ":" + pass;
         httpReq << "Authorization: Basic "
-                << RPCAuth::Base64Encode(reinterpret_cast<const uint8_t*>(creds.data()),
-                                         creds.size())
+                << RPCAuth::Base64Encode(reinterpret_cast<const uint8_t*>(pair.data()),
+                                         pair.size())
                 << "\r\n";
     }
     httpReq << "Content-Type: application/json\r\n";
@@ -96,18 +105,28 @@ string SendRPCRequest(uint16_t port, const string& method, const string& params 
     // Send request
     send(sock, request.c_str(), request.size(), 0);
 
-    // Read response
-    char buffer[4096];
-    int bytesRead = recv(sock, buffer, sizeof(buffer) - 1, 0);
+    // Read response. A SINGLE 4096-byte recv truncates: RPC_Help's body is
+    // already ~4.4 KB, so the `help` assertion was passing only because
+    // "getnewaddress" happens to be emitted first -- one reordering of
+    // RPC_Help away from a false pass. Drain the socket instead, as
+    // tx_index_integration_tests.cpp does.
+    string response;
+    {
+        char buffer[8192];
+        for (;;) {
+            int n = recv(sock, buffer, sizeof(buffer) - 1, 0);
+            if (n <= 0) break;
+            response.append(buffer, static_cast<size_t>(n));
+            if (n < static_cast<int>(sizeof(buffer) - 1)) break;
+        }
+    }
     closesocket(sock);
 
-    if (bytesRead <= 0) {
+    if (response.empty()) {
         return "";
     }
-    buffer[bytesRead] = '\0';
 
     // Extract JSON body from HTTP response
-    string response(buffer);
     size_t pos = response.find("\r\n\r\n");
     if (pos == string::npos) {
         pos = response.find("\n\n");
@@ -135,8 +154,16 @@ static bool PrepareServer(CRPCServer& server, const std::string& tag) {
         }
         auth_done = true;
     }
+    // A FIXED path here is a greenness gate held by anyone who can write /tmp.
+    // InitializePermissions -> LoadFromFile succeeds if the file merely EXISTS
+    // and returns without installing the legacy credentials, so a stale or
+    // planted file turns every request into a 401 and reds the suite
+    // deterministically, with a log that cheerfully says "Loaded N users".
     const std::string perms =
-        (std::filesystem::temp_directory_path() / ("dil_rpc_perms_" + tag + ".json")).string();
+        (std::filesystem::temp_directory_path()
+         / ("dil_rpc_perms_" + tag + "_" + std::to_string(static_cast<long>(::getpid())) + ".json")).string();
+    std::error_code perms_ec;
+    std::filesystem::remove(perms, perms_ec);
     if (!server.InitializePermissions(perms, kTestRpcUser, kTestRpcPass)) {
         cout << "  ✗ InitializePermissions failed (" << perms << ")" << endl;
         return false;
@@ -153,6 +180,59 @@ static void ReportStartFailure() {
     cout << "    auth configured : " << (RPCAuth::IsAuthConfigured() ? "yes" : "NO") << endl;
     cout << "    (a bind failure would be reported by Start() above; if auth"
             " says yes, suspect the port)" << endl;
+}
+
+// NEGATIVE CONTROLS. The happy path proves the suite can talk to the server;
+// only these prove the server still REFUSES. Without them, deleting the CSRF
+// block or inverting the auth gate in server.cpp leaves the whole roster green
+// -- and given the CVE-2026-RPC-AUTH history that put those gates there, an
+// unpinned gate is the part that matters.
+bool TestSecurityGatesReject() {
+    cout << "\nTesting RPC security gates REJECT (negative controls)..." << endl;
+
+    CWallet wallet;
+    wallet.GenerateNewKey();
+    CRPCServer server(18436);
+    server.RegisterWallet(&wallet);
+
+    if (!PrepareServer(server, "gates")) return false;
+    if (!server.Start()) { ReportStartFailure(); return false; }
+    this_thread::sleep_for(chrono::milliseconds(100));
+
+    bool ok = true;
+
+    // 1. No CSRF header -> must be refused.
+    string r = SendRPCRequest(18436, "getnewaddress", "[]", "1", Csrf::Omit, Creds::Good);
+    if (r.find("X-Dilithion-RPC") == string::npos) {
+        cout << "  ✗ CSRF gate did NOT reject a request without the header" << endl;
+        cout << "    response: " << r.substr(0, 160) << endl;
+        ok = false;
+    } else {
+        cout << "  ✓ CSRF gate rejects a request without X-Dilithion-RPC" << endl;
+    }
+
+    // 2. Wrong password -> must be refused.
+    r = SendRPCRequest(18436, "getnewaddress", "[]", "2", Csrf::Send, Creds::Bad);
+    if (r.find("Unauthorized") == string::npos) {
+        cout << "  ✗ Auth gate did NOT reject bad credentials" << endl;
+        cout << "    response: " << r.substr(0, 160) << endl;
+        ok = false;
+    } else {
+        cout << "  ✓ Auth gate rejects bad credentials" << endl;
+    }
+
+    // 3. No credentials at all -> must be refused.
+    r = SendRPCRequest(18436, "getnewaddress", "[]", "3", Csrf::Send, Creds::Omit);
+    if (r.find("Unauthorized") == string::npos) {
+        cout << "  ✗ Auth gate did NOT reject a request with no credentials" << endl;
+        cout << "    response: " << r.substr(0, 160) << endl;
+        ok = false;
+    } else {
+        cout << "  ✓ Auth gate rejects a request with no credentials" << endl;
+    }
+
+    server.Stop();
+    return ok;
 }
 
 bool TestServerStartStop() {
@@ -201,8 +281,18 @@ bool TestWalletRPCs() {
     wallet.GenerateNewKey();
 
     // Create UTXO set and chain state for getbalance test
+    // The return was discarded, so a failed Open() let getbalance be asserted
+    // against an unopened UTXO set. And remove_all ran ONLY on the success
+    // path, so every early return leaked .test_rpc_utxo into the CWD (the repo
+    // root under run_test_suites.sh) for the NEXT run to pick up -- a cross-run
+    // state channel that only starts mattering now the suite actually runs.
     CUTXOSet utxo_set;
-    utxo_set.Open(".test_rpc_utxo");
+    std::error_code ec_pre;
+    std::filesystem::remove_all(".test_rpc_utxo", ec_pre);
+    if (!utxo_set.Open(".test_rpc_utxo")) {
+        cout << "  ✗ Failed to open test UTXO set" << endl;
+        return false;
+    }
     CChainState chain_state;
 
     CRPCServer server(18333);
@@ -367,6 +457,7 @@ int main() {
     allPassed &= TestWalletRPCs();
     allPassed &= TestMiningRPCs();
     allPassed &= TestGeneralRPCs();
+    allPassed &= TestSecurityGatesReject();
 
     cout << endl;
     cout << "======================================" << endl;

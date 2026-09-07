@@ -414,12 +414,19 @@ bool TestFullNodeStack() {
         options.nMaxOutbound = 8;
         options.nMaxInbound = 117;
         options.nMaxTotal = 125;
+        // Identical shape to the RPC skip this commit exists to remove, and it
+        // sits 39 lines above it in the same function: it printed a cross,
+        // continued, and TestFullNodeStack still returned true -- so
+        // "✓ Full node stack initialization" printed with P2P never started.
+        // The failure branch also abandoned a partially-started CConnman
+        // without calling Stop().
         if (!connman.Start(peer_manager, message_processor, options)) {
             cout << "  ✗ Failed to start CConnman" << endl;
-        } else {
-            cout << "  ✓ P2P components initialized (CConnman)" << endl;
-            connman.Stop();  // Clean shutdown
+            connman.Stop();  // do not abandon a partially-started connman
+            return false;
         }
+        cout << "  ✓ P2P components initialized (CConnman)" << endl;
+        connman.Stop();  // Clean shutdown
 
         // Phase 3: Mining
         CMiningController miner(2);
@@ -517,28 +524,42 @@ int main() {
     cout << "======================================" << endl;
     cout << endl;
 
-    cout << "Components Validated:" << endl;
-    cout << "  ✓ Blockchain + Mempool working together" << endl;
-    cout << "  ✓ Mining controller functional" << endl;
-    cout << "  ✓ Wallet operations working" << endl;
-    cout << "  ✓ RPC server start/stop" << endl;
-    cout << "  ✓ RPC Authentication (TASK-001)" << endl;
-    cout << "  ✓ Block Timestamp Validation (TASK-002)" << endl;
-    cout << "  ✓ Full node stack initialization" << endl;
-    cout << endl;
+    // These 15 ticks used to print UNCONDITIONALLY, including on a failing run
+    // -- "✓ RPC server start/stop" and "✓ Security features operational" were
+    // exactly what a human reading test-suite-logs/integration_tests.log saw
+    // while the RPC server had never started. The exit code was always right;
+    // the part people READ was not, which is how the skip survived so long.
+    //
+    // Caught by red-team on this very commit: the sibling fix in rpc_tests.cpp
+    // was applied and this one was missed -- a fix aimed at a SITE leaving its
+    // twin untouched, in the same commit as its own thesis.
+    if (allPassed) {
+        cout << "Components Validated:" << endl;
+        cout << "  ✓ Blockchain + Mempool working together" << endl;
+        cout << "  ✓ Mining controller functional" << endl;
+        cout << "  ✓ Wallet operations working" << endl;
+        cout << "  ✓ RPC server start/stop" << endl;
+        cout << "  ✓ RPC Authentication (TASK-001)" << endl;
+        cout << "  ✓ Block Timestamp Validation (TASK-002)" << endl;
+        cout << "  ✓ Full node stack initialization" << endl;
+        cout << endl;
 
-    cout << "Security Features Validated:" << endl;
-    cout << "  ✓ HTTP Basic Auth working" << endl;
-    cout << "  ✓ Password hashing (SHA-3-256)" << endl;
-    cout << "  ✓ Credential validation" << endl;
-    cout << "  ✓ Future timestamp rejection" << endl;
-    cout << "  ✓ Median-time-past validation" << endl;
-    cout << endl;
+        cout << "Security Features Validated:" << endl;
+        cout << "  ✓ HTTP Basic Auth working" << endl;
+        cout << "  ✓ Password hashing (SHA-3-256)" << endl;
+        cout << "  ✓ Credential validation" << endl;
+        cout << "  ✓ Future timestamp rejection" << endl;
+        cout << "  ✓ Median-time-past validation" << endl;
+        cout << endl;
 
-    cout << "Production Readiness:" << endl;
-    cout << "  ✓ All core components integrated" << endl;
-    cout << "  ✓ Security features operational" << endl;
-    cout << "  ✓ Ready for end-to-end testing" << endl;
+        cout << "Production Readiness:" << endl;
+        cout << "  ✓ All core components integrated" << endl;
+        cout << "  ✓ Security features operational" << endl;
+        cout << "  ✓ Ready for end-to-end testing" << endl;
+    } else {
+        cout << "NOTHING above is validated -- the run failed. There is no" << endl;
+        cout << "component list for a failing run; do not read one." << endl;
+    }
     cout << endl;
 
     return allPassed ? 0 : 1;
