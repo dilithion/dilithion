@@ -13,13 +13,24 @@
 // wired: CHeadersManager::nMinimumChainWork (headers_manager.cpp:91) is
 // assigned and never read, and InitializeDoSProtectedSync /
 // ProcessHeadersWithDoSProtection have zero call sites, so HeadersSyncState is
-// never constructed in production and header processing falls through to the
-// legacy ProcessHeaders, which applies no chain-work threshold. A
-// reject/accept test written today could only call HeadersSyncState directly
-// -- which is exactly the "correct check that nothing reaches" defect LP-10
-// exists to close. That test belongs with the wiring, and must assert the
-// WIRING. This suite pins the constants and the UNITS so that when the wiring
-// lands, the numbers it enforces are the measured ones.
+// never constructed in production. The LIVE header path is the node's
+// SetHeadersHandler lambda -> QueueRawHeadersForProcessing (:3317) ->
+// HeaderProcessorThread (:3350) -> QueueHeadersForValidation (:2514), and it
+// applies no chain-work threshold either. (An earlier revision of this comment
+// named ProcessHeaders as the live path. That was wrong: ProcessHeaders is
+// itself near-dead, reachable only when the async validation thread fails to
+// start.) A reject/accept test written today could only call HeadersSyncState
+// directly -- which is exactly the "correct check that nothing reaches" defect
+// LP-10 exists to close. That test belongs with the wiring, and must assert the
+// WIRING.
+//
+// ⚠️ AND SEE chainparams.cpp: wiring is NOT a one-line change. These thresholds
+// are ABSOLUTE sums from genesis, while HeadersSyncState zeroes its accumulator
+// (headerssync.cpp:42-44) and starts from the LOCAL TIP. Comparing the two
+// would stall header sync on any non-fresh node.
+//
+// This suite pins the constants and the UNITS so that when the wiring lands,
+// the numbers it enforces are the measured ones.
 
 #include <consensus/chain_work.h>
 #include <core/chainparams.h>

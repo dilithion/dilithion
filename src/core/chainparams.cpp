@@ -133,9 +133,28 @@ ChainParams ChainParams::Mainnet() {
     // :91) is assigned and never read, and the only path that would carry it
     // into HeadersSyncState -- InitializeDoSProtectedSync /
     // ProcessHeadersWithDoSProtection -- has zero call sites, so
-    // mapHeadersSyncStates is never populated and header processing falls
-    // through to the legacy ProcessHeaders, which applies no work threshold.
-    // Landing the constant now so wiring it is a one-line change; the
+    // mapHeadersSyncStates is never populated and the chain-work comparisons at
+    // headerssync.cpp:85/:115 are unreachable.
+    //
+    // The LIVE header path is NOT ProcessHeaders: it is the node's
+    // SetHeadersHandler lambda -> QueueRawHeadersForProcessing (:3317) ->
+    // HeaderProcessorThread (:3350) -> QueueHeadersForValidation (:2514), and
+    // that path applies no chain-work threshold either. ProcessHeaders is
+    // itself near-dead -- its only non-internal call site (:2536) is a fallback
+    // taken when the async validation thread fails to start.
+    //
+    // ⚠️ AND WIRING THIS VALUE IS NOT A ONE-LINE CHANGE. The threshold above is
+    // an ABSOLUTE sum from genesis, but HeadersSyncState starts its accumulator
+    // at ZERO (headerssync.cpp:42-44) from the LOCAL TIP, not genesis
+    // (InitializeDoSProtectedSync :752-753 uses hashBestHeader). Upstream seeds
+    // it from chain_start->nChainWork; this port does not. Comparing an
+    // absolute threshold against a tip-relative accumulator would demand a peer
+    // supply a whole checkpoint's worth of NEW work beyond our tip, which never
+    // happens -- header sync would stall on any non-fresh node. The accumulator
+    // seeding must be fixed, or this value redefined as relative, BEFORE the
+    // gate is wired. (Found by red-team, 2026-09-07; not by me.)
+    //
+    // Landing the constant now so the measurement is not lost; the
     // reject/accept test belongs with that wiring and must assert the WIRING,
     // not HeadersSyncState in isolation.
     params.nMinimumChainWork = uint256S(
@@ -823,6 +842,15 @@ ChainParams ChainParams::Regtest() {
     // so cap-saturation tests can exercise eviction without flooding 500K+
     // headers. Override of inherited Testnet value.
     params.nMapBlockIndexCap = 1000;
+
+    // LP-10 (2026-09-07): regtest keeps NO presync chain-work gate, stated
+    // EXPLICITLY. It was previously zero only because Regtest() never assigned
+    // the field and uint256's default constructor memsets -- an absence, not a
+    // decision, and describing an absence as deliberate is the same
+    // inferred-as-measured shape this mission exists to police. Regtest chains
+    // are a handful of blocks, so any non-zero threshold would refuse to sync
+    // them.
+    params.nMinimumChainWork = uint256();
 
     // Phase 8 PR8.0 (2026-05-01): disable the 45s minBlockTimestampGap
     // inherited from Testnet. Regtest inherits Testnet's gap = 45 + height = 0
