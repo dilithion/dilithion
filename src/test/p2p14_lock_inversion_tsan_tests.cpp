@@ -170,14 +170,40 @@ int main(int argc, char* argv[])
     // private, so a test cannot hold it directly — this is the available way
     // to get a lock-held write to the same object.
     //
-    // ⚠️ CONFOUND, STATED RATHER THAN HIDDEN: the unsafe arm reads nStatus
-    // (the field the writer touches) while the safe arm reads nHeight via the
-    // value accessor, because the accessor added by this fix returns height.
-    // The arms therefore differ in field as well as in mechanism. That makes
-    // this a demonstration that POINTER ESCAPE races and VALUE RETURN does
-    // not — it is NOT a same-field A/B. A same-field control would need a
-    // value accessor for nStatus, which this contract does not add. Read the
-    // result with that limit in mind.
+    // ⚠️ WHAT THESE ARMS DO AND DO NOT SHOW — corrected after red-team M-1,
+    // which found my original claim unsupported by my own fixture.
+    //
+    // THE RED ARM IS EVIDENCE. It shows the PRE-FIX pattern — pointer obtained
+    // under cs_main, dereferenced after release — races against a writer that
+    // holds cs_main. TSan names it: write of 4 bytes by T2 holding M0, previous
+    // read of the same address by T1 holding nothing, on the CBlockIndex.
+    //
+    // THE GREEN ARM IS NOT A CONTROL FOR IT, and saying so is the honest read.
+    // The unsafe arm reads nStatus (the field the writer varies); the safe arm
+    // reads nHeight, and the writer sets nHeight to the SAME value every
+    // iteration because AddBlockIndex's topology invariant forbids varying it.
+    // So nothing ever writes a different value to the field the safe arm reads.
+    // A deliberately UNSAFE read of nHeight would be green in this fixture too.
+    // The green is explained by the field choice, independently of the
+    // mechanism — it has no discriminating power.
+    //
+    // An earlier version of this comment stated the confound and then drew the
+    // conclusion the confound forbids ("a demonstration that POINTER ESCAPE
+    // races and VALUE RETURN does not"). It demonstrates no such thing.
+    //
+    // SO THE SAFE HALF RESTS ON CONSTRUCTION, LABELLED AS SUCH:
+    // GetBlockHeightByHash performs the lookup, the dereference and the copy
+    // inside one cs_main scope, so no pointer exists to outlive the lock. That
+    // is an argument, not a measurement, and it is the same resolution this
+    // project accepted for #178 — where two mutants of a real race both
+    // survived because the window was unobservable, the theatre test was
+    // DELETED, and the property was rested on `exchange()` being correct by
+    // construction with red-team adjudicating the argument rather than a badge.
+    //
+    // A genuine same-field A/B would need a value accessor for nStatus. That is
+    // production API added solely to make a test discriminate, which is its own
+    // smell; not added. If someone wants the measurement instead of the
+    // argument, that is the price.
     if (accessor_arm) {
         const bool unsafe = (arm == "accessor-unsafe");
         std::cout << "[p2p1415-accessor] arm=" << arm << "  pattern="

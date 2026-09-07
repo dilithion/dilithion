@@ -294,6 +294,29 @@ private:
     // Values, not a pointer. Do not "optimise" this back to a CBlockIndex* — that
     // reintroduces defect 2 silently and defect 1 the moment a consumer takes a
     // lock. Add a field to the snapshot instead.
+    //
+    // ⚠️ CONTRACT CHANGE FOR EVERY CONSUMER, PRESENT AND FUTURE (red-team H-3).
+    // Before this change, callbacks fired INSIDE cs_main, so they were mutually
+    // exclusive and totally ordered for free: one mutex serialised activations
+    // and their notifications together. Firing after release DECOUPLES them.
+    //
+    //   * Two threads can be inside the callback list SIMULTANEOUSLY. A
+    //     consumer must now be re-entrant.
+    //   * A later tip's callback can COMPLETE BEFORE an earlier tip's. A
+    //     consumer that tracks "best" must be monotonic on its own and must not
+    //     assume delivery order matches activation order.
+    //   * Per-activation order IS preserved (the queue is appended under
+    //     cs_main and drained in order) — that is a narrower guarantee than it
+    //     sounds, and it is NOT cross-activation ordering.
+    //   * A thread can return from ActivateBestChain with its own notification
+    //     not yet delivered, because another thread's drain may have swapped
+    //     the queue out. Almost always delivered before return; never
+    //     guaranteed. Do not build a barrier on it.
+    //
+    // The current consumer (CHeadersManager::OnBlockActivated) is safe under
+    // this: its writes are idempotent and its best-header update is
+    // work-monotone. That is a property of TODAY's consumer, not a guarantee of
+    // the mechanism — which is why it is written here rather than assumed.
     using TipUpdateCallback = std::function<void(const CBlockHeader&, const uint256&)>;
     std::vector<TipUpdateCallback> m_tipCallbacks;
 
