@@ -115,7 +115,10 @@ uint256 HashFor(uint8_t tag, int height)
 //       "control" -> the reader touches nHeight (never written concurrently)
 int Run(const std::string& mode)
 {
-    const bool raceMode = (mode == "race");
+    // "race" and "class" both read the field the writer writes; they differ only
+    // in HOW the pointer is obtained (GetTip vs GetBlockIndex). "control" uses
+    // the same acquisition as "race" but reads a field nothing writes.
+    const bool readsWrittenField = (mode != "control");
 
     CChainState chain;
 
@@ -149,9 +152,21 @@ int Run(const std::string& mode)
     std::atomic<long long> observed{0};
     std::thread reader([&]() {
         while (!g_stop.load(std::memory_order_relaxed)) {
-            CBlockIndex* t = chain.GetTip();
+            // "class" mode reads through GetBlockIndex rather than GetTip.
+            //
+            // GetBlockIndex is the ROOT of the nine-site class: it takes
+            // cs_main, returns `it->second.get()` -- a raw pointer out of a
+            // unique_ptr -- and drops the lock at return (chain.cpp, and note
+            // its own comment "HIGH-C001 FIX: Return raw pointer (non-owning)
+            // via .get()", so the shape was introduced deliberately). Eight
+            // further callers dereference the result without cs_main, and
+            // cs_main is PRIVATE so none of them could take it even if they
+            // tried. Observing this path proves the class root, not just the
+            // GetTip instance.
+            CBlockIndex* t = (mode == "class") ? chain.GetBlockIndex(hashA)
+                                               : chain.GetTip();
             if (t == nullptr) continue;
-            if (raceMode) {
+            if (readsWrittenField) {
                 if (t->IsOnMainChain()) observed.fetch_add(1, std::memory_order_relaxed);
             } else {
                 if (t->nHeight >= 0)    observed.fetch_add(1, std::memory_order_relaxed);
@@ -165,7 +180,8 @@ int Run(const std::string& mode)
     reader.join();
 
     std::cout << "mode=" << mode
-              << "  reader touched " << (raceMode ? "pnext (via IsOnMainChain)" : "nHeight (control)")
+              << "  acquired via " << (mode == "class" ? "GetBlockIndex" : "GetTip")
+              << "  reader touched " << (readsWrittenField ? "pnext (via IsOnMainChain)" : "nHeight (control)")
               << "  iterations=" << observed.load() << "\n";
     std::cout << "TSan reports, if any, are on stderr above. Exit code is TSan's.\n";
 
@@ -179,10 +195,12 @@ int Run(const std::string& mode)
 int main(int argc, char* argv[])
 {
     const std::string mode = (argc > 1) ? argv[1] : "race";
-    if (mode != "race" && mode != "control") {
+    if (mode != "race" && mode != "control" && mode != "class") {
         std::cerr << "usage: chainstate_pointer_race_tests [race|control]\n"
                   << "  race    reader reads pnext   (the field ConnectTip writes) -> expect a TSan report\n"
-                  << "  control reader reads nHeight (never written concurrently)  -> expect NO report\n";
+                  << "  control reader reads nHeight (never written concurrently)  -> expect NO report\n"
+                  << "  class   same as race but the pointer comes from GetBlockIndex, the root of\n"
+                  << "          the nine-site class -> expect a TSan report\n";
         return 2;
     }
     std::cout << "=== CChainState raw-pointer escape, mode=" << mode << " ===\n";
