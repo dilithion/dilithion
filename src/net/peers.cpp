@@ -960,7 +960,12 @@ size_t CPeerManager::GetAddressCount() const {
 }
 
 bool CPeerManager::EvictPeersIfNeeded() {
-    std::lock_guard<std::recursive_mutex> lock(cs_peers);
+    // P2P-14/15: unique_lock, NOT lock_guard, so the fallback branch below can
+    // RELEASE cs_peers before dispatching. See the comment at that branch — the
+    // dispatch reaches cs_headers, and holding cs_peers across it is the inner
+    // leg of the same cycle this contract closes. unique_lock keeps every early
+    // return in this function unchanged (it unlocks on destruction if still held).
+    std::unique_lock<std::recursive_mutex> lock(cs_peers);
 
     // Only evict if we're at or over the limit
     if (peers.size() < MAX_TOTAL_CONNECTIONS) {
@@ -1085,10 +1090,36 @@ bool CPeerManager::EvictPeersIfNeeded() {
             // there is no socket / m_nodes entry for the reaper to find, so fall
             // back to the legacy direct path to clean up the orphaned peers-map
             // entry. Dispatch first (while state is still observable), then erase.
+            //
+            // ⚠️ P2P-14/15: cs_peers is RELEASED before dispatching. This branch
+            // was the INNER leg of the same cycle the accept-path fix addressed,
+            // and it survived that fix because only the outer lock was hoisted:
+            //
+            //   peers.cpp:963            unique_lock(cs_peers)            HELD
+            //     -> DispatchPeerDisconnected (this line)
+            //   peers.cpp:1708           headers_manager->OnPeerDisconnected
+            //   headers_manager.cpp:1470 lock_guard(cs_headers)           ACQUIRED
+            //
+            // against the live reverse edge: ProcessHeaders holds cs_headers
+            // (headers_manager.cpp:222) and calls Misbehaving at :351/:498/:530/
+            // :674/:2917/:2987, which takes cs_peers via GetPeer (peers.cpp:283).
+            // cs_headers is a plain mutex; cs_peers being recursive buys nothing
+            // across threads. Two threads, opposite order = deadlock.
+            //
+            // Found by the confirmation read, AFTER two earlier passes had each
+            // declared the cycle closed. Recorded because the pattern is the
+            // lesson: fixing one lock level and claiming completion, three times.
+            //
+            // Releasing here is the contract's own rule — decide under the lock,
+            // act after. The decision (peer_to_evict, and that no live CNode
+            // exists) is already taken; the peer may be gone by the time
+            // RemovePeer runs, in which case it is a no-op. That staleness is
+            // the same trade the accept path accepts.
+            lock.unlock();
             if (g_node_context.connman) {
                 g_node_context.connman->DispatchPeerDisconnected(peer_to_evict);
             }
-            RemovePeer(peer_to_evict);
+            RemovePeer(peer_to_evict);  // re-acquires cs_peers itself
         }
         return true;
     }

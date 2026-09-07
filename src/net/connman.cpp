@@ -455,8 +455,8 @@ bool CConnman::AcceptConnection(std::unique_ptr<CSocket> socket, const NetProtoc
     //     peers.cpp:963             lock_guard(cs_peers)
     //       -> fallback dispatch when no live CNode exists
     //     peers.cpp:1089            connman->DispatchPeerDisconnected(id)
-    //     peers.cpp:1708            headers_manager->OnPeerDisconnected(id)
-    //     headers_manager.cpp:1450  lock_guard(cs_headers)             ACQUIRED
+    //     peers.cpp:1708           headers_manager->OnPeerDisconnected(id)
+    //     headers_manager.cpp:1470  lock_guard(cs_headers)             ACQUIRED
     //
     // against the live reverse edge headers_manager.cpp:222 (cs_headers) -> :498
     // PushMessage -> connman.cpp:598 (cs_vNodes). Both non-recursive: deadlock.
@@ -1796,6 +1796,13 @@ void CConnman::DisconnectNodes() {
     // Phase 1 — under cs_vNodes: decide and detach only. No outbound calls.
     {
         std::lock_guard<std::mutex> lock(cs_vNodes);
+        // Reserve BEFORE detaching anything (confirmation-read F-2). push_back
+        // can throw bad_alloc on reallocation, and by then `detached` already
+        // owns nodes erased from m_nodes — the unwind would free them without
+        // RemoveNode, which is the same node_refs-dangles-on-throw failure the
+        // phase-2 try/catch closes. Allocating up front means the only throw
+        // point happens while nothing is detached yet.
+        detached.reserve(m_nodes.size());
 
         auto it = m_nodes.begin();
         while (it != m_nodes.end()) {
@@ -1857,8 +1864,18 @@ void CConnman::DisconnectNodes() {
                 m_peer_manager->RemoveNode(node_id);
             }
         } catch (...) {
+            // Confirmation-read F-3: continuing to free THIS node would hand a
+            // dangling CNode* to anything still holding its node_ref — the
+            // narrowed form of the same UAF. Deliberately LEAK the CNode
+            // instead. A leaked node is strictly better than a freed one that
+            // node_refs may still point at and hand to Misbehaving /
+            // PeriodicMaintenance / GetConnectionCount.
             std::cerr << "[CConnman] RemoveNode threw for node " << node_id
-                      << " — node_refs may still hold this id" << std::endl;
+                      << " — node_refs may still hold this id; LEAKING the CNode "
+                         "rather than freeing one that may still be referenced"
+                      << std::endl;
+            (void)node.release();
+            continue;  // skip CloseSocket: the object is no longer ours to touch
         }
 
         try {

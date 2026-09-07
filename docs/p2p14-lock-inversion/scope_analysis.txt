@@ -1,52 +1,47 @@
 P2P-14/15 SCOPE ANALYSIS — which locks are held at each site
-Tree: b574b92f  base origin/main 105f3d8b
+Tree: d63df3a6  base origin/main 105f3d8b
 
 ############################################################################
-# ⛔ READ THIS FIRST — WHAT THIS TOOL CANNOT ANSWER.
+# ⛔ TWO LIMITATIONS. BOTH BIT THIS MISSION. READ BEFORE USING ANY LINE BELOW.
 #
-# An earlier version of this file said: 'no outbound dispatch under cs_vNodes
-# in connman.cpp — (empty = the forward edge is broken)'. THAT CONCLUSION WAS
-# FALSE, and the tool was not wrong — the QUESTION was.
+# (1) PER-FILE AND LEXICAL — it cannot establish acyclicity.
+# It answers 'is this lock textually in scope at this line, IN THIS FILE'.
+# The real question is 'can lock B be acquired while A is held, ANYWHERE'.
+# THREE passes declared this cycle closed and were wrong:
+#   pass 1  my analysis   -> missed the accept path   (connman.cpp:447)
+#   pass 2  after that fix-> missed the eviction path (peers.cpp:963)
+#   pass 3  review seats  -> caught both, by CALL GRAPH, not by this tool
+# The trap is in this file's own validation block: 'peers.cpp:1708 [held: -]'
+# is the per-file view of that function's BODY. Its CALLERS held locks.
 #
-# This tool answers: 'is a lock textually in scope at this line, in THIS FILE'.
-# The actual question is: 'can cs_headers be acquired while cs_vNodes is held,
-# ANYWHERE'. Those differ the moment the path leaves the file. A second live
-# forward edge sat one indirection away and this analysis reported clean:
-#
-#   connman.cpp:447          lock_guard(cs_vNodes)             HELD
-#     -> EvictPeersIfNeeded
-#   peers.cpp:963            lock_guard(cs_peers)
-#   peers.cpp:1089           connman->DispatchPeerDisconnected(id)   [fallback]
-#   peers.cpp:1708           headers_manager->OnPeerDisconnected(id)
-#   headers_manager.cpp:1450 lock_guard(cs_headers)            ACQUIRED
-#
-# Found by the port-reviewer seat, NOT by this tool and NOT by me. A per-file
-# lexical scope check is necessary and NOT sufficient for an acyclicity claim;
-# it is the same blind spot that let an inverted std::function call survive two
-# independent censuses earlier in this mission. Do not cite this file as proof
-# that a cycle is closed — cite it for what is held WHERE, and get the
-# reachability from the call graph.
+# (2) IT DOES NOT MODEL std::unique_lock::unlock(). ⚠️ FALSE POSITIVES.
+# It tracks guard DECLARATIONS and brace scope only. After an explicit
+# lock.unlock() it still reports the lock as held for the rest of the scope.
+# Live example in this very tree — the tool says:
+#     1120: [held: cs_peers] connman->DispatchPeerDisconnected(peer_to_evict)
+# and that is WRONG: peers.cpp:1118 is 'lock.unlock();'. cs_peers is NOT held
+# at :1120. Errs toward reporting a lock held, which is the safe direction for
+# hunting inversions and the WRONG direction for certifying one is closed.
 ############################################################################
 
-=== VALIDATION (must pass before any result below is trusted) ===
+=== VALIDATION (tool sanity within one file — NOT an acyclicity claim) ===
 498: [held: cs_headers] connman->PushMessage(peer, getheaders);
-1701: [held: cs_peers] collector->on_peer_disconnected(peer_dna_id);
-1708: [held: -] g_node_context.headers_manager->OnPeerDisconnected(peer_id);
-  ^ expected: :498 cs_headers HELD | :1701 cs_peers HELD | :1708 NOTHING held
+1701: [held: -] {
 
-=== connman.cpp: eviction / dispatch / RemoveNode under cs_vNodes ===
+=== connman.cpp: eviction/dispatch/RemoveNode under cs_vNodes ===
 1332: [held: cs_vNodes] // EvictPeersIfNeeded() here: it would acquire CPeerManager's
-  (the only hit is a COMMENT at :1332 — the sibling accept path explaining why
-   it refuses to call EvictPeersIfNeeded here. No live call remains.)
+  (empty of CALLS; comment lines quoting these names may still appear)
 
-=== reverse-edge sites still under cs_headers (CONFORMING, not violations) ===
+=== peers.cpp: the eviction leg — READ WITH LIMITATION (2) IN MIND ===
+  peers.cpp:1118  lock.unlock();      <- cs_peers RELEASED here
+  peers.cpp:1120  DispatchPeerDisconnected(peer_to_evict)   <- NOT under cs_peers
+  The tool cannot see the unlock and will label :1120 as held. Verified by
+  reading the source, not by the tool.
+
+=== reverse-edge sites under cs_headers (CONFORMING to the net.h order) ===
 351: [held: cs_headers] g_node_context.peer_manager->Misbehaving(peer, 20, MisbehaviorType::INVALID_BLOCK_HEADER);
 498: [held: cs_headers] connman->PushMessage(peer, getheaders);
 530: [held: cs_headers] g_node_context.peer_manager->Misbehaving(peer, 20, MisbehaviorType::INVALID_BLOCK_HEADER);
 674: [held: cs_headers] g_node_context.peer_manager->Misbehaving(peer, 20, MisbehaviorType::INVALID_BLOCK_HEADER);
-2917: [held: cs_headers] g_node_context.peer_manager->Misbehaving(peer, 20, MisbehaviorType::INVALID_BLOCK_HEADER);
-2987: [held: cs_headers] g_node_context.peer_manager->Misbehaving(peer, 20, MisbehaviorType::INVALID_BLOCK_HEADER);
-  These 6 remain and conform to the order now RATIFIED IN net.h BY THIS CHANGE
-  (cs_headers above cs_vNodes/cs_peers). Before this branch no document in
-  src/net ordered cs_headers against those two at all — an earlier version of
-  this file cited net.h as already ratifying it, which it did not.
+2937: [held: cs_headers] g_node_context.peer_manager->Misbehaving(peer, 20, MisbehaviorType::INVALID_BLOCK_HEADER);
+3007: [held: cs_headers] g_node_context.peer_manager->Misbehaving(peer, 20, MisbehaviorType::INVALID_BLOCK_HEADER);
