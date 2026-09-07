@@ -266,7 +266,12 @@ private:
     /** Server socket.
      *
      *  ATOMIC because Stop() and ServerThread() touch it concurrently:
-     *  Stop() writes INVALID_SOCKET (server.cpp, after closesocket) while
+     *  Stop() claims the fd and publishes INVALID_SOCKET in ONE exchange,
+     *  BEFORE the closesocket (not after -- an earlier draft of this PR
+     *  stored after the close, and that trailing store was a latent clobber:
+     *  Start() becomes admissible the moment m_running goes false, so a
+     *  Start() landing between the close and the store would have had its
+     *  fresh listening fd overwritten with INVALID_SOCKET). Meanwhile
      *  ServerThread() reads it as the accept() argument. As a plain `int`
      *  that pairing is a data race and therefore undefined behaviour --
      *  TSan reported it 7 times in one CI run, every report from a fixture

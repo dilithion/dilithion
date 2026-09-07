@@ -654,7 +654,10 @@ void CRPCServer::Stop() {
     //
     // A load/close/store trio is not merely weaker here -- it is worse than the
     // plain `int` this PR replaced. With three separate reads of the member (the
-    // shape still live in the untouched twin at websocket.cpp:109-116) a second
+    // shape still live in the untouched twin at websocket.cpp:109-116, which
+    // ⚠️ THIS FUNCTION CALLS at server.cpp:635-637 -- so the twin is not a
+    // distant illustration, it is driven from inside this very teardown, and
+    // every reachability argument made here propagates straight into it) a second
     // concurrent caller could re-read INVALID_SOCKET at the close and skip it,
     // so a double close needed an unlucky interleaving. Loading ONCE into a
     // local and closing THAT makes it certain: both callers hold the same live
@@ -667,8 +670,27 @@ void CRPCServer::Stop() {
     // revision of this PR was reverted for. That one came from exchanging
     // m_running and returning bool, which let the LOSER return before the
     // teardown and allowed ~CRPCServer to destroy thread objects under a live
-    // join(). Stop() is void, both callers still run the joins, and joinable()
-    // makes the second pass a no-op. This exchange is on the SOCKET only.
+    // join(). Stop() is void and there is no early return after the m_running
+    // check, so both callers still traverse the whole teardown. This exchange
+    // is on the SOCKET only and changes nothing about the joins.
+    //
+    // ⚠️ DO NOT read that as "the joins are therefore safe". An earlier draft
+    // of this comment said joinable() makes the second pass a no-op. THAT IS
+    // FALSE and it blessed UB as safe: joinable() at the join below stays TRUE
+    // for the entire duration of the first caller's join(), so both threads
+    // enter it -- and concurrent join() on one std::thread is a data race on
+    // the thread object, while m_workerThreads.clear() destroys objects the
+    // other caller is holding by reference in its range-for.
+    //
+    // That hazard is PRE-EXISTING and this PR neither causes nor fixes it. It
+    // belongs to the RPC-lifecycle register row with Stop() re-entrancy. The
+    // point of writing it here is that the three blocks in this function are
+    // NOT equally safe and a reader should not generalise from one to another:
+    //   SSL block     idempotent -- mutex + clear
+    //   socket block  idempotent -- this exchange
+    //   join block    NOT idempotent
+    // A comment claiming otherwise is how the original hole in this file
+    // survived review, so it does not get to happen twice.
     //
     // Ordering: m_running = false above is sequenced-before this release
     // exchange, so any thread observing INVALID_SOCKET here must also observe
