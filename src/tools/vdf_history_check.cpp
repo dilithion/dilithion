@@ -963,6 +963,29 @@ int main(int argc, char* argv[])
     for (const auto& want : findIds) {
         auto it = r.registeredIdentities.find(want);
         const bool found = (it != r.registeredIdentities.end());
+        // A NEGATIVE here is the sentence a consensus decision gets read off,
+        // so it is gated on the census having actually covered the chain --
+        // not only on the derivation control. Previously the control was the
+        // sole gate, which meant a truncated walk, an unreadable block, or a
+        // partial --from/--to range could all produce a confident "not
+        // registered" about a range that was never fully looked at.
+        std::vector<std::string> blockers;
+        if (!r.walkComplete)   blockers.push_back("the chain walk was INCOMPLETE");
+        if (r.unreadable > 0)  blockers.push_back(std::to_string(r.unreadable)
+                                   + " block bodies were unreadable, so some blobs were never parsed");
+        if (fromHeight > 1)    blockers.push_back("--from " + std::to_string(fromHeight)
+                                   + " skipped heights 1.." + std::to_string(fromHeight - 1));
+        if (toHeight >= 0 && toHeight < r.tipHeight)
+                               blockers.push_back("--to " + std::to_string(toHeight)
+                                   + " stopped short of the tip " + std::to_string(r.tipHeight));
+        if (r.derivationCrossChecks == 0)
+                               blockers.push_back("the derivation control did not confirm");
+        if (!found && !blockers.empty()) {
+            std::cout << "\nLOOKUP " << want << "\n   NOT ANSWERABLE from this run:\n";
+            for (const auto& b : blockers) std::cout << "      * " << b << "\n";
+            std::cout << "      A negative needs a COMPLETE census; re-run over the full chain.\n";
+            continue;
+        }
         std::cout << "\nLOOKUP " << want << "\n   "
                   << (found ? "REGISTERED on-chain, first registration block at height "
                               + std::to_string(it->second)
