@@ -32,6 +32,8 @@
 // This suite pins the constants and the UNITS so that when the wiring lands,
 // the numbers it enforces are the measured ones.
 
+#include "dil_nbits_census.h"
+
 #include <consensus/chain_work.h>
 #include <core/chainparams.h>
 #include <primitives/block.h>
@@ -110,6 +112,44 @@ void test_dilv_constant_is_re_derived_not_just_restated()
     std::cout << " OK" << std::endl;
 }
 
+void test_dil_constant_is_re_derived_from_the_committed_census()
+{
+    std::cout << "  test_dil_constant_is_re_derived_from_the_committed_census..." << std::flush;
+    using namespace dilithion::consensus;
+    using namespace dilithion::test;
+
+    // Closes the provenance gap the red-team found: previously DIL was pinned
+    // only literal-against-literal, which detects an EDIT but cannot detect an
+    // ERROR. DIL retargets on roughly half its blocks, so unlike DilV there is
+    // no closed form -- the per-block evidence has to be committed, and it is,
+    // in dil_nbits_census.h (generated under a write gate from a seed dump
+    // whose sha256 the header records).
+    //
+    // Chain work is a SUM, so aggregating equal nBits is exact. Guard the
+    // coverage first: a census that silently covered fewer blocks would produce
+    // a smaller, entirely plausible total.
+    assert(DIL_CENSUS_TIP_HEIGHT == 54000);
+    assert(DIL_CENSUS_TOTAL_BLOCKS == DIL_CENSUS_TIP_HEIGHT + 1);
+
+    long long counted = 0;
+    uint256 sum;
+    for (size_t i = 0; i < DIL_NBITS_CENSUS_LEN; ++i) {
+        const uint32_t nbits = DIL_NBITS_CENSUS[i].nBits;
+        assert(nbits != 0);  // a zero mantissa saturates work to MAX, invisibly
+        for (uint32_t n = 0; n < DIL_NBITS_CENSUS[i].count; ++n)
+            sum = AddChainWork(sum, ComputeChainWork(nbits));
+        counted += DIL_NBITS_CENSUS[i].count;
+    }
+    // The census must account for every block from genesis to the checkpoint,
+    // or the sum is short in a way no comparison against itself would reveal.
+    assert(counted == DIL_CENSUS_TOTAL_BLOCKS);
+
+    RequireEqual("DIL re-derived work at height 54000", sum, uint256S(DIL_EXPECT));
+    RequireEqual("DIL census sum vs chainparams",
+                 sum, Dilithion::ChainParams::Mainnet().nMinimumChainWork);
+    std::cout << " OK" << std::endl;
+}
+
 void test_chainparams_carry_the_measured_values()
 {
     std::cout << "  test_chainparams_carry_the_measured_values..." << std::flush;
@@ -161,6 +201,7 @@ int main()
     test_hex_literals_round_trip();
     test_work_units_are_this_ports_units_not_bitcoin_cores();
     test_dilv_constant_is_re_derived_not_just_restated();
+    test_dil_constant_is_re_derived_from_the_committed_census();
     test_chainparams_carry_the_measured_values();
     test_thresholds_sit_below_measured_tip_work();
     std::cout << "minimum_chain_work_kat_tests: ALL PASS" << std::endl;
