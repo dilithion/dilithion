@@ -370,6 +370,14 @@ bool CChainState::MaybeAnchorVdfGrace(CBlockIndex* p) {
 }
 
 bool CChainState::ActivateBestChain(CBlockIndex* pindexNew, const CBlock& block, bool& reorgOccurred) {
+    // P2P-14/15: DECLARATION ORDER IS LOAD-BEARING. `drain` is declared BEFORE
+    // the lock_guard, so C++ destroys it AFTER the guard — i.e. the tip
+    // callbacks fire with cs_main already released, which is what breaks the
+    // cs_main ↔ cs_headers cycle. Reversing these two lines silently restores
+    // the deadlock. It also covers every return path in this function, of which
+    // there are many, without a goto or a wrapper.
+    TipNotifyDrain drain(*this);
+
     // CRITICAL-1 FIX: Acquire lock before accessing shared state
     // This protects pindexTip, mapBlockIndex, and all chain operations
     std::lock_guard<std::recursive_mutex> lock(cs_main);
@@ -2514,23 +2522,58 @@ void CChainState::RegisterTipUpdateCallback(TipUpdateCallback callback) {
 }
 
 void CChainState::NotifyTipUpdate(const CBlockIndex* pindex) {
-    // NOTE: Caller must already hold cs_main lock
-    // This is always called from within ActivateBestChain which holds the lock
+    // NOTE: Caller must already hold cs_main lock.
+    // All four call sites are inside ActivateBestChain, which owns the guard.
+    //
+    // P2P-14/15: this SNAPSHOTS and returns. It does not invoke callbacks —
+    // invoking them here is what created the cs_main → cs_headers edge that
+    // closes the deadlock cycle (docs/p2p14-lock-inversion/). The pointer is
+    // dereferenced HERE, under the lock, and never leaves this function.
 
     if (pindex == nullptr) {
         return;
     }
 
-    // Execute all registered callbacks with exception handling
-    for (size_t i = 0; i < m_tipCallbacks.size(); ++i) {
-        try {
-            m_tipCallbacks[i](pindex);
-        } catch (const std::exception& e) {
-            std::cerr << "[Chain] ERROR: Tip callback " << i << " threw exception: " << e.what() << std::endl;
-            // Continue executing other callbacks even if one fails
-        } catch (...) {
-            std::cerr << "[Chain] ERROR: Tip callback " << i << " threw unknown exception" << std::endl;
-            // Continue executing other callbacks even if one fails
+    m_pendingTipNotifications.push_back(
+        PendingTipNotification{pindex->header, pindex->GetBlockHash()});
+}
+
+void CChainState::DrainTipNotifications() {
+    // Fires the snapshots taken by NotifyTipUpdate, with cs_main NOT held.
+    // See the header for why "the guard ended" genuinely means "the mutex is
+    // free" here, and for the two facts that would invalidate it.
+
+    std::vector<PendingTipNotification> toFire;
+    std::vector<TipUpdateCallback> callbacks;
+    {
+        // Brief re-acquisition to move the queue out. Both the queue AND the
+        // callback vector are copied under the lock: RegisterTipUpdateCallback
+        // mutates m_tipCallbacks under cs_main, so iterating it unlocked would
+        // be a data race — the exact class of defect this change exists to fix.
+        std::lock_guard<std::recursive_mutex> lock(cs_main);
+        if (m_pendingTipNotifications.empty()) {
+            return;
+        }
+        toFire.swap(m_pendingTipNotifications);
+        callbacks = m_tipCallbacks;
+    }
+
+    // cs_main is released. Consumers may now take their own locks (cs_headers)
+    // without inverting against it.
+    //
+    // Ordering: notifications fire in the order they were queued, and the queue
+    // is only appended under cs_main, so per-activation order is preserved.
+    for (const auto& notification : toFire) {
+        for (size_t i = 0; i < callbacks.size(); ++i) {
+            try {
+                callbacks[i](notification.header, notification.hash);
+            } catch (const std::exception& e) {
+                std::cerr << "[Chain] ERROR: Tip callback " << i << " threw exception: " << e.what() << std::endl;
+                // Continue executing other callbacks even if one fails
+            } catch (...) {
+                std::cerr << "[Chain] ERROR: Tip callback " << i << " threw unknown exception" << std::endl;
+                // Continue executing other callbacks even if one fails
+            }
         }
     }
 }

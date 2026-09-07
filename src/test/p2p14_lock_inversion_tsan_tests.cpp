@@ -163,11 +163,26 @@ int main(int argc, char* argv[])
     // and dilv-node.cpp:3371. This single line is the difference between the
     // two arms, and it is the line that puts the reverse edge in the binary.
     if (register_callback) {
-        chainstate.RegisterTipUpdateCallback([](const CBlockIndex* pindex) {
-            if (g_node_context.headers_manager && pindex) {
+        // P2P-14/15 SIGNATURE UPDATE (a8, 2026-09-07). This registration was
+        // written against the pre-fix `void(const CBlockIndex*)` signature. The
+        // fix passes the header and hash BY VALUE, so the old form no longer
+        // compiles and this had to change with it.
+        //
+        // WHAT DID NOT CHANGE — and this is what keeps the two arms comparable:
+        // the callback still calls OnBlockActivated, which still takes
+        // cs_headers. The reverse edge this harness exists to put in the binary
+        // is identical; only the parameter list differs. If this arm ever stops
+        // reaching cs_headers, the harness stops testing anything.
+        //
+        // The RED baseline in docs/p2p14-lock-inversion/*.err was produced by
+        // the PRE-FIX harness against the PRE-FIX tree — the correct pairing.
+        // A post-fix green from this updated harness is evidence about the
+        // post-fix tree; it is NOT a re-run of the recorded baseline, and must
+        // not be presented as one.
+        chainstate.RegisterTipUpdateCallback([](const CBlockHeader& header, const uint256& hash) {
+            if (g_node_context.headers_manager) {
                 g_reverse_fired.fetch_add(1);
-                g_node_context.headers_manager->OnBlockActivated(
-                    pindex->header, pindex->GetBlockHash());
+                g_node_context.headers_manager->OnBlockActivated(header, hash);
             }
         });
     }
