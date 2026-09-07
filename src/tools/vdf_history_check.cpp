@@ -76,6 +76,9 @@ void Usage()
         "  --to <height>        last height to check (default: chain tip)\n"
         "  --verbose            print every failing height\n"
         "  --selftest           prove this binary detects forgeries, then exit\n"
+        "  --find <hex40>       ask whether one identity has an on-chain registration\n"
+        "                       (exactly 40 lowercase hex chars; repeatable). A NEGATIVE\n"
+        "                       is refused unless the census covered the whole chain.\n"
         "  --census-only        classify MIK blobs + derive registration identities,\n"
         "                       running NO consensus verification (fast; never\n"
         "                       reports pass/fail)\n\n"
@@ -538,15 +541,94 @@ ScanResult ScanChain(const std::string& blocksDir, int fromHeight, int toHeight,
         {
         }
     }
+    // Computed HERE, inside ScanChain, because this is where the data lives.
+    // It used to be computed in main() -- so every other consumer of a
+    // ScanResult, the self-test included, received an unpopulated field and the
+    // coverage gate then refused on a fixture that was actually fine. Same
+    // class as the toHeight clamp: a value normalised in one caller is not
+    // normalised for anyone else. The self-test found this the moment the gate
+    // became reachable from it.
+    for (const auto& kv : res.registeredIdentities)
+        if (res.seenByIdentity.count(kv.first) || res.verifiedByIdentity.count(kv.first)
+            || res.failOpenByIdentity.count(kv.first))
+            ++res.derivationCrossChecks;
+
     return res;
+}
+
+// The coverage gate, as a FUNCTION so it is reachable from the self-test.
+//
+// It previously existed only inline in main(), which meant the one piece of
+// logic standing between a partial run and a published consensus claim was the
+// single piece the binary's own self-check could not execute -- the
+// "verify the verifier" hole in its purest form. Not theoretical: a regression
+// in exactly this gate (an input read above where it was computed, making every
+// full run refuse) was caught by eye in a transcript, not by a test.
+std::vector<std::string> ComputeCensusBlockers(const ScanResult& r, const Ctx& ctx,
+                                               int fromHeight, int toHeight)
+{
+    std::vector<std::string> b;
+    if (!r.walkComplete)  b.push_back("the chain walk was INCOMPLETE");
+    if (r.unreadable > 0) b.push_back(std::to_string(r.unreadable)
+                              + " block bodies were unreadable, so some blobs were never parsed");
+    if (fromHeight > 1)   b.push_back("--from " + std::to_string(fromHeight)
+                              + " skipped heights 1.." + std::to_string(fromHeight - 1));
+    if (toHeight >= 0 && toHeight < r.tipHeight)
+                          b.push_back("--to " + std::to_string(toHeight)
+                              + " stopped short of the tip " + std::to_string(r.tipHeight));
+    if (r.derivationCrossChecks == 0)
+                          b.push_back("the derivation control did not confirm");
+    if (r.scanned != r.vdfBlocks)
+                          b.push_back("only " + std::to_string(r.vdfBlocks) + " of "
+                              + std::to_string(r.scanned) + " blocks read were VDF blocks, and the census "
+                                "skips non-VDF blocks while the node's identity-DB writers do not");
+    if (!r.genesisMatch)  b.push_back("genesis does NOT match --network " + ctx.network
+                              + " -- this datadir is a different chain than the one named");
+    if (r.coinbaseUnparsed > 0)
+                          b.push_back(std::to_string(r.coinbaseUnparsed)
+                              + " coinbases could not be deserialized, so any blob in them was never seen");
+    return b;
+}
+
+// Is a lookup key one this census could ever have stored? Identity::GetHex()
+// emits exactly 40 lowercase hex characters.
+bool IsWellFormedIdentity(const std::string& want)
+{
+    if (want.size() != 40) return false;
+    for (char c : want)
+        if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'))) return false;
+    return true;
+}
+
+enum class LookupVerdict { Registered, NotRegistered, NotAnswerable };
+
+LookupVerdict EvaluateLookup(const ScanResult& r, const Ctx& ctx, const std::string& want,
+                             int fromHeight, int toHeight)
+{
+    if (r.registeredIdentities.count(want)) return LookupVerdict::Registered;
+    std::vector<std::string> b = ComputeCensusBlockers(r, ctx, fromHeight, toHeight);
+    if (!IsWellFormedIdentity(want)) b.push_back("malformed key");
+    return b.empty() ? LookupVerdict::NotRegistered : LookupVerdict::NotAnswerable;
 }
 
 // ---------------------------------------------------------------------------
 // SELF-TEST
 // ---------------------------------------------------------------------------
 
+// registration = true emits [0xDF][0x01][pubkey][sig]; false emits the
+// REFERENCE form [0xDF][0x02][identity][sig].
+//
+// The fixture used to build every block as a registration, which made it
+// unrepresentative in the one dimension that matters: a real chain is
+// overwhelmingly reference blocks (measured 464 registration to 254,562
+// reference on DilV). Worse, with no reference blob the derivation
+// cross-check can never confirm, so the coverage gate always refused and the
+// full-coverage negative -- the exact path the published conclusion travels --
+// was untestable. The self-test caught this on its first run after the gate
+// became reachable.
 CBlock BuildSignedVDFBlock(const uint256& prevHash, int height,
-                           DFMP::CMiningIdentityKey& mik, uint64_t iterations)
+                           DFMP::CMiningIdentityKey& mik, uint64_t iterations,
+                           bool registration = true)
 {
     CBlock block;
     block.nVersion      = CBlockHeader::VDF_VERSION;
@@ -569,7 +651,8 @@ CBlock BuildSignedVDFBlock(const uint256& prevHash, int height,
     std::vector<uint8_t> mikSig;
     if (!mik.Sign(prevHash, height, block.nTime, mikSig)) { block.vtx.clear(); return block; }
     std::vector<uint8_t> mikScriptData;
-    DFMP::BuildMIKScriptSigRegistration(mik.pubkey, mikSig, mikScriptData);
+    if (registration) DFMP::BuildMIKScriptSigRegistration(mik.pubkey, mikSig, mikScriptData);
+    else              DFMP::BuildMIKScriptSigReference(mik.identity, mikSig, mikScriptData);
 
     std::vector<uint8_t> vtx;
     vtx.push_back(1);
@@ -657,7 +740,10 @@ int RunSelfTest()
         }
         uint256 prev, tip;
         for (int h = 0; h < kChainLen && built; ++h) {
-            CBlock b = BuildSignedVDFBlock(prev, h, mik, iters);
+            // h==1 registers the identity; every later block REFERENCES it, so
+            // the derivation cross-check has an independent inline source to
+            // confirm against -- mirroring a real chain's shape.
+            CBlock b = BuildSignedVDFBlock(prev, h, mik, iters, /*registration=*/(h <= 1));
             if (b.vtx.empty()) { built = false; break; }
             if (h == kForgedAt) b.vdfOutput.data[0] ^= 0x01;
             uint256 hash = b.GetHash();
@@ -696,6 +782,51 @@ int RunSelfTest()
     require(r.failures.size() == 1, "exactly ONE failure was reported");
     require(!r.failures.empty() && r.failures[0].height == kForgedAt,
             "the failure is at the planted height " + std::to_string(kForgedAt));
+
+    // ---- THE COVERAGE GATE, which nothing used to exercise ----------------
+    //
+    // Every assertion above is about DETECTION. None of them touches the gate
+    // that decides whether a registration verdict may be published at all --
+    // the single piece of logic standing between a partial run and a consensus
+    // claim, and until now the one piece the self-test could not reach. A
+    // regression inside it was caught by a human noticing two contradictory
+    // lines in a transcript; that is not a control.
+    //
+    // The fixture builds every block as a REGISTRATION under one identity, so
+    // the census must see exactly one, and it is a known-present key.
+    require(r.registeredIdentities.size() == 1,
+            "the census derived exactly ONE registration identity from the fixture");
+    require(r.derivationCrossChecks > 0,
+            "the derivation control CONFIRMS on the fixture (registration + reference present)");
+    require(r.refBlocks > 0 && r.regBlocks > 0,
+            "the fixture contains BOTH registration and reference blobs, like a real chain");
+
+    const std::string presentKey = r.registeredIdentities.empty()
+                                     ? std::string() : r.registeredIdentities.begin()->first;
+    const std::string absentKey  = "ffffffffffffffffffffffffffffffffffffffff";  // valid shape, not present
+    const std::string shortKey   = "0bd43004";                                   // the abbreviated form
+
+    // Full coverage (from=1, to=tip): a present key RESOLVES, an absent
+    // well-formed key answers NEGATIVE, a malformed key is REFUSED.
+    require(!presentKey.empty() &&
+            EvaluateLookup(r, ctx, presentKey, 1, -1) == LookupVerdict::Registered,
+            "a REGISTERED identity resolves under full coverage");
+    require(EvaluateLookup(r, ctx, absentKey, 1, -1) == LookupVerdict::NotRegistered,
+            "an absent well-formed key answers NOT REGISTERED under full coverage");
+    require(EvaluateLookup(r, ctx, shortKey, 1, -1) == LookupVerdict::NotAnswerable,
+            "a truncated key is REFUSED, not answered absent");
+
+    // Partial coverage must REFUSE the negative -- this is the whole point of
+    // the gate, and it is the assertion that would have failed when the gate
+    // was reading an input computed below it.
+    require(EvaluateLookup(r, ctx, absentKey, 2, -1) == LookupVerdict::NotAnswerable,
+            "a negative is REFUSED when --from skipped part of the chain");
+
+    // ...but a POSITIVE stays answerable under partial coverage: finding a
+    // registration is evidence regardless of what else was skipped.
+    require(!presentKey.empty() &&
+            EvaluateLookup(r, ctx, presentKey, 2, -1) == LookupVerdict::Registered,
+            "a POSITIVE still resolves under partial coverage");
 
     if (r.failures.size() != 1) {
         std::cout << "\n  reported failures:\n";
@@ -778,6 +909,19 @@ int main(int argc, char* argv[])
 
     ScanResult r = ScanChain(blocksdir, fromHeight, toHeight, verbose, ctx);
     if (!r.opened) { vdf::shutdown(); return 2; }
+
+    // ⚠️ ScanChain clamps toHeight on its OWN BY-VALUE PARAMETER, so main's copy
+    // never saw it. Every later read here used the raw argument. With
+    // `--to 999999` on a 255k chain, scanTop became 999999, `recent` went false,
+    // and the tool took the OLD-REGIME branch — handing an operator a fork-height
+    // FLOOR in precisely the case where it is supposed to refuse to offer one.
+    // That is the inversion the no-bare-floor rule exists to prevent, re-entering
+    // through a different door.
+    //
+    // Rule this cost us: when a callee normalises a by-value parameter, the
+    // caller's copy stays un-normalised, and the clamp is invisible across the
+    // call boundary.
+    if (toHeight < 0 || toHeight > r.tipHeight) toHeight = r.tipHeight;
 
     std::cout << "\n---------------------------------------------------------------\n"
               << "blocks read        " << r.scanned << "\n"
@@ -869,39 +1013,7 @@ int main(int argc, char* argv[])
     // conclusion. Same defect shape as the locator: the fix reached one
     // emitter, not all of them. The list is computed ONCE here so a third
     // emitter cannot silently be born ungated.
-    // Computed BEFORE the gate that reads it. It used to be computed inside the
-    // identity-table block below, which sits AFTER the gate -- so hoisting the
-    // gate made every full run report "the derivation control did not confirm"
-    // while the census line two lines above said CONFIRMED. Caught by testing
-    // the POSITIVE path, not just that the new gates fire.
-    for (const auto& kv : r.registeredIdentities)
-        if (r.seenByIdentity.count(kv.first) || r.verifiedByIdentity.count(kv.first)
-            || r.failOpenByIdentity.count(kv.first))
-            ++const_cast<ScanResult&>(r).derivationCrossChecks;
-
-    std::vector<std::string> censusBlockers;
-    if (!r.walkComplete)  censusBlockers.push_back("the chain walk was INCOMPLETE");
-    if (r.unreadable > 0) censusBlockers.push_back(std::to_string(r.unreadable)
-                              + " block bodies were unreadable, so some blobs were never parsed");
-    if (fromHeight > 1)   censusBlockers.push_back("--from " + std::to_string(fromHeight)
-                              + " skipped heights 1.." + std::to_string(fromHeight - 1));
-    if (toHeight >= 0 && toHeight < r.tipHeight)
-                          censusBlockers.push_back("--to " + std::to_string(toHeight)
-                              + " stopped short of the tip " + std::to_string(r.tipHeight));
-    if (r.derivationCrossChecks == 0)
-                          censusBlockers.push_back("the derivation control did not confirm");
-    // The node's identity-DB writers do NOT filter on block version, so a
-    // registration in a non-VDF block would be registered by the node and
-    // invisible to a census that skipped it. Equal counts prove no block was
-    // skipped on this chain; unequal counts mean the census saw fewer blocks
-    // than the node would have.
-    if (r.scanned != r.vdfBlocks)
-                          censusBlockers.push_back("only " + std::to_string(r.vdfBlocks) + " of "
-                              + std::to_string(r.scanned) + " blocks read were VDF blocks, and the census "
-                                "skips non-VDF blocks while the node's identity-DB writers do not");
-    if (r.coinbaseUnparsed > 0)
-                          censusBlockers.push_back(std::to_string(r.coinbaseUnparsed)
-                              + " coinbases could not be deserialized, so any blob in them was never seen");
+    std::vector<std::string> censusBlockers = ComputeCensusBlockers(r, ctx, fromHeight, toHeight);
 
     if (!r.failOpenByIdentity.empty() || !r.verifiedByIdentity.empty() || !r.seenByIdentity.empty()) {
         std::vector<std::pair<long long, std::string>> top;
@@ -992,6 +1104,21 @@ int main(int argc, char* argv[])
                   << "\n";
     }
 
+    // A --census-only run verifies NOTHING by design, so the control-based
+    // diagnoses below would otherwise assert things about the DATA that were
+    // never tested ("the proof checker was not live on this data",
+    // "CheckVDFBlockMIKSignature FAILS OPEN for them"). Say what the run is
+    // instead of diagnosing what it did not measure.
+    if (ctx.censusOnly) {
+        std::cout << "\nCENSUS-ONLY RUN: no consensus check was executed. The blob census and the\n"
+                     "registration verdict above are the only findings; nothing here says whether\n"
+                     "any block is valid, and the control lines below are omitted for that reason.\n";
+        if (!r.failures.empty()) {
+            std::cout << "consensus failures seen anyway: " << r.failures.size() << "\n";
+        }
+        vdf::shutdown();
+        return censusBlockers.empty() ? 0 : 2;
+    }
     if (!untrusted.empty()) {
         std::cout << "\n⛔ RESULT: UNTRUSTWORTHY. This run cannot support a fork-height decision:\n";
         for (const auto& u : untrusted) std::cout << "   * " << u << "\n";
