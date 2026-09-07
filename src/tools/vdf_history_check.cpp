@@ -156,6 +156,7 @@ struct ScanResult {
     // for it.
     long long mikEnforced  = 0;   // corrupting the signature flipped the verdict
     long long mikFailOpen  = 0;   // corrupted signature STILL accepted
+    long long mikProbeUnapplied = 0;  // probe could not be applied -> UNMEASURED
     // WHICH identities fail open, and how many blocks each accounts for. The
     // shape of this distribution decides whether the fail-open is a small
     // population problem with a targeted fix or a systemic one.
@@ -287,65 +288,11 @@ MikView ParseMik(const CBlock& block)
 // Read-only: the 20-byte identity of a REFERENCE MIK blob, as hex. Registration
 // blobs carry a pubkey rather than a stored identity, and they verify inline,
 // so the fail-open population is reference-type by construction.
-std::string ReferenceIdentityHex(const CBlock& block)
-{
-    static const char* H = "0123456789abcdef";
-    for (size_t i = 0; i + 1 < block.vtx.size(); ++i) {
-        if (block.vtx[i] != DFMP::MIK_MARKER) continue;
-        if (block.vtx[i + 1] != DFMP::MIK_TYPE_REFERENCE) continue;
-        if (i + 2 + 20 > block.vtx.size()) return std::string();
-        std::string out;
-        out.reserve(40);
-        for (size_t k = i + 2; k < i + 22; ++k) {
-            out.push_back(H[(block.vtx[k] >> 4) & 0xF]);
-            out.push_back(H[block.vtx[k] & 0xF]);
-        }
-        return out;
-    }
-    return std::string();
-}
 
 // Read-only: the identity of a REGISTRATION MIK blob, derived from its pubkey
 // by the production function the node itself uses. Empty if not a registration.
-std::string RegistrationIdentityHex(const CBlock& block)
-{
-    // ⚠️ Locate the FIRST valid MIK blob and use it ONLY if it is a
-    // registration. Scanning ahead for a registration marker specifically is
-    // WRONG and was measured wrong: a reference blob is followed by a
-    // 3309-byte Dilithium signature of effectively random bytes, in which the
-    // pair [0xDF][0x01] occurs by chance, so the scan skipped the real blob
-    // and "derived" an identity from signature noise. It produced 24 phantom
-    // registration identities in a window the census proves contains ZERO
-    // registration blocks, and the derivation cross-check caught it by
-    // returning 0 matches. Same failure mode as the ~10% flake in the LP-10
-    // suite: never pattern-scan across cryptographic material.
-    for (size_t i = 0; i + 1 < block.vtx.size(); ++i) {
-        if (block.vtx[i] != DFMP::MIK_MARKER) continue;
-        const uint8_t type = block.vtx[i + 1];
-        if (type != DFMP::MIK_TYPE_REGISTRATION && type != DFMP::MIK_TYPE_REFERENCE) continue;
-        if (type != DFMP::MIK_TYPE_REGISTRATION) return std::string();   // first blob is a reference
-        const size_t pkStart = i + 2;
-        if (pkStart + DFMP::MIK_PUBKEY_SIZE > block.vtx.size()) return std::string();
-        const std::vector<uint8_t> pubkey(block.vtx.begin() + pkStart,
-                                          block.vtx.begin() + pkStart + DFMP::MIK_PUBKEY_SIZE);
-        DFMP::Identity id = DFMP::DeriveIdentityFromMIK(pubkey);
-        if (id.IsNull()) return std::string();
-        return id.GetHex();
-    }
-    return std::string();
-}
 
 // Read-only: which MIK blob, if any, does this coinbase carry?
-int DetectMIKType(const CBlock& block)
-{
-    for (size_t i = 0; i + 1 < block.vtx.size(); ++i) {
-        if (block.vtx[i] != DFMP::MIK_MARKER) continue;
-        const uint8_t t = block.vtx[i + 1];
-        if (t == DFMP::MIK_TYPE_REGISTRATION || t == DFMP::MIK_TYPE_REFERENCE)
-            return static_cast<int>(t);
-    }
-    return -1;
-}
 
 bool ForgeMIKSignatureBytes(CBlock& block, int* outType)
 {
@@ -361,24 +308,6 @@ bool ForgeMIKSignatureBytes(CBlock& block, int* outType)
     return false;
 }
 
-bool ForgeMIKSignatureBytesLegacyUnused(CBlock& block, int* outType)
-{
-    for (size_t i = 0; i + 1 < block.vtx.size(); ++i) {
-        if (block.vtx[i] != DFMP::MIK_MARKER) continue;
-        const uint8_t type = block.vtx[i + 1];
-        size_t body;
-        if      (type == DFMP::MIK_TYPE_REGISTRATION) body = DFMP::MIK_PUBKEY_SIZE;
-        else if (type == DFMP::MIK_TYPE_REFERENCE)    body = 20;
-        else continue;
-
-        const size_t sigStart = i + 2 + body;
-        if (sigStart + DFMP::MIK_SIGNATURE_SIZE > block.vtx.size()) continue;
-        block.vtx[sigStart + 100] ^= 0xFF;
-        if (outType) *outType = static_cast<int>(type);
-        return true;
-    }
-    return false;
-}
 
 // The one scan path. --selftest drives THIS function, not a copy, so a passing
 // self-test is evidence about real runs.
@@ -508,6 +437,14 @@ ScanResult ScanChain(const std::string& blocksDir, int fromHeight, int toHeight,
         }
 
         // Per-block enforcement probe, on blocks that passed the MIK check.
+        //
+        // Identity attribution here goes through ParseMik (the PRODUCTION
+        // parser) like everything else. It previously used the raw-scanning
+        // ReferenceIdentityHex, so while --census-only runs were clean after
+        // the locator fix, VERIFYING runs still attributed fail-open counts to
+        // identities read at a possibly wrong offset — and that is the map the
+        // "two identities" finding is built from. Registration recording was
+        // also duplicated in here; the census pass above is the single writer.
         if (okMik) {
             CBlock probe = block;
             int pt = -1;
@@ -515,16 +452,18 @@ ScanResult ScanChain(const std::string& blocksDir, int fromHeight, int toHeight,
                 std::string ep;
                 const bool failOpen = CheckVDFBlockMIKSignature(probe, h, ep);
                 if (failOpen) ++res.mikFailOpen; else ++res.mikEnforced;
-                {
-            const std::string reg = RegistrationIdentityHex(block);
-            if (!reg.empty() && res.registeredIdentities.find(reg) == res.registeredIdentities.end())
-                res.registeredIdentities[reg] = h;
-        }
-        const std::string id = ReferenceIdentityHex(block);
-                if (!id.empty()) {
-                    if (failOpen) ++res.failOpenByIdentity[id];
-                    else          ++res.verifiedByIdentity[id];
+                const MikView mv = ParseMik(block);
+                if (mv.ok && mv.type == DFMP::MIK_TYPE_REFERENCE) {
+                    if (failOpen) ++res.failOpenByIdentity[mv.identity];
+                    else          ++res.verifiedByIdentity[mv.identity];
                 }
+            } else {
+                // MEDIUM-4: the probe could not be APPLIED to this block, so
+                // its enforcement status is UNMEASURED. Counted separately so
+                // "measured per block, not sampled" stays true of the numbers
+                // that are reported, rather than silently covering blocks the
+                // probe never reached.
+                ++res.mikProbeUnapplied;
             }
         }
 
