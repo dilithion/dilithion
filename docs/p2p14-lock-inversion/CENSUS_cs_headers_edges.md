@@ -22,10 +22,23 @@ not that one more site-fix will land. The fix was aimed at sites. This is aimed 
 | `cs_peers` | `peers.h:214` | `private:` at `:207` | **0** |
 | `cs_main` | `chain.h:136` | `private:` at `:107` | **0** |
 
-**Therefore only `connman.cpp` can hold `cs_vNodes`, only `peers.cpp` can hold `cs_peers`, and only
-`chain.cpp` can hold `cs_main`.** No other translation unit can hold any of the three, so no other
-file can create an inverted edge. This is the fact that turns a sample into a census, and it is the
-same argument that made the `TipNotifyDrain` sound.
+**Therefore only `connman.cpp`, `peers.cpp` and `chain.cpp` can ACQUIRE these locks** — the set of
+*holding frames* is bounded to three files.
+
+**⚠️ CORRECTED (final red-team MEDIUM-1): that bounds ACQUISITION, not REACH, and an earlier version
+of this section drew the stronger conclusion it does not support.** Privacy says where a lock is
+taken; an inverted edge is created by whatever RUNS while it is held — and all three locks are held
+across calls into other translation units (`cs_main` across the connect/disconnect callbacks and the
+test hooks; `cs_vNodes` across `DispatchPeerConnected` → `RegisterNode`; `cs_peers` across the
+`GetPeerTrustScore` `std::function` whose body lives in a node binary). So §1 alone cannot carry
+"no other file can create an inverted edge".
+
+**What §1 actually buys** is still substantial and is the reason to state it: the search for holding
+frames is confined to three files, so §3's exclusion and §4's enumeration only have to cover the
+outbound calls made *from those three files*, rather than the whole tree. **Completeness comes from
+§3 + §4 + §5a, not from §1.** The earlier text asserted "complete … by the privacy argument in §1"
+while §7 admitted the decisive enumeration had not been done — two statements that could not both be
+true, and the kind of contradiction that gets a document cited as settled.
 
 ## 2. `cs_headers` is acquired in exactly ONE file
 
@@ -76,14 +89,28 @@ call to any `CHeadersManager` method**. The only route was the **inverted** one 
 a `std::function` registered by the node binaries and fired from inside `ActivateBestChain`. That is
 what `TipNotifyDrain` moves outside the lock. No other callback family in `chain.h`
 (`m_blockConnectCallbacks`, `m_blockDisconnectCallbacks`) has a registrant that reaches
-`headers_manager` — **but see the boundary below: I enumerated the registrants, I did not read every
-registrant's body.**
+`headers_manager`.
+
+## 5a. The registrant enumeration — DONE, and it is what closes the `cs_main` leg
+
+This was an open gap in every prior pass, including the first version of this census. **The final
+red-team read every connect/disconnect registrant body in BOTH binaries** and confirmed none reaches
+the headers manager: tx_index, fee estimator, coinstats, wallet (a whole-tree grep of `src/wallet/`
+for `headers_manager|connman|peer_manager|cs_headers` returns **0 matches**), DFMP, session counters,
+VDF cooldown, miner-win, DNA, and the one that looked most dangerous —
+`CRPCServer::NotifyBlockTipChanged()`, which is a bare `cv.notify_all()`.
+
+**The only registrant that reaches the headers manager is the tip callback — the one this branch
+moved out of the lock.** So `cs_main → cs_headers` does not return by another route, and that
+verdict rests on the enumeration, not on §1's privacy argument.
 
 ## 6. Result
 
-**Every edge into `cs_headers` from a lock-holding frame is now lock-free at the call**, and the set
-is complete for `{cs_vNodes, cs_peers, cs_main}` by the privacy argument in §1 plus the enumeration
-in §4.
+**Every edge into `cs_headers` from a lock-holding frame is now lock-free at the call.** The set is
+complete for `{cs_vNodes, cs_peers, cs_main}` by: §1 bounding holding frames to three files, §3
+excluding five callee subsystems with zero references, §4 enumerating the 13 remaining references
+down to two live calls, and **§5a reading every callback registrant body** — the last of which is
+what actually closes the `cs_main` leg.
 
 ## 6b. ⚠️ CORRECTION — one entry point in this census is DEAD CODE
 
@@ -115,9 +142,13 @@ Stated because a census that overstates its scope is exactly the failure it exis
   sites) is *conforming* under the ratified order, not absent. The order says `cs_headers` is above;
   these sites are what establish that. They are edges, and they are the reason an inverted edge
   deadlocks.
-- **Registrant bodies for the block connect/disconnect callback families** were enumerated by name,
-  not read. If one reaches `headers_manager`, `cs_main → cs_headers` returns by that route. Named as
-  a gap by the first red-team pass; still a gap.
+- ~~Registrant bodies not read~~ — **CLOSED, see §5a.** Read in full by the final red-team, both
+  binaries. This was a gap in three consecutive passes.
+- **§3's exclusion is depth-1.** Zero direct references excludes a *direct* path only. The final
+  red-team probed the three riskiest indirect escapes (`GetPeerTrustScore`,
+  `sync_coordinator->IsInitialBlockDownload()`, `g_chainstate.GetHeight()`) and found none live —
+  the last of those load-bearing, since if it took `cs_main` then `cs_peers → cs_main` would exist
+  directly under the eviction lock. Deeper indirect paths remain unproven.
 - **Signal handlers** — not examined.
 - **The node binaries** call `CHeadersManager` methods in many places; none can hold `cs_vNodes`,
   `cs_peers` or `cs_main` (§1), so they cannot create an inverted edge, but they are not individually
