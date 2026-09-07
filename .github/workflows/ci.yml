@@ -66,6 +66,20 @@ jobs:
           echo "CC=gcc" >> $GITHUB_ENV
           echo "CXX=g++" >> $GITHUB_ENV
         fi
+        # Job-start clock for the hang watchdog further down. `timeout-minutes`
+        # is measured from JOB start, but a watchdog inside a step can only see
+        # STEP time -- so the watchdog has to know how much of the job budget
+        # the build already spent, or it fires after the ceiling and is inert.
+        echo "JOB_START_EPOCH=$(date +%s)" >> $GITHUB_ENV
+
+    # gdb is needed only on the hang path, but installing it THERE would spend
+    # minutes of a budget that is already exhausted, and would fail silently.
+    - name: Install hang-capture tooling
+      run: |
+        sudo apt-get install -y -q gdb
+        # gdb must be able to attach to a non-descendant; the runner default
+        # blocks that and a failed attach would waste the one occurrence we get.
+        sudo sysctl -w kernel.yama.ptrace_scope=0
 
     - name: Build RandomX
       run: |
@@ -131,40 +145,51 @@ jobs:
         # HANG INSTRUMENT. test_dilithion intermittently hangs (~8% of Release
         # runs: this job on run 33929931137, and gcc/Release on main run
         # 33887089440, both ending "Terminate orphan process: (test_dilithion)").
-        # The job ceiling is timeout-minutes: 45, and when it fires the runner
-        # kills the orphan and the process state is GONE - which is why the hang
-        # has never been diagnosed. 44 local runs (20 full-width + 24 pinned to
-        # 4 cores) reproduced it ZERO times, so the evidence has to be captured
-        # where it actually happens: here.
+        # When the job ceiling fires the runner kills the orphan and the process
+        # state is GONE - which is why the hang has never been diagnosed. 44
+        # local runs (20 full-width + 24 pinned to 4 cores) reproduced it ZERO
+        # times, so the evidence has to be captured where it happens: here.
         #
-        # Run under our own watchdog, inside the 45-minute ceiling, and capture
-        # a stack from the STILL-LIVE process before killing it. On a healthy
-        # run this changes nothing: the watchdog is cancelled and the suite's
-        # own exit code is propagated.
-        #
-        # 2280s (38 min) is chosen against BOTH bounds, not picked round: a
-        # healthy clang/Debug leg measured ~21 min wall (run 33929931137,
-        # 00:41:05 -> 01:02:00), so 38 min leaves ~17 min of headroom before a
-        # slow-but-healthy run would be killed; and it leaves ~7 min inside the
-        # 45-min ceiling for gdb to attach and the artifact to upload. A 30-min
-        # watchdog would have sat only 9 min above a known-good run.
+        # THE BUDGET IS COMPUTED, NOT A LITERAL, AND THAT IS THE WHOLE POINT.
+        # `timeout-minutes: 45` is measured from JOB start; a watchdog inside
+        # this step can only measure STEP time. Measured on the hung job
+        # (run 33929931137, steps API):
+        #     job start                 00:43:37
+        #     "Run Boost Unit Tests"    01:03:33   <- 19m56s of the job already
+        #                                             spent (16m19s of it in the
+        #                                             wallet-guard step alone)
+        #     45-min ceiling            01:28:37
+        # So this step had ~25 minutes of real budget, not 45. A fixed 38-minute
+        # watchdog - which is what the first version of this used - would have
+        # fired at 01:41, THIRTEEN MINUTES AFTER the ceiling: the instrument
+        # would never once have run. Deriving the budget from JOB_START_EPOCH
+        # makes it correct now and self-correcting as the build gets slower.
         set -uo pipefail
         mkdir -p test-hang-artifacts
 
-        # gdb must be able to attach to a non-descendant. Default ptrace_scope
-        # on the runner blocks that, and a failed attach at hang time would
-        # waste the one occurrence we get.
-        sudo sysctl -w kernel.yama.ptrace_scope=0 >/dev/null 2>&1 || true
-        command -v gdb >/dev/null 2>&1 || sudo apt-get install -y -q gdb >/dev/null 2>&1 || true
+        CEILING_SEC=$(( 45 * 60 ))
+        CAPTURE_MARGIN=240        # gdb attach + dump + artifact upload
+        MIN_BUDGET=300            # never watchdog a run into uselessness
+        elapsed=$(( $(date +%s) - JOB_START_EPOCH ))
+        BUDGET=$(( CEILING_SEC - elapsed - CAPTURE_MARGIN ))
+        # If the build has already eaten the budget there is nothing left to
+        # watchdog WITH, and the clamp below would arm a timer that fires after
+        # the ceiling -- inert, exactly like the version this replaces. Say so
+        # out loud: otherwise a missing artifact reads as "no hang happened"
+        # when it actually means "the instrument never armed".
+        if [ "$BUDGET" -lt "$MIN_BUDGET" ]; then
+          echo "::warning::hang watchdog NOT ARMED: ${elapsed}s of the ${CEILING_SEC}s job budget already spent, leaving less than ${MIN_BUDGET}s. A missing hang artifact from this run means nothing."
+          BUDGET="$MIN_BUDGET"
+        fi
+        echo "hang watchdog: ${elapsed}s of the job already spent; budget ${BUDGET}s"
 
-        ./test_dilithion --log_level=test_suite --report_level=short \
-          --run_test='!wallet_hd_tests:!rpc_hd_wallet_tests:!hd_wallet_standalone_tests' &
+        ./test_dilithion --log_level=test_suite --report_level=short           --run_test='!wallet_hd_tests:!rpc_hd_wallet_tests:!hd_wallet_standalone_tests' &
         TD_PID=$!
 
         (
-          sleep 2280
+          sleep "$BUDGET"
           if kill -0 "$TD_PID" 2>/dev/null; then
-            echo "::error::test_dilithion still alive after 2280s - capturing stack before kill (BUG: intermittent hang)"
+            echo "::error::test_dilithion still alive after ${BUDGET}s - capturing stack before kill (intermittent hang)"
             {
               echo "=== test_dilithion hang, captured $(date -u +%FT%TZ) ==="
               echo "=== /proc/$TD_PID/status ==="; cat "/proc/$TD_PID/status" 2>&1
@@ -172,16 +197,27 @@ jobs:
               for t in /proc/"$TD_PID"/task/*; do
                 echo "--- tid ${t##*/} comm=$(cat "$t/comm" 2>/dev/null) wchan=$(cat "$t/wchan" 2>/dev/null)"
               done
-              echo "=== gdb: all thread backtraces ==="
-              gdb -p "$TD_PID" -batch -ex 'thread apply all bt 25' 2>&1
+              # gdb gets its own timeout: if IT stalls on attach we ride to the
+              # ceiling and learn nothing, which is the failure this exists to end.
+              echo "=== gdb: thread map + all backtraces ==="
+              timeout 120 gdb -p "$TD_PID" -batch                 -ex 'info threads' -ex 'thread apply all bt 25' 2>&1
+              echo "(gdb exit: $?)"
             } > test-hang-artifacts/test_dilithion_hang_stack.txt
             kill -9 "$TD_PID" 2>/dev/null || true
           fi
         ) &
         WATCHDOG=$!
 
-        wait "$TD_PID"; rc=$?
+        # `wait` under bash -e (GitHub's default shell) ABORTS the step on a
+        # non-zero status, so `wait "$TD_PID"; rc=$?` would make every line
+        # below dead on exactly the failure path we care about.
+        rc=0
+        wait "$TD_PID" || rc=$?
+
+        # Kill the watchdog AND its sleep child. Killing only the subshell
+        # leaves the sleep orphaned holding this step's stdout open.
         kill "$WATCHDOG" 2>/dev/null || true
+        pkill -P "$WATCHDOG" 2>/dev/null || true
         wait "$WATCHDOG" 2>/dev/null || true
 
         if [ "$rc" -ne 0 ]; then
