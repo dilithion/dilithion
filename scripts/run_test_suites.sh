@@ -199,7 +199,7 @@ fast|phase1_test|120|STALE TEST (diagnosed, fix deliberately NOT taken here): ph
 fast|timestamp_tests|120||
 fast|seed_attestation_key_tests|180|UNTRIAGED: 3 of ~40 checks fail around key-file MAC verification / migration. Needs the seed-attestation owner; failure mode is not obviously stale.|
 fast|test_passphrase_validator|60|SUSPECTED REAL (policy): 2 of 16 cases -- two passphrases the suite expects REJECTED are now ACCEPTED at "Moderate (57/100)". Either the strength policy was deliberately loosened (then fix the expectations, with a reason) or it regressed. Do not just flip the expectations.|
-fast|chain_case_2_5_equivalence_tests|180|partial: scenarios 2 and 4 are excluded, both on ONE behaviour change: each asserts ok=true after a ConnectTip failure that FOLLOWS a committed disconnect (:305 and :392), and ActivateBestChainStep now truncates the chain and triggers auto_rebuild, so ok=false. Needs a chainstate owner to say which side is right. Scenario 4 had NEVER been observed failing: scenario_2 aborts the process first, so 3, 4 and 5 had never executed in any run and the old quarantine reason named only scenario_2. Scenarios 1, 3 and 5 pass deterministically (5/5, Linux/WSL 2026-09-07) and gate here.|--only=scenario_1_replacement_succeeds --only=scenario_3_disconnect_old_tip_fails --only=scenario_5_write_best_block_fails_triggers_rebuild
+fast|chain_case_2_5_equivalence_tests|180|UNTRIAGED: scenario_2 (connect-replacement-fails-then-recovers) now truncates the chain and triggers auto_rebuild instead of recovering (chain_case_2_5_equivalence_tests.cpp:304). Behaviour change in ActivateBestChainStep; needs a chainstate owner to say which side is right.|
 fast|vdf_consensus_test|300||
 fast|vdf_lottery_test|300||
 fast|rpc_tests|300||
@@ -274,6 +274,22 @@ EOF
                 # claims it does -- a gate reporting on a scope nobody declared.
                 if [ -z "$args" ]; then
                     echo "ROSTER ERROR: $suite is marked partial: but carries no ARGS, so it excludes nothing while its reason says it does. Give it the --only= selectors, or drop the partial: prefix." >&2
+                    errs=$((errs + 1))
+                # ARGS PRESENCE IS NOT ARGS CONTENT. The first version of this
+                # validator checked only that ARGS was non-empty, and
+                # `--list-scenarios` sailed through it: the binary prints its
+                # scenario names, runs NOTHING, and exits 0, so the row reported
+                # [PASS] on zero executed scenarios. That is precisely the green
+                # -covering-nothing outcome this whole feature exists to
+                # prevent, arriving through the feature itself.
+                #
+                # So a partial: row must carry at least one real selection, and
+                # must not carry a query flag that suppresses execution.
+                elif printf '%s' "$args" | grep -qw -- '--list-scenarios'; then
+                    echo "ROSTER ERROR: $suite has --list-scenarios in its ARGS. That flag makes the binary print its scenario names, run NOTHING and exit 0, so the row would report PASS having executed nothing." >&2
+                    errs=$((errs + 1))
+                elif ! printf '%s' "$args" | grep -qE '(^|[[:space:]])--only=[^[:space:]]+'; then
+                    echo "ROSTER ERROR: $suite is marked partial: but its ARGS name no scenario (expected at least one --only=<name>). ARGS: $args" >&2
                     errs=$((errs + 1))
                 fi
                 ;;

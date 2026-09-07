@@ -47,6 +47,14 @@ fail(){ echo "   FAIL  $1"; shift; printf '%s\n' "$@" | sed 's/^/     | /' | hea
 sandbox() {               # sandbox <exit-code> <roster-row>...
     local rc="$1"; shift
     local d; d="$(mktemp -d)"
+    # A src/ tree and a Makefile, because #185's staleness guard refuses to run
+    # where it cannot establish a source reference -- under GITHUB_ACTIONS it is
+    # FATAL. Without these the whole file goes 10/12 red the moment this rebases
+    # onto #185, for a reason that has nothing to do with what it tests. The
+    # fake binary is touched AFTER the sources so it is never seen as stale.
+    mkdir -p "$d/src"
+    printf 'int main(){return 0;}\n' > "$d/src/fake.cpp"
+    printf 'all:\n' > "$d/Makefile"
     {
       echo '#!/usr/bin/env bash'
       echo 'echo "ARGV_COUNT=$#"'
@@ -55,6 +63,7 @@ sandbox() {               # sandbox <exit-code> <roster-row>...
     } > "$d/fake_suite"
     chmod +x "$d/fake_suite"
     cp "$d/fake_suite" "$d/other_suite"
+    touch "$d/fake_suite" "$d/other_suite"
     local rows; rows="$(printf '%s\n' "$@")"
     awk -v rows="$rows" '
       /^ROSTER=.$/ { print; print rows; skip=1; next }
@@ -147,6 +156,32 @@ if printf '%s\n' "$out" | grep -q 'ROSTER ERROR.*fake_suite'; then
 else
   fail "the ROSTER ERROR line did not name the row" "$out"
 fi
+
+echo
+echo "== ROSTER ERROR: ARGS that are present but SELECT NOTHING =="
+# Found by COORD's executed review (F1). The validator originally checked that
+# ARGS was non-empty and nothing else, so `--list-scenarios` passed it: the
+# binary prints its scenario names, runs NOTHING, exits 0, and the row reports
+# [PASS] on zero executed scenarios. The feature built to stop a green covering
+# nothing would have delivered one through its own front door.
+out="$(drive 0 'fast|fake_suite|60|partial: only scenario_1|--list-scenarios')"
+case "$out" in
+  *"RUNNER_EXIT=0"*) fail "--list-scenarios as ARGS was accepted -- PASS on zero scenarios" "$out" ;;
+  *)                 chk "a query flag that runs nothing is rejected as ARGS" yes yes ;;
+esac
+# And the general form: ARGS present, but naming no scenario at all.
+out="$(drive 0 'fast|fake_suite|60|partial: only scenario_1|--verbose --colour=never')"
+case "$out" in
+  *"RUNNER_EXIT=0"*) fail "ARGS naming no scenario was accepted" "$out" ;;
+  *)                 chk "ARGS that name no --only= scenario are rejected" yes yes ;;
+esac
+# DISCRIMINATOR: the rule must not reject a legitimate selection that also
+# carries an unrelated flag, or it will simply be worked around.
+out="$(drive 0 'fast|fake_suite|60|partial: only scenario_1|--verbose --only=scenario_1')"
+case "$out" in
+  *"[PASS"*) chk "a real --only= alongside another flag is still accepted" yes yes ;;
+  *) fail "the ARGS-content rule rejected a legitimate selection" "$out" ;;
+esac
 
 echo
 echo "== ROSTER ERROR: ARGS on a LIVE (empty-reason) row =="
