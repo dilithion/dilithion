@@ -208,44 +208,43 @@ RAN=0
 STALE=0
 TOTAL_SEC=0
 
-# HEAD's commit time, for the staleness guard below. A binary built from this
-# tree cannot be OLDER than the commit it was built from, so binary-mtime <
-# HEAD-commit-time is proof the binary predates the code under test.
+# Reference for the staleness guard below: the NEWEST source file, not HEAD's
+# commit time.
 #
-# Deliberately fails OPEN with a loud line rather than silently: if this is not
-# a git checkout there is no reference time, and a guard that silently disables
-# itself is the same defect it exists to catch.
-HEAD_EPOCH="$(git log -1 --format=%ct 2>/dev/null || echo 0)"
-case "${HEAD_EPOCH:-}" in (''|*[!0-9]*) HEAD_EPOCH=0 ;; esac
-if [ "$HEAD_EPOCH" -le 0 ]; then
-    # WHERE A DISABLED GUARD COSTS MOST, IT MUST NOT DISABLE ITSELF.
-    #
-    # Two situations produce a zero here and they are NOT the same:
-    #   * no git at all (a source tarball, a developer box without git) --
-    #     nothing can be done, warn loudly and continue;
-    #   * git IS present and we are demonstrably inside a repository, but the
-    #     timestamp still came back empty. That is broken, not absent, and it
-    #     is not hypothetical: a WSL shell cannot follow a Windows worktree's
-    #     `.git` file, so `git log` fails while `git` itself works fine. A guard
-    #     that shrugs at that is exactly the silent-disable it exists to prevent.
-    #
-    # In CI, or anywhere we can prove we are in a repo, a zero is FATAL.
-    in_repo=0
-    git rev-parse --git-dir >/dev/null 2>&1 && in_repo=1
-    if [ -n "${GITHUB_ACTIONS:-}${CI:-}" ] || [ "$in_repo" -eq 1 ]; then
+# The first version of this compared the binary against HEAD's commit time. That
+# is ONE-DIRECTIONAL and overclaimed: it catches "binary older than the commit",
+# but happily passes a binary built two hours ago from a DIFFERENT tree onto an
+# older-dated HEAD, and passes an UNCOMMITTED source edit entirely -- the case a
+# developer hits most. It also inherited the committer clock: a forward-skewed
+# timestamp on a push event marked every row STALE by 0h, and no rebuild could
+# clear it, because rebuilding cannot move a commit's date.
+#
+# Source mtime is the real dependency. A binary older than a file it is built
+# from is stale, whatever git thinks, and no clock but this filesystem's is
+# involved.
+SRC_REF=""
+if [ -d src ]; then
+    SRC_REF="$(find src Makefile -type f \( -name '*.cpp' -o -name '*.h' -o -name 'Makefile' \) \
+                 -printf '%T@\n' 2>/dev/null | sort -rn | head -1)"
+    SRC_REF="${SRC_REF%%.*}"
+fi
+case "${SRC_REF:-}" in (''|*[!0-9]*) SRC_REF=0 ;; esac
+if [ "$SRC_REF" -le 0 ]; then
+    # A guard with no reference is a guard that is off. Where that costs most,
+    # refuse rather than shrug -- this is the silent-disable the guard exists to
+    # prevent, turned on itself.
+    if [ -n "${GITHUB_ACTIONS:-}${CI:-}" ] || [ -d src ]; then
         echo "========================================================================"
-        echo "FATAL: the STALENESS GUARD could not read HEAD's commit time."
-        echo "  in-a-git-repo=${in_repo}  CI=${GITHUB_ACTIONS:-}${CI:-}"
-        echo "  Refusing to run: without a reference time every PASS below would be"
-        echo "  unverifiable, and an unverifiable PASS is what this guard exists to"
-        echo "  stop. Fix the checkout (a shallow clone still provides HEAD) rather"
-        echo "  than bypassing this."
+        echo "FATAL: the STALENESS GUARD could not determine a source reference time."
+        echo "  src/ present=$([ -d src ] && echo yes || echo no)  CI=${GITHUB_ACTIONS:-}${CI:-}"
+        echo "  Refusing to run: with no reference every PASS below would be"
+        echo "  unverifiable, and an unverifiable PASS is exactly what this guard"
+        echo "  exists to stop."
         echo "========================================================================"
         exit 2
     fi
-    echo "  WARNING: no git HEAD timestamp available -- the STALENESS GUARD IS OFF"
-    echo "           for this run. A PASS below does not prove the binaries match"
-    echo "           the source. (No git repository detected; in CI this is fatal.)"
+    echo "  WARNING: no source tree found -- the STALENESS GUARD IS OFF for this"
+    echo "           run. A PASS below does not prove the binaries match the source."
 fi
 
 echo "========================================================================"
@@ -288,12 +287,12 @@ while IFS='|' read -r tier suite timeout reason; do
     # A stale binary is NEVER a PASS. It is [STALE] and counted INCOMPLETE,
     # and it fails the run -- because "the gate did not actually execute" is
     # worse than a red, not better ([[lesson_absence_of_failure_is_not_evidence]]).
-    if [ "$HEAD_EPOCH" -gt 0 ]; then
+    if [ "$SRC_REF" -gt 0 ]; then
         bin_mtime="$(stat -c %Y "$bin" 2>/dev/null || stat -f %m "$bin" 2>/dev/null || echo 0)"
-        if [ "$bin_mtime" -gt 0 ] && [ "$bin_mtime" -lt "$HEAD_EPOCH" ]; then
-            age=$(( (HEAD_EPOCH - bin_mtime) / 3600 ))
-            printf '  [STALE     ] %-52s binary predates HEAD by %sh -- NOT RUN\n' "$suite" "$age"
-            RESULTS="${RESULTS}STALE|${suite}|0|binary older than HEAD commit by ${age}h -- rebuild before trusting any result\n"
+        if [ "$bin_mtime" -gt 0 ] && [ "$bin_mtime" -lt "$SRC_REF" ]; then
+            age=$(( (SRC_REF - bin_mtime) / 60 ))
+            printf '  [STALE     ] %-52s binary older than the newest source by %smin -- NOT RUN\n' "$suite" "$age"
+            RESULTS="${RESULTS}STALE|${suite}|0|binary predates the newest source by ${age}min -- rebuild before trusting any result\n"
             STALE=$((STALE + 1))
             FAILED=$((FAILED + 1))
             [ "$FAIL_FAST" -eq 1 ] && break
