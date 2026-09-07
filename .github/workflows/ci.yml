@@ -197,7 +197,11 @@ jobs:
 
         (
           sleep "$BUDGET"
-          if kill -0 "$TD_PID" 2>/dev/null; then
+          # PID-reuse guard (L-4). kill -0 alone would happily match a
+          # recycled PID on a busy runner and we would capture a stack of some
+          # unrelated process under an ::error:: saying test_dilithion hung.
+          # One comm check removes the ambiguity entirely.
+          if kill -0 "$TD_PID" 2>/dev/null              && [ "$(cat /proc/$TD_PID/comm 2>/dev/null)" = "test_dilithion" ]; then
             echo "::error::test_dilithion still alive after ${BUDGET}s - capturing stack before kill (intermittent hang)"
             {
               echo "=== test_dilithion hang, captured $(date -u +%FT%TZ) ==="
