@@ -65,8 +65,8 @@ void RequireEqual(const char* what, const uint256& got, const uint256& want)
 // assertion macro: this repo ships -DNDEBUG release builds (build-release.sh:62
 // passes it, and Makefile's `CXXFLAGS ?=` means an environment CXXFLAGS
 // replaces the default wholesale), under which every such assertion here would
-// compile to nothing and the suite would
-// print ALL PASS with its guards hollowed out -- including the single check
+// compile to nothing and the suite would print ALL PASS with its guards
+// hollowed out -- including the single check
 // standing between a silently-short census and a plausible wrong total.
 // Found by red-team round 2; the same reasoning as util/assert.h's Invariant().
 void RequireTrue(const char* what, bool ok)
@@ -199,28 +199,63 @@ void test_chainparams_carry_the_measured_values()
     std::cout << " OK" << std::endl;
 }
 
-void test_thresholds_sit_below_measured_tip_work()
+void test_thresholds_are_nonzero_and_dilv_margin_is_re_derived()
 {
-    std::cout << "  test_thresholds_sit_below_measured_tip_work..." << std::flush;
+    std::cout << "  test_thresholds_are_nonzero_and_dilv_margin_is_re_derived..." << std::flush;
     using namespace dilithion::consensus;
     using Dilithion::ChainParams;
 
     // A threshold at or above the live tip work would reject the real chain and
-    // brick IBD. These bounds are the tip chain work measured when the values
-    // were derived (DIL height 94,221 over seed RPC; DilV height 255,027 from a
-    // block-database walk), so the assertion is that each threshold is strictly
-    // below the work its own chain had already accumulated.
-    const uint256 dil_tip_work  = uint256S(
-        "0000000000000000000000000000000000000000000382e20fa3c40eaa90d100");
-    const uint256 dilv_tip_work = uint256S(
-        "000000000000000000000000000000000000000003e437e437e437e434000000");
+    // brick IBD -- so this test asserted "threshold < tip work" against two
+    // hardcoded tip literals.
+    //
+    // ⚠️ BOTH LITERALS ARE DELETED, and the assertion they backed is replaced,
+    // because red-team round 2 was right that they were unverifiable -- and
+    // looking at WHY, the assertion itself was hollow:
+    //
+    //   Chain work is a CUMULATIVE SUM over blocks, and every block contributes
+    //   strictly positive work (ComputeChainWork returns 0 only for a mantissa
+    //   the census gate now rejects). So work is STRICTLY INCREASING in height.
+    //   Each threshold is by construction the work at a CHECKPOINT height that
+    //   is BELOW its chain's tip -- DIL 54,000 vs tip 94,221; DilV 67,000 vs tip
+    //   255,027. "Threshold < tip work" is therefore true by construction and
+    //   cannot fail, whatever the literals say. It was ceremony: a green
+    //   assertion that could never go red, backed by a number nobody could
+    //   check. dil_tip_work in particular came from a relayed RPC read with an
+    //   elided prefix and was verifiable by no one.
+    //
+    // What is asserted instead is the property that CAN fail and that the
+    // literals were a proxy for: each threshold is the work at its own
+    // checkpoint height, on the same chain, strictly above zero. The DIL half is
+    // proven against the committed census in the test above; the DilV half is
+    // re-derived here, from its own measured tip height, with no literal.
+    //
+    // The live tip figures are recorded where they belong -- as provenance, in
+    // missions/lp10-headerssync-wiring/PROVENANCE_dil_nbits_dump.md -- not as
+    // assertions pretending to be checks.
 
-    REQUIRE(!ChainWorkGreaterOrEqual(ChainParams::Mainnet().nMinimumChainWork, dil_tip_work));
-    REQUIRE(!ChainWorkGreaterOrEqual(ChainParams::DilV().nMinimumChainWork,    dilv_tip_work));
-
-    // ...and strictly above zero, or the gate is a no-op even once wired.
+    // Strictly above zero, or the gate is a no-op even once wired. This one CAN
+    // fail: it is what catches a value being reset to uint256() in a merge.
     REQUIRE(ChainWorkGreaterOrEqual(ChainParams::Mainnet().nMinimumChainWork, uint256S("1")));
     REQUIRE(ChainWorkGreaterOrEqual(ChainParams::DilV().nMinimumChainWork,    uint256S("1")));
+
+    // DilV: re-derive the tip work rather than quote it. DilV's nBits is
+    // 0x1d00ffff on all 255,028 canonical blocks (measured), so the tip work is
+    // exactly (tipHeight + 1) contributions -- no literal, and it fails if
+    // either the formula or the threshold changes.
+    const int kDilvTipHeight = 255027;  // measured from a DilV block-database walk
+    uint256 dilv_tip_derived;
+    for (int h = 0; h <= kDilvTipHeight; ++h)
+        dilv_tip_derived = AddChainWork(dilv_tip_derived, ComputeChainWork(0x1d00ffff));
+    REQUIRE(!ChainWorkGreaterOrEqual(ChainParams::DilV().nMinimumChainWork, dilv_tip_derived));
+
+    // ...and the margin is real, not marginal: the DilV tip carries strictly
+    // more than 3x the threshold. This is the assertion that would actually
+    // notice the threshold creeping up toward the tip.
+    uint256 three_x = ChainParams::DilV().nMinimumChainWork;
+    three_x = AddChainWork(three_x, ChainParams::DilV().nMinimumChainWork);
+    three_x = AddChainWork(three_x, ChainParams::DilV().nMinimumChainWork);
+    REQUIRE(ChainWorkGreaterOrEqual(dilv_tip_derived, three_x));
     std::cout << " OK" << std::endl;
 }
 
@@ -234,7 +269,7 @@ int main()
     test_dilv_constant_is_re_derived_not_just_restated();
     test_dil_constant_is_re_derived_from_the_committed_census();
     test_chainparams_carry_the_measured_values();
-    test_thresholds_sit_below_measured_tip_work();
+    test_thresholds_are_nonzero_and_dilv_margin_is_re_derived();
     std::cout << "minimum_chain_work_kat_tests: ALL PASS" << std::endl;
     return 0;
 }
