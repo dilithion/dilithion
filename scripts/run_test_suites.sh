@@ -232,7 +232,28 @@ while IFS='|' read -r tier suite timeout reason; do
     if [ "$rc" -eq 0 ]; then
         printf '  [PASS      ] %-52s %4ds\n' "$suite" "$elapsed"
         RESULTS="${RESULTS}PASS|${suite}|${elapsed}|\n"
-    elif [ "$rc" -eq 124 ] || [ "$rc" -eq 137 ]; then
+    # 143 is the one that actually happens here, and its absence meant EVERY
+    # HANG WAS REPORTED AS A TEST FAILURE.
+    #
+    # `timeout --preserve-status` (line ~207) deliberately returns the command's
+    # signal-derived status instead of timeout's own 124 — that is what the flag
+    # is for. A SIGTERM'd child is 128+15 = 143, so the common timeout never
+    # matched this branch and fell through to [FAIL] with "exit 143". Measured on
+    # this machine rather than read from the man page:
+    #
+    #   timeout --preserve-status -k 10 1 sleep 30   -> 143   (SIGTERM honoured)
+    #   timeout -k 10 1 sleep 30                     -> 124   (no --preserve-status)
+    #   ... with SIGTERM trapped and ignored         -> 137   (SIGKILL after -k)
+    #
+    # Why it matters beyond the label: a hang and a genuine assertion failure have
+    # completely different causes, and the RESULTS row drives the summary. Every
+    # TIMEOUT row was being emitted as FAIL|...|exit 143, so a suite that hung
+    # looked like a suite whose tests broke, and the TIMEOUT count was structurally
+    # always zero.
+    #
+    # 124 is currently unreachable while --preserve-status is set; it is kept so
+    # that removing that flag does not silently re-open the same hole in reverse.
+    elif [ "$rc" -eq 124 ] || [ "$rc" -eq 137 ] || [ "$rc" -eq 143 ]; then
         printf '  [TIMEOUT   ] %-52s %4ds  (limit %ss)\n' "$suite" "$elapsed" "$timeout"
         RESULTS="${RESULTS}TIMEOUT|${suite}|${elapsed}|exceeded ${timeout}s\n"
         FAILED=$((FAILED + 1))
