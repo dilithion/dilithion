@@ -14,7 +14,7 @@
 # treats it as the COMMAND and every run exits 126 ("Permission denied"),
 # which tallies as 20/20 FAIL and looks exactly like a real result.
 # Classification: 124/137/143 = TIMEOUT (hang), anything else non-zero = FAIL.
-# NOTE, and this is a live gap rather than a footnote: run_test_suites.sh:235
+# NOTE, and this is a live gap rather than a footnote: run_test_suites.sh:259
 # currently matches only 124 and 137, NOT 143 -- so a suite killed by SIGTERM
 # under `timeout --preserve-status` is filed by the gate as [FAIL], not
 # [TIMEOUT]. PR #180 adds 143 and is still an open draft at time of writing.
