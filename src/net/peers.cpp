@@ -1115,6 +1115,22 @@ bool CPeerManager::EvictPeersIfNeeded() {
             // exists) is already taken; the peer may be gone by the time
             // RemovePeer runs, in which case it is a no-op. That staleness is
             // the same trade the accept path accepts.
+            // ⚠️ PREMISE THIS UNLOCK DEPENDS ON, written out because it is
+            // load-bearing and invisible (port-review Q2).
+            //
+            // cs_peers is a RECURSIVE mutex. unlock() decrements the count by
+            // ONE. If a caller of EvictPeersIfNeeded already held cs_peers in an
+            // outer frame, this unlock would NOT release it, the dispatch below
+            // would still run inside cs_peers, and the comment above would be
+            // asserting the opposite of the truth — silently, with no test red.
+            //
+            // It is safe because BOTH callers hold nothing:
+            //   peers.cpp:1135   PeriodicMaintenance      (the live route)
+            //   connman.cpp:487  AcceptConnection         (dead code — zero callers)
+            // Verified at source. If a third caller appears, or either of those
+            // gains an outer cs_peers, THIS UNLOCK STOPS WORKING and the cycle
+            // returns. The sibling construct TipNotifyDrain (chain.h) writes its
+            // equivalent premise out the same way, for the same reason.
             lock.unlock();
             if (g_node_context.connman) {
                 g_node_context.connman->DispatchPeerDisconnected(peer_to_evict);
@@ -1748,9 +1764,19 @@ void CPeerManager::OnPeerDisconnected(int peer_id)
     // (never reused, connman m_next_node_id), so on a long-running seed serving
     // IBD to churning peers the maps grew unbounded = slow memory-exhaustion DoS.
     // Wiring it here releases that state on EVERY disconnect.
-    // Lock-order safety (F-009 BLOCKER-1): this runs under the eviction/disconnect
-    // locks (cs_vNodes and/or cs_peers — e.g. EvictPeersIfNeeded holds cs_peers
-    // across DispatchPeerDisconnected). CleanupPeerRateLimitState takes only the
+    // Lock-order safety (F-009 BLOCKER-1).
+    //
+    // ⚠️ CORRECTED BY P2P-14/15 (port-review N12). This used to read "this runs
+    // under the eviction/disconnect locks (cs_vNodes and/or cs_peers — e.g.
+    // EvictPeersIfNeeded holds cs_peers across DispatchPeerDisconnected)".
+    // BOTH halves are now false: DisconnectNodes dispatches after releasing
+    // cs_vNodes, and EvictPeersIfNeeded releases cs_peers before dispatching.
+    // The stale text mattered — I cited it as evidence that the edge was live
+    // while it was describing the pre-fix tree.
+    //
+    // The F-009 reasoning below still stands on its own terms: it only requires
+    // that the rate-limit mutexes sit LAST, which they do whether or not an
+    // outer net lock is held. CleanupPeerRateLimitState takes only the
     // rate-limit mutexes, which sit LAST in the global order
     // (cs_vNodes → cs_peers → {rate-limit mutexes}). This is safe ONLY because the
     // invariant "never call Misbehaving / acquire cs_peers while holding a rate-limit

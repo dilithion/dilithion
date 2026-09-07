@@ -85,6 +85,27 @@ registrant's body.**
 is complete for `{cs_vNodes, cs_peers, cs_main}` by the privacy argument in §1 plus the enumeration
 in §4.
 
+## 6b. ⚠️ CORRECTION — one entry point in this census is DEAD CODE
+
+Final-head red-team, verified independently: **`CConnman::AcceptConnection` has ZERO callers** in the
+whole tree — no production call site, no test. Only the declaration (`connman.h:130`), its own log
+strings, two comments, and a deprecated doc reference (`peers.cpp:1768`). The tree already said so at
+`connman.cpp:1327`: *"it has NO production caller — every real inbound is accepted here in
+SocketHandler"*.
+
+**What that changes:** the branch's earlier rationale called `connman.cpp:447` "the SECOND live
+forward edge". The cycle it described was real; the **entry point was not live**. The genuinely live
+route into `EvictPeersIfNeeded` is `peers.cpp:1135` (PeriodicMaintenance), and the inversion on that
+route is closed inside `EvictPeersIfNeeded` itself, where `cs_peers` is now released before the
+fallback dispatch.
+
+**What it does not change:** this census's §4 count. `connman.cpp` was already recorded as *"4
+comments — zero live calls"*, which is consistent. The dead entry point never contributed an edge.
+
+**Why it is recorded rather than quietly dropped:** an "unreachable today" verdict is exactly the
+kind of thing that silently becomes reachable. The `AcceptConnection` fix is kept as defence in
+depth, and this note exists so nobody cites it as the fix that closed the cycle.
+
 ## 7. BOUNDARY — what this census does NOT cover
 
 Stated because a census that overstates its scope is exactly the failure it exists to correct.

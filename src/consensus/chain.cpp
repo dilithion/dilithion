@@ -2137,11 +2137,27 @@ bool CChainState::DisconnectTip(CBlockIndex* pindex, bool force_skip_utxo) {
     }
 
     // BUG #56 FIX: Notify block disconnect callbacks (wallet update)
-    // NOTE: cs_main is NOT held during these callbacks. The cs_main scope
-    // ends at line ~1425 above ("cs_main released here"); the disconnect
-    // callbacks fire afterwards. (Compare with ConnectTip, where cs_main
-    // IS held during its callbacks -- see line ~1283.) The wallet has its
-    // own lock (cs_wallet).
+    //
+    // ⚠️ CORRECTED BY P2P-14/15 (port-review L6/M1). This used to assert
+    // "cs_main is NOT held during these callbacks", reasoning that an inner
+    // cs_main scope had ended above. THAT IS FALSE ON THE REORG PATH:
+    //
+    //   cs_main is a RECURSIVE mutex. DisconnectTip is called from
+    //   ActivateBestChain (chain.cpp:777, :1087, :1176, :1249), which holds
+    //   cs_main at FUNCTION scope. An inner scope ending decrements the
+    //   recursion count; it does not release the mutex while an outer frame
+    //   holds it. So on every reorg these callbacks fire WITH cs_main HELD.
+    //
+    // This is the third instance of the same recursive-mutex mis-reasoning
+    // found in this blast radius, and it is the exact shape of the defect
+    // P2P-14/15 fixed for the TIP callback — a consumer that takes its own
+    // lock here creates a cs_main → <consumer lock> edge.
+    //
+    // The behaviour is NOT changed here: rerouting the block connect/disconnect
+    // callback families through a deferred drain is a separate contract with
+    // its own consumers (wallet, txindex, coinstatsindex, ZMQ) to audit. Only
+    // the false claim is removed, so nobody builds on it. The wallet's own
+    // cs_wallet does not make the ordering safe — it is what would deadlock.
     for (size_t i = 0; i < m_blockDisconnectCallbacks.size(); ++i) {
         try {
             m_blockDisconnectCallbacks[i](block, disconnectHeight, disconnectHash);

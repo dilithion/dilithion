@@ -444,11 +444,26 @@ bool CConnman::AcceptConnection(std::unique_ptr<CSocket> socket, const NetProtoc
 
     // Check connection limits.
     //
-    // P2P-14/15: EvictPeersIfNeeded() is called with cs_vNodes RELEASED. It used
-    // to be called inside the scope below, and that was the SECOND live forward
-    // edge of the cs_headers cycles — the one that survived the DisconnectNodes
-    // fix, and that a per-file scope analysis of connman.cpp could not see
-    // because the path leaves the file:
+    // P2P-14/15: EvictPeersIfNeeded() is called with cs_vNodes RELEASED.
+    //
+    // ⚠️ CORRECTED CLAIM (final-head red-team). An earlier version of this
+    // comment called this "the SECOND live forward edge … that survived the
+    // DisconnectNodes fix". **That was wrong about liveness: AcceptConnection
+    // has ZERO callers in the entire tree** — no production call site, no test.
+    // The comment at connman.cpp:1325-1331 says so explicitly, and I quoted its
+    // neighbouring lines while making the opposite claim.
+    //
+    // The cycle it describes was real; the entry point was not. The LIVE route
+    // into EvictPeersIfNeeded is peers.cpp:1135 (PeriodicMaintenance), and the
+    // inversion on that route is closed inside EvictPeersIfNeeded itself, where
+    // cs_peers is now released before the fallback dispatch.
+    //
+    // This change is therefore DEFENCE IN DEPTH on a currently-unreachable
+    // function, not the load-bearing fix. Kept because if AcceptConnection ever
+    // gains a caller it must not reintroduce the inversion — but do not cite it
+    // as the fix that closed the cycle.
+    //
+    // The shape it guards against, for whoever revives this function:
     //
     //     connman.cpp:447           lock_guard(cs_vNodes)              HELD
     //       -> EvictPeersIfNeeded
@@ -1847,13 +1862,17 @@ void CConnman::DisconnectNodes() {
             // BUG #262: before RemoveNode.
             DispatchPeerDisconnected(node_id);
         } catch (const std::exception& e) {
-            std::cerr << "[CConnman] DispatchPeerDisconnected threw for node "
-                      << node_id << ": " << e.what()
-                      << " — continuing teardown so node_refs cannot dangle" << std::endl;
+            // Port-review N10: LogPrintf, not std::cerr. DisconnectNodes runs on
+            // the ~20 Hz reaper loop and the rest of this function already uses
+            // categorised LogPrintf(NET, …); raw unthrottled stderr on a hot loop
+            // is a log-flood vector as well as an inconsistency.
+            LogPrintf(NET, ERROR,
+                      "[CConnman] DispatchPeerDisconnected threw for node %d: %s — continuing "
+                      "teardown so node_refs cannot dangle\n", node_id, e.what());
         } catch (...) {
-            std::cerr << "[CConnman] DispatchPeerDisconnected threw (unknown) for node "
-                      << node_id << " — continuing teardown so node_refs cannot dangle"
-                      << std::endl;
+            LogPrintf(NET, ERROR,
+                      "[CConnman] DispatchPeerDisconnected threw (unknown) for node %d — "
+                      "continuing teardown so node_refs cannot dangle\n", node_id);
         }
 
         // BUG #153: MUST happen before the CNode dies (it dies when `detached`
@@ -1870,18 +1889,31 @@ void CConnman::DisconnectNodes() {
             // instead. A leaked node is strictly better than a freed one that
             // node_refs may still point at and hand to Misbehaving /
             // PeriodicMaintenance / GetConnectionCount.
-            std::cerr << "[CConnman] RemoveNode threw for node " << node_id
-                      << " — node_refs may still hold this id; LEAKING the CNode "
-                         "rather than freeing one that may still be referenced"
-                      << std::endl;
+            LogPrintf(NET, ERROR,
+                      "[CConnman] RemoveNode threw for node %d — node_refs may still hold this id; "
+                      "closing its socket and LEAKING the CNode rather than freeing one that may "
+                      "still be referenced\n", node_id);
+            // Port-review N11: close the socket BEFORE leaking the object.
+            // An earlier version did `release(); continue;` and skipped this,
+            // which leaked the file descriptor AND the connection slot along
+            // with the node — the fd would never be reclaimed and the accept
+            // caps would count a peer that no longer exists. Upstream closes
+            // the socket on the reaping path for exactly this reason. Leaking
+            // the CNode is the deliberate trade (see above); leaking the fd is
+            // not, and was not intended.
+            try {
+                node->CloseSocket();
+            } catch (...) {
+                LogPrintf(NET, ERROR, "[CConnman] CloseSocket also threw for node %d\n", node_id);
+            }
             (void)node.release();
-            continue;  // skip CloseSocket: the object is no longer ours to touch
+            continue;  // object deliberately leaked; do not touch it again
         }
 
         try {
             node->CloseSocket();
         } catch (...) {
-            std::cerr << "[CConnman] CloseSocket threw for node " << node_id << std::endl;
+            LogPrintf(NET, ERROR, "[CConnman] CloseSocket threw for node %d\n", node_id);
         }
     }
     // `detached` unwinds here — CNodes destroyed after RemoveNode. BUG #148/#153
