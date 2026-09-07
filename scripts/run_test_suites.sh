@@ -76,6 +76,30 @@ set -u
 # before their sources were touched and both after. COUNTED, not derived: the
 # fast tier is now 41 rows, 37 of them live (4 quarantined). The "32/32 in 72s"
 # figure above is the 2026-08-10 measurement and is no longer the current count.
+#
+# QUARANTINE LIFTED 2026-09-07: rpc_tests. Measured on Linux (WSL Ubuntu-24.04,
+# which is the platform every `runs-on:` in ci.yml uses), N=20 with the
+# exit-code histogram, using scripts/measure_suite_stability.sh:
+#     BEFORE  PASS=0  FAIL=20  HANG=0   histogram: 1 x20
+#     AFTER   PASS=20 FAIL=0   HANG=0   histogram: 0 x20
+# A DETERMINISTIC failure, not a hang -- which is why the quarantine was lifted
+# rather than its timeout raised. The stated reason was accurate but incomplete:
+# it named the auth/permissions init, and fixing that revealed two further real
+# requirements the never-starting server had hidden (the X-Dilithion-RPC CSRF
+# header, then HTTP Basic credentials). The quarantine was covering three
+# defects, not one.
+#
+# integration_tests was NOT quarantined and needs its own note, because its exit
+# code cannot show what changed: it exited 0 BEFORE and 0 AFTER. It had been
+# passing while its RPC server never started once -- Start() failed, the test
+# printed "may be port conflict or system limitation" and returned true. Proven
+# by MUTATION rather than by exit code: with the permissions init removed the
+# suite now exits 1 (mutant dies), so the fix is load-bearing.
+#
+# Negative controls were added at the same time and are the reason the lift is
+# worth anything: before them, deleting the CSRF check in server.cpp left every
+# suite in this roster green. Verified load-bearing by disabling that gate --
+# rpc_tests exits 1 -- and restored.
 ROSTER='
 fast|rpc_auth_tests|120|
 fast|rpc_host_header_tests|60|

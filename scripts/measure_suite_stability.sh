@@ -31,13 +31,15 @@ TMO="${TMO:-60}"
 
 pass=0; fail=0; hang=0
 first_bad=""
+RUNDIR="$(mktemp -d)"   # per-invocation: the header invites running this twice
+trap 'rm -rf "$RUNDIR"' EXIT
 declare -A codes
 for i in $(seq 1 "$N"); do
-  timeout --preserve-status -k 5 "$TMO" "$BIN" >"/tmp/rpcrun_$i.out" 2>&1
+  timeout --preserve-status -k 5 "$TMO" "$BIN" >"$RUNDIR/run_$i.out" 2>&1
   rc=$?
   codes[$rc]=$(( ${codes[$rc]:-0} + 1 ))
   if [ "$rc" -eq 0 ]; then pass=$((pass+1))
-  elif [ "$rc" -eq 124 ] || [ "$rc" -eq 137 ] || [ "$rc" -eq 143 ]; then hang=$((hang+1))
+  elif [ "$rc" -eq 124 ] || [ "$rc" -eq 137 ] || [ "$rc" -eq 143 ]; then hang=$((hang+1)); [ -z "$first_bad" ] && first_bad="$i"
   else fail=$((fail+1)); [ -z "$first_bad" ] && first_bad="$i"; fi
 done
 
@@ -49,4 +51,4 @@ echo
 # the one run you do not need.
 show="${first_bad:-1}"
 echo "--- tail of run ${show} ---"
-tail -12 "/tmp/rpcrun_${show}.out"
+tail -12 "$RUNDIR/run_${show}.out"

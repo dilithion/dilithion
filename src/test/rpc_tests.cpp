@@ -117,7 +117,12 @@ string SendRPCRequest(uint16_t port, const string& method, const string& params 
             int n = recv(sock, buffer, sizeof(buffer) - 1, 0);
             if (n <= 0) break;
             response.append(buffer, static_cast<size_t>(n));
-            if (n < static_cast<int>(sizeof(buffer) - 1)) break;
+            // NO "stop when the buffer wasn't filled" break here. That would be
+            // the one construct in this loop that can still truncate -- any
+            // response delivered in >=2 segments where an intermediate recv
+            // returns short. The plain drain terminates because every server
+            // response carries Connection: close and the server does one send()
+            // then shutdown()+close (server.cpp:978-981), so recv returns 0.
         }
     }
     closesocket(sock);
@@ -159,9 +164,18 @@ static bool PrepareServer(CRPCServer& server, const std::string& tag) {
     // and returns without installing the legacy credentials, so a stale or
     // planted file turns every request into a 401 and reds the suite
     // deterministically, with a log that cheerfully says "Loaded N users".
+    // Windows has no ::getpid here -- this file includes <winsock2.h> under
+    // _WIN32 and <unistd.h> only in the #else branch, so the naive call would
+    // not compile on the very platform the roster's evidence was gathered on.
+    // Mirrors util/pidfile.cpp:199-205.
+#ifdef _WIN32
+    const long pid_for_path = static_cast<long>(GetCurrentProcessId());
+#else
+    const long pid_for_path = static_cast<long>(getpid());
+#endif
     const std::string perms =
         (std::filesystem::temp_directory_path()
-         / ("dil_rpc_perms_" + tag + "_" + std::to_string(static_cast<long>(::getpid())) + ".json")).string();
+         / ("dil_rpc_perms_" + tag + "_" + std::to_string(pid_for_path) + ".json")).string();
     std::error_code perms_ec;
     std::filesystem::remove(perms, perms_ec);
     if (!server.InitializePermissions(perms, kTestRpcUser, kTestRpcPass)) {
@@ -321,8 +335,19 @@ bool TestWalletRPCs() {
     cout << "  ✓ getnewaddress works" << endl;
 
     // Test getbalance
+    // find("0") was satisfied by the "2.0" in the {"jsonrpc":"2.0",...} envelope
+    // that every response carries (server.cpp:2638), so the balance half of this
+    // assertion was tautological and the printed "(balance: 0)" was a hard-coded
+    // claim rather than a measured one. Assert the literal result instead.
     response = SendRPCRequest(18333, "getbalance");
-    if (response.find("result") == string::npos || response.find("0") == string::npos) {
+    // Assert the actual field, verified against the real response:
+    //   {"jsonrpc":"2.0","result":{"balance":0.00000000,...},"id":1}
+    // NOT "result":0 (the result is an object, not a scalar) and NOT
+    // find("0"), which the "2.0" in every envelope satisfies regardless of the
+    // balance -- that was the tautology this replaces. Matching on the bare
+    // "balance":0 prefix would also accept "balance":0.5, so match the full
+    // zero literal the server emits.
+    if (response.find("\"balance\":0.00000000") == string::npos) {
         cout << "  ✗ getbalance failed" << endl;
         cout << "  Response: " << response << endl;
         server.Stop();

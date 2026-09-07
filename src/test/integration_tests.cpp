@@ -34,6 +34,14 @@
 #include <vector>
 #include <filesystem>
 
+// Needed by UniqueTempPath below. This file previously had no platform include
+// block at all, so the process-id call has to bring its own.
+#ifdef _WIN32
+    #include <windows.h>
+#else
+    #include <unistd.h>
+#endif
+
 using namespace std;
 
 // MEM-MED-001 FIX: Replace system() with std::filesystem for safe directory operations
@@ -48,6 +56,26 @@ void CleanupTestDir(const string& path) {
 void CreateTestDir(const string& path) {
     std::error_code ec;
     std::filesystem::create_directories(path, ec);
+}
+
+// Per-invocation temp paths. This is the THIRD consecutive review round in
+// which a principle landed in rpc_tests.cpp and not in its twin here, so it is
+// being applied to both files at once rather than a third time to one. A fixed
+// /tmp path is a greenness gate held by anyone who can write /tmp:
+// InitializePermissions -> LoadFromFile succeeds if the file merely EXISTS and
+// returns without installing the credentials.
+static std::string UniqueTempPath(const std::string& stem) {
+#ifdef _WIN32
+    const long pid = static_cast<long>(GetCurrentProcessId());
+#else
+    const long pid = static_cast<long>(getpid());
+#endif
+    const std::string p =
+        (std::filesystem::temp_directory_path()
+         / (stem + "_" + std::to_string(pid) + ".json")).string();
+    std::error_code ec;
+    std::filesystem::remove(p, ec);
+    return p;
 }
 
 bool TestBlockchainAndMempool() {
@@ -229,8 +257,7 @@ bool TestRPCIntegration() {
         cout << "  ✗ RPCAuth::InitializeAuth failed" << endl;
         return false;
     }
-    const std::string perms_path =
-        (std::filesystem::temp_directory_path() / "dil_integration_rpc_perms.json").string();
+    const std::string perms_path = UniqueTempPath("dil_integration_rpc_perms");
     if (!server.InitializePermissions(perms_path, "testuser", "testpassword123")) {
         cout << "  ✗ InitializePermissions failed (" << perms_path << ")" << endl;
         return false;
@@ -449,8 +476,7 @@ bool TestFullNodeStack() {
         // check and tripped the permissions check instead
         // ("Start() called before InitializePermissions()"). Both were reported
         // as "not critical", so neither ever surfaced.
-        const std::string stack_perms =
-            (std::filesystem::temp_directory_path() / "dil_integration_stack_perms.json").string();
+        const std::string stack_perms = UniqueTempPath("dil_integration_stack_perms");
         if (!RPCAuth::IsAuthConfigured() &&
             !RPCAuth::InitializeAuth("testuser", "testpassword123")) {
             cout << "  ✗ RPCAuth::InitializeAuth failed" << endl;
