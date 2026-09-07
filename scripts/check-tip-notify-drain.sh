@@ -83,8 +83,46 @@ if grep -q "using TipUpdateCallback = std::function<void(const CBlockIndex\*)>" 
     fail=1
 fi
 
+# 5. THE CENSUS PREMISE: the three locks must stay PRIVATE with no friends.
+#
+#    docs/p2p14-lock-inversion/CENSUS_cs_headers_edges.md argues that every edge
+#    into cs_headers is accounted for, and that argument is "complete by
+#    construction" ONLY because cs_vNodes, cs_peers and cs_main are private
+#    members with zero friend declarations — so only connman.cpp, peers.cpp and
+#    chain.cpp can hold them, and no other translation unit can create an
+#    inverted edge.
+#
+#    Add a `friend` or a public accessor returning one of these mutexes and the
+#    census silently stops being complete: any TU could then hold the lock and
+#    reach cs_headers, and nothing else in this repo would notice. That is the
+#    failure this check exists for — the premise is load-bearing and invisible.
+for hdr in src/net/connman.h src/net/peers.h src/consensus/chain.h; do
+    if [ ! -f "$hdr" ]; then
+        echo "FAIL: $hdr missing — census premise cannot be checked"
+        fail=1
+        continue
+    fi
+    if grep -qE '^\s*friend\b' "$hdr"; then
+        echo "FAIL: $hdr introduces a 'friend' declaration."
+        echo "      The cs_headers edge census is 'complete by construction' ONLY while"
+        echo "      cs_vNodes / cs_peers / cs_main are unreachable outside their own class."
+        echo "      A friend breaks that premise — re-run the census before proceeding."
+        echo "      See docs/p2p14-lock-inversion/CENSUS_cs_headers_edges.md §1."
+        fail=1
+    fi
+done
+
+# A public accessor handing out one of the mutexes breaks the premise the same way.
+if grep -nE '(std::)?(recursive_)?mutex\s*&\s*[A-Za-z_]+\s*\(' \
+        src/net/connman.h src/net/peers.h src/consensus/chain.h 2>/dev/null; then
+    echo "FAIL: a header above appears to expose a mutex by reference."
+    echo "      Same premise break as a friend declaration — see CENSUS §1."
+    fail=1
+fi
+
 if [ "$fail" -eq 0 ]; then
     echo "PASS: tip-notification drain invariant holds"
+    echo "  - census premise intact: cs_vNodes / cs_peers / cs_main private, no friends, not exposed"
     echo "  - NotifyTipUpdate confined to chain.cpp"
     echo "  - exactly one TipNotifyDrain, declared before the cs_main guard"
     echo "  - TipUpdateCallback passes values, not a CBlockIndex*"
