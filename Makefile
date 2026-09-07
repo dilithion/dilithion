@@ -909,6 +909,11 @@ chain_work_smoke_tests: $(CORE_OBJECTS) $(OBJ_DIR)/test/chain_work_smoke_tests.o
 	@$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS) $(LIBS)
 	@echo "$(COLOR_GREEN)✓ chain_work_smoke_tests built successfully$(COLOR_RESET)"
 
+chainstate_pointer_race_tests: $(CORE_OBJECTS) $(OBJ_DIR)/test/chainstate_pointer_race_tests.o $(DILITHIUM_OBJECTS) $(CHIAVDF_OBJECTS)
+	@echo "$(COLOR_BLUE)[LINK]$(COLOR_RESET) $@"
+	@$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS) $(LIBS)
+	@echo "$(COLOR_GREEN)$@ built$(COLOR_RESET)"
+
 # v4.3.2 M1 fix: regression suite for LDN canary 2026-05-04. Verifies the
 # auto_rebuild marker is reliably written under both --usenewpeerman=0 and
 # --usenewpeerman=1 sync-coordinator configurations. See
