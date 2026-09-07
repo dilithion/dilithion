@@ -213,6 +213,24 @@ case "$out" in
 esac
 
 echo
+echo "== WHITESPACE must not decide whether a row has ARGS =="
+# dilithion-7b flagged the shape while adding the ARGS field to two rows.
+# `fast|x|60||` with a trailing SPACE parses to args=" ", which is non-empty --
+# so a LIVE row gets rejected for carrying ARGS it does not have, and a
+# partial: row gets accepted as having a selection it does not have. The second
+# is the dangerous one: it reports PASS on a scope nobody declared.
+out="$(drive 0 'fast|fake_suite|60||   ')"
+case "$out" in
+  *"RUNNER_EXIT=0"*) chk "a live row with trailing whitespace is still live" yes yes ;;
+  *) fail "whitespace after the last pipe rejected a valid live row" "$out" ;;
+esac
+out="$(drive 0 'fast|fake_suite|60|partial: only scenario_1|   ')"
+case "$out" in
+  *"RUNNER_EXIT=0"*) fail "a partial: row whose ARGS are only whitespace was accepted" "$out" ;;
+  *)                 chk "a partial: row with whitespace-only ARGS is fatal" yes yes ;;
+esac
+
+echo
 echo "== no regression: plain quarantine and plain live rows are unchanged =="
 out="$(drive 0 'fast|fake_suite|60|UNTRIAGED: broken|' 'fast|other_suite|60||')"
 case "$out" in

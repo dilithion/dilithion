@@ -261,6 +261,19 @@ validate_roster() {
         IFS='|' read -r tier suite timeout reason args <<EOF
 $line
 EOF
+        # Trim ARGS. `fast|x|60||` with a trailing SPACE parses to args=" ",
+        # which is non-empty, so a live row would be rejected for carrying ARGS
+        # it does not have -- and a partial: row would be accepted as having a
+        # selection it does not have. dilithion-7b flagged the shape while
+        # adding the field to two rows. Whitespace must not decide either
+        # answer.
+        case "$args" in
+            *[![:space:]]*)
+                args="${args#"${args%%[![:space:]]*}"}"
+                args="${args%"${args##*[![:space:]]}"}"
+                ;;
+            *) args="" ;;
+        esac
         case "$tier" in
             fast|full) ;;
             *) echo "ROSTER ERROR: $suite has unknown tier '$tier' (expected fast or full)" >&2; errs=$((errs + 1)) ;;
@@ -394,6 +407,16 @@ while IFS='|' read -r tier suite timeout reason args; do
     # ARGS is word-split deliberately: passed as one quoted string a suite sees
     # a single unparseable argv[1], exits non-zero on an unknown selector, and
     # the roster bug reads as a suite failure.
+    # Same whitespace normalisation the validator applies, so the run loop and
+    # the validator can never disagree about whether a row has ARGS.
+    case "${args:-}" in
+        *[![:space:]]*)
+            args="${args#"${args%%[![:space:]]*}"}"
+            args="${args%"${args##*[![:space:]]}"}"
+            ;;
+        *) args="" ;;
+    esac
+
     args_arr=()
     if [ -n "${args:-}" ]; then
         read -r -a args_arr <<EOF
