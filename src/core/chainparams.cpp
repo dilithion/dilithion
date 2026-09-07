@@ -106,7 +106,40 @@ ChainParams ChainParams::Mainnet() {
     // CHeadersManager). A non-zero value can be set in a follow-up after
     // smoke-testing that a fresh node successfully clears the threshold
     // against a live seed. Q7 plan recommendation deferred to Phase 4.
-    params.nMinimumChainWork = uint256();
+    //
+    // LP-10 (2026-09-07), PROPOSED — NOT YET RATIFIED BY A DECISION ROW.
+    // Measured chain work at DIL's most recent checkpoint, height 54000
+    // (hash 0000000bb44c964b4e3c6fec8c15941738cd74b434bafbfe4aadce898140b993,
+    // see checkpoints below). Derived by summing ComputeChainWork(nBits) over
+    // heights 0..54000 from a read-only seed dump, through the SAME production
+    // helpers the node uses (consensus/chain_work.h), never by reading
+    // nChainWork back from storage -- the block index does not serialize that
+    // field, so a read-back yields a zero meaning "not stored".
+    // Controls: checkpoint hash matched; sum verified strictly below the tip
+    // chain work reported by two seeds; a mutated nBits moved the sum.
+    // Margin: tip work is 1.38x this value, so the gate rejects a header chain
+    // claiming less than ~73% of current chain work. DIL retargets on roughly
+    // half of all blocks (25,992 distinct nBits over 54,001), so this is a
+    // genuine cumulative-work threshold.
+    //
+    // ⚠️ UNITS: NEVER copy a value from a Bitcoin Core chainparams file into
+    // this field. ComputeChainWork here yields 2^(320-8*size)/mantissa; Core
+    // yields 2^(280-8*size)/mantissa. Our work unit is 2^40 times Core's for
+    // the same nBits -- a Core constant would be wrong by a factor of ~10^12.
+    // Ordering and ratios are unaffected, so consensus comparisons are fine.
+    //
+    // ⚠️ INERT UNTIL THE GATE IS WIRED. As of this commit nothing reads this
+    // value at runtime: CHeadersManager::nMinimumChainWork (headers_manager.cpp
+    // :91) is assigned and never read, and the only path that would carry it
+    // into HeadersSyncState -- InitializeDoSProtectedSync /
+    // ProcessHeadersWithDoSProtection -- has zero call sites, so
+    // mapHeadersSyncStates is never populated and header processing falls
+    // through to the legacy ProcessHeaders, which applies no work threshold.
+    // Landing the constant now so wiring it is a one-line change; the
+    // reject/accept test belongs with that wiring and must assert the WIRING,
+    // not HeadersSyncState in isolation.
+    params.nMinimumChainWork = uint256S(
+        "000000000000000000000000000000000000000000028c85dd20c10003e46900");
 
     // Phase 4 port: outbound connection class targets. DIL has 240s blocks
     // where propagation latency is well-absorbed; Bitcoin defaults are fine.
@@ -328,6 +361,15 @@ ChainParams ChainParams::Testnet() {
     params.timestampValidationHeight = 0;
 
     // Phase 3 port: testnet has no PRESYNC chain-work gate.
+    //
+    // LP-10 (2026-09-07): DELIBERATELY LEFT AT ZERO. The DIL and DilV values
+    // are measurements of those specific chains; there is no equivalent
+    // measurement for testnet, and a value invented for it would be a
+    // fabricated constant on a consensus-relevant field. Testnet is also reset
+    // and re-launched, so any fixed threshold would lock honest nodes out of
+    // the next incarnation. Regtest inherits this zero (it copies Testnet and
+    // overrides only what it needs), which is correct: regtest chains are a
+    // handful of blocks and must never be gated on accumulated work.
     params.nMinimumChainWork = uint256();
 
     // Phase 4 port: outbound class targets — testnet uses DIL defaults.
@@ -485,7 +527,33 @@ ChainParams ChainParams::DilV() {
     // Phase 3 port: DilV starts with no PRESYNC chain-work gate; the
     // gate value can be tightened in Phase 4 after telemetry confirms
     // typical fresh-node IBD work accumulation against live seeds.
-    params.nMinimumChainWork = uint256();
+    //
+    // LP-10 (2026-09-07), PROPOSED — NOT YET RATIFIED BY A DECISION ROW.
+    // Measured chain work at DilV's most recent checkpoint, height 67000
+    // (hash c929e38f1709c04c3174627edfe03c57eefdc36846d9d74ab32f899979205eff,
+    // see checkpoints below). Summed with ComputeChainWork/AddChainWork over
+    // heights 0..67000 walked from a copy of a live DilV block database; the
+    // walk reached genesis and the block at 67000 hashed byte-identically to
+    // the checkpoint. A mutated nBits moved both the sum and the census.
+    //
+    // ⚠️ WEAKER GATE THAN DIL'S, BY CONSTRUCTION. DilV nBits is 0x1d00ffff on
+    // ALL 255,028 canonical blocks measured -- difficulty has NEVER retargeted,
+    // it sits at powLimit. Chain work is therefore exactly linear in height and
+    // this threshold is arithmetically a minimum-HEIGHT gate. Worth setting,
+    // but it does not buy Bitcoin-equivalent protection: an attacker pays the
+    // same per-block work the honest chain pays, with no retarget ramp. The
+    // margin is also loose -- tip work is 3.81x this value, so it only rejects
+    // chains below ~26% of current work, because checkpoint 67000 is far behind
+    // a tip of 255,027. Adding a fresh DilV checkpoint near the tip is what
+    // would let this be tightened.
+    //
+    // ⚠️ UNITS: see the Mainnet() note -- our work unit is 2^40 times Bitcoin
+    // Core's for the same nBits. Never copy a Core constant into this field.
+    //
+    // ⚠️ INERT UNTIL THE GATE IS WIRED -- see the Mainnet() note; nothing reads
+    // this value at runtime as of this commit.
+    params.nMinimumChainWork = uint256S(
+        "00000000000000000000000000000000000000000105ba05ba05ba05b9000000");
 
     // Phase 4 port: outbound class targets — DilV's 45s blocks benefit
     // from faster propagation, so bump BlockRelay to 4 (Q4 recommendation).

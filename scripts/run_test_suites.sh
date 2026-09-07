@@ -147,6 +147,7 @@ fast|timestamp_tests|120|
 fast|seed_attestation_key_tests|180|UNTRIAGED: 3 of ~40 checks fail around key-file MAC verification / migration. Needs the seed-attestation owner; failure mode is not obviously stale.
 fast|test_passphrase_validator|60|SUSPECTED REAL (policy): 2 of 16 cases -- two passphrases the suite expects REJECTED are now ACCEPTED at "Moderate (57/100)". Either the strength policy was deliberately loosened (then fix the expectations, with a reason) or it regressed. Do not just flip the expectations.
 fast|chain_case_2_5_equivalence_tests|180|UNTRIAGED: scenario_2 (connect-replacement-fails-then-recovers) now truncates the chain and triggers auto_rebuild instead of recovering (chain_case_2_5_equivalence_tests.cpp:304). Behaviour change in ActivateBestChainStep; needs a chainstate owner to say which side is right.
+fast|minimum_chain_work_kat_tests|120|
 fast|vdf_consensus_test|300|
 fast|vdf_lottery_test|300|
 fast|rpc_tests|300|
