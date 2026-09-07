@@ -607,6 +607,7 @@ tests: tests-build
 	@bash scripts/run_test_suites.sh all
 
 tests-fast: $(TEST_SUITES_FAST)
+	@bash scripts/test_run_test_suites_timeout.sh
 	@bash scripts/run_test_suites.sh fast
 
 tests-full: $(TEST_SUITES_FULL)

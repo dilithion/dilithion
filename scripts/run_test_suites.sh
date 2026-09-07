@@ -136,6 +136,9 @@ full|large_pages_optin_test|2100|
 # ---------------------------------------------------------------------------
 LIST_ONLY=0
 FAIL_FAST=0
+# Seconds of tolerance when deciding whether a signal-kill was really the
+# timeout firing: clock granularity plus the `timeout -k 10` grace period.
+TIMEOUT_SLACK="${TIMEOUT_SLACK:-15}"
 TIER="all"
 for arg in "$@"; do
     case "$arg" in
@@ -253,9 +256,30 @@ while IFS='|' read -r tier suite timeout reason; do
     #
     # 124 is currently unreachable while --preserve-status is set; it is kept so
     # that removing that flag does not silently re-open the same hole in reverse.
-    elif [ "$rc" -eq 124 ] || [ "$rc" -eq 137 ] || [ "$rc" -eq 143 ]; then
-        printf '  [TIMEOUT   ] %-52s %4ds  (limit %ss)\n' "$suite" "$elapsed" "$timeout"
-        RESULTS="${RESULTS}TIMEOUT|${suite}|${elapsed}|exceeded ${timeout}s\n"
+    #
+    # PLATFORM CAVEAT, stated because the roster contradicts the headline. The
+    # measurements above are Linux (WSL Ubuntu-24.04, which is what every
+    # `runs-on:` in ci.yml uses). The ONE real hang this repo has actually
+    # observed and written down -- tx_relay_tests, roster row below -- was
+    # recorded as "exit 124 at 600s" on Windows/MSYS2. So 143 is what happens on
+    # the platform CI runs; 124 is what was seen on the platform the roster's
+    # older evidence came from. Both codes are matched here deliberately, and
+    # neither is claimed to be universal. Do not "simplify" this to whichever
+    # one your machine produces.
+    # The exit code alone does NOT identify a hang. 143 is SIGTERM and 137 is
+    # SIGKILL from ANY source: a suite that raises SIGTERM on itself, or one the
+    # OOM killer takes, produces the same code as one `timeout` killed -- and
+    # would be filed as a hang that never happened. `elapsed` was already
+    # measured at :210 and simply never consulted. A real timeout kill can only
+    # happen at or after the limit, so require both. SLACK covers clock
+    # granularity and the -k grace period.
+    #
+    # This matters most for exactly the suites most likely to trip it: the
+    # crash-injection and shutdown suites, which kill themselves by design.
+    elif { [ "$rc" -eq 124 ] || [ "$rc" -eq 137 ] || [ "$rc" -eq 143 ]; } \
+         && [ "$elapsed" -ge $(( timeout > TIMEOUT_SLACK ? timeout - TIMEOUT_SLACK : 0 )) ]; then
+        printf '  [TIMEOUT   ] %-52s %4ds  (limit %ss, exit %s)\n' "$suite" "$elapsed" "$timeout" "$rc"
+        RESULTS="${RESULTS}TIMEOUT|${suite}|${elapsed}|exceeded ${timeout}s (exit ${rc})\n"
         FAILED=$((FAILED + 1))
         echo "  ---- tail of $log ----"
         tail -n 30 "$log" | sed 's/^/  | /'

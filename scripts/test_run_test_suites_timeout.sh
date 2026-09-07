@@ -46,25 +46,63 @@ chk "--preserve-status, SIGTERM ignored -> 137 (SIGKILL after -k)" "$rc_kill" "1
 #    real code instead of a restatement of it.
 # ---------------------------------------------------------------------------
 echo
-echo "== the runner's own classification expression, applied to those codes =="
-COND="$(grep -oE '\[ "\$rc" -eq 124 \].*then' "$RUNNER" | head -1 | sed 's/; then$//')"
-if [ -z "$COND" ]; then
-  echo "   FAIL  could not extract the timeout condition from $RUNNER"; F=$((F+1))
-else
-  echo "   condition: $COND"
-  for code in 124 137 143; do
-    rc="$code"
-    if eval "$COND"; then verdict=TIMEOUT; else verdict=FAIL; fi
-    chk "exit $code is classified TIMEOUT (not a test failure)" "$verdict" "TIMEOUT"
-  done
-  # Non-timeout codes must NOT be swallowed as timeouts, or a real failing suite
-  # would be filed as a hang — the same defect pointing the other way.
-  for code in 1 2 139; do
-    rc="$code"
-    if eval "$COND"; then verdict=TIMEOUT; else verdict=FAIL; fi
-    chk "exit $code is still a FAILURE (no over-broad match)" "$verdict" "FAIL"
-  done
-fi
+echo "== drive the REAL runner against binaries that really hang / really fail =="
+# Previously this section extracted the classifier expression with grep and
+# `eval`d it. That was still a restatement: it exercised a string, never the
+# runner, so the [TIMEOUT] arm and its FAILED increment had no coverage at all
+# -- and the extraction broke the moment the condition spanned two lines.
+#
+# Instead: copy the real runner, swap ONLY its ROSTER for fake suites, and run
+# it. Everything under test -- the timeout invocation, the classification, the
+# printed row, the exit status -- is the real code.
+drive() {                       # drive <script-body> <timeout> ; echoes the row
+  local body="$1" tmo="$2" d
+  d="$(mktemp -d)"
+  printf '%s' "$body" > "$d/fake_suite"
+  chmod +x "$d/fake_suite"
+  sed "s|^ROSTER='$|ROSTER='\nfast\|fake_suite\|${tmo}\||" "$RUNNER" > "$d/runner.sh"
+  ( cd "$d" && TEST_SUITE_LOGDIR="$d/logs" bash runner.sh fast >"$d/out" 2>&1 )
+  echo "RUNNER_EXIT=$?" >> "$d/out"
+  grep -E '\[(TIMEOUT|FAIL|PASS) ' "$d/out" | head -1
+  grep -E '^RUNNER_EXIT=' "$d/out"
+  rm -rf "$d"
+}
+
+# (a) A binary that genuinely hangs must be classified TIMEOUT.
+out="$(drive '#!/usr/bin/env bash
+sleep 300
+' 2)"
+case "$out" in
+  *"[TIMEOUT"*) chk "a real hang is classified TIMEOUT by the real runner" "yes" "yes" ;;
+  *)            echo "   FAIL  real hang not classified TIMEOUT. Got:"; echo "$out" | sed 's/^/     | /'; F=$((F+1)) ;;
+esac
+case "$out" in
+  *"RUNNER_EXIT=0"*) echo "   FAIL  runner exited 0 on a hung suite"; F=$((F+1)) ;;
+  *)                 chk "a hung suite makes the runner exit non-zero" "yes" "yes" ;;
+esac
+
+# (b) A binary that fails fast must be FAIL, not swallowed as a timeout.
+out="$(drive '#!/usr/bin/env bash
+exit 1
+' 30)"
+case "$out" in
+  *"[FAIL"*) chk "a fast failure is classified FAIL (not a hang)" "yes" "yes" ;;
+  *)         echo "   FAIL  fast failure misclassified. Got:"; echo "$out" | sed 's/^/     | /'; F=$((F+1)) ;;
+esac
+
+# (c) THE ELAPSED CHECK. A suite that SIGTERMs itself immediately exits 143 --
+#     the same code `timeout` produces -- but it is not a hang and must not be
+#     recorded as one. This is the case the exit-code-only classifier got wrong,
+#     and it is live for the crash-injection and shutdown suites, which kill
+#     themselves by design.
+out="$(drive '#!/usr/bin/env bash
+kill -TERM $$
+sleep 5
+' 300)"
+case "$out" in
+  *"[FAIL"*) chk "a self-SIGTERM that exits 143 EARLY is FAIL, not a false hang" "yes" "yes" ;;
+  *)         echo "   FAIL  early self-SIGTERM recorded as a hang. Got:"; echo "$out" | sed 's/^/     | /'; F=$((F+1)) ;;
+esac
 
 echo
 echo "   ===== run_test_suites timeout classification: $P passed, $F failed ====="
