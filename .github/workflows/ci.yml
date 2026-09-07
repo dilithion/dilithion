@@ -122,10 +122,86 @@ jobs:
       run: |
         # Skip HD wallet tests temporarily - GetNewHDAddress() hangs in CI (BUG-77)
         # Likely blocking on /dev/random or deadlock issue
+        # NOTE: the "/dev/random" half of that guess is FALSE - every entropy
+        # source in the tree is /dev/urandom (rpc/auth.cpp:168,
+        # script/htlc.cpp:282, wallet/crypter.cpp:411), which does not block on
+        # modern Linux. The live hypothesis is the "or deadlock" half.
         # Affected: wallet_hd_tests, rpc_hd_wallet_tests, hd_wallet_standalone_tests
+        #
+        # HANG INSTRUMENT. test_dilithion intermittently hangs (~8% of Release
+        # runs: this job on run 33929931137, and gcc/Release on main run
+        # 33887089440, both ending "Terminate orphan process: (test_dilithion)").
+        # The job ceiling is timeout-minutes: 45, and when it fires the runner
+        # kills the orphan and the process state is GONE - which is why the hang
+        # has never been diagnosed. 44 local runs (20 full-width + 24 pinned to
+        # 4 cores) reproduced it ZERO times, so the evidence has to be captured
+        # where it actually happens: here.
+        #
+        # Run under our own watchdog, inside the 45-minute ceiling, and capture
+        # a stack from the STILL-LIVE process before killing it. On a healthy
+        # run this changes nothing: the watchdog is cancelled and the suite's
+        # own exit code is propagated.
+        #
+        # 2280s (38 min) is chosen against BOTH bounds, not picked round: a
+        # healthy clang/Debug leg measured ~21 min wall (run 33929931137,
+        # 00:41:05 -> 01:02:00), so 38 min leaves ~17 min of headroom before a
+        # slow-but-healthy run would be killed; and it leaves ~7 min inside the
+        # 45-min ceiling for gdb to attach and the artifact to upload. A 30-min
+        # watchdog would have sat only 9 min above a known-good run.
+        set -uo pipefail
+        mkdir -p test-hang-artifacts
+
+        # gdb must be able to attach to a non-descendant. Default ptrace_scope
+        # on the runner blocks that, and a failed attach at hang time would
+        # waste the one occurrence we get.
+        sudo sysctl -w kernel.yama.ptrace_scope=0 >/dev/null 2>&1 || true
+        command -v gdb >/dev/null 2>&1 || sudo apt-get install -y -q gdb >/dev/null 2>&1 || true
+
         ./test_dilithion --log_level=test_suite --report_level=short \
-          --run_test='!wallet_hd_tests:!rpc_hd_wallet_tests:!hd_wallet_standalone_tests'
+          --run_test='!wallet_hd_tests:!rpc_hd_wallet_tests:!hd_wallet_standalone_tests' &
+        TD_PID=$!
+
+        (
+          sleep 2280
+          if kill -0 "$TD_PID" 2>/dev/null; then
+            echo "::error::test_dilithion still alive after 2280s - capturing stack before kill (BUG: intermittent hang)"
+            {
+              echo "=== test_dilithion hang, captured $(date -u +%FT%TZ) ==="
+              echo "=== /proc/$TD_PID/status ==="; cat "/proc/$TD_PID/status" 2>&1
+              echo "=== per-thread wchan (kernel wait channel) ==="
+              for t in /proc/"$TD_PID"/task/*; do
+                echo "--- tid ${t##*/} comm=$(cat "$t/comm" 2>/dev/null) wchan=$(cat "$t/wchan" 2>/dev/null)"
+              done
+              echo "=== gdb: all thread backtraces ==="
+              gdb -p "$TD_PID" -batch -ex 'thread apply all bt 25' 2>&1
+            } > test-hang-artifacts/test_dilithion_hang_stack.txt
+            kill -9 "$TD_PID" 2>/dev/null || true
+          fi
+        ) &
+        WATCHDOG=$!
+
+        wait "$TD_PID"; rc=$?
+        kill "$WATCHDOG" 2>/dev/null || true
+        wait "$WATCHDOG" 2>/dev/null || true
+
+        if [ "$rc" -ne 0 ]; then
+          echo "Boost unit tests exited $rc"
+          exit "$rc"
+        fi
         echo "✅ Boost unit tests completed (HD wallet tests skipped - BUG-77)"
+
+    # Only produces a file when the hang actually fired; otherwise no-op.
+    - name: Upload hang stack (only if the hang fired)
+      # NOT gated to one compiler: the hang has been observed on clang/Release
+      # (run 33929931137) AND gcc/Release (main run 33887089440). if-no-files-found
+      # makes this a no-op on every healthy leg.
+      if: always()
+      uses: actions/upload-artifact@v7
+      with:
+        name: test-dilithion-hang-stack-${{ matrix.compiler }}-${{ matrix.build_type }}
+        path: test-hang-artifacts/
+        retention-days: 30
+        if-no-files-found: ignore
 
     # ------------------------------------------------------------------
     # F4: the standalone (non-Boost) test suites.
