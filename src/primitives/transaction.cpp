@@ -94,16 +94,40 @@ std::vector<uint8_t> CTransaction::Serialize() const {
     return data;
 }
 
-uint256 CTransaction::GetHash() const {
-    if (!hash_valid) {
-        // Serialize transaction
-        std::vector<uint8_t> data = Serialize();
+uint256 CTransaction::ComputeHash() const {
+    // Serialize transaction, then SHA3-256 (quantum-resistant). Pure function
+    // of the public fields; never touches the memo.
+    const std::vector<uint8_t> data = Serialize();
+    uint256 h;
+    SHA3_256(data.data(), data.size(), h.data);
+    return h;
+}
 
-        // Hash with SHA3-256 (quantum-resistant)
-        SHA3_256(data.data(), data.size(), hash_cached.data);
-        hash_valid = true;
+uint256 CTransaction::GetHash() const {
+    // BKL-01 / issue #167 — compute-once memo, race-free by construction.
+    //
+    // Fast path: the acquire-load pairs with the release-store below, so a
+    // caller that observes HASH_VALID also observes every byte of hash_cached
+    // written before that store.
+    if (hash_state.load(std::memory_order_acquire) == HASH_VALID) {
+        return hash_cached;
     }
-    return hash_cached;
+
+    // Slow path: compute into a LOCAL first. Only the one caller that wins the
+    // EMPTY->COMPUTING transition ever writes hash_cached, so the cache has a
+    // single writer per fill and no reader touches it before HASH_VALID is
+    // published. Losers (a concurrent caller is filling, or has filled since
+    // our load) return their own local, which is identical because every
+    // caller observes the same const fields. Nobody blocks or spins.
+    const uint256 h = ComputeHash();
+    uint8_t expected = HASH_EMPTY;
+    if (hash_state.compare_exchange_strong(expected, HASH_COMPUTING,
+                                           std::memory_order_acq_rel,
+                                           std::memory_order_acquire)) {
+        hash_cached = h;
+        hash_state.store(HASH_VALID, std::memory_order_release);
+    }
+    return h;
 }
 
 uint256 CTransaction::GetSigningHash() const {
@@ -525,8 +549,8 @@ bool CTransaction::Deserialize(const uint8_t* data, size_t len, std::string* err
         }
     }
 
-    // Invalidate cached hash (will be recalculated on next GetHash())
-    hash_valid = false;
+    // Invalidate the txid memo (SetNull() above already reset it; kept as the explicit post-condition)
+    InvalidateHashCache();
 
     return true;
 }
