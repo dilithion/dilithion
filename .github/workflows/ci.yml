@@ -170,8 +170,17 @@ jobs:
         CEILING_SEC=$(( 45 * 60 ))
         CAPTURE_MARGIN=240        # gdb attach + dump + artifact upload
         MIN_BUDGET=300            # never watchdog a run into uselessness
+        # Cap against the MEASURED healthy step, not against the ceiling. On a
+        # green main run (34082001939) this step takes 44s / 47s / 57s / 61s
+        # across the four legs; the hung leg ran 1516s. 600s is ~10x the healthy
+        # maximum and ~2.5x below the hang, so it catches the hang ten minutes
+        # in instead of twenty-five, and leaves the rest of the ceiling as
+        # margin. (An earlier comment here cited "~21 min" for this step -- that
+        # was the JOB's wall time misread as the step's. The step is ~1 minute.)
+        MAX_BUDGET=600
         elapsed=$(( $(date +%s) - JOB_START_EPOCH ))
         BUDGET=$(( CEILING_SEC - elapsed - CAPTURE_MARGIN ))
+        [ "$BUDGET" -gt "$MAX_BUDGET" ] && BUDGET="$MAX_BUDGET"
         # If the build has already eaten the budget there is nothing left to
         # watchdog WITH, and the clamp below would arm a timer that fires after
         # the ceiling -- inert, exactly like the version this replaces. Say so
@@ -200,7 +209,7 @@ jobs:
               # gdb gets its own timeout: if IT stalls on attach we ride to the
               # ceiling and learn nothing, which is the failure this exists to end.
               echo "=== gdb: thread map + all backtraces ==="
-              timeout 120 gdb -p "$TD_PID" -batch                 -ex 'info threads' -ex 'thread apply all bt 25' 2>&1
+              timeout -k 10 180 gdb -p "$TD_PID" -batch -ex 'info threads' -ex 'thread apply all bt 25' 2>&1
               echo "(gdb exit: $?)"
             } > test-hang-artifacts/test_dilithion_hang_stack.txt
             kill -9 "$TD_PID" 2>/dev/null || true
