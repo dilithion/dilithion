@@ -205,7 +205,23 @@ FAILED=0
 QUARANTINED=0
 DEGRADED=0
 RAN=0
+STALE=0
 TOTAL_SEC=0
+
+# HEAD's commit time, for the staleness guard below. A binary built from this
+# tree cannot be OLDER than the commit it was built from, so binary-mtime <
+# HEAD-commit-time is proof the binary predates the code under test.
+#
+# Deliberately fails OPEN with a loud line rather than silently: if this is not
+# a git checkout there is no reference time, and a guard that silently disables
+# itself is the same defect it exists to catch.
+HEAD_EPOCH="$(git log -1 --format=%ct 2>/dev/null || echo 0)"
+if [ "${HEAD_EPOCH:-0}" -le 0 ]; then
+    HEAD_EPOCH=0
+    echo "  WARNING: no git HEAD timestamp available -- the STALENESS GUARD IS OFF"
+    echo "           for this run. A PASS below does not prove the binaries match"
+    echo "           the source."
+fi
 
 echo "========================================================================"
 echo "Standalone test suites — tier: $TIER"
@@ -231,6 +247,33 @@ while IFS='|' read -r tier suite timeout reason; do
         FAILED=$((FAILED + 1))
         [ "$FAIL_FAST" -eq 1 ] && break
         continue
+    fi
+
+    # ---------------------------------------------------------------------
+    # STALENESS GUARD. A PASS from a binary older than the code is worthless,
+    # and -- this is the whole problem -- it is TEXTUALLY IDENTICAL to a real
+    # one. Measured incident (2026-09-07, r8): 54 suites reported PASS on
+    # binaries built two to four days before the merge under test. Nothing in
+    # the output distinguished that run from a genuine one.
+    #
+    # It happens because `make` builds the node binaries and `make tests`
+    # builds the roster: run the runner directly, or after a partial build,
+    # and you test yesterday's code while reading today's green.
+    #
+    # A stale binary is NEVER a PASS. It is [STALE] and counted INCOMPLETE,
+    # and it fails the run -- because "the gate did not actually execute" is
+    # worse than a red, not better ([[lesson_absence_of_failure_is_not_evidence]]).
+    if [ "$HEAD_EPOCH" -gt 0 ]; then
+        bin_mtime="$(stat -c %Y "$bin" 2>/dev/null || stat -f %m "$bin" 2>/dev/null || echo 0)"
+        if [ "$bin_mtime" -gt 0 ] && [ "$bin_mtime" -lt "$HEAD_EPOCH" ]; then
+            age=$(( (HEAD_EPOCH - bin_mtime) / 3600 ))
+            printf '  [STALE     ] %-52s binary predates HEAD by %sh -- NOT RUN\n' "$suite" "$age"
+            RESULTS="${RESULTS}STALE|${suite}|0|binary older than HEAD commit by ${age}h -- rebuild before trusting any result\n"
+            STALE=$((STALE + 1))
+            FAILED=$((FAILED + 1))
+            [ "$FAIL_FAST" -eq 1 ] && break
+            continue
+        fi
     fi
 
     log="$LOGDIR/$suite.log"
@@ -290,7 +333,13 @@ printf '%b' "$RESULTS" | while IFS='|' read -r status suite secs detail; do
     printf '  %-12s %-52s %4ss %s\n' "$status" "$suite" "$secs" "$detail"
 done
 echo "------------------------------------------------------------------------"
-echo "  ran=$RAN  failed=$FAILED  quarantined=$QUARANTINED  degraded=$DEGRADED  wall=${TOTAL_SEC}s"
+echo "  ran=$RAN  failed=$FAILED  quarantined=$QUARANTINED  degraded=$DEGRADED  stale=$STALE  wall=${TOTAL_SEC}s"
+if [ "$STALE" -gt 0 ]; then
+    echo "  ------------------------------------------------------------------"
+    echo "  $STALE suite(s) were NOT RUN because their binaries predate HEAD."
+    echo "  Those rows are INCOMPLETE, not passes. Rebuild (make tests-build)"
+    echo "  and re-run before reading anything below as a result."
+fi
 echo "  per-suite output: $LOGDIR/<suite>.log"
 echo "========================================================================"
 
