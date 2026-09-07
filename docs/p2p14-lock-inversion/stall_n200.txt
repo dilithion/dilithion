@@ -1,0 +1,15 @@
+cs_headers -> g_validation_mutex STALL, measured n=200, origin/main f47b9b24
+WSL Ubuntu-24.04, make TSAN=1, setarch -R, RandomX light mode
+
+=== ARM unwarmed (mirrors ProcessHeaders:331 - hash computed UNDER cs_headers) ===
+[p2p14-stall] arm=unwarmed
+[p2p14-stall] headers=200  cached_before=0  cached_after=200
+[p2p14-stall] ProcessHeaders wall=3305ms  MAX_PROBE_STALL=3305860us
+
+=== ARM prewarmed (RED control; mirrors QueueHeadersForValidation:2789) ===
+[p2p14-stall] arm=prewarmed
+[p2p14-stall] headers=200  cached_before=200  cached_after=200
+[p2p14-stall] ProcessHeaders wall=6ms  MAX_PROBE_STALL=6227us
+
+MAX_PROBE_STALL is how long a thread doing nothing but GetHeaderCount() (which
+only takes cs_headers) was blocked. 3305860us vs 6227us = 531x.
