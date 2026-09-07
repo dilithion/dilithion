@@ -36,6 +36,7 @@
 // be reconstructed. v1 reported it as a consensus failure — a cry-wolf on the
 // one instrument whose alarm has to be believed.
 
+#include <consensus/validation.h>
 #include <consensus/vdf_validation.h>
 #include <core/chainparams.h>
 #include <crypto/sha3.h>
@@ -214,6 +215,75 @@ struct ScanResult {
 //
 //   registration: [0xDF][0x01][pubkey 1952][signature 3309]
 //   reference:    [0xDF][0x02][identity  20][signature 3309]
+// ===========================================================================
+// THE ONLY MIK LOCATOR. It deserializes the coinbase and calls the PRODUCTION
+// parser, DFMP::ParseMIKFromScriptSig — the same function every consensus
+// consumer and both identity-DB population sites use.
+//
+// ⚠️ WHY THIS REPLACED THREE HAND-ROLLED SCANNERS. They raw-scanned block.vtx
+// from byte 0 for [0xDF][0x01|0x02]. Production does NOT: mik.cpp:365-373 skips
+// the BIP34 height push first. That push is LITTLE-ENDIAN, so at heights whose
+// encoding contains DF 01 / DF 02 the scan matched HEIGHT BYTES instead of the
+// MIK blob. MEASURED: heights 122,624..122,879 reported registration 256 /
+// reference 0 — all 256 phantom — against a control band's 0 / 256. Worse than
+// noise: the phantom made the scanner early-out and MISS the real blob, so the
+// census UNDER-reported real registrations at up to 514 heights, on the run
+// that answered a release-critical question.
+//
+// The derivation control could not catch it: it validates the HASH against an
+// independent source, and the defect was in the LOCATOR upstream of the hash.
+// Two locators for one logical fact is the whole bug; there is now one.
+// ===========================================================================
+struct MikView {
+    bool        ok        = false;
+    int         type      = -1;     // MIK_TYPE_REGISTRATION / _REFERENCE
+    std::string identity;           // production-derived, for BOTH types
+    bool        haveSigOffset = false;
+    size_t      sigOffsetInVtx = 0; // first byte of the Dilithium signature
+};
+
+MikView ParseMik(const CBlock& block)
+{
+    MikView v;
+    CBlockValidator validator;
+    std::vector<CTransactionRef> txs;
+    std::string err;
+    if (!validator.DeserializeBlockTransactions(block, txs, err)) return v;
+    if (txs.empty() || txs[0]->vin.empty()) return v;
+    const std::vector<uint8_t>& ss = txs[0]->vin[0].scriptSig;
+
+    DFMP::CMIKScriptData d;
+    if (!DFMP::ParseMIKFromScriptSig(ss, d)) return v;
+    if (d.identity.IsNull()) return v;
+
+    v.ok       = true;
+    v.type     = d.isRegistration ? DFMP::MIK_TYPE_REGISTRATION : DFMP::MIK_TYPE_REFERENCE;
+    v.identity = d.identity.GetHex();
+
+    // Offset of the signature, for the mutation control only. Re-derived with
+    // production's OWN rule (skip the height push, then find the marker), then
+    // mapped into block.vtx by locating the scriptSig itself.
+    size_t pos = 0;
+    if (!ss.empty()) {
+        const uint8_t heightLen = ss[0];
+        if (heightLen >= 1 && heightLen <= 4 && ss.size() > heightLen) pos = 1 + heightLen;
+    }
+    for (size_t i = pos; i + 1 < ss.size(); ++i) {
+        if (ss[i] != DFMP::MIK_MARKER) continue;
+        const uint8_t t = ss[i + 1];
+        if (t != DFMP::MIK_TYPE_REGISTRATION && t != DFMP::MIK_TYPE_REFERENCE) continue;
+        const size_t body     = (t == DFMP::MIK_TYPE_REGISTRATION) ? DFMP::MIK_PUBKEY_SIZE : 20;
+        const size_t sigInSs  = i + 2 + body;
+        if (sigInSs + DFMP::MIK_SIGNATURE_SIZE > ss.size()) break;
+        auto it = std::search(block.vtx.begin(), block.vtx.end(), ss.begin(), ss.end());
+        if (it == block.vtx.end()) break;
+        v.sigOffsetInVtx = static_cast<size_t>(it - block.vtx.begin()) + sigInSs;
+        v.haveSigOffset  = (v.sigOffsetInVtx + DFMP::MIK_SIGNATURE_SIZE <= block.vtx.size());
+        break;
+    }
+    return v;
+}
+
 // Read-only: the 20-byte identity of a REFERENCE MIK blob, as hex. Registration
 // blobs carry a pubkey rather than a stored identity, and they verify inline,
 // so the fail-open population is reference-type by construction.
@@ -278,6 +348,20 @@ int DetectMIKType(const CBlock& block)
 }
 
 bool ForgeMIKSignatureBytes(CBlock& block, int* outType)
+{
+    {
+        const MikView v = ParseMik(block);
+        if (v.ok && v.haveSigOffset) {
+            block.vtx[v.sigOffsetInVtx + 100] ^= 0xFF;
+            if (outType) *outType = v.type;
+            return true;
+        }
+        if (v.ok) return false;   // parsed, but the signature could not be located
+    }
+    return false;
+}
+
+bool ForgeMIKSignatureBytesLegacyUnused(CBlock& block, int* outType)
 {
     for (size_t i = 0; i + 1 < block.vtx.size(); ++i) {
         if (block.vtx[i] != DFMP::MIK_MARKER) continue;
@@ -393,15 +477,17 @@ ScanResult ScanChain(const std::string& blocksDir, int fromHeight, int toHeight,
         ++res.vdfBlocks;
 
         {
-            const std::string reg = RegistrationIdentityHex(block);
-            if (!reg.empty() && res.registeredIdentities.find(reg) == res.registeredIdentities.end())
-                res.registeredIdentities[reg] = h;
-            const int mtc = DetectMIKType(block);
-            if      (mtc == DFMP::MIK_TYPE_REGISTRATION) ++res.regBlocks;
-            else if (mtc == DFMP::MIK_TYPE_REFERENCE)    ++res.refBlocks;
-            else                                         ++res.noMikBlocks;
-            const std::string rid = ReferenceIdentityHex(block);
-            if (!rid.empty()) ++res.seenByIdentity[rid];
+            const MikView v = ParseMik(block);
+            if (!v.ok) {
+                ++res.noMikBlocks;
+            } else if (v.type == DFMP::MIK_TYPE_REGISTRATION) {
+                ++res.regBlocks;
+                if (res.registeredIdentities.find(v.identity) == res.registeredIdentities.end())
+                    res.registeredIdentities[v.identity] = h;
+            } else {
+                ++res.refBlocks;
+                ++res.seenByIdentity[v.identity];
+            }
         }
         if (ctx.censusOnly) {
             if (res.scanned % 25000 == 0) std::cout << "  ... " << res.scanned << " blocks\n";
@@ -442,10 +528,9 @@ ScanResult ScanChain(const std::string& blocksDir, int fromHeight, int toHeight,
             }
         }
 
-        const int mt = DetectMIKType(block);
-        if      (mt == DFMP::MIK_TYPE_REGISTRATION) ++res.regBlocks;
-        else if (mt == DFMP::MIK_TYPE_REFERENCE)    ++res.refBlocks;
-        else                                        ++res.noMikBlocks;
+        // Blob classification happens ONCE, in the census pass above. It used to
+        // be repeated here, double-counting every category on a verifying run.
+        const int mt = ParseMik(block).type;
 
         // THE PROBE MUST BE A BLOCK THAT PASSED BOTH CHECKS — and we keep one
         // per MIK type, because the two types take different branches.
