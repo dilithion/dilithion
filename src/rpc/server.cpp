@@ -649,13 +649,33 @@ void CRPCServer::Stop() {
 
     // Shutdown and close server socket.
     //
-    // ONE load into a local, then operate on the local. Reading the atomic
-    // separately for the guard, the shutdown and the close would be three
-    // independent loads that are not guaranteed to observe the same value,
-    // which would reintroduce a TOCTOU on top of the fix. m_running was
-    // already set false above, so ServerThread breaks out rather than
-    // retrying once accept() returns.
-    const int serverSock = m_serverSocket.load(std::memory_order_acquire);
+    // EXCHANGE, not load-then-close-the-local. Claiming the fd and publishing
+    // INVALID_SOCKET in one atomic step is what makes the close EXACTLY ONCE.
+    //
+    // A load/close/store trio is not merely weaker here -- it is worse than the
+    // plain `int` this PR replaced. With three separate reads of the member (the
+    // shape still live in the untouched twin at websocket.cpp:109-116) a second
+    // concurrent caller could re-read INVALID_SOCKET at the close and skip it,
+    // so a double close needed an unlucky interleaving. Loading ONCE into a
+    // local and closing THAT makes it certain: both callers hold the same live
+    // fd in their own frame and both close it. Reachable -- Stop() runs from
+    // main (node/dilithion-node.cpp:8862), from a POSIX signal handler
+    // (:2366 -> :529) and from SetConsoleCtrlHandler (:2386), on separate
+    // threads, and `if (!m_running)` above is check-then-act so both get past it.
+    //
+    // This does NOT reintroduce the early-return regression that an earlier
+    // revision of this PR was reverted for. That one came from exchanging
+    // m_running and returning bool, which let the LOSER return before the
+    // teardown and allowed ~CRPCServer to destroy thread objects under a live
+    // join(). Stop() is void, both callers still run the joins, and joinable()
+    // makes the second pass a no-op. This exchange is on the SOCKET only.
+    //
+    // Ordering: m_running = false above is sequenced-before this release
+    // exchange, so any thread observing INVALID_SOCKET here must also observe
+    // m_running == false -- ServerThread breaks out rather than spinning in the
+    // accept() retry.
+    const int serverSock = m_serverSocket.exchange(INVALID_SOCKET,
+                                                   std::memory_order_acq_rel);
     if (serverSock != INVALID_SOCKET) {
         // Shutdown the socket to unblock accept() call
         #ifdef _WIN32
@@ -665,7 +685,10 @@ void CRPCServer::Stop() {
         #endif
 
         closesocket(serverSock);
-        m_serverSocket.store(INVALID_SOCKET, std::memory_order_release);
+        // No store: the exchange already published INVALID_SOCKET, and did so
+        // BEFORE the close rather than after -- which also narrows the window
+        // in which ServerThread can still load a live fd this thread is about
+        // to destroy.
     }
 
     // RPC-002: Wake up all worker threads so they can exit
