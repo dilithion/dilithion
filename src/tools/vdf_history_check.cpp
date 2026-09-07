@@ -157,6 +157,7 @@ struct ScanResult {
     long long mikEnforced  = 0;   // corrupting the signature flipped the verdict
     long long mikFailOpen  = 0;   // corrupted signature STILL accepted
     long long mikProbeUnapplied = 0;  // probe could not be applied -> UNMEASURED
+    long long coinbaseUnparsed  = 0;  // coinbase would not deserialize at all
     // WHICH identities fail open, and how many blocks each accounts for. The
     // shape of this distribution decides whether the fail-open is a small
     // population problem with a targeted fix or a systemic one.
@@ -237,6 +238,10 @@ struct ScanResult {
 // ===========================================================================
 struct MikView {
     bool        ok        = false;
+    // A coinbase that could not be deserialized is NOT the same fact as a
+    // coinbase carrying no MIK blob, and binning both as "none" hides a
+    // false-negative path for the one sentence this tool exists to produce.
+    bool        deserializeFailed = false;
     int         type      = -1;     // MIK_TYPE_REGISTRATION / _REFERENCE
     std::string identity;           // production-derived, for BOTH types
     bool        haveSigOffset = false;
@@ -249,8 +254,8 @@ MikView ParseMik(const CBlock& block)
     CBlockValidator validator;
     std::vector<CTransactionRef> txs;
     std::string err;
-    if (!validator.DeserializeBlockTransactions(block, txs, err)) return v;
-    if (txs.empty() || txs[0]->vin.empty()) return v;
+    if (!validator.DeserializeBlockTransactions(block, txs, err)) { v.deserializeFailed = true; return v; }
+    if (txs.empty() || txs[0]->vin.empty()) { v.deserializeFailed = true; return v; }
     const std::vector<uint8_t>& ss = txs[0]->vin[0].scriptSig;
 
     DFMP::CMIKScriptData d;
@@ -409,6 +414,7 @@ ScanResult ScanChain(const std::string& blocksDir, int fromHeight, int toHeight,
             const MikView v = ParseMik(block);
             if (!v.ok) {
                 ++res.noMikBlocks;
+                if (v.deserializeFailed) ++res.coinbaseUnparsed;
             } else if (v.type == DFMP::MIK_TYPE_REGISTRATION) {
                 ++res.regBlocks;
                 if (res.registeredIdentities.find(v.identity) == res.registeredIdentities.end())
@@ -780,6 +786,9 @@ int main(int argc, char* argv[])
               << "failure entries    " << r.failures.size()
               << "   (a block failing both checks contributes two)\n"
               << "proof control      " << (r.proofControl ? "FIRED" : "DID NOT FIRE") << "\n"
+              << "probe UNAPPLIED     " << r.mikProbeUnapplied
+              << "   (blocks whose signature probe could not be applied -> enforcement UNMEASURED for them)\n"
+              << "coinbase unparsed  " << r.coinbaseUnparsed << "\n"
               << "MIK control        " << (r.mikControl ? "FIRED"
                     : (r.mikMutApplied ? "DID NOT FIRE (mutation WAS applied)"
                                        : "NOT APPLIED (no MIK blob located in the probe)")) << "\n"
@@ -852,15 +861,52 @@ int main(int argc, char* argv[])
         untrusted.push_back("no MIK blob could be located in the probe block, so the MIK control was never "
             "applied — this is a TOOL limitation, not evidence about the chain. Do not read it either way.");
 
+    // ⚠️ ONE GATE, TWO EMITTERS. The "NO on-chain registration -> UNREGISTERED
+    // MINER" verdict is printed from two places: the fail-open table below and
+    // the --find lookup further down. Gating only the second one left an
+    // UNGATED TWIN that printed the identical sentence on every verifying run
+    // with no flag at all — and that twin is the likelier source of a quoted
+    // conclusion. Same defect shape as the locator: the fix reached one
+    // emitter, not all of them. The list is computed ONCE here so a third
+    // emitter cannot silently be born ungated.
+    // Computed BEFORE the gate that reads it. It used to be computed inside the
+    // identity-table block below, which sits AFTER the gate -- so hoisting the
+    // gate made every full run report "the derivation control did not confirm"
+    // while the census line two lines above said CONFIRMED. Caught by testing
+    // the POSITIVE path, not just that the new gates fire.
+    for (const auto& kv : r.registeredIdentities)
+        if (r.seenByIdentity.count(kv.first) || r.verifiedByIdentity.count(kv.first)
+            || r.failOpenByIdentity.count(kv.first))
+            ++const_cast<ScanResult&>(r).derivationCrossChecks;
+
+    std::vector<std::string> censusBlockers;
+    if (!r.walkComplete)  censusBlockers.push_back("the chain walk was INCOMPLETE");
+    if (r.unreadable > 0) censusBlockers.push_back(std::to_string(r.unreadable)
+                              + " block bodies were unreadable, so some blobs were never parsed");
+    if (fromHeight > 1)   censusBlockers.push_back("--from " + std::to_string(fromHeight)
+                              + " skipped heights 1.." + std::to_string(fromHeight - 1));
+    if (toHeight >= 0 && toHeight < r.tipHeight)
+                          censusBlockers.push_back("--to " + std::to_string(toHeight)
+                              + " stopped short of the tip " + std::to_string(r.tipHeight));
+    if (r.derivationCrossChecks == 0)
+                          censusBlockers.push_back("the derivation control did not confirm");
+    // The node's identity-DB writers do NOT filter on block version, so a
+    // registration in a non-VDF block would be registered by the node and
+    // invisible to a census that skipped it. Equal counts prove no block was
+    // skipped on this chain; unequal counts mean the census saw fewer blocks
+    // than the node would have.
+    if (r.scanned != r.vdfBlocks)
+                          censusBlockers.push_back("only " + std::to_string(r.vdfBlocks) + " of "
+                              + std::to_string(r.scanned) + " blocks read were VDF blocks, and the census "
+                                "skips non-VDF blocks while the node's identity-DB writers do not");
+    if (r.coinbaseUnparsed > 0)
+                          censusBlockers.push_back(std::to_string(r.coinbaseUnparsed)
+                              + " coinbases could not be deserialized, so any blob in them was never seen");
+
     if (!r.failOpenByIdentity.empty() || !r.verifiedByIdentity.empty() || !r.seenByIdentity.empty()) {
         std::vector<std::pair<long long, std::string>> top;
         for (const auto& kv : r.failOpenByIdentity) top.push_back({kv.second, kv.first});
         std::sort(top.rbegin(), top.rend());
-        for (const auto& kv : r.registeredIdentities)
-            if (r.seenByIdentity.count(kv.first) || r.verifiedByIdentity.count(kv.first)
-                || r.failOpenByIdentity.count(kv.first))
-                ++const_cast<ScanResult&>(r).derivationCrossChecks;
-
         std::cout << "\nREGISTRATION CENSUS   " << r.registeredIdentities.size()
                   << " distinct identities derived from on-chain registration blocks\n"
                   << "  derivation control  " << r.derivationCrossChecks
@@ -884,10 +930,17 @@ int main(int argc, char* argv[])
                       << (registered
                             ? "  REGISTERED on-chain at h" + std::to_string(rit->second)
                               + "  -> identity-DB POPULATION BUG"
-                            : "  NO on-chain registration block  -> UNREGISTERED MINER")
+                            : (censusBlockers.empty()
+                                 ? "  NO on-chain registration block  -> UNREGISTERED MINER"
+                                 : "  registration status NOT ANSWERABLE from this run"))
                       << "\n";
         }
         if (top.size() > 12) std::cout << "   ... and " << (top.size() - 12) << " more\n";
+        if (!censusBlockers.empty()) {
+            std::cout << "   (registration status withheld above -- this run does not cover the chain:\n";
+            for (const auto& b : censusBlockers) std::cout << "      * " << b << "\n";
+            std::cout << "    re-run over the full chain before reading a registration verdict.)\n";
+        }
     }
 
     // Failure DETAIL is printed even on an untrusted run. Suppressing it meant a
@@ -908,17 +961,18 @@ int main(int argc, char* argv[])
         // sole gate, which meant a truncated walk, an unreadable block, or a
         // partial --from/--to range could all produce a confident "not
         // registered" about a range that was never fully looked at.
-        std::vector<std::string> blockers;
-        if (!r.walkComplete)   blockers.push_back("the chain walk was INCOMPLETE");
-        if (r.unreadable > 0)  blockers.push_back(std::to_string(r.unreadable)
-                                   + " block bodies were unreadable, so some blobs were never parsed");
-        if (fromHeight > 1)    blockers.push_back("--from " + std::to_string(fromHeight)
-                                   + " skipped heights 1.." + std::to_string(fromHeight - 1));
-        if (toHeight >= 0 && toHeight < r.tipHeight)
-                               blockers.push_back("--to " + std::to_string(toHeight)
-                                   + " stopped short of the tip " + std::to_string(r.tipHeight));
-        if (r.derivationCrossChecks == 0)
-                               blockers.push_back("the derivation control did not confirm");
+        std::vector<std::string> blockers = censusBlockers;
+        // MEDIUM-4: a lookup key that could never have been stored must be
+        // refused, not answered "absent". Identity::GetHex() emits exactly 40
+        // lowercase hex characters, so anything else -- a truncated form, an
+        // 0x prefix, uppercase -- misses the map and would otherwise fall
+        // straight through to a confident UNREGISTERED MINER.
+        bool wellFormed = (want.size() == 40);
+        for (char c : want)
+            if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'))) { wellFormed = false; break; }
+        if (!wellFormed)
+            blockers.push_back("the lookup key is not a well-formed identity (expected exactly 40 "
+                               "lowercase hex characters, got " + std::to_string(want.size()) + ")");
         if (!found && !blockers.empty()) {
             std::cout << "\nLOOKUP " << want << "\n   NOT ANSWERABLE from this run:\n";
             for (const auto& b : blockers) std::cout << "      * " << b << "\n";
