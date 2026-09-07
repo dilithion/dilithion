@@ -91,5 +91,34 @@ case "$out" in
 esac
 
 echo
+echo "== a guard that cannot read HEAD must FAIL in CI, not quietly skip =="
+# The zero-HEAD_EPOCH case is not hypothetical: a WSL shell cannot follow a
+# Windows worktree .git file, so `git log` returns nothing while git itself
+# works fine. Under CI that must be fatal -- CI is exactly where a silently
+# disabled guard costs the most.
+dd="$(mktemp -d)"                      # outside any repo: no HEAD to read
+printf '#!/usr/bin/env bash\nexit 0\n' > "$dd/fake_suite"; chmod +x "$dd/fake_suite"
+awk -v row="fast|fake_suite|60|" '
+  /^ROSTER=.$/ { print; print row; skip=1; next }
+  skip && /^.$/ { print; skip=0; next }
+  skip { next }
+  { print }
+' "$RUNNER" > "$dd/runner.sh"
+( cd "$dd" && GITHUB_ACTIONS=1 TEST_SUITE_LOGDIR="$dd/logs" bash runner.sh fast >"$dd/out" 2>&1 )
+rc_ci=$?
+if [ "$rc_ci" -eq 0 ]; then
+  echo "   FAIL  runner exited 0 with NO HEAD timestamp under CI -- guard silently off"
+  F=$((F+1))
+else
+  chk "no HEAD timestamp under CI fails the run" "yes" "yes"
+fi
+if grep -q "STALENESS GUARD could not read" "$dd/out" 2>/dev/null; then
+  chk "and it says why, rather than failing opaquely" "yes" "yes"
+else
+  echo "   FAIL  fatal exit carried no explanation"; F=$((F+1))
+fi
+rm -rf "$dd"
+
+echo
 echo "   ===== run_test_suites staleness guard: $P passed, $F failed ====="
 [ "$F" -eq 0 ]

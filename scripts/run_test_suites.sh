@@ -216,11 +216,36 @@ TOTAL_SEC=0
 # a git checkout there is no reference time, and a guard that silently disables
 # itself is the same defect it exists to catch.
 HEAD_EPOCH="$(git log -1 --format=%ct 2>/dev/null || echo 0)"
-if [ "${HEAD_EPOCH:-0}" -le 0 ]; then
-    HEAD_EPOCH=0
+case "${HEAD_EPOCH:-}" in (''|*[!0-9]*) HEAD_EPOCH=0 ;; esac
+if [ "$HEAD_EPOCH" -le 0 ]; then
+    # WHERE A DISABLED GUARD COSTS MOST, IT MUST NOT DISABLE ITSELF.
+    #
+    # Two situations produce a zero here and they are NOT the same:
+    #   * no git at all (a source tarball, a developer box without git) --
+    #     nothing can be done, warn loudly and continue;
+    #   * git IS present and we are demonstrably inside a repository, but the
+    #     timestamp still came back empty. That is broken, not absent, and it
+    #     is not hypothetical: a WSL shell cannot follow a Windows worktree's
+    #     `.git` file, so `git log` fails while `git` itself works fine. A guard
+    #     that shrugs at that is exactly the silent-disable it exists to prevent.
+    #
+    # In CI, or anywhere we can prove we are in a repo, a zero is FATAL.
+    in_repo=0
+    git rev-parse --git-dir >/dev/null 2>&1 && in_repo=1
+    if [ -n "${GITHUB_ACTIONS:-}${CI:-}" ] || [ "$in_repo" -eq 1 ]; then
+        echo "========================================================================"
+        echo "FATAL: the STALENESS GUARD could not read HEAD's commit time."
+        echo "  in-a-git-repo=${in_repo}  CI=${GITHUB_ACTIONS:-}${CI:-}"
+        echo "  Refusing to run: without a reference time every PASS below would be"
+        echo "  unverifiable, and an unverifiable PASS is what this guard exists to"
+        echo "  stop. Fix the checkout (a shallow clone still provides HEAD) rather"
+        echo "  than bypassing this."
+        echo "========================================================================"
+        exit 2
+    fi
     echo "  WARNING: no git HEAD timestamp available -- the STALENESS GUARD IS OFF"
     echo "           for this run. A PASS below does not prove the binaries match"
-    echo "           the source."
+    echo "           the source. (No git repository detected; in CI this is fatal.)"
 fi
 
 echo "========================================================================"
