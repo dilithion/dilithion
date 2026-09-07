@@ -218,10 +218,30 @@ bool TestRPCIntegration() {
     server.RegisterWallet(&wallet);
     server.RegisterMiner(&miner);
 
+    // CVE-2026-RPC-AUTH: Start() refuses unless auth AND permissions are
+    // initialised (server.cpp:468-478). Production does both
+    // (dilithion-node.cpp:7656). This test did neither, so Start() always
+    // failed -- and then blamed "port conflict or system limitation" and
+    // returned TRUE, so the suite reported "✓ RPC server start/stop" and exited
+    // 0 while the RPC server had never started once. The server prints the real
+    // reason on the line immediately above; the test overwrote it with a guess.
+    if (!RPCAuth::InitializeAuth("testuser", "testpassword123")) {
+        cout << "  ✗ RPCAuth::InitializeAuth failed" << endl;
+        return false;
+    }
+    const std::string perms_path =
+        (std::filesystem::temp_directory_path() / "dil_integration_rpc_perms.json").string();
+    if (!server.InitializePermissions(perms_path, "testuser", "testpassword123")) {
+        cout << "  ✗ InitializePermissions failed (" << perms_path << ")" << endl;
+        return false;
+    }
+
     if (!server.Start()) {
-        cout << "  ✗ Failed to start RPC server (may be port conflict or system limitation)" << endl;
-        cout << "  ℹ️  Skipping RPC test - not critical for core integration" << endl;
-        return true;  // Don't fail entire test
+        cout << "  ✗ Failed to start RPC server" << endl;
+        cout << "    auth configured : " << (RPCAuth::IsAuthConfigured() ? "yes" : "NO") << endl;
+        cout << "    Start() printed the actual cause above. Not skipping: an RPC" << endl;
+        cout << "    server that will not start is a failure of this test." << endl;
+        return false;
     }
     cout << "  ✓ RPC server started on port 18546" << endl;
 
@@ -416,11 +436,29 @@ bool TestFullNodeStack() {
         rpc_server.RegisterWallet(&wallet);
         rpc_server.RegisterMiner(&miner);
 
-        if (!rpc_server.Start()) {
-            cout << "  ⚠️  RPC server failed to start (not critical - testing other components)" << endl;
-        } else {
-            cout << "  ✓ RPC server started" << endl;
+        // Second site, and it failed for a DIFFERENT reason than the first:
+        // by the time the full-stack phase runs, InitializeAuth has been called
+        // by TestRPCAuthenticationIntegration, so this one got past the auth
+        // check and tripped the permissions check instead
+        // ("Start() called before InitializePermissions()"). Both were reported
+        // as "not critical", so neither ever surfaced.
+        const std::string stack_perms =
+            (std::filesystem::temp_directory_path() / "dil_integration_stack_perms.json").string();
+        if (!RPCAuth::IsAuthConfigured() &&
+            !RPCAuth::InitializeAuth("testuser", "testpassword123")) {
+            cout << "  ✗ RPCAuth::InitializeAuth failed" << endl;
+            return false;
         }
+        if (!rpc_server.InitializePermissions(stack_perms, "testuser", "testpassword123")) {
+            cout << "  ✗ InitializePermissions failed (" << stack_perms << ")" << endl;
+            return false;
+        }
+        if (!rpc_server.Start()) {
+            cout << "  ✗ RPC server failed to start in the full-stack phase" << endl;
+            cout << "    auth configured : " << (RPCAuth::IsAuthConfigured() ? "yes" : "NO") << endl;
+            return false;
+        }
+        cout << "  ✓ RPC server started" << endl;
 
         // Let everything run for a moment
         this_thread::sleep_for(chrono::milliseconds(500));

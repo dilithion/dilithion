@@ -2,6 +2,7 @@
 // Distributed under the MIT software license
 
 #include <rpc/server.h>
+#include <rpc/auth.h>
 #include <wallet/wallet.h>
 #include <miner/controller.h>
 #include <node/utxo_set.h>
@@ -26,6 +27,13 @@
 #endif
 
 using namespace std;
+
+// ONE definition of the test credentials. They are needed in two places that
+// must agree -- the server's auth/permissions init and the client's
+// Authorization header -- and a silent disagreement between them would present
+// as "Unauthorized", i.e. as a server bug rather than a test bug.
+static const char* kTestRpcUser = "testuser";
+static const char* kTestRpcPass = "testpassword123";
 
 // Helper: Send JSON-RPC request over HTTP
 string SendRPCRequest(uint16_t port, const string& method, const string& params = "[]", const string& id = "1") {
@@ -61,6 +69,23 @@ string SendRPCRequest(uint16_t port, const string& method, const string& params 
     ostringstream httpReq;
     httpReq << "POST / HTTP/1.1\r\n";
     httpReq << "Host: localhost\r\n";
+    // CSRF protection: the server rejects any request without this header
+    // ("Missing X-Dilithion-RPC header", code -32600). This suite never sent
+    // it, but the omission was invisible for as long as the server refused to
+    // start at all -- fixing the auth/permissions init is what surfaced it.
+    // Every RPC caller must send it; it is part of the documented contract.
+    httpReq << "X-Dilithion-RPC: 1\r\n";
+    // Auth is configured now (it was not before), so the server also requires
+    // HTTP Basic credentials: "Unauthorized - Invalid or missing credentials".
+    // Third layer down -- the server refusing to start hid the CSRF gap, which
+    // in turn hid this one. Each fix revealed the next real requirement.
+    {
+        const std::string creds = std::string(kTestRpcUser) + ":" + kTestRpcPass;
+        httpReq << "Authorization: Basic "
+                << RPCAuth::Base64Encode(reinterpret_cast<const uint8_t*>(creds.data()),
+                                         creds.size())
+                << "\r\n";
+    }
     httpReq << "Content-Type: application/json\r\n";
     httpReq << "Content-Length: " << body.size() << "\r\n";
     httpReq << "\r\n";
@@ -94,16 +119,53 @@ string SendRPCRequest(uint16_t port, const string& method, const string& params 
     return response.substr(pos + 4);
 }
 
+// CVE-2026-RPC-AUTH: Start() refuses unless BOTH RPCAuth::InitializeAuth()
+// has run (global) and InitializePermissions() has populated m_permissions
+// (per server). Production does both (dilithion-node.cpp:7656); this harness
+// did neither, so every Start() here returned false and this whole suite was
+// quarantined in run_test_suites.sh rather than ported forward. The refusal is
+// correct behaviour -- the test was wrong. Mirrors the pattern already used by
+// tx_index_integration_tests.cpp:347.
+static bool PrepareServer(CRPCServer& server, const std::string& tag) {
+    static bool auth_done = false;
+    if (!auth_done) {
+        if (!RPCAuth::InitializeAuth(kTestRpcUser, kTestRpcPass)) {
+            cout << "  ✗ RPCAuth::InitializeAuth failed" << endl;
+            return false;
+        }
+        auth_done = true;
+    }
+    const std::string perms =
+        (std::filesystem::temp_directory_path() / ("dil_rpc_perms_" + tag + ".json")).string();
+    if (!server.InitializePermissions(perms, kTestRpcUser, kTestRpcPass)) {
+        cout << "  ✗ InitializePermissions failed (" << perms << ")" << endl;
+        return false;
+    }
+    return true;
+}
+
+// A Start() failure is reported with the reason it actually had, never a guess.
+// The old text blamed "port conflict or system limitation" while the server had
+// just printed the real cause on the line above -- a message that misdiagnoses
+// its own failure is worse than no message.
+static void ReportStartFailure() {
+    cout << "  ✗ Failed to start RPC server" << endl;
+    cout << "    auth configured : " << (RPCAuth::IsAuthConfigured() ? "yes" : "NO") << endl;
+    cout << "    (a bind failure would be reported by Start() above; if auth"
+            " says yes, suspect the port)" << endl;
+}
+
 bool TestServerStartStop() {
     cout << "Testing RPC server start/stop..." << endl;
 
     // Use a unique port to avoid conflicts (18432 instead of 18332)
     CRPCServer server(18432);
 
+    if (!PrepareServer(server, "startstop")) return false;
+
     if (!server.Start()) {
-        cout << "  ✗ Failed to start server (this may be a port conflict or system limitation)" << endl;
-        cout << "  ℹ️  Skipping this test - not critical for production" << endl;
-        return true;  // Don't fail the entire test suite
+        ReportStartFailure();
+        return false;  // A server that will not start is a FAILURE, not a skip.
     }
     cout << "  ✓ Server started on port " << server.GetPort() << endl;
 
@@ -148,8 +210,10 @@ bool TestWalletRPCs() {
     server.RegisterUTXOSet(&utxo_set);
     server.RegisterChainState(&chain_state);
 
+    if (!PrepareServer(server, "wallet")) return false;
+
     if (!server.Start()) {
-        cout << "  ✗ Failed to start server" << endl;
+        ReportStartFailure();
         return false;
     }
 
@@ -202,8 +266,10 @@ bool TestMiningRPCs() {
     CRPCServer server(18334);
     server.RegisterMiner(&miner);
 
+    if (!PrepareServer(server, "mining")) return false;
+
     if (!server.Start()) {
-        cout << "  ✗ Failed to start server" << endl;
+        ReportStartFailure();
         return false;
     }
 
@@ -239,8 +305,10 @@ bool TestGeneralRPCs() {
 
     CRPCServer server(18335);
 
+    if (!PrepareServer(server, "general")) return false;
+
     if (!server.Start()) {
-        cout << "  ✗ Failed to start server" << endl;
+        ReportStartFailure();
         return false;
     }
 
@@ -310,13 +378,23 @@ int main() {
     cout << "======================================" << endl;
     cout << endl;
 
-    cout << "Phase 4 RPC Components Validated:" << endl;
-    cout << "  ✓ JSON-RPC 2.0 protocol" << endl;
-    cout << "  ✓ HTTP/1.1 transport" << endl;
-    cout << "  ✓ Wallet endpoints (getnewaddress, getbalance, getaddresses)" << endl;
-    cout << "  ✓ Mining endpoints (getmininginfo, stopmining)" << endl;
-    cout << "  ✓ General endpoints (help, getnetworkinfo)" << endl;
-    cout << "  ✓ Error handling (invalid methods)" << endl;
+    // This block used to print unconditionally. On a failing run it emitted six
+    // green ticks for components that had NOT been validated -- while the server
+    // had refused to start and nothing had been exercised at all. A summary that
+    // claims coverage the run did not achieve is the most expensive kind of lie
+    // in a test, because it is the part a human reads.
+    if (allPassed) {
+        cout << "Phase 4 RPC Components Validated:" << endl;
+        cout << "  ✓ JSON-RPC 2.0 protocol" << endl;
+        cout << "  ✓ HTTP/1.1 transport" << endl;
+        cout << "  ✓ Wallet endpoints (getnewaddress, getbalance, getaddresses)" << endl;
+        cout << "  ✓ Mining endpoints (getmininginfo, stopmining)" << endl;
+        cout << "  ✓ General endpoints (help, getnetworkinfo)" << endl;
+        cout << "  ✓ Error handling (invalid methods)" << endl;
+    } else {
+        cout << "NOTHING above is validated -- the run failed. Do not read the" << endl;
+        cout << "component list from a failing run; there isn't one." << endl;
+    }
     cout << endl;
 
 #ifdef _WIN32

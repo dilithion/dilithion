@@ -120,7 +120,7 @@ fast|vdf_consensus_test|300|
 fast|vdf_lottery_test|300|
 full|miner_tests|900|PRE-EXISTING, UNOWNED: 4 assertions fail -- "Failed to start mining", "No hashes computed", "No block found", "No hashes after mining". The mining controller does not start under the test harness. Flagged before F4; still unowned.
 full|wallet_tests|300|STALE TEST (likely): 4 assertions fail on coin selection / minimum relay fee / coinbase maturity -- e.g. builds a tx at 0.00001000 DIL against a 0.00010000 DIL minimum. Expectations predate the current fee and maturity rules.
-full|rpc_tests|300|STALE TEST: the harness calls CRPCServer::Start() without RPCAuth::InitializeAuth(), which the server now refuses by design. The test needs to initialise auth; the refusal itself is correct behaviour.
+full|rpc_tests|300|
 full|integration_tests|600|
 full|connman_tests|600|SUSPECTED REAL: high-load throughput test loses messages (pop_count != NUM_MESSAGES, connman_tests.cpp:552). Message loss under load in CConnman is not a stale expectation.
 full|tx_relay_tests|600|WINDOWS-ONLY teardown hang (re-scoped 2026-08-15): all 6 tests PASS, then the process never exits on Windows/MSYS2 (exit 124 at 600s; teardown-path, post-J1/F6). LINUX CONFIRMATION DONE: under TSan on Linux (WSL, gcc, -fsanitize=thread) the binary runs all tests AND EXITS CLEANLY, zero data-race warnings -- so the hang is a Windows-specific teardown path (likely winsock/thread-join semantics), not a portable logic bug. Do NOT lift the quarantine on Windows by raising the timeout; needs a Windows-teardown owner. Linux CI can run this suite ungated.
