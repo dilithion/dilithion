@@ -127,7 +127,13 @@ set -u
 #       does not start under the test harness" -- it starts fine; the harness
 #       was handing it an input the product had learned to refuse.
 # wallet_tests: no chainparams init (its own error said so), plus a fee
-# expectation of 1000 ions against MIN_RELAY_TX_FEE=10000 (consensus/fees.h:20).
+# expectation of 1000 ions against MIN_RELAY_FEE=10000 (amount.h:26 -- NOT
+# MIN_RELAY_TX_FEE in consensus/fees.h, which has the same value and does not
+# gate this path; cite the one that fires).
+#
+# TIER: both are fast, not full, for the reason rpc_tests is. A suite that only
+# runs nightly does not gate the PR that breaks it. Measured cost: miner_tests
+# 19s (it mines for real), wallet_tests under 1s.
 ROSTER='
 fast|rpc_auth_tests|120|
 fast|rpc_host_header_tests|60|
@@ -171,8 +177,8 @@ fast|chain_case_2_5_equivalence_tests|180|UNTRIAGED: scenario_2 (connect-replace
 fast|vdf_consensus_test|300|
 fast|vdf_lottery_test|300|
 fast|rpc_tests|300|
-full|miner_tests|900|
-full|wallet_tests|300|
+fast|wallet_tests|300|
+fast|miner_tests|900|
 full|integration_tests|600|
 full|connman_tests|600|SUSPECTED REAL: high-load throughput test loses messages (pop_count != NUM_MESSAGES, connman_tests.cpp:552). Message loss under load in CConnman is not a stale expectation.
 full|tx_relay_tests|600|WINDOWS-ONLY teardown hang (re-scoped 2026-08-15): all 6 tests PASS, then the process never exits on Windows/MSYS2 (exit 124 at 600s; teardown-path, post-J1/F6). LINUX CONFIRMATION DONE: under TSan on Linux (WSL, gcc, -fsanitize=thread) the binary runs all tests AND EXITS CLEANLY, zero data-race warnings -- so the hang is a Windows-specific teardown path (likely winsock/thread-join semantics), not a portable logic bug. Do NOT lift the quarantine on Windows by raising the timeout; needs a Windows-teardown owner. Linux CI can run this suite ungated.

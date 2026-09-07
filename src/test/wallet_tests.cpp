@@ -435,10 +435,15 @@ bool TestTransactionCreation() {
 
     // Create transaction
     CAmount amount_to_send = 50000000;  // 0.5 DLT
-    // STALE EXPECTATION, fixed with its cite. 1000 ions = 0.00001000 DIL, which
-    // is an order of magnitude BELOW MIN_RELAY_TX_FEE = 10000
-    // (consensus/fees.h:20), so CreateTransaction refused with "Fee below
-    // minimum relay fee". The expectation predates the current fee policy.
+    // STALE EXPECTATION, fixed with the cite that actually FIRES. 1000 ions =
+    // 0.00001000 DIL, an order of magnitude below MIN_RELAY_FEE = 10000
+    // (amount.h:26), so CreateTransaction refused at wallet.cpp:4677 with
+    // "Fee below minimum relay fee". The expectation predates the fee policy.
+    //
+    // Note there are TWO similarly-named constants with the same value:
+    // MIN_RELAY_FEE (amount.h:26) and MIN_RELAY_TX_FEE (consensus/fees.h:20).
+    // Only the first one gates this path -- cite the one that fires, or the
+    // next person changes the other and wonders why nothing moves.
     // Use the wallet's own estimator rather than a fresh hardcoded number --
     // a literal here would go stale again the next time policy moves, and the
     // sibling test at :538 in this same file was ALREADY migrated to it.

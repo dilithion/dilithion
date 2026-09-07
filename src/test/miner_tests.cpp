@@ -270,11 +270,19 @@ int main() {
     // call randomx_init_for_hashing and passes the IDENTICAL assertions. Census
     // over both files: 1 call there, 0 here.
     //
-    // light_mode=1 is the tests' convention (bug_003_block_size_tests.cpp,
-    // integration_tests.cpp) -- full mode allocates a ~2GB dataset.
+    // MIRROR PRODUCTION, not the other tests. randomx_init_for_hashing is the
+    // LEGACY API (randomx_hash.h:19, "LEGACY API: Uses global VM with mutex")
+    // and its per-thread VMs come from a backward-compatibility fallback the
+    // node never takes. Production calls randomx_init_validation_mode
+    // (dilithion-node.cpp:2651): light mode for block validation, blocking,
+    // 1-2 seconds.
+    //
+    // Using the legacy call here would have made this harness pass down a path
+    // production does not use -- which is the same class of defect as the
+    // quarantine this commit is fixing, just pointing the other way.
     const char* rxKey = "dilithion_miner_tests";
-    randomx_init_for_hashing(rxKey, strlen(rxKey), 1);
-    cout << "  (RandomX VM initialised, light mode)" << endl;
+    randomx_init_validation_mode(rxKey, strlen(rxKey));
+    cout << "  (RandomX validation-mode VM initialised, as production does)" << endl;
     cout << endl;
 
     bool allPassed = true;
