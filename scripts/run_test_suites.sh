@@ -136,9 +136,6 @@ full|large_pages_optin_test|2100|
 # ---------------------------------------------------------------------------
 LIST_ONLY=0
 FAIL_FAST=0
-# Seconds of tolerance when deciding whether a signal-kill was really the
-# timeout firing: clock granularity plus the `timeout -k 10` grace period.
-TIMEOUT_SLACK="${TIMEOUT_SLACK:-15}"
 TIER="all"
 for arg in "$@"; do
     case "$arg" in
@@ -257,27 +254,40 @@ while IFS='|' read -r tier suite timeout reason; do
     # 124 is currently unreachable while --preserve-status is set; it is kept so
     # that removing that flag does not silently re-open the same hole in reverse.
     #
-    # PLATFORM CAVEAT, stated because the roster contradicts the headline. The
-    # measurements above are Linux (WSL Ubuntu-24.04, which is what every
-    # `runs-on:` in ci.yml uses). The ONE real hang this repo has actually
-    # observed and written down -- tx_relay_tests, roster row below -- was
-    # recorded as "exit 124 at 600s" on Windows/MSYS2. So 143 is what happens on
-    # the platform CI runs; 124 is what was seen on the platform the roster's
-    # older evidence came from. Both codes are matched here deliberately, and
-    # neither is claimed to be universal. Do not "simplify" this to whichever
-    # one your machine produces.
+    # PLATFORM NOTE, corrected. An earlier revision of this comment attributed
+    # exit 124 to Windows/MSYS2, citing the tx_relay_tests roster row ("exit 124
+    # at 600s"). That attribution was never reproduced and is now contradicted:
+    # measured under this runner's exact flags, native PING.EXE returns 143 on
+    # both MSYS flavours, and 124 appears only WITHOUT --preserve-status -- a
+    # flag that predates the roster note. So the roster row most likely records
+    # a pre---preserve-status observation, not a platform difference. Both codes
+    # stay matched because either can occur depending on the flag, but 124 is
+    # NOT claimed to be "the Windows one".
     # The exit code alone does NOT identify a hang. 143 is SIGTERM and 137 is
     # SIGKILL from ANY source: a suite that raises SIGTERM on itself, or one the
     # OOM killer takes, produces the same code as one `timeout` killed -- and
     # would be filed as a hang that never happened. `elapsed` was already
-    # measured at :210 and simply never consulted. A real timeout kill can only
-    # happen at or after the limit, so require both. SLACK covers clock
-    # granularity and the -k grace period.
+    # measured and simply never consulted.
     #
-    # This matters most for exactly the suites most likely to trip it: the
+    # THE TOLERANCE IS 2 SECONDS -- not 15, and not zero. Both extremes were
+    # tried and both were wrong, so the reasoning is recorded here rather than
+    # left to be re-derived:
+    #
+    #   15s (first attempt) was BACKWARDS in effect. Subtracting a large slack
+    #   only widens the window in which a self-inflicted signal is mistaken for
+    #   a hang: a self-TERM at 46s under a 60s limit would have been filed as
+    #   TIMEOUT, which is the very confusion this check exists to remove.
+    #
+    #   0s (the obvious correction) MISFILES REAL HANGS. Measured here, not
+    #   reasoned: a genuine hang under a 20s limit reports elapsed=19s and was
+    #   classified FAIL. `start`/`end` come from `date +%s`, which samples whole
+    #   seconds, so a kill at T=20.0 straddling a second boundary reads as 19.
+    #
+    # 2s covers that sampling artefact and nothing else: it still rejects the
+    # 46s-under-60 self-TERM by a 12-second margin. This matters most for the
     # crash-injection and shutdown suites, which kill themselves by design.
     elif { [ "$rc" -eq 124 ] || [ "$rc" -eq 137 ] || [ "$rc" -eq 143 ]; } \
-         && [ "$elapsed" -ge $(( timeout > TIMEOUT_SLACK ? timeout - TIMEOUT_SLACK : 0 )) ]; then
+         && [ "$elapsed" -ge $(( timeout > 2 ? timeout - 2 : 0 )) ]; then
         printf '  [TIMEOUT   ] %-52s %4ds  (limit %ss, exit %s)\n' "$suite" "$elapsed" "$timeout" "$rc"
         RESULTS="${RESULTS}TIMEOUT|${suite}|${elapsed}|exceeded ${timeout}s (exit ${rc})\n"
         FAILED=$((FAILED + 1))

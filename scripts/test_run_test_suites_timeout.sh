@@ -55,30 +55,48 @@ echo "== drive the REAL runner against binaries that really hang / really fail =
 # Instead: copy the real runner, swap ONLY its ROSTER for fake suites, and run
 # it. Everything under test -- the timeout invocation, the classification, the
 # printed row, the exit status -- is the real code.
-drive() {                       # drive <script-body> <timeout> ; echoes the row
+drive() {                       # drive <script-body> <timeout> ; echoes row + counts
   local body="$1" tmo="$2" d
   d="$(mktemp -d)"
   printf '%s' "$body" > "$d/fake_suite"
   chmod +x "$d/fake_suite"
-  sed "s|^ROSTER='$|ROSTER='\nfast\|fake_suite\|${tmo}\||" "$RUNNER" > "$d/runner.sh"
+  # REPLACE the roster, do not prepend to it. An earlier version inserted the
+  # fake row and left the other ~41 rows in place, so 37 of them resolved to no
+  # binary and reported [MISSING], supplying failed=37 all by themselves. That
+  # made "a hung suite makes the runner exit non-zero" VACUOUS -- deleting the
+  # TIMEOUT arm's FAILED increment still passed. With a one-row roster the
+  # counts mean what they say.
+  awk -v row="fast|fake_suite|${tmo}|" '
+    /^ROSTER=.$/ { print; print row; skip=1; next }
+    skip && /^.$/ { print; skip=0; next }
+    skip { next }
+    { print }
+  ' "$RUNNER" > "$d/runner.sh"
   ( cd "$d" && TEST_SUITE_LOGDIR="$d/logs" bash runner.sh fast >"$d/out" 2>&1 )
   echo "RUNNER_EXIT=$?" >> "$d/out"
   grep -E '\[(TIMEOUT|FAIL|PASS) ' "$d/out" | head -1
+  grep -E '^  ran=' "$d/out" | head -1
   grep -E '^RUNNER_EXIT=' "$d/out"
   rm -rf "$d"
 }
 
 # (a) A binary that genuinely hangs must be classified TIMEOUT.
+#     Limit 20 (not 2): with the threshold now `elapsed >= timeout` and no
+#     slack, a 2-second limit is too coarse to demonstrate the real arm -- the
+#     comparison has to be made against a limit a hang can plausibly sit under.
 out="$(drive '#!/usr/bin/env bash
 sleep 300
-' 2)"
+' 20)"
 case "$out" in
   *"[TIMEOUT"*) chk "a real hang is classified TIMEOUT by the real runner" "yes" "yes" ;;
   *)            echo "   FAIL  real hang not classified TIMEOUT. Got:"; echo "$out" | sed 's/^/     | /'; F=$((F+1)) ;;
 esac
+# COUNT DELTA, not a bare non-zero exit: with a one-row roster, a hang must
+# produce exactly ran=1 failed=1. "exit non-zero" alone was satisfiable by
+# unrelated rows and so proved nothing.
 case "$out" in
-  *"RUNNER_EXIT=0"*) echo "   FAIL  runner exited 0 on a hung suite"; F=$((F+1)) ;;
-  *)                 chk "a hung suite makes the runner exit non-zero" "yes" "yes" ;;
+  *"ran=1  failed=1"*) chk "the hang is counted: ran=1 failed=1" "yes" "yes" ;;
+  *)                   echo "   FAIL  counts wrong for a hung suite. Got:"; echo "$out" | sed 's/^/     | /'; F=$((F+1)) ;;
 esac
 
 # (b) A binary that fails fast must be FAIL, not swallowed as a timeout.
@@ -88,6 +106,10 @@ exit 1
 case "$out" in
   *"[FAIL"*) chk "a fast failure is classified FAIL (not a hang)" "yes" "yes" ;;
   *)         echo "   FAIL  fast failure misclassified. Got:"; echo "$out" | sed 's/^/     | /'; F=$((F+1)) ;;
+esac
+case "$out" in
+  *"ran=1  failed=1"*) chk "the fast failure is counted: ran=1 failed=1" "yes" "yes" ;;
+  *)                   echo "   FAIL  counts wrong for a failing suite. Got:"; echo "$out" | sed 's/^/     | /'; F=$((F+1)) ;;
 esac
 
 # (c) THE ELAPSED CHECK. A suite that SIGTERMs itself immediately exits 143 --
