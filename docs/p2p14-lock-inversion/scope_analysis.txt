@@ -1,27 +1,52 @@
 P2P-14/15 SCOPE ANALYSIS — which locks are held at each site
-Tree: 9f594a99 (branch fix/p2p14-15-cs-headers-lock-order, base origin/main 9e12e649)
-Tool: brace-depth scope tracker, strings/char-literals/comments stripped before counting.
-      Grep cannot answer 'is this lock held here' and produced a WRONG shape on this finding twice.
-      Validated 3/3 against known-truth cases before its results were used (see below).
+Tree: b574b92f  base origin/main 105f3d8b
+
+############################################################################
+# ⛔ READ THIS FIRST — WHAT THIS TOOL CANNOT ANSWER.
+#
+# An earlier version of this file said: 'no outbound dispatch under cs_vNodes
+# in connman.cpp — (empty = the forward edge is broken)'. THAT CONCLUSION WAS
+# FALSE, and the tool was not wrong — the QUESTION was.
+#
+# This tool answers: 'is a lock textually in scope at this line, in THIS FILE'.
+# The actual question is: 'can cs_headers be acquired while cs_vNodes is held,
+# ANYWHERE'. Those differ the moment the path leaves the file. A second live
+# forward edge sat one indirection away and this analysis reported clean:
+#
+#   connman.cpp:447          lock_guard(cs_vNodes)             HELD
+#     -> EvictPeersIfNeeded
+#   peers.cpp:963            lock_guard(cs_peers)
+#   peers.cpp:1089           connman->DispatchPeerDisconnected(id)   [fallback]
+#   peers.cpp:1708           headers_manager->OnPeerDisconnected(id)
+#   headers_manager.cpp:1450 lock_guard(cs_headers)            ACQUIRED
+#
+# Found by the port-reviewer seat, NOT by this tool and NOT by me. A per-file
+# lexical scope check is necessary and NOT sufficient for an acyclicity claim;
+# it is the same blind spot that let an inverted std::function call survive two
+# independent censuses earlier in this mission. Do not cite this file as proof
+# that a cycle is closed — cite it for what is held WHERE, and get the
+# reachability from the call graph.
+############################################################################
 
 === VALIDATION (must pass before any result below is trusted) ===
 498: [held: cs_headers] connman->PushMessage(peer, getheaders);
 1701: [held: cs_peers] collector->on_peer_disconnected(peer_dna_id);
 1708: [held: -] g_node_context.headers_manager->OnPeerDisconnected(peer_id);
   ^ expected: :498 cs_headers HELD | :1701 cs_peers HELD | :1708 NOTHING held
-    (:1708 is the closed-scope case that nearly killed a true finding)
 
-=== AFTER THE FIX: no outbound dispatch under cs_vNodes in connman.cpp ===
-  (empty = the forward edge is broken at the primary reaper CConnman::DisconnectNodes)
+=== connman.cpp: eviction / dispatch / RemoveNode under cs_vNodes ===
+1332: [held: cs_vNodes] // EvictPeersIfNeeded() here: it would acquire CPeerManager's
+  (the only hit is a COMMENT at :1332 — the sibling accept path explaining why
+   it refuses to call EvictPeersIfNeeded here. No live call remains.)
 
-=== reverse-edge sites still under cs_headers in headers_manager.cpp ===
+=== reverse-edge sites still under cs_headers (CONFORMING, not violations) ===
 351: [held: cs_headers] g_node_context.peer_manager->Misbehaving(peer, 20, MisbehaviorType::INVALID_BLOCK_HEADER);
 498: [held: cs_headers] connman->PushMessage(peer, getheaders);
 530: [held: cs_headers] g_node_context.peer_manager->Misbehaving(peer, 20, MisbehaviorType::INVALID_BLOCK_HEADER);
 674: [held: cs_headers] g_node_context.peer_manager->Misbehaving(peer, 20, MisbehaviorType::INVALID_BLOCK_HEADER);
 2917: [held: cs_headers] g_node_context.peer_manager->Misbehaving(peer, 20, MisbehaviorType::INVALID_BLOCK_HEADER);
 2987: [held: cs_headers] g_node_context.peer_manager->Misbehaving(peer, 20, MisbehaviorType::INVALID_BLOCK_HEADER);
-  These 6 remain and are CONFORMING under the ratified order (cs_headers ABOVE
-  cs_vNodes/cs_peers, net.h). They are not violations; they are what establishes
-  that direction. The cycles close because the DISCONNECT path took cs_headers
-  while holding the other two — that is the site this branch fixes.
+  These 6 remain and conform to the order now RATIFIED IN net.h BY THIS CHANGE
+  (cs_headers above cs_vNodes/cs_peers). Before this branch no document in
+  src/net ordered cs_headers against those two at all — an earlier version of
+  this file cited net.h as already ratifying it, which it did not.

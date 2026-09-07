@@ -997,7 +997,20 @@ private:
     class TipNotifyDrain {
     public:
         explicit TipNotifyDrain(CChainState& chainstate) : m_chainstate(chainstate) {}
-        ~TipNotifyDrain() { m_chainstate.DrainTipNotifications(); }
+        ~TipNotifyDrain() {
+            // Destructors are implicitly noexcept, so ANY exception escaping
+            // here calls std::terminate and kills the node. DrainTipNotifications
+            // catches what the callbacks throw, but not what its own lock
+            // acquisition or vector allocation can throw. Killing a node over a
+            // notification-bookkeeping failure would be a far worse outcome than
+            // the failure itself. (Red-team M-4.)
+            try {
+                m_chainstate.DrainTipNotifications();
+            } catch (...) {
+                // Deliberately swallowed: see above. Not silent — the drain
+                // logs per-callback failures itself.
+            }
+        }
         TipNotifyDrain(const TipNotifyDrain&) = delete;
         TipNotifyDrain& operator=(const TipNotifyDrain&) = delete;
     private:

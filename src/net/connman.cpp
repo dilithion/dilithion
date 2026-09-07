@@ -442,33 +442,62 @@ bool CConnman::AcceptConnection(std::unique_ptr<CSocket> socket, const NetProtoc
         return false;
     }
 
-    // Check connection limits
+    // Check connection limits.
+    //
+    // P2P-14/15: EvictPeersIfNeeded() is called with cs_vNodes RELEASED. It used
+    // to be called inside the scope below, and that was the SECOND live forward
+    // edge of the cs_headers cycles — the one that survived the DisconnectNodes
+    // fix, and that a per-file scope analysis of connman.cpp could not see
+    // because the path leaves the file:
+    //
+    //     connman.cpp:447           lock_guard(cs_vNodes)              HELD
+    //       -> EvictPeersIfNeeded
+    //     peers.cpp:963             lock_guard(cs_peers)
+    //       -> fallback dispatch when no live CNode exists
+    //     peers.cpp:1089            connman->DispatchPeerDisconnected(id)
+    //     peers.cpp:1708            headers_manager->OnPeerDisconnected(id)
+    //     headers_manager.cpp:1450  lock_guard(cs_headers)             ACQUIRED
+    //
+    // against the live reverse edge headers_manager.cpp:222 (cs_headers) -> :498
+    // PushMessage -> connman.cpp:598 (cs_vNodes). Both non-recursive: deadlock.
+    //
+    // The codebase already knew: the sibling accept path at connman.cpp:1302-1310
+    // DELIBERATELY refuses to call EvictPeersIfNeeded under cs_vNodes and says
+    // why. One accept path refused and the other did it. This aligns them.
+    //
+    // Counts are read under the lock and the DECISION is taken after releasing —
+    // the same "decide under the lock, act after" rule this contract applies
+    // everywhere else. The counts may be one connection stale by the time they
+    // are used; that is already true of the sibling path, and connection caps
+    // are advisory under concurrency regardless.
+    size_t inbound_count = 0;
+    size_t total_count = 0;
     {
         std::lock_guard<std::mutex> lock(cs_vNodes);
-        size_t inbound_count = 0;
-        size_t total_count = m_nodes.size();
+        total_count = m_nodes.size();
         for (const auto& node : m_nodes) {
             if (node->fInbound) {
                 inbound_count++;
             }
         }
-        if (inbound_count >= static_cast<size_t>(m_options.nMaxInbound)) {
-            // Phase 4: Try to evict a low-trust peer to make room
-            if (m_peer_manager && m_peer_manager->EvictPeersIfNeeded()) {
-                if (g_verbose.load(std::memory_order_relaxed))
-                    std::cout << "[P2P] Evicted low-value peer to accept new inbound" << std::endl;
-                // Continue to accept — slot freed by eviction
-            } else {
-                LogPrintf(NET, WARN, "[CConnman] Inbound connection limit reached (%zu/%d)\n",
-                          inbound_count, m_options.nMaxInbound);
-                return false;
-            }
-        }
-        if (total_count >= static_cast<size_t>(m_options.nMaxTotal)) {
-            LogPrintf(NET, WARN, "[CConnman] Total connection limit reached (%zu/%d)\n",
-                      total_count, m_options.nMaxTotal);
+    }
+    // cs_vNodes RELEASED — eviction may now take cs_peers/cs_headers safely.
+    if (inbound_count >= static_cast<size_t>(m_options.nMaxInbound)) {
+        // Phase 4: Try to evict a low-trust peer to make room
+        if (m_peer_manager && m_peer_manager->EvictPeersIfNeeded()) {
+            if (g_verbose.load(std::memory_order_relaxed))
+                std::cout << "[P2P] Evicted low-value peer to accept new inbound" << std::endl;
+            // Continue to accept — slot freed by eviction
+        } else {
+            LogPrintf(NET, WARN, "[CConnman] Inbound connection limit reached (%zu/%d)\n",
+                      inbound_count, m_options.nMaxInbound);
             return false;
         }
+    }
+    if (total_count >= static_cast<size_t>(m_options.nMaxTotal)) {
+        LogPrintf(NET, WARN, "[CConnman] Total connection limit reached (%zu/%d)\n",
+                  total_count, m_options.nMaxTotal);
+        return false;
     }
 
     // Extract IP string (supports both IPv4 and IPv6)
@@ -1754,8 +1783,14 @@ void CConnman::DisconnectNodes() {
     // Phase 1 DETACHES the unique_ptrs into a local, so the CNodes stay ALIVE
     // with cs_vNodes released; phase 2 then runs dispatch → RemoveNode →
     // CloseSocket in the required order, and the locals destruct afterwards.
-    // Destroying them here rather than inside the lock is strictly safer than
-    // before: the CNode now provably outlives RemoveNode.
+    //
+    // On the ordering guarantees the CNode now provably outlives RemoveNode,
+    // where before it was destroyed inside the lock. (An earlier version of
+    // this comment called that "strictly safer than before". It was NOT: taking
+    // ownership in `detached` makes an escaping exception FREE the remaining
+    // CNodes without RemoveNode, which the pre-fix code could not do. That is
+    // why phase 2 contains exceptions per node — see below. Corrected after
+    // red-team H-2 rather than left standing.)
     std::vector<std::unique_ptr<CNode>> detached;
 
     // Phase 1 — under cs_vNodes: decide and detach only. No outbound calls.
@@ -1775,23 +1810,65 @@ void CConnman::DisconnectNodes() {
 
     // Phase 2 — cs_vNodes RELEASED. Consumers may now take cs_peers/cs_headers
     // without inverting against it.
+    //
+    // ⚠️ EVERY ITERATION IS EXCEPTION-CONTAINED, and that is not defensive
+    // padding — it is required for correctness of THIS construction.
+    //
+    // Phase 1 moved the CNodes out of m_nodes into `detached`, so `detached`
+    // now OWNS them. If any phase-2 call escaped with an exception, the loop
+    // would abandon and `detached`'s destructor would free every REMAINING
+    // CNode without ever calling RemoveNode — leaving CPeerManager::node_refs
+    // holding raw pointers to freed memory, which GetNode() then hands to
+    // Misbehaving / PeriodicMaintenance / GetConnectionCount. That is a
+    // use-after-free, and it breaks BUG #148 and BUG #153 on the throw path.
+    //
+    // Nothing on this path is noexcept: DispatchPeerDisconnected reaches
+    // CPeerManager::OnPeerDisconnected, the headers manager and the DNA
+    // collector, and any of them can throw (bad_alloc alone suffices).
+    //
+    // The PRE-FIX code could not fail this way: the CNode stayed owned by
+    // m_nodes until after RemoveNode, so an escaping exception left it alive
+    // and re-reapable. Taking ownership is what makes a throw destructive, so
+    // taking ownership obliges us to contain the throw.
     for (auto& node : detached) {
         if (!node) {
             continue;
         }
         const int node_id = node->id;
 
-        // BUG #262: before RemoveNode.
-        DispatchPeerDisconnected(node_id);
-
-        // BUG #153: before the CNode dies (it dies when `detached` unwinds).
-        if (m_peer_manager) {
-            m_peer_manager->RemoveNode(node_id);
+        try {
+            // BUG #262: before RemoveNode.
+            DispatchPeerDisconnected(node_id);
+        } catch (const std::exception& e) {
+            std::cerr << "[CConnman] DispatchPeerDisconnected threw for node "
+                      << node_id << ": " << e.what()
+                      << " — continuing teardown so node_refs cannot dangle" << std::endl;
+        } catch (...) {
+            std::cerr << "[CConnman] DispatchPeerDisconnected threw (unknown) for node "
+                      << node_id << " — continuing teardown so node_refs cannot dangle"
+                      << std::endl;
         }
 
-        node->CloseSocket();
+        // BUG #153: MUST happen before the CNode dies (it dies when `detached`
+        // unwinds). Reached even if the dispatch above threw — that is the
+        // whole point of containing it.
+        try {
+            if (m_peer_manager) {
+                m_peer_manager->RemoveNode(node_id);
+            }
+        } catch (...) {
+            std::cerr << "[CConnman] RemoveNode threw for node " << node_id
+                      << " — node_refs may still hold this id" << std::endl;
+        }
+
+        try {
+            node->CloseSocket();
+        } catch (...) {
+            std::cerr << "[CConnman] CloseSocket threw for node " << node_id << std::endl;
+        }
     }
-    // `detached` unwinds here — CNodes destroyed after RemoveNode. BUG #148/#153 hold.
+    // `detached` unwinds here — CNodes destroyed after RemoveNode. BUG #148/#153
+    // hold on every path, including the throwing one.
 }
 
 void CConnman::InactivityCheck() {
