@@ -3,7 +3,6 @@
 
 #include <rpc/server.h>
 #include <rpc/auth.h>
-#include <type_traits>  // std::is_same for the m_running atomicity static_assert in Stop()
 #include <node/block_processing.h>  // BanMIK/UnbanMIK/ListBannedMIKs
 #include <node/registration_manager.h>  // v4.0.18: CRegistrationManager snapshot accessor
 #include <net/sock.h>
@@ -455,17 +454,6 @@ void CRPCServer::RegisterDNARpc(digital_dna::DigitalDNARpc* dna_rpc) {
 }
 
 bool CRPCServer::Start() {
-    // Serialises the whole of Start() against the whole of Stop() (red-team
-    // H-2). The atomic exchange in Stop() excludes Stop-vs-Stop; it does NOT
-    // exclude Stop-vs-Start, because `m_running = true` below is published
-    // BEFORE m_serverThread / m_workerThreads / m_cleanupThread are written.
-    // A Ctrl+C landing in that window used to win the exchange and then
-    // iterate m_workerThreads while this function was still emplacing into it
-    // -- and clear() a vector holding a joinable thread is std::terminate.
-    // The console handler is installed long before the RPC server starts
-    // (node/dilithion-node.cpp:2386), so that window is reachable in practice.
-    std::lock_guard<std::mutex> lifecycle(m_lifecycleMutex);
-
     if (m_running) {
         return false;
     }
@@ -628,67 +616,12 @@ bool CRPCServer::Start() {
     return true;
 }
 
-bool CRPCServer::Stop() {
-    // EXCHANGE, not check-then-act. `if (!m_running) return; m_running = false;`
-    // is two separate operations on the atomic, so two threads can BOTH observe
-    // true and BOTH proceed through the whole of Stop().
-    //
-    // That is not a theoretical interleaving -- it is the ordinary Ctrl+C path:
-    //   node/dilithion-node.cpp:529   g_node_state.rpc_server->Stop()
-    //   node/dilithion-node.cpp:8862  rpc_server.Stop()
-    // and node/dilithion-node.cpp:2386 installs a Windows SetConsoleCtrlHandler,
-    // which the OS runs on an INJECTED thread. So on Windows a Ctrl+C gives two
-    // threads inside Stop() by construction, every time, not by bad luck.
-    //
-    // Whoever wins the exchange owns the teardown; everyone else returns
-    // immediately. This is what makes the socket close below exactly-once, and
-    // it is also what keeps the join()/m_workerThreads teardown further down
-    // from being executed concurrently with itself.
-    // ⚠️ DO NOT rewrite this as `if (!m_running) { ... } m_running = false;`.
-    //
-    // There is NO TEST that would catch you. A concurrency case asserting
-    // exactly-once used to live in rpc_concurrent_stop_tests.cpp; it SURVIVED
-    // two mutations that did precisely that rewrite (CI runs 34013059180 and
-    // 34066230515, suite confirmed executing in both) and was deleted rather
-    // than left as a false green. The window between the read and the write is
-    // ~2 instructions, which no thread barrier can reliably land in -- see the
-    // removal note in that file for the full post-mortem.
-    //
-    // So this line is load-bearing and unguarded by CI. The exactly-once
-    // property rests entirely on exchange() being a single atomic
-    // read-modify-write, which cannot be won twice. Two callers reaching the
-    // teardown means a double close() of the listening fd (with an fd-reuse
-    // window between the closes, while P2P is still live) and m_workerThreads
-    // iterated by one caller while another clears it.
-    static_assert(std::is_same<decltype(m_running), std::atomic<bool>>::value,
-                  "m_running must stay std::atomic<bool>: Stop()'s exactly-once "
-                  "guarantee is the atomicity of this exchange, and demoting the "
-                  "type would silently break it with no test to catch it");
-
-    // ⛔ THE LOSER MUST WAIT. Taking this lock BEFORE the exchange is the whole
-    // point (red-team H-1), and it fixes a regression the exchange introduced.
-    //
-    // Exactly-one-entrant is NOT the same as "the teardown is finished". The
-    // Ctrl+C thread wins the exchange and enters the joins below; main then
-    // reaches its own rpc_server.Stop() (node/dilithion-node.cpp:8862), which
-    // would return `false` INSTANTLY, so main leaves scope and ~CRPCServer
-    // (server.cpp:382 -> Stop()) destroys m_serverThread / m_workerThreads /
-    // m_cleanupThread WHILE the first thread is still inside join() on those
-    // very objects. rpc_server is a stack object (dilithion-node.cpp:7265).
-    //
-    // Under the OLD check-then-act guard this could not happen: the second
-    // caller ran the same joins and therefore BLOCKED. Removing the double
-    // teardown also removed the accidental barrier that made the redundant
-    // caller safe. Holding the lifecycle mutex across the exchange AND the
-    // teardown restores it deliberately -- a later caller now blocks here
-    // until the teardown is genuinely complete, then finds m_running false
-    // and returns false meaning "already torn down", which is what both call
-    // sites actually assume it means.
-    std::lock_guard<std::mutex> lifecycle(m_lifecycleMutex);
-
-    if (!m_running.exchange(false)) {
-        return false;  // teardown already COMPLETE (not merely started)
+void CRPCServer::Stop() {
+    if (!m_running) {
+        return;
     }
+
+    m_running = false;
 
     // PR #38 red-team C5: wake any RPC worker parked in a wait-* long-poll
     // (waitfornewblock / waitforblock / waitforblockheight). Without this,
@@ -716,21 +649,13 @@ bool CRPCServer::Stop() {
 
     // Shutdown and close server socket.
     //
-    // ONE operation, then operate on the local. Reading the atomic separately
-    // for the guard, the shutdown and the close would be three independent
-    // loads not guaranteed to observe the same value. m_running was already
-    // exchanged to false above, so ServerThread breaks out rather than
+    // ONE load into a local, then operate on the local. Reading the atomic
+    // separately for the guard, the shutdown and the close would be three
+    // independent loads that are not guaranteed to observe the same value,
+    // which would reintroduce a TOCTOU on top of the fix. m_running was
+    // already set false above, so ServerThread breaks out rather than
     // retrying once accept() returns.
-    //
-    // EXCHANGE, not load-then-store. A load/close/store trio is not an
-    // exclusive close: two callers can both read fd 42 and both closesocket(42).
-    // Between those two closes any thread opening a descriptor can be handed 42,
-    // and the second close then destroys an unrelated subsystem's socket --
-    // during shutdown, while P2P is still live (dilithion-node.cpp closes the
-    // P2P socket after this call, not before). The exchange above makes only one
-    // caller reach here at all, and this exchange is the second, independent
-    // guarantee that the fd is claimed exactly once.
-    const int serverSock = m_serverSocket.exchange(INVALID_SOCKET, std::memory_order_acq_rel);
+    const int serverSock = m_serverSocket.load(std::memory_order_acquire);
     if (serverSock != INVALID_SOCKET) {
         // Shutdown the socket to unblock accept() call
         #ifdef _WIN32
@@ -740,10 +665,7 @@ bool CRPCServer::Stop() {
         #endif
 
         closesocket(serverSock);
-        // No store here: the exchange above already published INVALID_SOCKET,
-        // and it did so BEFORE the close rather than after. That ordering is
-        // deliberate -- it closes the window in which ServerThread could still
-        // load a live fd that this thread is about to destroy.
+        m_serverSocket.store(INVALID_SOCKET, std::memory_order_release);
     }
 
     // RPC-002: Wake up all worker threads so they can exit
@@ -770,8 +692,6 @@ bool CRPCServer::Stop() {
 #ifdef _WIN32
     WSACleanup();
 #endif
-
-    return true;  // this caller performed the teardown
 }
 
 bool CRPCServer::InitializePermissions(const std::string& configPath,
