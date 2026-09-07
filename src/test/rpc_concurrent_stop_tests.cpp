@@ -39,14 +39,22 @@
 // The Windows console handler runs on an OS-INJECTED thread, so a Ctrl+C puts
 // two threads inside Stop() by construction, every time.
 //
-// HOW TO CONFIRM THIS SUITE IS NOT DECORATIVE
-// -------------------------------------------
-// Revert server.cpp's guard to the check-then-act form above and rebuild.
-// concurrent_stop_is_exactly_once must go RED -- by a std::system_error
-// escaping the double join(), or by the process aborting. If it still passes,
-// this suite is theatre and should be deleted rather than trusted. A green
-// run here is only meaningful against a mutation that has been shown to
-// redden it.
+// WHAT THIS SUITE DOES AND DOES NOT COVER -- READ BEFORE TRUSTING A GREEN
+// -----------------------------------------------------------------------
+// It covers the Stop() RETURN CONTRACT: the first caller reports performing
+// the teardown, later callers report that they did not.
+//
+// It does NOT cover the concurrent exactly-once guarantee. The case that
+// claimed to was removed after surviving TWO mutations of the very guard it
+// existed to protect -- the full post-mortem is at the removal note further
+// down, and the short version is that the check-then-act window is nanoseconds
+// wide and a thread barrier cannot reliably land in it.
+//
+// So: this suite going green says NOTHING about the race. The race is closed
+// by construction (a single atomic exchange cannot be won twice), not by any
+// test here. Do not cite a green run from this file as evidence about
+// concurrency, and do not add a case to this file that has not itself been
+// shown to redden against a mutation.
 
 #include <boost/test/unit_test.hpp>
 
@@ -125,83 +133,48 @@ struct StartedServer {
 
 BOOST_AUTO_TEST_SUITE(rpc_concurrent_stop_tests)
 
-// The load-bearing case. N threads enter Stop() as close to simultaneously as
-// the platform allows; exactly one may perform the teardown.
+// ============================================================================
+// REMOVED: concurrent_stop_is_exactly_once -- it was THEATRE, and twice over.
 //
-// Under the old check-then-act guard every thread proceeds, so this reaches
-// join() on an already-joined std::thread -- undefined behaviour, in practice
-// a std::system_error or an abort -- and iterates m_workerThreads while
-// another thread clears it.
-BOOST_AUTO_TEST_CASE(concurrent_stop_is_exactly_once)
-{
-    StartedServer s;
+// It asserted that exactly one of 8 concurrent Stop() callers performs the
+// teardown. It PASSED against two separate mutants that restored the broken
+// check-then-act guard (CI runs 34013059180 and 34066230515). In BOTH the
+// suite provably EXECUTED -- the job logs show every case entering and
+// leaving green -- so this is not "the test did not run". A test that passes
+// against the exact bug it was written for is worse than no test: it turns an
+// unverified property into a green badge.
+//
+// WHY IT CANNOT DISCRIMINATE, recorded so nobody rebuilds it the same way:
+// the check-then-act window is the ~2 instructions between
+//     if (!m_running) { return false; }      and      m_running = false;
+// A spin gate releases 8 threads within MICROseconds of one another. That
+// window is NANOseconds wide. One thread wins it and the rest arrive long
+// after the store, take the early return, and the mutant looks correct.
+// Widening the gate, adding threads, or repeating the burst do not change the
+// ratio, and the fixture starts a real RPC server per iteration, so a run long
+// enough to land in the window is far too slow for CI.
+//
+// WHAT WOULD ACTUALLY PIN IT -- none of it done, none of it claimed:
+//   * a mutant carrying a deliberate yield()/sleep INSIDE the window, which
+//     proves the test detects the CLASS while conceding the real window is
+//     tiny; or
+//   * a single-threaded unit test over the guard extracted out of Stop(); or
+//   * TSan on the mutant -- it flags an unsynchronised read-modify-write
+//     without having to lose the race. That is the most promising route and
+//     is blocked only by the sanitizer legs being unable to fail (PR #165).
+//
+// STATUS OF THE PROPERTY: exactly-once rests on m_running.exchange(false)
+// being correct BY CONSTRUCTION -- a single atomic read-modify-write cannot
+// be won twice -- and NOT on any test in this repository. That is a weaker
+// assurance than a passing test would have implied, which is precisely why
+// the misleading test is deleted rather than kept.
+// ============================================================================
 
-    constexpr int kThreads = 8;
-
-    // Spin gate: every thread parks until the flag flips, so they enter Stop()
-    // together rather than in a staggered line. Without this the calls
-    // serialise and the defect never presents.
-    std::atomic<bool> go{false};
-    std::atomic<int> ready{0};
-    std::atomic<int> threw{0};
-    std::atomic<int> performed_teardown{0};
-
-    std::vector<std::thread> callers;
-    callers.reserve(kThreads);
-    for (int i = 0; i < kThreads; ++i) {
-        callers.emplace_back([&]() {
-            ready.fetch_add(1, std::memory_order_release);
-            while (!go.load(std::memory_order_acquire)) {
-                std::this_thread::yield();
-            }
-            try {
-                // THE assertion of this suite. Stop() returns true only for
-                // the caller that won the exchange and ran the teardown.
-                if (s.server->Stop()) {
-                    performed_teardown.fetch_add(1, std::memory_order_relaxed);
-                }
-            } catch (const std::exception&) {
-                threw.fetch_add(1, std::memory_order_relaxed);
-            }
-        });
-    }
-
-    while (ready.load(std::memory_order_acquire) < kThreads) {
-        std::this_thread::yield();
-    }
-    go.store(true, std::memory_order_release);
-
-    for (auto& t : callers) t.join();
-
-    // EXACTLY ONE. This is the whole test.
-    //
-    // Do NOT weaken this to "threw == 0" or to a liveness check. An earlier
-    // revision of this case did exactly that and PASSED against deliberately
-    // broken code: every teardown step is separately guarded
-    // (`if (m_serverThread.joinable())`), so a re-entrant Stop() fails
-    // QUIETLY rather than throwing. Counting winners is the only assertion
-    // here that can tell a correct Stop() from a re-entrant one.
-    BOOST_CHECK_MESSAGE(performed_teardown.load() == 1,
-        performed_teardown.load() << " of " << kThreads
-        << " concurrent Stop() callers performed the teardown; exactly 1 may. "
-           ">1 means the guard is check-then-act rather than an exchange, so "
-           "the listening fd is closed more than once (with an fd-reuse window "
-           "between the closes, while P2P is still live) and m_workerThreads is "
-           "iterated by one caller while another clears it.");
-
-    BOOST_CHECK_MESSAGE(threw.load() == 0,
-        "Stop() threw from " << threw.load() << " of " << kThreads
-        << " concurrent callers");
-
-    BOOST_CHECK_MESSAGE(!s.server->IsRunning(),
-        "server still reports running after " << kThreads << " Stop() calls");
-}
-
-// Sequential Stop() must also be exactly-once. This is the cheap half of the
-// property and it holds under BOTH the old and new guards -- included so that
-// a mutation which reddens the concurrent case but not this one is visibly a
-// CONCURRENCY defect rather than a general Stop() breakage. It is a control,
-// not extra coverage, and it is expected to stay green across the mutation.
+// Sequential Stop() must be exactly-once. This is the CHEAP HALF of the
+// property and it is all this suite still verifies: it pins the bool contract
+// (first caller true, later callers false) but NOT the concurrent guarantee,
+// because it holds under the broken check-then-act guard too. See the removal
+// note above -- do not read a green here as covering the race.
 BOOST_AUTO_TEST_CASE(repeated_sequential_stop_is_safe)
 {
     StartedServer s;
