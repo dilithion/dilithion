@@ -476,8 +476,18 @@ BOOST_RPC_WEBSOCKET_TEST_SOURCE := src/test/rpc_websocket_tests.cpp
 # Targets
 # ============================================================================
 
-.PHONY: all clean install help tests test depends
+.PHONY: all clean install help tests test depends check-tip-notify-drain
 .DEFAULT_GOAL := all
+
+# P2P-14/15 structural guard. Asserts the tip-notification drain invariant that
+# the cs_main <-> cs_headers fix rests on — chiefly that TipNotifyDrain is still
+# declared BEFORE ActivateBestChain's cs_main guard, since reverse-order
+# destruction is the entire mechanism and swapping those two lines silently
+# restores the deadlock with every test still green.
+#
+# Wired here deliberately: a check nobody runs is not a check.
+check-tip-notify-drain:
+	@bash scripts/check-tip-notify-drain.sh
 
 # Default target: build main binaries and utilities
 all: dilithion-node dilv-node genesis_gen check-wallet-balance
@@ -606,10 +616,14 @@ tests-build: $(TEST_SUITES_ALL)
 tests: tests-build
 	@bash scripts/run_test_suites.sh all
 
-tests-fast: $(TEST_SUITES_FAST)
+# P2P-14/15: check-tip-notify-drain is a PREREQUISITE, not a suggestion. It is
+# wired into the target CI actually runs because a guard with zero callers is
+# not a guard — it is a file. It runs FIRST: it is a sub-second grep, and if the
+# drain invariant is broken there is no point running the suites.
+tests-fast: check-tip-notify-drain $(TEST_SUITES_FAST)
 	@bash scripts/run_test_suites.sh fast
 
-tests-full: $(TEST_SUITES_FULL)
+tests-full: check-tip-notify-drain $(TEST_SUITES_FULL)
 	@bash scripts/run_test_suites.sh full
 
 phase1_test: $(CORE_OBJECTS) $(OBJ_DIR)/test/phase1_simple_test.o $(DILITHIUM_OBJECTS) $(CHIAVDF_OBJECTS)
