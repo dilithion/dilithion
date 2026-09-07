@@ -61,7 +61,12 @@ static void pbkdf2_f(const uint8_t* password, size_t password_len,
         // Use std::vector for automatic memory management (RAII)
         size_t salt_block_len = salt_len + 4;
         std::vector<uint8_t> salt_block(salt_block_len);
-        std::memcpy(salt_block.data(), salt, salt_len);
+        // salt == nullptr is accepted when salt_len == 0 (validated by the
+        // caller), and memcpy(dst, nullptr, 0) is UB under memcpy's nonnull
+        // attribute. Same guard shape as HMAC_SHA3_*; output is unchanged.
+        if (salt_len > 0) {
+            std::memcpy(salt_block.data(), salt, salt_len);
+        }
         INT_32_BE(block_index, salt_block.data() + salt_len);
 
         // U1 = HMAC(password, salt || block_index)
