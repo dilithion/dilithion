@@ -160,6 +160,13 @@ struct ScanResult {
     // population problem with a targeted fix or a systemic one.
     std::map<std::string, long long> failOpenByIdentity;
     std::map<std::string, long long> verifiedByIdentity;
+    // SEEN inline as a reference identity, regardless of whether its signature
+    // was ever verified. Kept SEPARATE from verifiedByIdentity: conflating them
+    // made two identities that never verified once report "(+82 verified -
+    // MIXED)", because the census pass incremented the same map the enforcement
+    // pass owns. Caught by re-running a prior measurement on a new base and
+    // diffing the output rather than only reading the headline number.
+    std::map<std::string, long long> seenByIdentity;
     // Identities DERIVED from on-chain REGISTRATION blocks, height of first
     // registration. A registration blob carries a PUBKEY, not an identity, so
     // the identity must be derived exactly as the node does — via the
@@ -394,7 +401,7 @@ ScanResult ScanChain(const std::string& blocksDir, int fromHeight, int toHeight,
             else if (mtc == DFMP::MIK_TYPE_REFERENCE)    ++res.refBlocks;
             else                                         ++res.noMikBlocks;
             const std::string rid = ReferenceIdentityHex(block);
-            if (!rid.empty()) ++res.verifiedByIdentity[rid];   // "seen", not "verified", in this mode
+            if (!rid.empty()) ++res.seenByIdentity[rid];
         }
         if (ctx.censusOnly) {
             if (res.scanned % 25000 == 0) std::cout << "  ... " << res.scanned << " blocks\n";
@@ -821,12 +828,13 @@ int main(int argc, char* argv[])
         untrusted.push_back("no MIK blob could be located in the probe block, so the MIK control was never "
             "applied — this is a TOOL limitation, not evidence about the chain. Do not read it either way.");
 
-    if (!r.failOpenByIdentity.empty() || !r.verifiedByIdentity.empty()) {
+    if (!r.failOpenByIdentity.empty() || !r.verifiedByIdentity.empty() || !r.seenByIdentity.empty()) {
         std::vector<std::pair<long long, std::string>> top;
         for (const auto& kv : r.failOpenByIdentity) top.push_back({kv.second, kv.first});
         std::sort(top.rbegin(), top.rend());
         for (const auto& kv : r.registeredIdentities)
-            if (r.verifiedByIdentity.count(kv.first) || r.failOpenByIdentity.count(kv.first))
+            if (r.seenByIdentity.count(kv.first) || r.verifiedByIdentity.count(kv.first)
+                || r.failOpenByIdentity.count(kv.first))
                 ++const_cast<ScanResult&>(r).derivationCrossChecks;
 
         std::cout << "\nREGISTRATION CENSUS   " << r.registeredIdentities.size()
