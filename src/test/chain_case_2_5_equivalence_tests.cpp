@@ -39,6 +39,7 @@
 #include <core/chainparams.h>
 #include <node/block_index.h>
 #include <primitives/block.h>
+#include <test/test_only_selector.h>
 
 #include <cassert>
 #include <cstdlib>
@@ -447,28 +448,48 @@ void test_scenario_5_write_best_block_fails_triggers_rebuild()
     std::cout << " OK (WriteBestBlock failure surfaces auto_rebuild — PHASE-5.X-WRITEBESTBLOCK-RESILIENCE delivered in v4.3.1)\n";
 }
 
-int main()
+int main(int argc, char** argv)
 {
+    // SCOPE SELECTION. The hand-written reordering that used to live here is
+    // now expressed as a roster ARGS field, so the gate can read it.
+    //
+    // What it said: scenario_5 was MOVED ahead of scenario_2 because
+    // scenario_2 has a pre-existing assertion failure on port/v4.3-rc1 HEAD
+    // (it asserts ok=true after a connect-fail post-disconnect-commit, but the
+    // BLOCKER #1 fix surfaces auto_rebuild -> ok=false). Tracked as a separate
+    // v4.3-rc1 fix; not in scope for v4.3.1 candidate-set seeding work.
+    //
+    // What it did NOT say, and what the reordering could not fix: scenario_2
+    // asserts, assert() aborts the process, so scenarios 3 and 4 -- which sit
+    // after it -- HAVE NEVER EXECUTED IN ANY RUN. The reorder rescued
+    // scenario_5 and left two scenarios silently unreached, with the whole file
+    // quarantined on top of that.
+    //
+    // With --only=, the roster runs 1, 3, 4 and 5 as a gating suite and
+    // excludes 2 IN WRITING. The declaration order below is now the source
+    // order again; the selector filters, it never reorders.
+    test_only::Selector only(argc, argv);
+
     std::cout << "\n=== Phase 5 Day 4 V1: New-path scenario tests ===\n"
               << "    (Patch B legacy-vs-new comparison deferred to V2 integration)\n"
               << std::endl;
     try {
-        test_scenario_1_replacement_succeeds();
-        // v4.3.1 hotfix: run scenario_5 (updated for new WBB-failure semantics)
-        // BEFORE scenario_2/3/4. Scenario_2 has a PRE-EXISTING assertion
-        // failure on port/v4.3-rc1 HEAD (asserts `ok=true` after connect-fail
-        // post-disconnect-commit, but the BLOCKER #1 fix already surfaces
-        // auto_rebuild → ok=false). Tracked as a separate v4.3-rc1 fix; not
-        // in scope for v4.3.1's chain-selection candidate-set seeding work.
-        test_scenario_5_write_best_block_fails_triggers_rebuild();
-        test_scenario_2_connect_replacement_fails_then_recovers();
-        test_scenario_3_disconnect_old_tip_fails();
-        test_scenario_4_both_connects_fail_unrecoverable();
-        std::cout << "\n=== All 5 V1 scenarios passed ===\n"
-                  << "\nNext: V2 integration test (regtest/testnet sync env-var=0 vs =1\n"
+        if (only.ShouldRun("scenario_1_replacement_succeeds"))
+            test_scenario_1_replacement_succeeds();
+        if (only.ShouldRun("scenario_2_connect_replacement_fails_then_recovers"))
+            test_scenario_2_connect_replacement_fails_then_recovers();
+        if (only.ShouldRun("scenario_3_disconnect_old_tip_fails"))
+            test_scenario_3_disconnect_old_tip_fails();
+        if (only.ShouldRun("scenario_4_both_connects_fail_unrecoverable"))
+            test_scenario_4_both_connects_fail_unrecoverable();
+        if (only.ShouldRun("scenario_5_write_best_block_fails_triggers_rebuild"))
+            test_scenario_5_write_best_block_fails_triggers_rebuild();
+        std::cout << "\nNext: V2 integration test (regtest/testnet sync env-var=0 vs =1\n"
                   << "+ leveldb_diff). PR5.4 (Patch B deletion) gates on V1 + V2 both green.\n"
                   << std::endl;
-        return 0;
+        // Deliberately NOT "All 5 V1 scenarios passed" any more. That line was
+        // printed by a run that had executed at most 3 of them.
+        return only.Finish();
     } catch (const std::exception& e) {
         std::cerr << "Test failed: " << e.what() << std::endl;
         DisengagePath();
