@@ -998,11 +998,25 @@ void CHeadersManager::OnBlockActivated(const CBlockHeader& header, const uint256
         } else {
             // Parent not in mapHeaders (compact block arrived without header pipeline).
             // Look up actual height from chainstate block index.
-            // Safe: cs_main is already held (called from ConnectTip→NotifyTipUpdate),
-            // and cs_main is a recursive_mutex.
-            CBlockIndex* pindex = g_chainstate.GetBlockIndex(hash);
-            if (pindex) {
-                height = pindex->nHeight;
+            //
+            // P2P-14/15 §0.3-POST: this USED to read
+            //     CBlockIndex* pindex = g_chainstate.GetBlockIndex(hash);
+            //     if (pindex) { height = pindex->nHeight; }
+            // with the comment "Safe: cs_main is already held (called from
+            // ConnectTip→NotifyTipUpdate), and cs_main is a recursive_mutex."
+            //
+            // That guarantee is GONE. The tip callback now fires AFTER cs_main
+            // is released — that is the whole point of the fix — so this ran
+            // with a raw pointer from a function that takes and releases the
+            // lock, dereferenced outside it. That is exactly the race LP10
+            // measured under TSan at 6353bc33.
+            //
+            // Snapshotting the callback's own parameters did not cover this:
+            // it is a SECOND, internal pointer. Read the value under the lock
+            // instead, so nothing escapes the lock scope.
+            int lookedUpHeight = 0;
+            if (g_chainstate.GetBlockHeightByHash(hash, lookedUpHeight)) {
+                height = lookedUpHeight;
             }
         }
     }

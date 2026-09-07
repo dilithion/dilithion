@@ -640,6 +640,30 @@ public:
     CBlockIndex* GetBlockIndex(const uint256& hash);
 
     /**
+     * P2P-14/15 §0.3-POST: read a block's height BY VALUE, under cs_main.
+     *
+     * GetBlockIndex above acquires cs_main, releases it, and hands back a raw
+     * pointer. Every caller that dereferences that pointer without separately
+     * holding cs_main is racing the eviction path — the shape LP10 measured
+     * under TSan at 6353bc33 ("a mutex on one side buys nothing").
+     *
+     * CHeadersManager::OnBlockActivated did exactly that, and got away with it
+     * ONLY because its caller (ConnectTip → NotifyTipUpdate) still held cs_main
+     * — a dependency its own comment relied on. The P2P-14/15 fix fires that
+     * callback with cs_main RELEASED, which removed the guarantee. Snapshotting
+     * the callback's parameters does NOT cover this: it is a second, internal
+     * pointer.
+     *
+     * So: return the value, never the pointer. The read and the dereference
+     * happen inside one lock scope.
+     *
+     * @param hash      block to look up
+     * @param heightOut set to the block's height on success, untouched on failure
+     * @return true if the block index exists
+     */
+    bool GetBlockHeightByHash(const uint256& hash, int& heightOut) const;
+
+    /**
      * Check if block index exists in memory
      */
     bool HasBlockIndex(const uint256& hash) const;

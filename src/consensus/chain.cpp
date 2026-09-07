@@ -195,6 +195,20 @@ CBlockIndex* CChainState::GetBlockIndex(const uint256& hash) {
     return nullptr;
 }
 
+bool CChainState::GetBlockHeightByHash(const uint256& hash, int& heightOut) const {
+    // P2P-14/15 §0.3-POST. Read AND dereference inside one lock scope, so no
+    // pointer escapes for a caller to use after the lock is gone. See the
+    // header for why GetBlockIndex's pointer return is unsafe for this caller.
+    std::lock_guard<std::recursive_mutex> lock(cs_main);
+
+    auto it = mapBlockIndex.find(hash);
+    if (it == mapBlockIndex.end() || it->second == nullptr) {
+        return false;
+    }
+    heightOut = it->second->nHeight;  // dereferenced under the lock, copied out
+    return true;
+}
+
 bool CChainState::HasBlockIndex(const uint256& hash) const {
     // CRITICAL-1 FIX: Acquire lock before accessing shared state
     std::lock_guard<std::recursive_mutex> lock(cs_main);
