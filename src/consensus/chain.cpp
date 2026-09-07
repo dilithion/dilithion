@@ -2550,6 +2550,32 @@ void CChainState::NotifyTipUpdate(const CBlockIndex* pindex) {
 
     m_pendingTipNotifications.push_back(
         PendingTipNotification{pindex->header, pindex->GetBlockHash()});
+
+    // UNDRAINED-QUEUE CANARY.
+    //
+    // All four NotifyTipUpdate call sites (chain.cpp:684, :749, :803, :1324)
+    // are inside ActivateBestChain, which declares the one TipNotifyDrain. So
+    // the queue is bounded by the notifications of a single activation — a
+    // handful — and is emptied before that function returns.
+    //
+    // The failure this guards is a FUTURE one: someone adds a fifth call site
+    // in a scope with no TipNotifyDrain. That notification would be queued and
+    // never fired, so a tip update would be silently dropped and the queue
+    // would grow without bound. Both halves of that are invisible — no crash,
+    // no failing test, just a consumer that stops being told about new tips.
+    //
+    // Growth is the observable symptom, so watch it rather than trusting the
+    // structure to stay as it is. This is a loud log, not an assert: dropping
+    // a node in production over a bookkeeping leak would be a worse failure
+    // than the leak.
+    constexpr size_t kPendingTipNotificationWarnThreshold = 64;
+    if (m_pendingTipNotifications.size() > kPendingTipNotificationWarnThreshold) {
+        std::cerr << "[Chain] WARNING: " << m_pendingTipNotifications.size()
+                  << " undrained tip notifications. A NotifyTipUpdate call site is "
+                     "almost certainly queueing in a scope with no TipNotifyDrain "
+                     "— tip updates are being silently dropped. See P2P-14/15."
+                  << std::endl;
+    }
 }
 
 void CChainState::DrainTipNotifications() {
