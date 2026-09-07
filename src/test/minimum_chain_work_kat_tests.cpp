@@ -61,6 +61,23 @@ void RequireEqual(const char* what, const uint256& got, const uint256& want)
     }
 }
 
+// Load-bearing boolean check. Deliberately NOT the standard library's
+// assertion macro: this repo ships -DNDEBUG release builds (build-release.sh:62
+// passes it, and Makefile's `CXXFLAGS ?=` means an environment CXXFLAGS
+// replaces the default wholesale), under which every such assertion here would
+// compile to nothing and the suite would
+// print ALL PASS with its guards hollowed out -- including the single check
+// standing between a silently-short census and a plausible wrong total.
+// Found by red-team round 2; the same reasoning as util/assert.h's Invariant().
+void RequireTrue(const char* what, bool ok)
+{
+    if (!ok) {
+        std::cerr << "\n  FAIL " << what << std::endl;
+        std::abort();
+    }
+}
+#define REQUIRE(cond) RequireTrue(#cond, (cond))
+
 void test_hex_literals_round_trip()
 {
     std::cout << "  test_hex_literals_round_trip..." << std::flush;
@@ -68,10 +85,10 @@ void test_hex_literals_round_trip()
     // other assertion in this file would be comparing a value against itself.
     RequireEqual("DIL round-trip",  uint256S(uint256S(DIL_EXPECT).GetHex()),  uint256S(DIL_EXPECT));
     RequireEqual("DilV round-trip", uint256S(uint256S(DILV_EXPECT).GetHex()), uint256S(DILV_EXPECT));
-    assert(uint256S(DIL_EXPECT).GetHex()  == DIL_EXPECT);
-    assert(uint256S(DILV_EXPECT).GetHex() == DILV_EXPECT);
-    assert(!uint256S(DIL_EXPECT).IsNull());
-    assert(!uint256S(DILV_EXPECT).IsNull());
+    REQUIRE(uint256S(DIL_EXPECT).GetHex()  == DIL_EXPECT);
+    REQUIRE(uint256S(DILV_EXPECT).GetHex() == DILV_EXPECT);
+    REQUIRE(!uint256S(DIL_EXPECT).IsNull());
+    REQUIRE(!uint256S(DILV_EXPECT).IsNull());
     std::cout << " OK" << std::endl;
 }
 
@@ -91,6 +108,20 @@ void test_work_units_are_this_ports_units_not_bitcoin_cores()
     RequireEqual("work(0x1d1ea6b8)",  // DIL at its checkpoint height
                  ComputeChainWork(0x1d1ea6b8),
                  uint256S("0000000000000000000000000000000000000000000000085a1e6258a9000000"));
+
+    // A THIRD value, with the compact-encoding SIGN BIT SET (mantissa >=
+    // 0x800000). 1,667 blocks in the DIL census carry such nBits -- the "EDA +
+    // sign bit compounding" history fixed at compactEncodingFixHeight = 18500.
+    // In Bitcoin's compact encoding those are negative targets; ComputeChainWork
+    // here ignores the sign bit and divides by the full 24-bit mantissa, and so
+    // does the node, so there is no mismatch today. The hazard is forward: if
+    // anyone "ports ComputeChainWork closer to Core" by adding Core's
+    // negative/overflow handling, the work of those 1,667 historical blocks
+    // changes and nMinimumChainWork silently becomes wrong. The two values above
+    // are both sign-CLEAR and would not fire. This one does, and names the cause.
+    RequireEqual("work(0x1ef0c7e6) -- sign bit SET, 898 blocks in the census",
+                 ComputeChainWork(0x1ef0c7e6),
+                 uint256S("00000000000000000000000000000000000000000000000001102e5d3fd90000"));
     std::cout << " OK" << std::endl;
 }
 
@@ -128,21 +159,21 @@ void test_dil_constant_is_re_derived_from_the_committed_census()
     // Chain work is a SUM, so aggregating equal nBits is exact. Guard the
     // coverage first: a census that silently covered fewer blocks would produce
     // a smaller, entirely plausible total.
-    assert(DIL_CENSUS_TIP_HEIGHT == 54000);
-    assert(DIL_CENSUS_TOTAL_BLOCKS == DIL_CENSUS_TIP_HEIGHT + 1);
+    REQUIRE(DIL_CENSUS_TIP_HEIGHT == 54000);
+    REQUIRE(DIL_CENSUS_TOTAL_BLOCKS == DIL_CENSUS_TIP_HEIGHT + 1);
 
     long long counted = 0;
     uint256 sum;
     for (size_t i = 0; i < DIL_NBITS_CENSUS_LEN; ++i) {
         const uint32_t nbits = DIL_NBITS_CENSUS[i].nBits;
-        assert(nbits != 0);  // a zero mantissa saturates work to MAX, invisibly
+        REQUIRE(nbits != 0);  // a zero mantissa saturates work to MAX, invisibly
         for (uint32_t n = 0; n < DIL_NBITS_CENSUS[i].count; ++n)
             sum = AddChainWork(sum, ComputeChainWork(nbits));
         counted += DIL_NBITS_CENSUS[i].count;
     }
     // The census must account for every block from genesis to the checkpoint,
     // or the sum is short in a way no comparison against itself would reveal.
-    assert(counted == DIL_CENSUS_TOTAL_BLOCKS);
+    REQUIRE(counted == DIL_CENSUS_TOTAL_BLOCKS);
 
     RequireEqual("DIL re-derived work at height 54000", sum, uint256S(DIL_EXPECT));
     RequireEqual("DIL census sum vs chainparams",
@@ -163,8 +194,8 @@ void test_chainparams_carry_the_measured_values()
     // Testnet and regtest stay zero deliberately: there is no measurement for
     // either, testnet is reset and relaunched, and regtest chains are a handful
     // of blocks. A non-zero value on either would lock honest nodes out.
-    assert(ChainParams::Testnet().nMinimumChainWork.IsNull());
-    assert(ChainParams::Regtest().nMinimumChainWork.IsNull());
+    REQUIRE(ChainParams::Testnet().nMinimumChainWork.IsNull());
+    REQUIRE(ChainParams::Regtest().nMinimumChainWork.IsNull());
     std::cout << " OK" << std::endl;
 }
 
@@ -184,12 +215,12 @@ void test_thresholds_sit_below_measured_tip_work()
     const uint256 dilv_tip_work = uint256S(
         "000000000000000000000000000000000000000003e437e437e437e434000000");
 
-    assert(!ChainWorkGreaterOrEqual(ChainParams::Mainnet().nMinimumChainWork, dil_tip_work));
-    assert(!ChainWorkGreaterOrEqual(ChainParams::DilV().nMinimumChainWork,    dilv_tip_work));
+    REQUIRE(!ChainWorkGreaterOrEqual(ChainParams::Mainnet().nMinimumChainWork, dil_tip_work));
+    REQUIRE(!ChainWorkGreaterOrEqual(ChainParams::DilV().nMinimumChainWork,    dilv_tip_work));
 
     // ...and strictly above zero, or the gate is a no-op even once wired.
-    assert(ChainWorkGreaterOrEqual(ChainParams::Mainnet().nMinimumChainWork, uint256S("1")));
-    assert(ChainWorkGreaterOrEqual(ChainParams::DilV().nMinimumChainWork,    uint256S("1")));
+    REQUIRE(ChainWorkGreaterOrEqual(ChainParams::Mainnet().nMinimumChainWork, uint256S("1")));
+    REQUIRE(ChainWorkGreaterOrEqual(ChainParams::DilV().nMinimumChainWork,    uint256S("1")));
     std::cout << " OK" << std::endl;
 }
 

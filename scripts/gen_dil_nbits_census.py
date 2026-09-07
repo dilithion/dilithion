@@ -57,6 +57,10 @@ EXPECT_ROWS = EXPECT_TIP + 1
 EXPECT_GENESIS_HASH = "0000009eaa5e7781ba6d14525c3f75c35444045b21ddafbbea61090db99b0bc3"
 EXPECT_TIP_HASH = "0000000bb44c964b4e3c6fec8c15941738cd74b434bafbfe4aadce898140b993"
 
+# src/consensus/pow.h MIN_DIFFICULTY_BITS / MAX_DIFFICULTY_BITS.
+MIN_DIFFICULTY_BITS = 0x1d00ffff
+MAX_DIFFICULTY_BITS = 0x1f0fffff
+
 
 def die(msg):
     sys.stderr.write("CENSUS ABORTED (nothing written): %s\n" % msg)
@@ -105,6 +109,16 @@ def main():
             die("line %d: nBits is zero (would saturate work to MAX)" % lineno)
         if nbits > 0xFFFFFFFF:
             die("line %d: nBits does not fit in 32 bits: %r" % (lineno, tok))
+        # Consensus bounds from src/consensus/pow.h (MIN_DIFFICULTY_BITS /
+        # MAX_DIFFICULTY_BITS). Without this a garbage row such as 0x01000001
+        # -- which makes ComputeChainWork return an astronomically large value
+        # -- passes every other check and inflates the constant beyond any
+        # honest chain. The committed artifact happens to sit entirely inside
+        # this window, but "happens to" is not a gate.
+        if not (MIN_DIFFICULTY_BITS <= nbits <= MAX_DIFFICULTY_BITS):
+            die("line %d: nBits %s is outside the consensus difficulty window "
+                "[0x%08x, 0x%08x]" % (lineno, tok, MIN_DIFFICULTY_BITS,
+                                      MAX_DIFFICULTY_BITS))
         if height in seen:
             die("duplicate row for height %d" % height)
         seen[height] = nbits

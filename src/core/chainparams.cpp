@@ -101,11 +101,13 @@ ChainParams ChainParams::Mainnet() {
     // Moved from 20160 to 18500 to stop ongoing chain degradation.
     params.compactEncodingFixHeight = 18500;
 
-    // Phase 3 port: HeadersSync PRESYNC chain-work gate. Zero for now
-    // (preserves pre-port behaviour where this gate was hardcoded zero in
-    // CHeadersManager). A non-zero value can be set in a follow-up after
-    // smoke-testing that a fresh node successfully clears the threshold
-    // against a live seed. Q7 plan recommendation deferred to Phase 4.
+    // Phase 3 port: HeadersSync PRESYNC chain-work gate.
+    // [SUPERSEDED 2026-09-07 — this block used to read "Zero for now ... a
+    // non-zero value can be set in a follow-up". A non-zero value IS set
+    // below. Left as a marker rather than deleted, because a stale lead
+    // sentence sitting above a contradicting assignment is exactly the
+    // comment-asserts-a-state defect this mission exists to close, and it was
+    // caught here by review rather than by a reader trusting it.]
     //
     // LP-10 (2026-09-07), PROPOSED — NOT YET RATIFIED BY A DECISION ROW.
     // Measured chain work at DIL's most recent checkpoint, height 54000
@@ -543,9 +545,11 @@ ChainParams ChainParams::DilV() {
     // Timestamp validation: active from genesis
     params.timestampValidationHeight = 0;
 
-    // Phase 3 port: DilV starts with no PRESYNC chain-work gate; the
-    // gate value can be tightened in Phase 4 after telemetry confirms
-    // typical fresh-node IBD work accumulation against live seeds.
+    // Phase 3 port: DilV PRESYNC chain-work gate.
+    // [SUPERSEDED 2026-09-07 — this block used to read "DilV starts with no
+    // PRESYNC chain-work gate". A value IS set below. Same reason as the
+    // Mainnet() marker: a stale lead above a contradicting assignment is the
+    // defect this mission exists to close.]
     //
     // LP-10 (2026-09-07), PROPOSED — NOT YET RATIFIED BY A DECISION ROW.
     // Measured chain work at DilV's most recent checkpoint, height 67000
