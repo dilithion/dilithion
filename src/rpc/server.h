@@ -125,6 +125,28 @@ using RPCHandler = std::function<std::string(const std::string&)>;
 class CRPCServer {
 private:
     uint16_t m_port;
+
+    /** Serialises the WHOLE of Start() against the WHOLE of Stop().
+     *
+     *  Not redundant with m_running's atomic exchange. The exchange gives
+     *  exactly-one-ENTRANT; this gives the two things the exchange does not:
+     *    (1) a later Stop() caller WAITS for the teardown to finish rather
+     *        than returning early and letting ~CRPCServer destroy the very
+     *        thread objects the winner is still join()ing (red-team H-1);
+     *    (2) Stop() cannot interleave with Start()'s window between
+     *        `m_running = true` and the writes to m_serverThread /
+     *        m_workerThreads / m_cleanupThread (red-team H-2).
+     *
+     *  ⚠️ Stop() is reachable from a POSIX signal handler
+     *  (node/dilithion-node.cpp:2370 -> :523). Taking a mutex there is not
+     *  async-signal-safe: if the signal lands on a thread already inside
+     *  Start()/Stop(), shutdown deadlocks. That hazard PRE-DATES this mutex
+     *  (Stop() already locked m_ssl_mutex) but this widens it, and it is
+     *  recorded rather than hidden. The correct fix is for the handler to set
+     *  a flag and let a normal thread run the teardown; that is a separate
+     *  change and is NOT done here. */
+    mutable std::mutex m_lifecycleMutex;
+
     std::atomic<bool> m_running{false};
     std::thread m_serverThread;
     std::thread m_cleanupThread;  // Rate limiter cleanup thread

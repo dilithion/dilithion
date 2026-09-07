@@ -455,6 +455,17 @@ void CRPCServer::RegisterDNARpc(digital_dna::DigitalDNARpc* dna_rpc) {
 }
 
 bool CRPCServer::Start() {
+    // Serialises the whole of Start() against the whole of Stop() (red-team
+    // H-2). The atomic exchange in Stop() excludes Stop-vs-Stop; it does NOT
+    // exclude Stop-vs-Start, because `m_running = true` below is published
+    // BEFORE m_serverThread / m_workerThreads / m_cleanupThread are written.
+    // A Ctrl+C landing in that window used to win the exchange and then
+    // iterate m_workerThreads while this function was still emplacing into it
+    // -- and clear() a vector holding a joinable thread is std::terminate.
+    // The console handler is installed long before the RPC server starts
+    // (node/dilithion-node.cpp:2386), so that window is reachable in practice.
+    std::lock_guard<std::mutex> lifecycle(m_lifecycleMutex);
+
     if (m_running) {
         return false;
     }
@@ -653,8 +664,30 @@ bool CRPCServer::Stop() {
                   "m_running must stay std::atomic<bool>: Stop()'s exactly-once "
                   "guarantee is the atomicity of this exchange, and demoting the "
                   "type would silently break it with no test to catch it");
+
+    // ⛔ THE LOSER MUST WAIT. Taking this lock BEFORE the exchange is the whole
+    // point (red-team H-1), and it fixes a regression the exchange introduced.
+    //
+    // Exactly-one-entrant is NOT the same as "the teardown is finished". The
+    // Ctrl+C thread wins the exchange and enters the joins below; main then
+    // reaches its own rpc_server.Stop() (node/dilithion-node.cpp:8862), which
+    // would return `false` INSTANTLY, so main leaves scope and ~CRPCServer
+    // (server.cpp:382 -> Stop()) destroys m_serverThread / m_workerThreads /
+    // m_cleanupThread WHILE the first thread is still inside join() on those
+    // very objects. rpc_server is a stack object (dilithion-node.cpp:7265).
+    //
+    // Under the OLD check-then-act guard this could not happen: the second
+    // caller ran the same joins and therefore BLOCKED. Removing the double
+    // teardown also removed the accidental barrier that made the redundant
+    // caller safe. Holding the lifecycle mutex across the exchange AND the
+    // teardown restores it deliberately -- a later caller now blocks here
+    // until the teardown is genuinely complete, then finds m_running false
+    // and returns false meaning "already torn down", which is what both call
+    // sites actually assume it means.
+    std::lock_guard<std::mutex> lifecycle(m_lifecycleMutex);
+
     if (!m_running.exchange(false)) {
-        return false;  // another caller owns the teardown
+        return false;  // teardown already COMPLETE (not merely started)
     }
 
     // PR #38 red-team C5: wake any RPC worker parked in a wait-* long-poll
