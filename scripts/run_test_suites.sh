@@ -278,10 +278,13 @@ while IFS='|' read -r tier suite timeout reason; do
     #   a hang: a self-TERM at 46s under a 60s limit would have been filed as
     #   TIMEOUT, which is the very confusion this check exists to remove.
     #
-    #   0s (the obvious correction) MISFILES REAL HANGS. Measured here, not
-    #   reasoned: a genuine hang under a 20s limit reports elapsed=19s and was
-    #   classified FAIL. `start`/`end` come from `date +%s`, which samples whole
-    #   seconds, so a kill at T=20.0 straddling a second boundary reads as 19.
+    #   0s is too tight to be safe. I observed a genuine hang under a 20s limit
+    #   report elapsed=19s and get classified FAIL. A later 47-sample run did
+    #   NOT reproduce that, so the mechanism is NOT the whole-second rounding I
+    #   first claimed -- treat the 19s as unexplained scheduling jitter rather
+    #   than a rounding law. Either way a threshold with zero margin turns any
+    #   such jitter into a misfiled hang, and the cost of 2s of margin is
+    #   nothing.
     #
     # 2s covers that sampling artefact and nothing else: it still rejects the
     # 46s-under-60 self-TERM by a 12-second margin. This matters most for the

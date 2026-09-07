@@ -126,6 +126,22 @@ case "$out" in
   *)         echo "   FAIL  early self-SIGTERM recorded as a hang. Got:"; echo "$out" | sed 's/^/     | /'; F=$((F+1)) ;;
 esac
 
+# (d) PIN THE SLACK MAGNITUDE, not just its sign. Case (c) catches slack=0 and
+#     the wrong sign, but a regression back to a LARGE slack (the original 15s)
+#     passes every case above -- so the magnitude was unpinned.
+#     Limit 20 with a self-TERM at ~10s discriminates:
+#         slack 2  -> threshold 18 -> 10 < 18 -> FAIL      (correct)
+#         slack 15 -> threshold  5 -> 10 >= 5 -> TIMEOUT   (wrong, caught here)
+out="$(drive '#!/usr/bin/env bash
+sleep 10
+kill -TERM $$
+sleep 60
+' 20)"
+case "$out" in
+  *"[FAIL"*) chk "a self-SIGTERM at ~half the limit is FAIL (slack magnitude pinned)" "yes" "yes" ;;
+  *)         echo "   FAIL  mid-limit self-SIGTERM recorded as a hang - slack too large. Got:"; echo "$out" | sed 's/^/     | /'; F=$((F+1)) ;;
+esac
+
 echo
 echo "   ===== run_test_suites timeout classification: $P passed, $F failed ====="
 [ "$F" -eq 0 ]
