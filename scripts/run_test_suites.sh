@@ -76,6 +76,37 @@ set -u
 # before their sources were touched and both after. COUNTED, not derived: the
 # fast tier is now 41 rows, 37 of them live (4 quarantined). The "32/32 in 72s"
 # figure above is the 2026-08-10 measurement and is no longer the current count.
+#
+# QUARANTINE LIFTED 2026-09-07: rpc_tests. Measured on Linux (WSL Ubuntu-24.04,
+# which is the platform every `runs-on:` in ci.yml uses), N=20 with the
+# exit-code histogram, using scripts/measure_suite_stability.sh:
+#     BEFORE  PASS=0  FAIL=20  HANG=0   histogram: 1 x20
+#     AFTER   PASS=20 FAIL=0   HANG=0   histogram: 0 x20
+# A DETERMINISTIC failure, not a hang -- which is why the quarantine was lifted
+# rather than its timeout raised. The stated reason was accurate but incomplete:
+# it named the auth/permissions init, and fixing that revealed two further real
+# requirements the never-starting server had hidden (the X-Dilithion-RPC CSRF
+# header, then HTTP Basic credentials). The quarantine was covering three
+# defects, not one.
+#
+# integration_tests was NOT quarantined and needs its own note, because its exit
+# code cannot show what changed: it exited 0 BEFORE and 0 AFTER. It had been
+# passing while its RPC server never started once -- Start() failed, the test
+# printed "may be port conflict or system limitation" and returned true. Proven
+# by MUTATION rather than by exit code: with the permissions init removed the
+# suite now exits 1 (mutant dies), so the fix is load-bearing.
+#
+# Negative controls were added at the same time and are the reason the lift is
+# worth anything: before them, deleting the CSRF check in server.cpp left every
+# suite in this roster green. Verified load-bearing by disabling that gate --
+# rpc_tests exits 1 -- and restored.
+#
+# TIER: rpc_tests is fast, NOT full, and that is load-bearing rather than a
+# preference. It is the only suite that pins the CSRF and auth gates by asserting
+# they REJECT. In the full tier those pins run nightly and on roster-touching PRs
+# only -- so a PR that deleted the CSRF block in server.cpp would merge GREEN,
+# which is the exact hole the negative controls were written to close. A gate that
+# does not run on the PR that breaks it is not a gate. Cost is ~6s.
 ROSTER='
 fast|rpc_auth_tests|120|
 fast|rpc_host_header_tests|60|
@@ -118,9 +149,9 @@ fast|test_passphrase_validator|60|SUSPECTED REAL (policy): 2 of 16 cases -- two 
 fast|chain_case_2_5_equivalence_tests|180|UNTRIAGED: scenario_2 (connect-replacement-fails-then-recovers) now truncates the chain and triggers auto_rebuild instead of recovering (chain_case_2_5_equivalence_tests.cpp:304). Behaviour change in ActivateBestChainStep; needs a chainstate owner to say which side is right.
 fast|vdf_consensus_test|300|
 fast|vdf_lottery_test|300|
+fast|rpc_tests|300|
 full|miner_tests|900|PRE-EXISTING, UNOWNED: 4 assertions fail -- "Failed to start mining", "No hashes computed", "No block found", "No hashes after mining". The mining controller does not start under the test harness. Flagged before F4; still unowned.
 full|wallet_tests|300|STALE TEST (likely): 4 assertions fail on coin selection / minimum relay fee / coinbase maturity -- e.g. builds a tx at 0.00001000 DIL against a 0.00010000 DIL minimum. Expectations predate the current fee and maturity rules.
-full|rpc_tests|300|STALE TEST: the harness calls CRPCServer::Start() without RPCAuth::InitializeAuth(), which the server now refuses by design. The test needs to initialise auth; the refusal itself is correct behaviour.
 full|integration_tests|600|
 full|connman_tests|600|SUSPECTED REAL: high-load throughput test loses messages (pop_count != NUM_MESSAGES, connman_tests.cpp:552). Message loss under load in CConnman is not a stale expectation.
 full|tx_relay_tests|600|WINDOWS-ONLY teardown hang (re-scoped 2026-08-15): all 6 tests PASS, then the process never exits on Windows/MSYS2 (exit 124 at 600s; teardown-path, post-J1/F6). LINUX CONFIRMATION DONE: under TSan on Linux (WSL, gcc, -fsanitize=thread) the binary runs all tests AND EXITS CLEANLY, zero data-race warnings -- so the hang is a Windows-specific teardown path (likely winsock/thread-join semantics), not a portable logic bug. Do NOT lift the quarantine on Windows by raising the timeout; needs a Windows-teardown owner. Linux CI can run this suite ungated.
