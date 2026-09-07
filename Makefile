@@ -519,6 +519,11 @@ inspect_db: $(CORE_OBJECTS) $(OBJ_DIR)/tools/inspect_db.o $(DILITHIUM_OBJECTS) $
 	@$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS) $(LIBS)
 	@echo "$(COLOR_GREEN)✓ inspect_db built successfully$(COLOR_RESET)"
 
+vdf_history_check: $(CORE_OBJECTS) $(OBJ_DIR)/tools/vdf_history_check.o $(DILITHIUM_OBJECTS) $(CHIAVDF_OBJECTS)
+	@echo "$(COLOR_BLUE)[LINK]$(COLOR_RESET) $@"
+	@$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS) $(LIBS)
+	@echo "$(COLOR_GREEN)✓ vdf_history_check built successfully$(COLOR_RESET)"
+
 # Phase 5 Day 5: leveldb state-hash tool for V2 byte-equivalence testing.
 # Computes SHA3-256 of sorted (key,value) entries; comparing two outputs
 # proves byte-level equivalence of two LevelDB databases.
