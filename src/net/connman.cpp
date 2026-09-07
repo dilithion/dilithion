@@ -1726,39 +1726,72 @@ void CConnman::ExtractMessages(CNode* pnode) {
 }
 
 void CConnman::DisconnectNodes() {
-    // BUG #148 + BUG #153 FIX: Remove from CPeerManager BEFORE destroying CNode
-    // This eliminates race window where node_refs could point to freed memory
-    std::vector<int> nodes_to_remove;
+    // P2P-14/15: THIS IS THE PRIMARY DISCONNECT REAPER and it was the forward
+    // edge of both lock-order cycles. DispatchPeerDisconnected reaches
+    // CPeerManager::OnPeerDisconnected (cs_peers) and, through it,
+    // CHeadersManager::OnPeerDisconnected (cs_headers). Calling it inside the
+    // cs_vNodes scope below produced cs_vNodes → cs_peers → cs_headers, against
+    // the ratified order in net.h where cs_headers sits ABOVE both.
+    //
+    // (Eviction at peers.cpp:1089 dispatches too, but only as a FALLBACK when
+    // no live CNode exists — since the 2026-06-01 socket-orphan fix this is the
+    // path that runs in production. An earlier draft of the contract cited only
+    // the eviction path, taken from a stale net.h comment rather than the call
+    // graph, and would have left this site untouched.)
+    //
+    // Fixed by the ratified rule — decide under the lock, act after releasing —
+    // in two phases. THE THREE ORDERING CONSTRAINTS ENCODED BY PRIOR BUG FIXES
+    // ARE PRESERVED, and they are why this is a detach rather than a plain
+    // "collect ids and dispatch later":
+    //
+    //   BUG #262 — DispatchPeerDisconnected MUST precede RemoveNode, because
+    //              OnPeerDisconnected → GetAndClearPeerBlocks needs the peer to
+    //              still exist in the peers map or mapBlocksInFlight leaks.
+    //   BUG #153 — RemoveNode MUST precede CNode destruction, so node_refs is
+    //              cleared while the CNode is still alive.
+    //   BUG #148 — no node_ref may outlive its CNode.
+    //
+    // Phase 1 DETACHES the unique_ptrs into a local, so the CNodes stay ALIVE
+    // with cs_vNodes released; phase 2 then runs dispatch → RemoveNode →
+    // CloseSocket in the required order, and the locals destruct afterwards.
+    // Destroying them here rather than inside the lock is strictly safer than
+    // before: the CNode now provably outlives RemoveNode.
+    std::vector<std::unique_ptr<CNode>> detached;
 
+    // Phase 1 — under cs_vNodes: decide and detach only. No outbound calls.
     {
         std::lock_guard<std::mutex> lock(cs_vNodes);
 
         auto it = m_nodes.begin();
         while (it != m_nodes.end()) {
             if ((*it)->fDisconnect.load()) {
-                int node_id = (*it)->id;
-                nodes_to_remove.push_back(node_id);
-
-                // BUG #262 FIX (Memory Leak): Call OnPeerDisconnected BEFORE RemoveNode
-                // OnPeerDisconnected calls GetAndClearPeerBlocks which needs the peer
-                // to exist in the peers map to clean up mapBlocksInFlight entries.
-                // If RemoveNode is called first, GetAndClearPeerBlocks bails early
-                // and mapBlocksInFlight entries are never cleaned up = memory leak.
-                DispatchPeerDisconnected(node_id);
-
-                // BUG #153 FIX: Remove from CPeerManager BEFORE destroying CNode
-                // This ensures node_refs is cleared while CNode still exists.
-                if (m_peer_manager) {
-                    m_peer_manager->RemoveNode(node_id);
-                }
-
-                (*it)->CloseSocket();
+                detached.push_back(std::move(*it));
                 it = m_nodes.erase(it);
             } else {
                 ++it;
             }
         }
     }
+
+    // Phase 2 — cs_vNodes RELEASED. Consumers may now take cs_peers/cs_headers
+    // without inverting against it.
+    for (auto& node : detached) {
+        if (!node) {
+            continue;
+        }
+        const int node_id = node->id;
+
+        // BUG #262: before RemoveNode.
+        DispatchPeerDisconnected(node_id);
+
+        // BUG #153: before the CNode dies (it dies when `detached` unwinds).
+        if (m_peer_manager) {
+            m_peer_manager->RemoveNode(node_id);
+        }
+
+        node->CloseSocket();
+    }
+    // `detached` unwinds here — CNodes destroyed after RemoveNode. BUG #148/#153 hold.
 }
 
 void CConnman::InactivityCheck() {
