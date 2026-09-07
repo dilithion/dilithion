@@ -5,6 +5,7 @@
 #define DILITHION_PRIMITIVES_TRANSACTION_H
 
 #include <primitives/block.h>
+#include <atomic>
 #include <cstdint>
 #include <vector>
 #include <memory>
@@ -118,20 +119,21 @@ public:
     // Lock time (0 = not locked)
     uint32_t nLockTime;
 
-    // Cached hash
-    mutable uint256 hash_cached;
-    mutable bool hash_valid;
-
     /** Construct a CTransaction with default values. */
-    CTransaction() : nVersion(1), nLockTime(0), hash_valid(false) {}
+    CTransaction() : nVersion(1), nLockTime(0), hash_state(HASH_EMPTY) {}
 
     /** Construct a CTransaction with specified values. */
     CTransaction(int32_t nVersionIn, std::vector<CTxIn> vinIn, std::vector<CTxOut> voutIn, uint32_t nLockTimeIn)
-        : nVersion(nVersionIn), vin(vinIn), vout(voutIn), nLockTime(nLockTimeIn), hash_valid(false) {}
+        : nVersion(nVersionIn), vin(vinIn), vout(voutIn), nLockTime(nLockTimeIn), hash_state(HASH_EMPTY) {}
 
-    /** Copy constructor */
+    /** Copy constructor.
+     *  Deliberately does NOT carry the source's cached hash across: the copy
+     *  is the publication boundary (MakeTransactionRef copy-constructs into a
+     *  shared_ptr<const CTransaction>), and recomputing from the copied fields
+     *  guarantees a published ref can never inherit a cache that went stale
+     *  on a mutable builder-side local. */
     CTransaction(const CTransaction& tx)
-        : nVersion(tx.nVersion), vin(tx.vin), vout(tx.vout), nLockTime(tx.nLockTime), hash_valid(false) {}
+        : nVersion(tx.nVersion), vin(tx.vin), vout(tx.vout), nLockTime(tx.nLockTime), hash_state(HASH_EMPTY) {}
 
     /** Assignment operator */
     CTransaction& operator=(const CTransaction& tx) {
@@ -139,12 +141,34 @@ public:
         vin = tx.vin;
         vout = tx.vout;
         nLockTime = tx.nLockTime;
-        hash_valid = false;
+        InvalidateHashCache();
         return *this;
     }
 
-    /** Compute the hash of this transaction. */
+    /** Return the txid (SHA3-256 of Serialize()), memoised.
+     *
+     *  BKL-01 / issue #167: the memo is filled with a compute-once protocol so
+     *  that any number of threads may call GetHash() concurrently on one shared
+     *  `const CTransaction` (the CTransactionRef case) without a data race:
+     *  exactly one caller wins the HASH_EMPTY -> HASH_COMPUTING transition and
+     *  is the sole writer of `hash_cached`; it publishes with a release-store of
+     *  HASH_VALID, which every fast-path acquire-load pairs with. Losers return
+     *  their own locally computed (identical) value and never touch the cache.
+     *
+     *  The memo is invalidated by every member function that mutates the
+     *  transaction (SetNull, Deserialize, operator=; constructors start empty).
+     *  It is NOT invalidated by direct writes to the public fields — a caller
+     *  that calls GetHash() and then mutates vin/vout/nVersion/nLockTime in
+     *  place on the same object must treat the earlier txid as stale. Every
+     *  production builder (miner coinbase, wallet, RPC, genesis, net decoders)
+     *  mutates first and hashes last, and publication copies (see the copy
+     *  constructor), so no shared ref can carry a stale txid. */
     uint256 GetHash() const;
+
+    /** Compute the txid from the current fields without touching the memo.
+     *  Pure: safe to call from any thread on a const object. GetHash() returns
+     *  exactly this value. */
+    uint256 ComputeHash() const;
 
     /** Compute the signing hash of this transaction (excludes scriptSig for signature verification).
      *  This is used in both signing and verification to ensure consistent hash computation.
@@ -166,7 +190,7 @@ public:
         vin.clear();
         vout.clear();
         nLockTime = 0;
-        hash_valid = false;
+        InvalidateHashCache();
     }
 
     /** Basic validation - check structure is valid. */
@@ -192,6 +216,19 @@ public:
      * Note: If bytesConsumed is provided, extra data after transaction is allowed.
      */
     bool Deserialize(const uint8_t* data, size_t len, std::string* error = nullptr, size_t* bytesConsumed = nullptr);
+
+private:
+    /** Memo states for the txid cache. Transitions: EMPTY -> COMPUTING (by the
+     *  single CAS winner) -> VALID (release-store by that same winner); any
+     *  mutating member resets to EMPTY. */
+    enum : uint8_t { HASH_EMPTY = 0, HASH_COMPUTING = 1, HASH_VALID = 2 };
+
+    /** Cached txid. Written only by the thread that won the EMPTY->COMPUTING
+     *  CAS in GetHash(); read only after an acquire-load observed HASH_VALID. */
+    mutable uint256 hash_cached;
+    mutable std::atomic<uint8_t> hash_state;
+
+    void InvalidateHashCache() { hash_state.store(HASH_EMPTY, std::memory_order_release); }
 };
 
 /** A reference to a transaction (shared pointer for efficiency). */

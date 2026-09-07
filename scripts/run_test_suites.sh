@@ -66,6 +66,16 @@ set -u
 # build list would otherwise have silently stopped building it. The gate was
 # confirmed discriminating by injecting a deliberately-failing suite: the runner
 # exited 1 and `make tests-fast` exited 2; both returned to 0 on its removal.
+#
+# ADDED 2026-09-05 (Windows/MSYS2, measured by executing both binaries):
+# vdf_consensus_test (25/25 pass, 0.9s) and vdf_lottery_test (11/11 pass). Both
+# were ORPHANED -- built by the Makefile, named by no roster row, no aggregate
+# make target and no workflow, so `make tests` had never run either. The whole
+# DilV VDF test surface was unrun. Registration proved live by a discriminating
+# check, not by absence of error: `make -n tests-build` mentioned neither suite
+# before their sources were touched and both after. COUNTED, not derived: the
+# fast tier is now 41 rows, 37 of them live (4 quarantined). The "32/32 in 72s"
+# figure above is the 2026-08-10 measurement and is no longer the current count.
 ROSTER='
 fast|rpc_auth_tests|120|
 fast|rpc_host_header_tests|60|
@@ -106,6 +116,8 @@ fast|timestamp_tests|120|
 fast|seed_attestation_key_tests|180|UNTRIAGED: 3 of ~40 checks fail around key-file MAC verification / migration. Needs the seed-attestation owner; failure mode is not obviously stale.
 fast|test_passphrase_validator|60|SUSPECTED REAL (policy): 2 of 16 cases -- two passphrases the suite expects REJECTED are now ACCEPTED at "Moderate (57/100)". Either the strength policy was deliberately loosened (then fix the expectations, with a reason) or it regressed. Do not just flip the expectations.
 fast|chain_case_2_5_equivalence_tests|180|UNTRIAGED: scenario_2 (connect-replacement-fails-then-recovers) now truncates the chain and triggers auto_rebuild instead of recovering (chain_case_2_5_equivalence_tests.cpp:304). Behaviour change in ActivateBestChainStep; needs a chainstate owner to say which side is right.
+fast|vdf_consensus_test|300|
+fast|vdf_lottery_test|300|
 full|miner_tests|900|PRE-EXISTING, UNOWNED: 4 assertions fail -- "Failed to start mining", "No hashes computed", "No block found", "No hashes after mining". The mining controller does not start under the test harness. Flagged before F4; still unowned.
 full|wallet_tests|300|STALE TEST (likely): 4 assertions fail on coin selection / minimum relay fee / coinbase maturity -- e.g. builds a tx at 0.00001000 DIL against a 0.00010000 DIL minimum. Expectations predate the current fee and maturity rules.
 full|rpc_tests|300|STALE TEST: the harness calls CRPCServer::Start() without RPCAuth::InitializeAuth(), which the server now refuses by design. The test needs to initialise auth; the refusal itself is correct behaviour.
