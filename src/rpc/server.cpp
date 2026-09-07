@@ -3,6 +3,7 @@
 
 #include <rpc/server.h>
 #include <rpc/auth.h>
+#include <type_traits>  // std::is_same for the m_running atomicity static_assert in Stop()
 #include <node/block_processing.h>  // BanMIK/UnbanMIK/ListBannedMIKs
 #include <node/registration_manager.h>  // v4.0.18: CRegistrationManager snapshot accessor
 #include <net/sock.h>
@@ -632,6 +633,26 @@ bool CRPCServer::Stop() {
     // immediately. This is what makes the socket close below exactly-once, and
     // it is also what keeps the join()/m_workerThreads teardown further down
     // from being executed concurrently with itself.
+    // ⚠️ DO NOT rewrite this as `if (!m_running) { ... } m_running = false;`.
+    //
+    // There is NO TEST that would catch you. A concurrency case asserting
+    // exactly-once used to live in rpc_concurrent_stop_tests.cpp; it SURVIVED
+    // two mutations that did precisely that rewrite (CI runs 34013059180 and
+    // 34066230515, suite confirmed executing in both) and was deleted rather
+    // than left as a false green. The window between the read and the write is
+    // ~2 instructions, which no thread barrier can reliably land in -- see the
+    // removal note in that file for the full post-mortem.
+    //
+    // So this line is load-bearing and unguarded by CI. The exactly-once
+    // property rests entirely on exchange() being a single atomic
+    // read-modify-write, which cannot be won twice. Two callers reaching the
+    // teardown means a double close() of the listening fd (with an fd-reuse
+    // window between the closes, while P2P is still live) and m_workerThreads
+    // iterated by one caller while another clears it.
+    static_assert(std::is_same<decltype(m_running), std::atomic<bool>>::value,
+                  "m_running must stay std::atomic<bool>: Stop()'s exactly-once "
+                  "guarantee is the atomicity of this exchange, and demoting the "
+                  "type would silently break it with no test to catch it");
     if (!m_running.exchange(false)) {
         return false;  // another caller owns the teardown
     }
