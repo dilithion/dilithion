@@ -139,5 +139,55 @@ rc_src=$?
 rm -rf "$srcnoref"
 
 echo
+echo "== the PRIMARY oracle (make -q) must itself be exercised, not just the fallback =="
+# The sandboxes above have no make RULE for fake_suite, so `make -q` returns 2
+# ("cannot answer") and the mtime fallback does the work. That leaves the
+# primary path unpinned -- the exact shape of defect this whole guard exists to
+# catch. These two arms give make a real rule and a real prerequisite.
+mq_sandbox() {            # mq_sandbox <binary-skew-vs-prereq>
+    local skew="$1" d now
+    d="$(mktemp -d)"; mkdir -p "$d/src"
+    printf 'int main(){return 0;}\n' > "$d/src/fake.cpp"
+    now="$(date +%s)"
+    # A real rule: fake_suite depends on src/fake.cpp.
+    printf 'fake_suite: src/fake.cpp\n\t@touch fake_suite\n' > "$d/Makefile"
+    printf '#!/usr/bin/env bash\nexit 0\n' > "$d/fake_suite"; chmod +x "$d/fake_suite"
+    touch -d "@${now}" "$d/src/fake.cpp" "$d/Makefile"
+    touch -d "@$(( now + skew ))" "$d/fake_suite"
+    awk -v row="fast|fake_suite|60|" '
+      /^ROSTER=.$/ { print; print row; skip=1; next }
+      skip && /^.$/ { print; skip=0; next }
+      skip { next }
+      { print }
+    ' "$RUNNER" > "$d/runner.sh"
+    ( cd "$d" && TEST_SUITE_LOGDIR="$d/logs" bash runner.sh fast >"$d/out" 2>&1 )
+    echo "RUNNER_EXIT=$?" >> "$d/out"
+    grep -E '\[(STALE|PASS|FAIL) ' "$d/out" | head -1
+    grep -E '^RUNNER_EXIT=' "$d/out"
+    rm -rf "$d"
+}
+
+if ! command -v make >/dev/null 2>&1; then
+  echo "   SKIP  make is not on PATH here -- the primary oracle cannot be exercised"
+  echo "         (it IS exercised wherever make exists, which includes CI)"
+else
+out="$(mq_sandbox -600)"        # binary older than its declared prerequisite
+case "$out" in
+  *"[STALE"*) chk "make -q says out-of-date -> [STALE] (primary oracle fires)" "yes" "yes" ;;
+  *)          echo "   FAIL  make -q path did not flag an out-of-date target. Got:"; echo "$out" | sed 's/^/     | /'; F=$((F+1)) ;;
+esac
+case "$out" in
+  *"dependency graph"*) chk "and the reason names make, not the mtime fallback" "yes" "yes" ;;
+  *)                    echo "   FAIL  stale reason did not come from make -q"; F=$((F+1)) ;;
+esac
+
+out="$(mq_sandbox 600)"         # binary newer than its prerequisite
+case "$out" in
+  *"[STALE"*) echo "   FAIL  make -q flagged an up-to-date target. Got:"; echo "$out" | sed 's/^/     | /'; F=$((F+1)) ;;
+  *)          chk "make -q says up to date -> not stale" "yes" "yes" ;;
+esac
+fi
+
+echo
 echo "   ===== run_test_suites staleness guard: $P passed, $F failed ====="
 [ "$F" -eq 0 ]

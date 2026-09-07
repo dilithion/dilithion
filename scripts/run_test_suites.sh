@@ -222,6 +222,9 @@ TOTAL_SEC=0
 # Source mtime is the real dependency. A binary older than a file it is built
 # from is stale, whatever git thinks, and no clock but this filesystem's is
 # involved.
+HAVE_MAKE=0
+command -v make >/dev/null 2>&1 && [ -f Makefile ] && HAVE_MAKE=1
+
 SRC_REF=""
 if [ -d src ]; then
     SRC_REF="$(find src Makefile -type f \( -name '*.cpp' -o -name '*.h' -o -name 'Makefile' \) \
@@ -287,17 +290,62 @@ while IFS='|' read -r tier suite timeout reason; do
     # A stale binary is NEVER a PASS. It is [STALE] and counted INCOMPLETE,
     # and it fails the run -- because "the gate did not actually execute" is
     # worse than a red, not better ([[lesson_absence_of_failure_is_not_evidence]]).
-    if [ "$SRC_REF" -gt 0 ]; then
+    # PRIMARY ORACLE: ask make. `make -q <binary>` exits 0 when the target is
+    # up to date and non-zero when it needs remaking -- which is exactly the
+    # question, answered by the real .d dependency graph.
+    #
+    # The tree-wide mtime comparison this replaces was too blunt: make relinks
+    # PER dependency graph, so after editing one header an incremental
+    # `make tests-fast` correctly leaves unrelated suites untouched -- and a
+    # newest-source-in-the-tree reference then marks every one of them STALE.
+    # Worse, the remedy the message printed could not clear it, because those
+    # binaries did not need rebuilding in the first place.
+    #
+    # The mtime comparison is kept ONLY as a fallback for when make cannot
+    # answer (no make on PATH, or a Makefile that cannot evaluate here). It uses
+    # -le, not -lt: a binary with the SAME mtime as a source it depends on is
+    # not demonstrably newer than it, and one-second filesystem granularity
+    # makes that a real case rather than a pedantic one.
+    #
+    # OUT OF THE REFERENCE, deliberately: depends/ (Dilithium and chiavdf
+    # objects link into every suite, so any touch there would mark the whole
+    # roster stale), and .c/.cc/.hpp -- the suites are .cpp/.h. make -q knows
+    # about all of them properly, which is the point of preferring it.
+    #
+    # A stale binary is NEVER a PASS. It is [STALE], counted INCOMPLETE, and it
+    # fails the run -- "the gate did not actually execute" is worse than a red,
+    # not better ([[lesson_absence_of_failure_is_not_evidence]]).
+    stale_reason=""
+    # Only trust make when it demonstrably HAS A RULE for this target. `make -q`
+    # returns 0 for an existing file with no rule -- "up to date" because
+    # nothing claims otherwise -- so a suite the Makefile does not name would be
+    # silently passed by the oracle. Caught by this file's own sandbox, which
+    # has no rule for its fake suite: the guard reported PASS on a deliberately
+    # back-dated binary until this check was added.
+    mq=99
+    if [ "$HAVE_MAKE" -eq 1 ] && grep -q "^${suite}:" Makefile 2>/dev/null; then
+        make -q "$suite" >/dev/null 2>&1; mq=$?
+    fi
+    # make -q: 0 = up to date, 1 = needs remaking, 2 = it could not answer
+    # (no rule for this target, evaluation error). Only 1 means STALE. Treating
+    # 2 as stale would mark every suite the Makefile does not name -- a wrong
+    # answer dressed as a strict one -- so 2 falls through to the mtime check.
+    if [ "$mq" -eq 1 ]; then
+        stale_reason="make reports $suite out of date against its own dependency graph"
+    elif [ "$mq" -ne 0 ] && [ "$SRC_REF" -gt 0 ]; then
         bin_mtime="$(stat -c %Y "$bin" 2>/dev/null || stat -f %m "$bin" 2>/dev/null || echo 0)"
-        if [ "$bin_mtime" -gt 0 ] && [ "$bin_mtime" -lt "$SRC_REF" ]; then
+        if [ "$bin_mtime" -gt 0 ] && [ "$bin_mtime" -le "$SRC_REF" ]; then
             age=$(( (SRC_REF - bin_mtime) / 60 ))
-            printf '  [STALE     ] %-52s binary older than the newest source by %smin -- NOT RUN\n' "$suite" "$age"
-            RESULTS="${RESULTS}STALE|${suite}|0|binary predates the newest source by ${age}min -- rebuild before trusting any result\n"
-            STALE=$((STALE + 1))
-            FAILED=$((FAILED + 1))
-            [ "$FAIL_FAST" -eq 1 ] && break
-            continue
+            stale_reason="binary not newer than the newest source (by ${age}min); make could not answer, used mtime fallback"
         fi
+    fi
+    if [ -n "$stale_reason" ]; then
+        printf '  [STALE     ] %-52s %s -- NOT RUN\n' "$suite" "$stale_reason"
+        RESULTS="${RESULTS}STALE|${suite}|0|${stale_reason}\n"
+        STALE=$((STALE + 1))
+        FAILED=$((FAILED + 1))
+        [ "$FAIL_FAST" -eq 1 ] && break
+        continue
     fi
 
     log="$LOGDIR/$suite.log"
@@ -360,9 +408,10 @@ echo "------------------------------------------------------------------------"
 echo "  ran=$RAN  failed=$FAILED  quarantined=$QUARANTINED  degraded=$DEGRADED  stale=$STALE  wall=${TOTAL_SEC}s"
 if [ "$STALE" -gt 0 ]; then
     echo "  ------------------------------------------------------------------"
-    echo "  $STALE suite(s) were NOT RUN because their binaries predate HEAD."
-    echo "  Those rows are INCOMPLETE, not passes. Rebuild (make tests-build)"
-    echo "  and re-run before reading anything below as a result."
+    echo "  $STALE suite(s) were NOT RUN: their binaries are out of date."
+    echo "  Those rows are INCOMPLETE, not passes. Rebuild the named suites"
+    echo "  (make <suite>, or make tests-build for all of them) and re-run"
+    echo "  before reading anything above as a result."
 fi
 echo "  per-suite output: $LOGDIR/<suite>.log"
 echo "========================================================================"
