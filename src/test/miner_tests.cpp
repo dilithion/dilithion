@@ -3,20 +3,32 @@
 
 #include <miner/controller.h>
 #include <primitives/block.h>
+#include <crypto/randomx_hash.h>
 
 #include <iostream>
 #include <thread>
 #include <chrono>
 #include <iomanip>
+#include <cstring>   // strlen, for the RandomX key
 
 using namespace std;
 
 // Test helper: Create easy mining target for testing
 uint256 CreateEasyTarget() {
     uint256 target;
-    // Set a very easy target (high value = easy to find)
-    // Format: 0x00000FFF... (lots of leading zeros in reverse)
-    memset(target.begin(), 0xFF, 32);
+    // THE SECOND QUARANTINE CAUSE, and the controller is right, not this file.
+    //
+    // This used to `memset(target.begin(), 0xFF, 32)` -- an all-ones target.
+    // The MINE-008 fix in CMiningController::StartMining
+    // (miner/controller.cpp:170-181) explicitly REJECTS a target that is all
+    // 0x00 or all 0xFF as unachievable/invalid, so StartMining returned false
+    // and the suite reported "Failed to start mining". The roster read that as
+    // "the mining controller does not start under the test harness"; in fact
+    // the harness was handing it an input the product had learned to refuse.
+    //
+    // Use an easy-but-VALID target: leading zero bytes then all ones. Same
+    // shape integration_tests.cpp uses for the mining assertions that pass.
+    target.SetHex("00000000ffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
     return target;
 }
 
@@ -247,6 +259,24 @@ int main() {
     cout << "======================================" << endl;
     cout << endl;
 
+    // THE QUARANTINE CAUSE. Without this, every mining assertion in this file
+    // fails -- "Failed to start mining", "No hashes computed", "No block
+    // found", "No hashes after mining" -- because the controller cannot hash
+    // without an initialised RandomX VM. The suite was quarantined as
+    // "PRE-EXISTING, UNOWNED: the mining controller does not start under the
+    // test harness"; the controller is fine, the HARNESS never initialised it.
+    //
+    // Proof it is the harness and not the product: integration_tests.cpp does
+    // call randomx_init_for_hashing and passes the IDENTICAL assertions. Census
+    // over both files: 1 call there, 0 here.
+    //
+    // light_mode=1 is the tests' convention (bug_003_block_size_tests.cpp,
+    // integration_tests.cpp) -- full mode allocates a ~2GB dataset.
+    const char* rxKey = "dilithion_miner_tests";
+    randomx_init_for_hashing(rxKey, strlen(rxKey), 1);
+    cout << "  (RandomX VM initialised, light mode)" << endl;
+    cout << endl;
+
     bool allPassed = true;
 
     allPassed &= TestMinerConstruction();
@@ -266,13 +296,25 @@ int main() {
     cout << "======================================" << endl;
     cout << endl;
 
-    cout << "Phase 3 Mining Components Validated:" << endl;
-    cout << "  ✓ Mining controller" << endl;
-    cout << "  ✓ Thread pool management" << endl;
-    cout << "  ✓ Hash rate monitoring" << endl;
-    cout << "  ✓ RandomX integration" << endl;
-    cout << "  ✓ Block template handling" << endl;
-    cout << "  ✓ Statistics tracking" << endl;
+    // THIRD instance of this pattern in the repo, after rpc_tests.cpp and
+    // integration_tests.cpp (both fixed in #181): six green ticks printed
+    // UNCONDITIONALLY, including on the run where mining never started and the
+    // hash rate was 0 H/s. "✓ RandomX integration" and "✓ Statistics tracking"
+    // were being printed by a run that had just failed both. The exit code was
+    // always right; the part a human READS was not, which is how a suite can
+    // look healthy in a log while failing.
+    if (allPassed) {
+        cout << "Phase 3 Mining Components Validated:" << endl;
+        cout << "  ✓ Mining controller" << endl;
+        cout << "  ✓ Thread pool management" << endl;
+        cout << "  ✓ Hash rate monitoring" << endl;
+        cout << "  ✓ RandomX integration" << endl;
+        cout << "  ✓ Block template handling" << endl;
+        cout << "  ✓ Statistics tracking" << endl;
+    } else {
+        cout << "NOTHING above is validated -- the run failed. There is no" << endl;
+        cout << "component list for a failing run; do not read one." << endl;
+    }
     cout << endl;
 
     return allPassed ? 0 : 1;
