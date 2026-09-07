@@ -74,7 +74,10 @@ void Usage()
         "  --from <height>      first height to check (default 1; genesis is exempt)\n"
         "  --to <height>        last height to check (default: chain tip)\n"
         "  --verbose            print every failing height\n"
-        "  --selftest           prove this binary detects forgeries, then exit\n\n"
+        "  --selftest           prove this binary detects forgeries, then exit\n"
+        "  --census-only        classify MIK blobs + derive registration identities,\n"
+        "                       running NO consensus verification (fast; never\n"
+        "                       reports pass/fail)\n\n"
         "WITHOUT an identity DB the MIK-signature checker FAILS OPEN on every\n"
         "reference-MIK block, so that half is reported UNMEASURED rather than as\n"
         "passing. Point --datadir at a real node datadir to measure it.\n\n"
@@ -88,6 +91,12 @@ struct Ctx {
     std::string network = "dilv";
     bool identityDbOpen = false;
     bool checkGenesis   = true;   // false for the synthetic self-test fixture
+    // Census-only: classify MIK blobs and derive registration identities, and
+    // run NO consensus verification. The Wesolowski verify is ~500,000
+    // iterations per block and dominates a full run; the registration question
+    // needs none of it. This mode NEVER reports pass/fail and never claims a
+    // block is valid — it answers "which identities registered on-chain".
+    bool censusOnly     = false;
 };
 
 bool InstallParams(const std::string& network)
@@ -151,6 +160,18 @@ struct ScanResult {
     // population problem with a targeted fix or a systemic one.
     std::map<std::string, long long> failOpenByIdentity;
     std::map<std::string, long long> verifiedByIdentity;
+    // Identities DERIVED from on-chain REGISTRATION blocks, height of first
+    // registration. A registration blob carries a PUBKEY, not an identity, so
+    // the identity must be derived exactly as the node does — via the
+    // production DFMP::DeriveIdentityFromMIK, not a reimplementation.
+    std::map<std::string, int> registeredIdentities;
+    // CONTROL for that derivation, and it costs nothing: a reference blob
+    // carries its identity INLINE. If a derived registration identity also
+    // appears as an inline reference identity, the derivation is confirmed
+    // against an independent source in the same data. Without at least one
+    // such match, a "not registered" answer is unpublishable — it would be
+    // indistinguishable from a derivation that is simply wrong.
+    long long derivationCrossChecks = 0;
     bool      regControl   = false;
     bool      refControl   = false;
     bool      regProbe     = false;
@@ -203,6 +224,36 @@ std::string ReferenceIdentityHex(const CBlock& block)
             out.push_back(H[block.vtx[k] & 0xF]);
         }
         return out;
+    }
+    return std::string();
+}
+
+// Read-only: the identity of a REGISTRATION MIK blob, derived from its pubkey
+// by the production function the node itself uses. Empty if not a registration.
+std::string RegistrationIdentityHex(const CBlock& block)
+{
+    // ⚠️ Locate the FIRST valid MIK blob and use it ONLY if it is a
+    // registration. Scanning ahead for a registration marker specifically is
+    // WRONG and was measured wrong: a reference blob is followed by a
+    // 3309-byte Dilithium signature of effectively random bytes, in which the
+    // pair [0xDF][0x01] occurs by chance, so the scan skipped the real blob
+    // and "derived" an identity from signature noise. It produced 24 phantom
+    // registration identities in a window the census proves contains ZERO
+    // registration blocks, and the derivation cross-check caught it by
+    // returning 0 matches. Same failure mode as the ~10% flake in the LP-10
+    // suite: never pattern-scan across cryptographic material.
+    for (size_t i = 0; i + 1 < block.vtx.size(); ++i) {
+        if (block.vtx[i] != DFMP::MIK_MARKER) continue;
+        const uint8_t type = block.vtx[i + 1];
+        if (type != DFMP::MIK_TYPE_REGISTRATION && type != DFMP::MIK_TYPE_REFERENCE) continue;
+        if (type != DFMP::MIK_TYPE_REGISTRATION) return std::string();   // first blob is a reference
+        const size_t pkStart = i + 2;
+        if (pkStart + DFMP::MIK_PUBKEY_SIZE > block.vtx.size()) return std::string();
+        const std::vector<uint8_t> pubkey(block.vtx.begin() + pkStart,
+                                          block.vtx.begin() + pkStart + DFMP::MIK_PUBKEY_SIZE);
+        DFMP::Identity id = DFMP::DeriveIdentityFromMIK(pubkey);
+        if (id.IsNull()) return std::string();
+        return id.GetHex();
     }
     return std::string();
 }
@@ -334,6 +385,22 @@ ScanResult ScanChain(const std::string& blocksDir, int fromHeight, int toHeight,
         if (!block.IsVDFBlock()) continue;
         ++res.vdfBlocks;
 
+        {
+            const std::string reg = RegistrationIdentityHex(block);
+            if (!reg.empty() && res.registeredIdentities.find(reg) == res.registeredIdentities.end())
+                res.registeredIdentities[reg] = h;
+            const int mtc = DetectMIKType(block);
+            if      (mtc == DFMP::MIK_TYPE_REGISTRATION) ++res.regBlocks;
+            else if (mtc == DFMP::MIK_TYPE_REFERENCE)    ++res.refBlocks;
+            else                                         ++res.noMikBlocks;
+            const std::string rid = ReferenceIdentityHex(block);
+            if (!rid.empty()) ++res.verifiedByIdentity[rid];   // "seen", not "verified", in this mode
+        }
+        if (ctx.censusOnly) {
+            if (res.scanned % 25000 == 0) std::cout << "  ... " << res.scanned << " blocks\n";
+            continue;
+        }
+
         std::string e1;
         const bool okProof = CheckVDFProofConnect(block, h, block.hashPrevBlock, e1);
         if (!okProof) {
@@ -355,7 +422,12 @@ ScanResult ScanChain(const std::string& blocksDir, int fromHeight, int toHeight,
                 std::string ep;
                 const bool failOpen = CheckVDFBlockMIKSignature(probe, h, ep);
                 if (failOpen) ++res.mikFailOpen; else ++res.mikEnforced;
-                const std::string id = ReferenceIdentityHex(block);
+                {
+            const std::string reg = RegistrationIdentityHex(block);
+            if (!reg.empty() && res.registeredIdentities.find(reg) == res.registeredIdentities.end())
+                res.registeredIdentities[reg] = h;
+        }
+        const std::string id = ReferenceIdentityHex(block);
                 if (!id.empty()) {
                     if (failOpen) ++res.failOpenByIdentity[id];
                     else          ++res.verifiedByIdentity[id];
@@ -609,6 +681,7 @@ int RunSelfTest()
 int main(int argc, char* argv[])
 {
     std::string datadir, blocksdir, identitydb;
+    std::vector<std::string> findIds;   // identities to look up in the registration census
     Ctx  ctx;
     int  fromHeight = 1, toHeight = -1;   // genesis exempt by default
     bool verbose = false, selftest = false;
@@ -620,7 +693,7 @@ int main(int argc, char* argv[])
                 if (i + 1 >= argc) { std::cerr << "ERROR: " << what << " needs a value\n"; std::exit(2); }
                 return argv[++i];
             };
-            if      (a == "--datadir")    datadir     = next("--datadir");
+                    if      (a == "--datadir")    datadir     = next("--datadir");
             else if (a == "--blocksdir")  blocksdir   = next("--blocksdir");
             else if (a == "--identitydb") identitydb  = next("--identitydb");
             else if (a == "--network")    ctx.network = next("--network");
@@ -628,6 +701,8 @@ int main(int argc, char* argv[])
             else if (a == "--to")         toHeight    = std::stoi(next("--to"));
             else if (a == "--verbose")    verbose     = true;
             else if (a == "--selftest")   selftest    = true;
+            else if (a == "--census-only") ctx.censusOnly = true;
+            else if (a == "--find")       findIds.push_back(next("--find"));
             else if (a == "--help" || a == "-h") { Usage(); return 0; }
             else { std::cerr << "ERROR: unknown argument " << a << "\n\n"; Usage(); return 2; }
         }
@@ -750,15 +825,35 @@ int main(int argc, char* argv[])
         std::vector<std::pair<long long, std::string>> top;
         for (const auto& kv : r.failOpenByIdentity) top.push_back({kv.second, kv.first});
         std::sort(top.rbegin(), top.rend());
+        for (const auto& kv : r.registeredIdentities)
+            if (r.verifiedByIdentity.count(kv.first) || r.failOpenByIdentity.count(kv.first))
+                ++const_cast<ScanResult&>(r).derivationCrossChecks;
+
+        std::cout << "\nREGISTRATION CENSUS   " << r.registeredIdentities.size()
+                  << " distinct identities derived from on-chain registration blocks\n"
+                  << "  derivation control  " << r.derivationCrossChecks
+                  << " of them ALSO appear as inline reference identities"
+                  << (r.derivationCrossChecks > 0
+                        ? "  -> DERIVATION CONFIRMED"
+                        : "  -> ⛔ UNCONFIRMED: a 'not registered' answer is NOT publishable")
+                  << "\n";
+
         std::cout << "\nFAIL-OPEN IDENTITIES  " << r.failOpenByIdentity.size()
                   << " distinct, out of " << r.verifiedByIdentity.size()
                   << " that verified at least once\n";
         for (size_t i = 0; i < top.size() && i < 12; ++i) {
             auto it = r.verifiedByIdentity.find(top[i].second);
             const long long ver = (it == r.verifiedByIdentity.end() ? 0 : it->second);
+            auto rit = r.registeredIdentities.find(top[i].second);
+            const bool registered = (rit != r.registeredIdentities.end());
             std::cout << "   " << top[i].second << "  " << top[i].first
                       << " fail-open" << (ver ? "  (+" + std::to_string(ver) + " verified — MIXED)"
-                                              : "  (never verified)") << "\n";
+                                              : "  (never verified)")
+                      << (registered
+                            ? "  REGISTERED on-chain at h" + std::to_string(rit->second)
+                              + "  -> identity-DB POPULATION BUG"
+                            : "  NO on-chain registration block  -> UNREGISTERED MINER")
+                      << "\n";
         }
         if (top.size() > 12) std::cout << "   ... and " << (top.size() - 12) << " more\n";
     }
@@ -770,6 +865,22 @@ int main(int argc, char* argv[])
         std::cout << "\nconsensus failures (" << r.failures.size() << "):\n";
         for (const auto& f : r.failures)
             std::cout << "   h=" << f.height << "  " << f.what << "  " << f.detail << "\n";
+    }
+
+    for (const auto& want : findIds) {
+        auto it = r.registeredIdentities.find(want);
+        const bool found = (it != r.registeredIdentities.end());
+        std::cout << "\nLOOKUP " << want << "\n   "
+                  << (found ? "REGISTERED on-chain, first registration block at height "
+                              + std::to_string(it->second)
+                              + "  -> identity-DB POPULATION BUG (node-side)"
+                            : "NO on-chain registration among "
+                              + std::to_string(r.registeredIdentities.size())
+                              + " derived registration identities  -> UNREGISTERED MINER (consensus question)")
+                  << "\n   derivation control: " << r.derivationCrossChecks
+                  << " cross-checks - "
+                  << (r.derivationCrossChecks > 0 ? "CONFIRMED" : "UNCONFIRMED, answer NOT publishable")
+                  << "\n";
     }
 
     if (!untrusted.empty()) {
