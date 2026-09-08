@@ -34,6 +34,14 @@
 #include <vector>
 #include <filesystem>
 
+// Needed by UniqueTempPath below. This file previously had no platform include
+// block at all, so the process-id call has to bring its own.
+#ifdef _WIN32
+    #include <windows.h>
+#else
+    #include <unistd.h>
+#endif
+
 using namespace std;
 
 // MEM-MED-001 FIX: Replace system() with std::filesystem for safe directory operations
@@ -48,6 +56,26 @@ void CleanupTestDir(const string& path) {
 void CreateTestDir(const string& path) {
     std::error_code ec;
     std::filesystem::create_directories(path, ec);
+}
+
+// Per-invocation temp paths. This is the THIRD consecutive review round in
+// which a principle landed in rpc_tests.cpp and not in its twin here, so it is
+// being applied to both files at once rather than a third time to one. A fixed
+// /tmp path is a greenness gate held by anyone who can write /tmp:
+// InitializePermissions -> LoadFromFile succeeds if the file merely EXISTS and
+// returns without installing the credentials.
+static std::string UniqueTempPath(const std::string& stem) {
+#ifdef _WIN32
+    const long pid = static_cast<long>(GetCurrentProcessId());
+#else
+    const long pid = static_cast<long>(getpid());
+#endif
+    const std::string p =
+        (std::filesystem::temp_directory_path()
+         / (stem + "_" + std::to_string(pid) + ".json")).string();
+    std::error_code ec;
+    std::filesystem::remove(p, ec);
+    return p;
 }
 
 bool TestBlockchainAndMempool() {
@@ -218,10 +246,29 @@ bool TestRPCIntegration() {
     server.RegisterWallet(&wallet);
     server.RegisterMiner(&miner);
 
+    // CVE-2026-RPC-AUTH: Start() refuses unless auth AND permissions are
+    // initialised (server.cpp:468-478). Production does both
+    // (dilithion-node.cpp:7656). This test did neither, so Start() always
+    // failed -- and then blamed "port conflict or system limitation" and
+    // returned TRUE, so the suite reported "✓ RPC server start/stop" and exited
+    // 0 while the RPC server had never started once. The server prints the real
+    // reason on the line immediately above; the test overwrote it with a guess.
+    if (!RPCAuth::InitializeAuth("testuser", "testpassword123")) {
+        cout << "  ✗ RPCAuth::InitializeAuth failed" << endl;
+        return false;
+    }
+    const std::string perms_path = UniqueTempPath("dil_integration_rpc_perms");
+    if (!server.InitializePermissions(perms_path, "testuser", "testpassword123")) {
+        cout << "  ✗ InitializePermissions failed (" << perms_path << ")" << endl;
+        return false;
+    }
+
     if (!server.Start()) {
-        cout << "  ✗ Failed to start RPC server (may be port conflict or system limitation)" << endl;
-        cout << "  ℹ️  Skipping RPC test - not critical for core integration" << endl;
-        return true;  // Don't fail entire test
+        cout << "  ✗ Failed to start RPC server" << endl;
+        cout << "    auth configured : " << (RPCAuth::IsAuthConfigured() ? "yes" : "NO") << endl;
+        cout << "    Start() printed the actual cause above. Not skipping: an RPC" << endl;
+        cout << "    server that will not start is a failure of this test." << endl;
+        return false;
     }
     cout << "  ✓ RPC server started on port 18546" << endl;
 
@@ -394,12 +441,19 @@ bool TestFullNodeStack() {
         options.nMaxOutbound = 8;
         options.nMaxInbound = 117;
         options.nMaxTotal = 125;
+        // Identical shape to the RPC skip this commit exists to remove, and it
+        // sits 39 lines above it in the same function: it printed a cross,
+        // continued, and TestFullNodeStack still returned true -- so
+        // "✓ Full node stack initialization" printed with P2P never started.
+        // The failure branch also abandoned a partially-started CConnman
+        // without calling Stop().
         if (!connman.Start(peer_manager, message_processor, options)) {
             cout << "  ✗ Failed to start CConnman" << endl;
-        } else {
-            cout << "  ✓ P2P components initialized (CConnman)" << endl;
-            connman.Stop();  // Clean shutdown
+            connman.Stop();  // do not abandon a partially-started connman
+            return false;
         }
+        cout << "  ✓ P2P components initialized (CConnman)" << endl;
+        connman.Stop();  // Clean shutdown
 
         // Phase 3: Mining
         CMiningController miner(2);
@@ -416,11 +470,28 @@ bool TestFullNodeStack() {
         rpc_server.RegisterWallet(&wallet);
         rpc_server.RegisterMiner(&miner);
 
-        if (!rpc_server.Start()) {
-            cout << "  ⚠️  RPC server failed to start (not critical - testing other components)" << endl;
-        } else {
-            cout << "  ✓ RPC server started" << endl;
+        // Second site, and it failed for a DIFFERENT reason than the first:
+        // by the time the full-stack phase runs, InitializeAuth has been called
+        // by TestRPCAuthenticationIntegration, so this one got past the auth
+        // check and tripped the permissions check instead
+        // ("Start() called before InitializePermissions()"). Both were reported
+        // as "not critical", so neither ever surfaced.
+        const std::string stack_perms = UniqueTempPath("dil_integration_stack_perms");
+        if (!RPCAuth::IsAuthConfigured() &&
+            !RPCAuth::InitializeAuth("testuser", "testpassword123")) {
+            cout << "  ✗ RPCAuth::InitializeAuth failed" << endl;
+            return false;
         }
+        if (!rpc_server.InitializePermissions(stack_perms, "testuser", "testpassword123")) {
+            cout << "  ✗ InitializePermissions failed (" << stack_perms << ")" << endl;
+            return false;
+        }
+        if (!rpc_server.Start()) {
+            cout << "  ✗ RPC server failed to start in the full-stack phase" << endl;
+            cout << "    auth configured : " << (RPCAuth::IsAuthConfigured() ? "yes" : "NO") << endl;
+            return false;
+        }
+        cout << "  ✓ RPC server started" << endl;
 
         // Let everything run for a moment
         this_thread::sleep_for(chrono::milliseconds(500));
@@ -479,28 +550,42 @@ int main() {
     cout << "======================================" << endl;
     cout << endl;
 
-    cout << "Components Validated:" << endl;
-    cout << "  ✓ Blockchain + Mempool working together" << endl;
-    cout << "  ✓ Mining controller functional" << endl;
-    cout << "  ✓ Wallet operations working" << endl;
-    cout << "  ✓ RPC server start/stop" << endl;
-    cout << "  ✓ RPC Authentication (TASK-001)" << endl;
-    cout << "  ✓ Block Timestamp Validation (TASK-002)" << endl;
-    cout << "  ✓ Full node stack initialization" << endl;
-    cout << endl;
+    // These 15 ticks used to print UNCONDITIONALLY, including on a failing run
+    // -- "✓ RPC server start/stop" and "✓ Security features operational" were
+    // exactly what a human reading test-suite-logs/integration_tests.log saw
+    // while the RPC server had never started. The exit code was always right;
+    // the part people READ was not, which is how the skip survived so long.
+    //
+    // Caught by red-team on this very commit: the sibling fix in rpc_tests.cpp
+    // was applied and this one was missed -- a fix aimed at a SITE leaving its
+    // twin untouched, in the same commit as its own thesis.
+    if (allPassed) {
+        cout << "Components Validated:" << endl;
+        cout << "  ✓ Blockchain + Mempool working together" << endl;
+        cout << "  ✓ Mining controller functional" << endl;
+        cout << "  ✓ Wallet operations working" << endl;
+        cout << "  ✓ RPC server start/stop" << endl;
+        cout << "  ✓ RPC Authentication (TASK-001)" << endl;
+        cout << "  ✓ Block Timestamp Validation (TASK-002)" << endl;
+        cout << "  ✓ Full node stack initialization" << endl;
+        cout << endl;
 
-    cout << "Security Features Validated:" << endl;
-    cout << "  ✓ HTTP Basic Auth working" << endl;
-    cout << "  ✓ Password hashing (SHA-3-256)" << endl;
-    cout << "  ✓ Credential validation" << endl;
-    cout << "  ✓ Future timestamp rejection" << endl;
-    cout << "  ✓ Median-time-past validation" << endl;
-    cout << endl;
+        cout << "Security Features Validated:" << endl;
+        cout << "  ✓ HTTP Basic Auth working" << endl;
+        cout << "  ✓ Password hashing (SHA-3-256)" << endl;
+        cout << "  ✓ Credential validation" << endl;
+        cout << "  ✓ Future timestamp rejection" << endl;
+        cout << "  ✓ Median-time-past validation" << endl;
+        cout << endl;
 
-    cout << "Production Readiness:" << endl;
-    cout << "  ✓ All core components integrated" << endl;
-    cout << "  ✓ Security features operational" << endl;
-    cout << "  ✓ Ready for end-to-end testing" << endl;
+        cout << "Production Readiness:" << endl;
+        cout << "  ✓ All core components integrated" << endl;
+        cout << "  ✓ Security features operational" << endl;
+        cout << "  ✓ Ready for end-to-end testing" << endl;
+    } else {
+        cout << "NOTHING above is validated -- the run failed. There is no" << endl;
+        cout << "component list for a failing run; do not read one." << endl;
+    }
     cout << endl;
 
     return allPassed ? 0 : 1;
