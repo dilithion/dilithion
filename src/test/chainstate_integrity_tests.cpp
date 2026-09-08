@@ -759,12 +759,23 @@ void test_persistent_ioerror_escalates_but_never_bricks() {
 //   transient (IsIOError that did not clear) -> StopNoWipe  (return 1, NO marker)
 //   confirmed corruption / missing           -> WipeRebuild (return 2, marker)
 //
-// This test exercises (a) the pure helper directly (the exact branch the daemons
-// take), and (b) the end-to-end classification -> action chain through the real
-// fault injector + a real on-disk corruption, replaying the daemons' decision +
-// marker logic so a regression that reverts the startup path to transient-blind
-// (always-wipe) fails here. The dangerous direction the original BLOCKER was
-// about — corruption mislabelled transient and NOT wiped — is covered by Case B.
+// This test exercises (a) the pure helper directly, and (b) the REAL
+// Dilithion::RunStartupIntegrityCheck that both daemons call — retry loop,
+// wipe-vs-stop decision and marker write included.
+//
+// THE PREVIOUS VERSION OF THIS COMMENT WAS FALSE and that was the more
+// dangerous half of the finding. It claimed a regression to transient-blind
+// always-wipe "fails here". It did not: the cases replayed the decision in a
+// local lambda and asserted against that copy, so inverting the daemon branch,
+// swapping return 1 for return 2, or deleting the stop-no-wipe block entirely
+// left this suite reporting "All 14 tests passed" (fresh pass 2026-09-07,
+// HIGH-1). A test that re-implements the code it checks agrees with its own
+// copy no matter what the product does.
+//
+// Now measured rather than asserted: those three mutants exit 134 at Case A,
+// and the folded MEDIUMs are pinned by Cases E (sticky classification) and
+// F/G (wipe is an allowlist). A comment-only control mutant stays green, so
+// the suite is discriminating rather than merely loud.
 // =============================================================================
 void test_startup_decision_transient_no_wipe_corruption_wipes() {
     std::cout << "  test_startup_decision_transient_no_wipe_corruption_wipes..."
@@ -781,21 +792,19 @@ void test_startup_decision_transient_no_wipe_corruption_wipes() {
                "confirmed-corruption startup failure MUST wipe-rebuild (existing behavior)");
     }
 
-    // Helper replaying the daemons' post-retry decision + marker side-effect, so
-    // the assertions below verify the SAME observable outcome the node produces:
-    // returns the exit code (1 = stop-no-wipe, 2 = wipe) and writes the marker
-    // ONLY on the wipe branch. Mirrors dilv-node.cpp / dilithion-node.cpp.
-    auto applyStartupDecision = [](const UndoIntegrityFailure& failure,
-                                   const std::string& datadir) -> int {
-        if (DecideStartupIntegrityAction(failure) == StartupIntegrityAction::StopNoWipe) {
-            return 1;  // no marker written — operator inspection
-        }
-        const std::string reason =
-            "Startup integrity check failed at height "
-            + std::to_string(failure.height) + " cause=" + failure.cause;
-        Dilithion::WriteAutoRebuildMarker(datadir, reason);
-        return 2;
-    };
+    // NO LOCAL RE-IMPLEMENTATION. Every case below calls the REAL
+    // Dilithion::RunStartupIntegrityCheck -- the same function both daemons
+    // call and the only place the retry loop, the wipe-vs-stop decision and the
+    // marker write now live. The previous version of this test replayed that
+    // decision in a local lambda, so it agreed with its own copy regardless of
+    // what the daemons did: inverting the StopNoWipe branch, or swapping
+    // return 1 for return 2, left this suite reporting all tests passed.
+    //
+    // Backoff is 0ms here. It is a parameter precisely so these cases do not
+    // stall for kRevalidateBackoff * (kRevalidateAttempts-1) = 60s.
+    using Dilithion::RunStartupIntegrityCheck;
+    const auto kNoBackoff = std::chrono::milliseconds(0);
+    const int kAttempts = 3;
 
     // --- Case A: transient IsIOError that NEVER clears -> stop-no-wipe, NO marker.
     {
@@ -806,20 +815,23 @@ void test_startup_decision_transient_no_wipe_corruption_wipes() {
         CBlockIndex* tip = BuildSyntheticChain(50, chain);
         WriteValidUndoForChain(utxo, chain);  // CLEAN on disk
 
-        // Persistent (every-call) IsIOError — survives all retries.
-        g_undo_fetch_fault_injector = []() {
+        int calls = 0;
+        g_undo_fetch_fault_injector = [&calls]() {
+            ++calls;
             return leveldb::Status::IOError("persistent EIO (failing disk)");
         };
         UndoIntegrityFailure failure;
-        bool walkPass = utxo.VerifyUndoDataInRange(tip, 1, 50, failure);
+        const int rc = RunStartupIntegrityCheck(utxo, tip, 1, 50, td.str(),
+                                                kAttempts, kNoBackoff, failure);
         g_undo_fetch_fault_injector = nullptr;
 
-        assert(!walkPass && "injected IsIOError must surface as a walk failure");
+        assert(rc == 1 && "persistent transient fault MUST return 1 (stop, no wipe)");
         assert(failure.transient && "IsIOError must classify transient");
         assert(failure.cause == "io_error" && "cause must be io_error");
-
-        int rc = applyStartupDecision(failure, td.str());
-        assert(rc == 1 && "transient startup fault MUST return 1 (stop, no wipe)");
+        // The retry loop's REASON TO EXIST: it must actually walk more than once.
+        // The old Case A comment claimed the fault survived all retries; the code
+        // it exercised walked exactly once.
+        assert(calls >= kAttempts && "a persistent fault MUST be re-verified every attempt");
         auto markerPath = std::filesystem::path(td.str()) / "auto_rebuild";
         assert(!std::filesystem::exists(markerPath) &&
                "transient startup fault MUST NOT write the auto_rebuild marker");
@@ -839,15 +851,13 @@ void test_startup_decision_transient_no_wipe_corruption_wipes() {
             return leveldb::Status::Corruption("persistent SST CRC failure");
         };
         UndoIntegrityFailure failure;
-        bool walkPass = utxo.VerifyUndoDataInRange(tip, 1, 50, failure);
+        const int rc = RunStartupIntegrityCheck(utxo, tip, 1, 50, td.str(),
+                                                kAttempts, kNoBackoff, failure);
         g_undo_fetch_fault_injector = nullptr;
 
-        assert(!walkPass && "injected IsCorruption must surface as a walk failure");
+        assert(rc == 2 && "confirmed corruption MUST return 2 (wipe + resync)");
         assert(!failure.transient && "IsCorruption MUST be non-transient (hard-fail)");
         assert(failure.cause == "io_corruption" && "cause must be io_corruption");
-
-        int rc = applyStartupDecision(failure, td.str());
-        assert(rc == 2 && "confirmed corruption MUST return 2 (wipe + resync)");
         auto markerPath = std::filesystem::path(td.str()) / "auto_rebuild";
         assert(std::filesystem::exists(markerPath) &&
                "confirmed corruption MUST write the auto_rebuild marker");
@@ -855,8 +865,6 @@ void test_startup_decision_transient_no_wipe_corruption_wipes() {
     }
 
     // --- Case C: real on-disk missing undo (no injection) -> wipe-rebuild, marker.
-    // Proves the confirmed-corruption rebuild path is preserved for genuine data
-    // damage, not just for the injected seam.
     {
         TempDir td("startup-missing-real");
         CUTXOSet utxo;
@@ -867,17 +875,123 @@ void test_startup_decision_transient_no_wipe_corruption_wipes() {
         assert(utxo.DeleteUndoForTesting(chain[24]->phashBlock) && "delete undo entry");
 
         UndoIntegrityFailure failure;
-        bool walkPass = utxo.VerifyUndoDataInRange(tip, 1, 50, failure);
-        assert(!walkPass && "missing undo must surface as a walk failure");
+        const int rc = RunStartupIntegrityCheck(utxo, tip, 1, 50, td.str(),
+                                                kAttempts, kNoBackoff, failure);
+        assert(rc == 2 && "real missing-undo corruption MUST return 2 (wipe)");
         assert(!failure.transient && "missing undo MUST be non-transient");
         assert(failure.cause == "missing" && "cause must be missing");
-
-        int rc = applyStartupDecision(failure, td.str());
-        assert(rc == 2 && "real missing-undo corruption MUST return 2 (wipe)");
         auto markerPath = std::filesystem::path(td.str()) / "auto_rebuild";
         assert(std::filesystem::exists(markerPath) &&
                "real missing-undo corruption MUST write the marker");
         (void)tip;
+    }
+
+    // --- Case D: a fault that CLEARS on retry -> boot continues, no marker.
+    // The retry loop exists for exactly this, and it had zero coverage: every
+    // previous case drove a fault that never cleared, so a loop that walked once
+    // and gave up would have passed all of them.
+    {
+        TempDir td("startup-transient-clears");
+        CUTXOSet utxo;
+        assert(utxo.Open(td.str(), true));
+        std::vector<std::unique_ptr<CBlockIndex>> chain;
+        CBlockIndex* tip = BuildSyntheticChain(50, chain);
+        WriteValidUndoForChain(utxo, chain);
+
+        int calls = 0;
+        g_undo_fetch_fault_injector = [&calls]() {
+            ++calls;
+            // Fail only the first walk; every later read succeeds.
+            return calls <= 1 ? leveldb::Status::IOError("one-shot EIO blip")
+                              : leveldb::Status::OK();
+        };
+        UndoIntegrityFailure failure;
+        const int rc = RunStartupIntegrityCheck(utxo, tip, 1, 50, td.str(),
+                                                kAttempts, kNoBackoff, failure);
+        g_undo_fetch_fault_injector = nullptr;
+
+        assert(rc == 0 && "a fault that clears on retry MUST let the node boot");
+        assert(calls > 1 && "the loop MUST re-walk after a failed attempt");
+        auto markerPath = std::filesystem::path(td.str()) / "auto_rebuild";
+        assert(!std::filesystem::exists(markerPath) &&
+               "a cleared transient fault MUST NOT write a marker");
+        (void)tip;
+    }
+
+    // --- Case E: STICKY classification (fresh-pass MEDIUM-4).
+    // Real corruption on the early attempts, a transient blip on the last one.
+    // Last-attempt-wins would read the blip, return 1, KEEP the corruption and
+    // crash-loop. Any wipe-worthy cause must outrank a later transient.
+    {
+        TempDir td("startup-sticky");
+        CUTXOSet utxo;
+        assert(utxo.Open(td.str(), true));
+        std::vector<std::unique_ptr<CBlockIndex>> chain;
+        CBlockIndex* tip = BuildSyntheticChain(50, chain);
+        WriteValidUndoForChain(utxo, chain);
+
+        int walks = 0;
+        int lastWalkSeen = 0;
+        g_undo_fetch_fault_injector = [&walks, &lastWalkSeen]() {
+            // Each walk stops at its first failing block, so one fault per walk.
+            if (lastWalkSeen != walks) { lastWalkSeen = walks; }
+            ++walks;
+            return walks <= 2 ? leveldb::Status::Corruption("real SST CRC failure")
+                              : leveldb::Status::IOError("late transient blip");
+        };
+        UndoIntegrityFailure failure;
+        const int rc = RunStartupIntegrityCheck(utxo, tip, 1, 50, td.str(),
+                                                kAttempts, kNoBackoff, failure);
+        g_undo_fetch_fault_injector = nullptr;
+
+        assert(rc == 2 &&
+               "corruption seen on ANY attempt MUST win over a later transient blip -- "
+               "otherwise real corruption is kept and the node crash-loops");
+        assert(failure.cause == "io_corruption" &&
+               "the reported cause MUST be the corruption, not the late blip");
+        auto markerPath = std::filesystem::path(td.str()) / "auto_rebuild";
+        assert(std::filesystem::exists(markerPath) &&
+               "sticky corruption MUST still write the marker");
+        (void)tip;
+    }
+
+    // --- Case F: a NON-allowlisted cause must NOT wipe (fresh-pass MEDIUM-2).
+    // "db_not_open" is non-transient, so the old default-to-wipe rule would
+    // DESTROY A HEALTHY CHAIN because the database failed to open. Wiping is an
+    // allowlist now; anything unrecognised stops for inspection.
+    {
+        TempDir td("startup-db-not-open");
+        CUTXOSet utxo;                       // deliberately NOT opened
+        std::vector<std::unique_ptr<CBlockIndex>> chain;
+        CBlockIndex* tip = BuildSyntheticChain(50, chain);
+
+        UndoIntegrityFailure failure;
+        const int rc = RunStartupIntegrityCheck(utxo, tip, 1, 50, td.str(),
+                                                kAttempts, kNoBackoff, failure);
+        assert(failure.cause == "db_not_open" && "unopened db must report db_not_open");
+        assert(!failure.transient && "db_not_open is not flagged transient");
+        assert(rc == 1 &&
+               "a cause that is not evidence of corruption MUST stop, NOT wipe -- "
+               "a failed db open is not a reason to destroy the chain");
+        auto markerPath = std::filesystem::path(td.str()) / "auto_rebuild";
+        assert(!std::filesystem::exists(markerPath) &&
+               "a non-allowlisted cause MUST NOT write the marker");
+        (void)tip;
+    }
+
+    // --- Case G: the other non-allowlisted cause, same rule.
+    {
+        TempDir td("startup-null-tip");
+        CUTXOSet utxo;
+        assert(utxo.Open(td.str(), true));
+
+        UndoIntegrityFailure failure;
+        const int rc = RunStartupIntegrityCheck(utxo, nullptr, 1, 50, td.str(),
+                                                kAttempts, kNoBackoff, failure);
+        assert(failure.cause == "block_index_missing");
+        assert(rc == 1 && "a missing block index MUST stop, NOT wipe");
+        auto markerPath = std::filesystem::path(td.str()) / "auto_rebuild";
+        assert(!std::filesystem::exists(markerPath));
     }
 
     g_undo_fetch_fault_injector = nullptr;  // belt-and-braces before destructors
