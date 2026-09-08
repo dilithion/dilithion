@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
+# MERGE NOTE: the roster gained a fifth ARGS field, so these injected
+# rows carry a trailing pipe. A 4-field row is now a ROSTER ERROR and the
+# runner exits 2 before running anything -- which reads as every arm
+# failing for its own reason rather than as one format mismatch.
 # Self-test for run_test_suites.sh's STALENESS GUARD.
 #
 # WHY THIS FILE EXISTS. On 2026-09-07 an r8 roster run reported 54 suites PASS
@@ -39,7 +43,7 @@ make_sandbox() {          # make_sandbox <binary-age-seconds-relative-to-source>
     printf '#!/usr/bin/env bash\nexit 0\n' > "$d/fake_suite"
     chmod +x "$d/fake_suite"
     touch -d "@$(( now + skew ))" "$d/fake_suite"
-    awk -v row="fast|fake_suite|60|" '
+    awk -v row="fast|fake_suite|60||" '
       /^ROSTER=.$/ { print; print row; skip=1; next }
       skip && /^.$/ { print; skip=0; next }
       skip { next }
@@ -107,7 +111,7 @@ echo "== no reference => FATAL, in CI and wherever a source tree exists =="
 # first version and passed 8/0 with it deleted.
 nosrc="$(mktemp -d)"
 printf '#!/usr/bin/env bash\nexit 0\n' > "$nosrc/fake_suite"; chmod +x "$nosrc/fake_suite"
-awk -v row="fast|fake_suite|60|" '
+awk -v row="fast|fake_suite|60||" '
   /^ROSTER=.$/ { print; print row; skip=1; next }
   skip && /^.$/ { print; skip=0; next }
   skip { next }
@@ -126,7 +130,7 @@ rm -rf "$nosrc"
 srcnoref="$(mktemp -d)"
 mkdir -p "$srcnoref/src"                   # a src/ dir with no matching sources
 printf '#!/usr/bin/env bash\nexit 0\n' > "$srcnoref/fake_suite"; chmod +x "$srcnoref/fake_suite"
-awk -v row="fast|fake_suite|60|" '
+awk -v row="fast|fake_suite|60||" '
   /^ROSTER=.$/ { print; print row; skip=1; next }
   skip && /^.$/ { print; skip=0; next }
   skip { next }
@@ -154,7 +158,7 @@ mq_sandbox() {            # mq_sandbox <binary-skew-vs-prereq>
     printf '#!/usr/bin/env bash\nexit 0\n' > "$d/fake_suite"; chmod +x "$d/fake_suite"
     touch -d "@${now}" "$d/src/fake.cpp" "$d/Makefile"
     touch -d "@$(( now + skew ))" "$d/fake_suite"
-    awk -v row="fast|fake_suite|60|" '
+    awk -v row="fast|fake_suite|60||" '
       /^ROSTER=.$/ { print; print row; skip=1; next }
       skip && /^.$/ { print; skip=0; next }
       skip { next }

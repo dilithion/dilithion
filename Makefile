@@ -649,6 +649,7 @@ tests: tests-build
 tests-fast: check-tip-notify-drain $(TEST_SUITES_FAST)
 	@bash scripts/test_run_test_suites_timeout.sh
 	@bash scripts/test_run_test_suites_staleness.sh
+	@bash scripts/test_run_test_suites_args.sh
 	@bash scripts/run_test_suites.sh fast
 
 tests-full: check-tip-notify-drain $(TEST_SUITES_FULL)
@@ -804,6 +805,15 @@ shutdown_disarm_ownership_tests: $(OBJ_DIR)/test/shutdown_disarm_ownership_tests
 	@echo "$(COLOR_BLUE)[LINK]$(COLOR_RESET) $@"
 	@$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS)
 	@echo "$(COLOR_GREEN)✓ shutdown_disarm_ownership_tests built successfully$(COLOR_RESET)"
+
+# The --only= selector decides WHICH TEST CASES RUN across the roster, so a
+# defect in it does not produce a red suite -- it produces a green one covering
+# less than the roster claims. It links against nothing but its own header, so
+# it costs a second and gates on every PR.
+test_only_selector_selftest: $(OBJ_DIR)/test/test_only_selector_selftest.o
+	@echo "$(COLOR_BLUE)[LINK]$(COLOR_RESET) $@"
+	@$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS)
+	@echo "$(COLOR_GREEN)✓ test_only_selector_selftest built successfully$(COLOR_RESET)"
 
 mik_registration_persistence_tests: $(CORE_OBJECTS) $(OBJ_DIR)/test/mik_registration_persistence_tests.o $(DILITHIUM_OBJECTS) $(CHIAVDF_OBJECTS)
 	@echo "$(COLOR_BLUE)[LINK]$(COLOR_RESET) $@"
