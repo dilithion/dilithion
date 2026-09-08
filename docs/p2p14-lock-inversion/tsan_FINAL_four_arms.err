@@ -1,0 +1,19 @@
+=== FOUR ARMS on final head 48d25748 (post-census, post-guard) ===
+--- arm: registered ---
+lock-order-inversions=0
+data-races=0
+  [p2p14-tsan] EDGE-A ProcessHeaders accepted=200  EDGE-B callback fired=200
+  [p2p14-tsan] REACH forward-edge: threadA headers landed=200/200 (>0 means ProcessNewHeader ran under cs_headers)
+--- arm: unregistered ---
+lock-order-inversions=0
+data-races=0
+  [p2p14-tsan] EDGE-A ProcessHeaders accepted=200  EDGE-B callback fired=0
+  [p2p14-tsan] REACH forward-edge: threadA headers landed=200/200 (>0 means ProcessNewHeader ran under cs_headers)
+--- arm: accessor-unsafe ---
+lock-order-inversions=0
+data-races=2
+  [p2p1415-accessor] reads=9754 writes=4000
+--- arm: accessor-safe ---
+lock-order-inversions=0
+data-races=0
+  [p2p1415-accessor] reads=10882 writes=4000
