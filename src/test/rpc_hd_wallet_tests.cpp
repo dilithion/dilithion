@@ -10,6 +10,39 @@
 #include <memory>
 #include <sstream>
 
+// ---------------------------------------------------------------------------
+// BUG #115 BASE. GenerateHDWallet pre-generates HD_GAP_LIMIT addresses at
+// wallet creation (wallet.cpp:5286-5291) and sets nHDExternalChainIndex past
+// them (wallet.cpp:5316). Every EXTERNAL-chain expectation below is written
+// relative to this base rather than to a bare literal.
+//
+// WHY NOT JUST ADD 19 TO EACH LITERAL: that fixes today and rebuilds the trap.
+// The next gap-limit change would break the same 18 sites again with nothing
+// naming the reason. Centralised, such a change breaks ONE line, loudly --
+// which is what a test should do when product policy moves. Loudly is the
+// point: these expectations DID fail when BUG #115 landed, and the suites were
+// excluded from CI rather than updated (ci.yml: "GetNewHDAddress() hangs in CI
+// (BUG-77) ... blocking on /dev/random" -- a misdiagnosis, since there is no
+// /dev/random path anywhere in src/ or depends/dilithium/ and these suites fail
+// in seconds rather than hanging). See
+// missions/security-audit-2026-09/artifacts/audit_wallet_keys.md F2.
+//
+// INTERNAL-chain expectations are deliberately UNCHANGED: wallet.cpp:5284
+// leaves nHDInternalChainIndex at 0, so change addresses still start at 0 and
+// none of those assertions failed.
+//
+// Mirrors the private CWallet::HD_GAP_LIMIT (wallet.h:469). Kept honest by the
+// assertions themselves -- if the product value moves, these fail.
+static const uint32_t kHDPregen = 20;
+
+// The BIP44 EXTERNAL-chain path for an index, so path expectations move with
+// the base instead of being frozen strings.
+static std::string HDExternalPath(uint32_t index)
+{
+    return "m/44'/573'/0'/0'/" + std::to_string(index) + "'";
+}
+// ---------------------------------------------------------------------------
+
 // ============================================================================
 // Helper Functions
 // ============================================================================
@@ -206,7 +239,7 @@ BOOST_AUTO_TEST_CASE(rpc_get_hd_wallet_info_test) {
     BOOST_REQUIRE(wallet->GetHDWalletInfo(account, external_idx, internal_idx));
 
     BOOST_CHECK_EQUAL(account, 0);
-    BOOST_CHECK_EQUAL(external_idx, 1); // One address generated
+    BOOST_CHECK_EQUAL(external_idx, kHDPregen); // One address generated
     BOOST_CHECK_EQUAL(internal_idx, 0);
 
     // Generate more addresses
@@ -215,7 +248,7 @@ BOOST_AUTO_TEST_CASE(rpc_get_hd_wallet_info_test) {
     wallet->GetChangeAddress();
 
     BOOST_REQUIRE(wallet->GetHDWalletInfo(account, external_idx, internal_idx));
-    BOOST_CHECK_EQUAL(external_idx, 3);
+    BOOST_CHECK_EQUAL(external_idx, kHDPregen + 2);
     BOOST_CHECK_EQUAL(internal_idx, 1);
 }
 
@@ -233,7 +266,7 @@ BOOST_AUTO_TEST_CASE(rpc_list_hd_addresses_test) {
 
     // Get all addresses
     std::vector<CDilithiumAddress> addresses = wallet->GetAddresses();
-    BOOST_CHECK_EQUAL(addresses.size(), 4); // Initial + 2 receive + 1 change
+    BOOST_CHECK_EQUAL(addresses.size(), kHDPregen + 3); // Initial + 2 receive + 1 change
 
     // Verify paths
     for (const CDilithiumAddress& addr : addresses) {
@@ -336,7 +369,7 @@ BOOST_AUTO_TEST_CASE(rpc_hd_wallet_state_persistence_test) {
 
         uint32_t account, external_idx, internal_idx;
         BOOST_REQUIRE(wallet.GetHDWalletInfo(account, external_idx, internal_idx));
-        BOOST_CHECK_EQUAL(external_idx, 3);
+        BOOST_CHECK_EQUAL(external_idx, kHDPregen + 2);
         BOOST_CHECK_EQUAL(internal_idx, 1);
 
         std::string loaded_mnemonic;
@@ -363,10 +396,10 @@ BOOST_AUTO_TEST_CASE(rpc_hd_wallet_path_validation_test) {
     CHDKeyPath path;
 
     BOOST_REQUIRE(wallet->GetAddressPath(receive1, path));
-    BOOST_CHECK_EQUAL(path.ToString(), "m/44'/573'/0'/0'/1'");
+    BOOST_CHECK_EQUAL(path.ToString(), HDExternalPath(kHDPregen + 0));
 
     BOOST_REQUIRE(wallet->GetAddressPath(receive2, path));
-    BOOST_CHECK_EQUAL(path.ToString(), "m/44'/573'/0'/0'/2'");
+    BOOST_CHECK_EQUAL(path.ToString(), HDExternalPath(kHDPregen + 1));
 
     BOOST_REQUIRE(wallet->GetAddressPath(change1, path));
     BOOST_CHECK_EQUAL(path.ToString(), "m/44'/573'/0'/1'/0'");
@@ -410,7 +443,7 @@ BOOST_AUTO_TEST_CASE(rpc_list_addresses_empty_hd_wallet_test) {
 
     // Should have one initial address
     std::vector<CDilithiumAddress> addresses = wallet->GetAddresses();
-    BOOST_CHECK_EQUAL(addresses.size(), 1);
+    BOOST_CHECK_EQUAL(addresses.size(), kHDPregen + 0);
 }
 
 // Test 18: HD Wallet Large Index Test
@@ -428,7 +461,7 @@ BOOST_AUTO_TEST_CASE(rpc_hd_wallet_large_index_test) {
 
     uint32_t account, external_idx, internal_idx;
     BOOST_REQUIRE(wallet->GetHDWalletInfo(account, external_idx, internal_idx));
-    BOOST_CHECK_EQUAL(external_idx, 51); // Initial + 50
+    BOOST_CHECK_EQUAL(external_idx, kHDPregen + 50); // Initial + 50
 }
 
 // Test 19: Concurrent Address Generation
