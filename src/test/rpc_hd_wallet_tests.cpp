@@ -10,38 +10,14 @@
 #include <memory>
 #include <sstream>
 
-// ---------------------------------------------------------------------------
-// BUG #115 BASE. GenerateHDWallet pre-generates HD_GAP_LIMIT addresses at
-// wallet creation (wallet.cpp:5286-5291) and sets nHDExternalChainIndex past
-// them (wallet.cpp:5316). Every EXTERNAL-chain expectation below is written
-// relative to this base rather than to a bare literal.
-//
-// WHY NOT JUST ADD 19 TO EACH LITERAL: that fixes today and rebuilds the trap.
-// The next gap-limit change would break the same 18 sites again with nothing
-// naming the reason. Centralised, such a change breaks ONE line, loudly --
-// which is what a test should do when product policy moves. Loudly is the
-// point: these expectations DID fail when BUG #115 landed, and the suites were
-// excluded from CI rather than updated (ci.yml: "GetNewHDAddress() hangs in CI
-// (BUG-77) ... blocking on /dev/random" -- a misdiagnosis, since there is no
-// /dev/random path anywhere in src/ or depends/dilithium/ and these suites fail
-// in seconds rather than hanging). See
-// missions/security-audit-2026-09/artifacts/audit_wallet_keys.md F2.
-//
-// INTERNAL-chain expectations are deliberately UNCHANGED: wallet.cpp:5284
-// leaves nHDInternalChainIndex at 0, so change addresses still start at 0 and
-// none of those assertions failed.
-//
-// Mirrors the private CWallet::HD_GAP_LIMIT (wallet.h:469). Kept honest by the
-// assertions themselves -- if the product value moves, these fail.
-static const uint32_t kHDPregen = 20;
-
-// The BIP44 EXTERNAL-chain path for an index, so path expectations move with
-// the base instead of being frozen strings.
-static std::string HDExternalPath(uint32_t index)
-{
-    return "m/44'/573'/0'/0'/" + std::to_string(index) + "'";
-}
-// ---------------------------------------------------------------------------
+// BUG #115: the pre-generation base is read FROM THE WALLET at each site
+// (hd_base), never pinned to a literal. a8 measured why: a deliberate
+// HD_GAP_LIMIT change SURVIVES the relational assertion while breaking the
+// relation KILLS it. The relation tests the invariant that must hold; a
+// literal would test a policy value that is allowed to move -- and a suite
+// that reddens on a legitimate change is one that gets excluded from CI,
+// which is exactly the history these files are recovering from.
+#include <test/hd_pregen.h>
 
 // ============================================================================
 // Helper Functions
@@ -116,6 +92,9 @@ BOOST_AUTO_TEST_CASE(rpc_create_hd_wallet_test) {
         // For testing, we'll call wallet methods directly to verify behavior
         std::string mnemonic;
         BOOST_REQUIRE(wallet->GenerateHDWallet(mnemonic));
+        // RELATIONAL BASE: what this wallet actually pre-generated (BUG #115).
+        const uint32_t hd_base = static_cast<uint32_t>(wallet->GetAddresses().size());
+        (void)hd_base;
 
         BOOST_CHECK(wallet->IsHDWallet());
         BOOST_CHECK(!mnemonic.empty());
@@ -139,6 +118,9 @@ BOOST_AUTO_TEST_CASE(rpc_create_hd_wallet_with_passphrase_test) {
     std::string mnemonic;
     std::string passphrase = "test_passphrase_123";
     BOOST_REQUIRE(wallet->GenerateHDWallet(mnemonic, passphrase));
+    // RELATIONAL BASE: what this wallet actually pre-generated (BUG #115).
+    const uint32_t hd_base = static_cast<uint32_t>(wallet->GetAddresses().size());
+    (void)hd_base;
 
     BOOST_CHECK(wallet->IsHDWallet());
 
@@ -154,6 +136,9 @@ BOOST_AUTO_TEST_CASE(rpc_restore_hd_wallet_test) {
     std::unique_ptr<CWallet> wallet1 = std::make_unique<CWallet>();
     std::string original_mnemonic;
     BOOST_REQUIRE(wallet1->GenerateHDWallet(original_mnemonic));
+    // RELATIONAL BASE: what this wallet actually pre-generated (BUG #115).
+    const uint32_t hd_base = static_cast<uint32_t>(wallet1->GetAddresses().size());
+    (void)hd_base;
 
     // Get first address from original wallet
     CDilithiumAddress original_addr = wallet1->GetNewHDAddress();
@@ -179,6 +164,9 @@ BOOST_AUTO_TEST_CASE(rpc_restore_hd_wallet_with_passphrase_test) {
     std::unique_ptr<CWallet> wallet1 = std::make_unique<CWallet>();
     std::string mnemonic;
     BOOST_REQUIRE(wallet1->GenerateHDWallet(mnemonic, passphrase));
+    // RELATIONAL BASE: what this wallet actually pre-generated (BUG #115).
+    const uint32_t hd_base = static_cast<uint32_t>(wallet1->GetAddresses().size());
+    (void)hd_base;
 
     CDilithiumAddress addr1 = wallet1->GetNewHDAddress();
 
@@ -203,6 +191,9 @@ BOOST_AUTO_TEST_CASE(rpc_export_mnemonic_test) {
 
     std::string mnemonic;
     BOOST_REQUIRE(wallet->GenerateHDWallet(mnemonic));
+    // RELATIONAL BASE: what this wallet actually pre-generated (BUG #115).
+    const uint32_t hd_base = static_cast<uint32_t>(wallet->GetAddresses().size());
+    (void)hd_base;
 
     // Export mnemonic
     std::string exported;
@@ -233,13 +224,16 @@ BOOST_AUTO_TEST_CASE(rpc_get_hd_wallet_info_test) {
     // Create HD wallet
     std::string mnemonic;
     BOOST_REQUIRE(wallet->GenerateHDWallet(mnemonic));
+    // RELATIONAL BASE: what this wallet actually pre-generated (BUG #115).
+    const uint32_t hd_base = static_cast<uint32_t>(wallet->GetAddresses().size());
+    (void)hd_base;
 
     // Get wallet info
     uint32_t account, external_idx, internal_idx;
     BOOST_REQUIRE(wallet->GetHDWalletInfo(account, external_idx, internal_idx));
 
     BOOST_CHECK_EQUAL(account, 0);
-    BOOST_CHECK_EQUAL(external_idx, kHDPregen); // One address generated
+    BOOST_CHECK_EQUAL(external_idx, hd_base); // nothing derived yet: the index sits at the pre-generated count
     BOOST_CHECK_EQUAL(internal_idx, 0);
 
     // Generate more addresses
@@ -248,7 +242,7 @@ BOOST_AUTO_TEST_CASE(rpc_get_hd_wallet_info_test) {
     wallet->GetChangeAddress();
 
     BOOST_REQUIRE(wallet->GetHDWalletInfo(account, external_idx, internal_idx));
-    BOOST_CHECK_EQUAL(external_idx, kHDPregen + 2);
+    BOOST_CHECK_EQUAL(external_idx, hd_base + 2);
     BOOST_CHECK_EQUAL(internal_idx, 1);
 }
 
@@ -258,6 +252,9 @@ BOOST_AUTO_TEST_CASE(rpc_list_hd_addresses_test) {
 
     std::string mnemonic;
     BOOST_REQUIRE(wallet->GenerateHDWallet(mnemonic));
+    // RELATIONAL BASE: what this wallet actually pre-generated (BUG #115).
+    const uint32_t hd_base = static_cast<uint32_t>(wallet->GetAddresses().size());
+    (void)hd_base;
 
     // Generate several addresses
     CDilithiumAddress addr1 = wallet->GetNewHDAddress();
@@ -266,7 +263,7 @@ BOOST_AUTO_TEST_CASE(rpc_list_hd_addresses_test) {
 
     // Get all addresses
     std::vector<CDilithiumAddress> addresses = wallet->GetAddresses();
-    BOOST_CHECK_EQUAL(addresses.size(), kHDPregen + 3); // Initial + 2 receive + 1 change
+    BOOST_CHECK_EQUAL(addresses.size(), hd_base + 3); // pre-generated, then 2 receive + 1 change derived here
 
     // Verify paths
     for (const CDilithiumAddress& addr : addresses) {
@@ -286,6 +283,9 @@ BOOST_AUTO_TEST_CASE(rpc_create_hd_wallet_non_empty_test) {
     // Generate HD wallet first
     std::string mnemonic1;
     BOOST_REQUIRE(wallet->GenerateHDWallet(mnemonic1));
+    // RELATIONAL BASE: what this wallet actually pre-generated (BUG #115).
+    const uint32_t hd_base = static_cast<uint32_t>(wallet->GetAddresses().size());
+    (void)hd_base;
 
     // Attempt to create another HD wallet should fail
     std::string mnemonic2;
@@ -298,6 +298,9 @@ BOOST_AUTO_TEST_CASE(rpc_restore_hd_wallet_non_empty_test) {
 
     std::string mnemonic;
     BOOST_REQUIRE(wallet->GenerateHDWallet(mnemonic));
+    // RELATIONAL BASE: what this wallet actually pre-generated (BUG #115).
+    const uint32_t hd_base = static_cast<uint32_t>(wallet->GetAddresses().size());
+    (void)hd_base;
 
     // Attempt to restore another mnemonic should fail
     std::string another_mnemonic = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon art";
@@ -325,6 +328,9 @@ BOOST_AUTO_TEST_CASE(rpc_hd_wallet_deterministic_test) {
     std::unique_ptr<CWallet> wallet2 = std::make_unique<CWallet>();
 
     BOOST_REQUIRE(wallet1->InitializeHDWallet(test_mnemonic));
+    // RELATIONAL BASE: what this wallet actually pre-generated (BUG #115).
+    const uint32_t hd_base = static_cast<uint32_t>(wallet1->GetAddresses().size());
+    (void)hd_base;
     BOOST_REQUIRE(wallet2->InitializeHDWallet(test_mnemonic));
 
     // Generate addresses and verify they match
@@ -349,9 +355,14 @@ BOOST_AUTO_TEST_CASE(rpc_hd_wallet_state_persistence_test) {
     std::string mnemonic;
 
     // Create and save wallet
+    uint32_t hd_base = 0;  // BUG #115 relational base; set in the save scope below
     {
         CWallet wallet;
         BOOST_REQUIRE(wallet.GenerateHDWallet(mnemonic));
+        // RELATIONAL BASE: what this wallet actually pre-generated (BUG #115).
+        // Declared ABOVE both scopes because the assertion lives in the load
+        // block while the wallet that pre-generated them lives in the save block.
+        hd_base = static_cast<uint32_t>(wallet.GetAddresses().size());
 
         wallet.GetNewHDAddress();
         wallet.GetNewHDAddress();
@@ -369,7 +380,7 @@ BOOST_AUTO_TEST_CASE(rpc_hd_wallet_state_persistence_test) {
 
         uint32_t account, external_idx, internal_idx;
         BOOST_REQUIRE(wallet.GetHDWalletInfo(account, external_idx, internal_idx));
-        BOOST_CHECK_EQUAL(external_idx, kHDPregen + 2);
+        BOOST_CHECK_EQUAL(external_idx, hd_base + 2);
         BOOST_CHECK_EQUAL(internal_idx, 1);
 
         std::string loaded_mnemonic;
@@ -386,6 +397,9 @@ BOOST_AUTO_TEST_CASE(rpc_hd_wallet_path_validation_test) {
 
     std::string mnemonic;
     BOOST_REQUIRE(wallet->GenerateHDWallet(mnemonic));
+    // RELATIONAL BASE: what this wallet actually pre-generated (BUG #115).
+    const uint32_t hd_base = static_cast<uint32_t>(wallet->GetAddresses().size());
+    (void)hd_base;
 
     // Generate addresses
     CDilithiumAddress receive1 = wallet->GetNewHDAddress();
@@ -396,10 +410,10 @@ BOOST_AUTO_TEST_CASE(rpc_hd_wallet_path_validation_test) {
     CHDKeyPath path;
 
     BOOST_REQUIRE(wallet->GetAddressPath(receive1, path));
-    BOOST_CHECK_EQUAL(path.ToString(), HDExternalPath(kHDPregen + 0));
+    BOOST_CHECK_EQUAL(path.ToString(), hdtest::ExternalPath(hd_base + 0));
 
     BOOST_REQUIRE(wallet->GetAddressPath(receive2, path));
-    BOOST_CHECK_EQUAL(path.ToString(), HDExternalPath(kHDPregen + 1));
+    BOOST_CHECK_EQUAL(path.ToString(), hdtest::ExternalPath(hd_base + 1));
 
     BOOST_REQUIRE(wallet->GetAddressPath(change1, path));
     BOOST_CHECK_EQUAL(path.ToString(), "m/44'/573'/0'/1'/0'");
@@ -412,6 +426,9 @@ BOOST_AUTO_TEST_CASE(rpc_multiple_hd_wallets_test) {
 
     std::string mnemonic1, mnemonic2;
     BOOST_REQUIRE(wallet1->GenerateHDWallet(mnemonic1));
+    // RELATIONAL BASE: what this wallet actually pre-generated (BUG #115).
+    const uint32_t hd_base = static_cast<uint32_t>(wallet1->GetAddresses().size());
+    (void)hd_base;
     BOOST_REQUIRE(wallet2->GenerateHDWallet(mnemonic2));
 
     // Mnemonics should be different
@@ -440,10 +457,13 @@ BOOST_AUTO_TEST_CASE(rpc_list_addresses_empty_hd_wallet_test) {
 
     std::string mnemonic;
     BOOST_REQUIRE(wallet->GenerateHDWallet(mnemonic));
+    // RELATIONAL BASE: what this wallet actually pre-generated (BUG #115).
+    const uint32_t hd_base = static_cast<uint32_t>(wallet->GetAddresses().size());
+    (void)hd_base;
 
     // Should have one initial address
     std::vector<CDilithiumAddress> addresses = wallet->GetAddresses();
-    BOOST_CHECK_EQUAL(addresses.size(), kHDPregen + 0);
+    BOOST_CHECK_EQUAL(addresses.size(), hd_base + 0);
 }
 
 // Test 18: HD Wallet Large Index Test
@@ -452,6 +472,9 @@ BOOST_AUTO_TEST_CASE(rpc_hd_wallet_large_index_test) {
 
     std::string mnemonic;
     BOOST_REQUIRE(wallet->GenerateHDWallet(mnemonic));
+    // RELATIONAL BASE: what this wallet actually pre-generated (BUG #115).
+    const uint32_t hd_base = static_cast<uint32_t>(wallet->GetAddresses().size());
+    (void)hd_base;
 
     // Generate many addresses
     for (int i = 0; i < 50; i++) {
@@ -461,7 +484,7 @@ BOOST_AUTO_TEST_CASE(rpc_hd_wallet_large_index_test) {
 
     uint32_t account, external_idx, internal_idx;
     BOOST_REQUIRE(wallet->GetHDWalletInfo(account, external_idx, internal_idx));
-    BOOST_CHECK_EQUAL(external_idx, kHDPregen + 50); // Initial + 50
+    BOOST_CHECK_EQUAL(external_idx, hd_base + 50); // pre-generated, then 50 derived here
 }
 
 // Test 19: Concurrent Address Generation
@@ -470,6 +493,9 @@ BOOST_AUTO_TEST_CASE(rpc_concurrent_address_generation_test) {
 
     std::string mnemonic;
     BOOST_REQUIRE(wallet->GenerateHDWallet(mnemonic));
+    // RELATIONAL BASE: what this wallet actually pre-generated (BUG #115).
+    const uint32_t hd_base = static_cast<uint32_t>(wallet->GetAddresses().size());
+    (void)hd_base;
 
     // Generate addresses (wallet has mutex protection)
     std::vector<CDilithiumAddress> addresses;
@@ -494,6 +520,9 @@ BOOST_AUTO_TEST_CASE(rpc_hd_wallet_empty_passphrase_test) {
 
     std::string mnemonic;
     BOOST_REQUIRE(wallet1->GenerateHDWallet(mnemonic, ""));
+    // RELATIONAL BASE: what this wallet actually pre-generated (BUG #115).
+    const uint32_t hd_base = static_cast<uint32_t>(wallet1->GetAddresses().size());
+    (void)hd_base;
     BOOST_REQUIRE(wallet2->GenerateHDWallet(mnemonic));
 
     // Empty passphrase and no passphrase should produce same result

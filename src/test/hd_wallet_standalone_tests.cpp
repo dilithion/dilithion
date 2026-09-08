@@ -74,9 +74,16 @@ bool Test_GenerateHDWallet() {
     // the suite does not hang, it fails in 2 seconds on this line. The
     // misdiagnosis kept anyone from looking for ~1054 commits, per
     // missions/security-audit-2026-09/artifacts/audit_wallet_keys.md F2.
+    // RELATIONAL, not a pinned number (a8 review LOW-1, measured): a deliberate
+    // HD_GAP_LIMIT change SURVIVES this assertion while breaking the relation
+    // KILLS it -- so it tests the invariant that must hold rather than the
+    // policy value that is allowed to move. A literal here would redden the
+    // suite on a legitimate change, and a suite that reddens on legitimate
+    // changes is one that gets excluded from CI, which is exactly the history
+    // this file is recovering from.
     const size_t pregenerated = wallet.GetAddresses().size();
     TEST_ASSERT(pregenerated > 1,
-                "BUG #115 fix should pre-generate a gap limit of addresses, not one");
+                "BUG #115 must pre-generate a gap limit of addresses, not one");
     TEST_ASSERT(external_idx == pregenerated,
                 "External index must sit exactly past the pre-generated addresses");
     // Internal is NOT pre-advanced: wallet.cpp:5284 leaves it at 0.
