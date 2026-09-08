@@ -43,6 +43,23 @@ struct LatencyFingerprint {
 
     // Comparison
     static double distance(const LatencyFingerprint& a, const LatencyFingerprint& b);
+
+    // How many positional seed pairs are actually comparable — i.e. both sides
+    // hold a real median (> 0.0). distance() averages over exactly these.
+    //
+    // This exists because distance() returns the sentinel 1000.0 when there are
+    // none, and exp(-1000/100) ~= 0 made "we measured nothing in common" score
+    // identically to "these two nodes are maximally far apart". An attacker who
+    // serialized four zero doubles therefore bought a latency_similarity of ~0
+    // at full weight and diluted their own combined_score BELOW an honest
+    // node's — opting out of the discriminator by omission. Callers must ask
+    // this first and treat 0 as "dimension unavailable", never as evidence.
+    static size_t comparable_seed_count(const LatencyFingerprint& a,
+                                        const LatencyFingerprint& b);
+
+    // True if this fingerprint carries at least one real measurement. An
+    // all-zero fingerprint is an omission wearing the shape of data.
+    bool has_any_measurement() const;
     static double wasserstein_distance(const std::vector<double>& a, const std::vector<double>& b);
 };
 

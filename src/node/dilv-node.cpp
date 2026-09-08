@@ -4746,6 +4746,14 @@ load_genesis_block:  // Bug #29: Label for automatic retry after blockchain wipe
             const bool signed_envelope = !envelope.signature.empty();
 
             if (mapped && !signed_envelope) {
+                // OPEN (fresh-pass MEDIUM, H-1 adjacency) — NOT fixed here.
+                // Identical to the dilithion-node site; the full reasoning lives
+                // there. Short form: append_sample creates an entry keyed by the
+                // sender-chosen dna.address, H-1 capped only the first-seen-MIK
+                // handler, so a mapped MIK can still mint entries by rotating
+                // the address. check_mik_limits below bounds the RATE, not the
+                // TOTAL. The gate does not belong in append_sample — that
+                // contradicts its documented create-on-first-sample contract.
                 if (!g_dna_sample_limiter.check_mik_limits(peer_id, mik, now_sec)) return;
                 auto result = g_node_context.dna_registry->append_sample(*dna);
                 if (result == digital_dna::IDNARegistry::RegisterResult::UPDATED ||

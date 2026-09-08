@@ -307,7 +307,7 @@ struct NodeState {
     std::atomic<uint64_t> template_version{0}; // BUG #109 FIX: Template version counter for race detection
     std::string mining_address_override;       // --mining-address=Dxxx (empty = use wallet default)
     bool rotate_mining_address{false};         // --rotate-mining-address (new HD address per block)
-    bool shared_heat{true};                    // Phase 3b: shared cluster heat (default ON)
+    bool shared_heat{false};                   // Phase 3b: shared cluster heat — default OFF, D-DIL-2026-09-08-1
     CRPCServer* rpc_server = nullptr;
     CMiningController* miner = nullptr;
     CWallet* wallet = nullptr;
@@ -595,7 +595,25 @@ struct NodeConfig {
     int max_connections_per_ip = 2;  // --max-connections-per-ip: Max inbound per IP (default 2, range 1-64)
     int attestation_rate_limit = 1;  // --attestation-rate-limit: Max attestations per /24 subnet per day
     std::vector<std::string> rpc_allow_hosts;  // --rpcallowhost: extra allowed Host headers (anti-DNS-rebinding allowlist)
-    bool shared_heat = true;         // Phase 3b: shared cluster heat (default ON)
+    // Phase 3b shared cluster heat. DEFAULT OFF — decision D-DIL-2026-09-08-1 (Will,
+    // 2026-09-08), taken as part of this PR and not before it, for a reason specific
+    // to this diff:
+    //
+    // Before this PR the latency comparator was broken — every stored DNA scored
+    // latency ~= 0, so find_similar() never returned a cluster and shared heat was
+    // dead code on every live node. Repairing the comparator (the point of this PR)
+    // brings it back to life on DIL mainnet's nVersion=1 RandomX template. Combined
+    // with the 0.0-latency sentinel (HIGH-C, fixed in this same PR), the arming is
+    // asymmetric: honest co-located miners cluster and self-throttle up to 5x, while
+    // an attacker who zeroes their latency pays nothing. That is a penalty on an
+    // honest-distinguishable signal, which this project does not ship.
+    //
+    // It is NOT consensus (src/consensus and src/dfmp have zero refs to find_similar
+    // or shared_heat; pow.cpp:390 uses own heat only, so a throttled miner targets
+    // harder-or-equal and its blocks stay valid) — which is exactly why turning it
+    // off is safe and reversible. Re-arm deliberately with --shared-heat once the
+    // cluster penalty has been measured against real co-located topology.
+    bool shared_heat = false;        // Phase 3b: shared cluster heat (default OFF)
     // use_new_peerman field removed in v4.3.4 cut Block 8 with the --usenewpeerman
     // flag retirement (port::CPeerManager class deleted in Block 7; flag was a no-op
     // since Block 7).
@@ -835,8 +853,16 @@ struct NodeConfig {
                 std::string h = arg.substr(15);
                 if (!h.empty()) rpc_allow_hosts.push_back(h);
             }
+            else if (arg == "--shared-heat") {
+                // Opt IN to the Phase 3b shared cluster heat penalty. Default is
+                // OFF (D-DIL-2026-09-08-1) — see the field declaration for why.
+                shared_heat = true;
+            }
             else if (arg == "--no-shared-heat") {
-                // Disable Phase 3b shared cluster heat penalty
+                // Retained after the default flipped to OFF so existing seed-node
+                // wrappers and operator scripts carrying this flag keep starting
+                // instead of dying on an unknown argument. Now a no-op unless it
+                // follows --shared-heat on the same command line.
                 shared_heat = false;
             }
             else if (arg == "--upnp") {
@@ -973,7 +999,8 @@ struct NodeConfig {
         std::cout << "                          allowed. Under --public-api, remote REST/RPC clients" << std::endl;
         std::cout << "                          must be added here EXPLICITLY (by IP or DNS name) —" << std::endl;
         std::cout << "                          the node's own external IP is NOT auto-allowed." << std::endl;
-        std::cout << "  --no-shared-heat      Disable shared cluster heat penalty" << std::endl;
+        std::cout << "  --shared-heat         Enable shared cluster heat penalty (default OFF)" << std::endl;
+        std::cout << "  --no-shared-heat      Disable shared cluster heat penalty (now the default; kept for compatibility)" << std::endl;
         std::cout << "  --upnp                Enable automatic port mapping (UPnP)" << std::endl;
         std::cout << "  --no-upnp             Disable UPnP (don't prompt)" << std::endl;
         std::cout << "  --externalip=<ip>     Your public IP (for manual port forwarding)" << std::endl;
@@ -4933,6 +4960,28 @@ load_genesis_block:  // Bug #29: Label for automatic retry after blockchain wipe
             // Fast path: mapped + unsigned → full replacement, skip crypto.
             // This preserves Phase 1 trust for the miner's own connection.
             if (mapped && !signed_envelope) {
+                // OPEN (fresh-pass MEDIUM, H-1 adjacency) — NOT fixed here, and
+                // saying so rather than letting silence read as coverage:
+                //
+                // append_sample CREATES a registry entry when the address key is
+                // absent (dna_registry_db.cpp, the !status.ok() branch), and the
+                // key is dna.address, which the sender chooses. H-1 capped the
+                // first-seen-MIK handler above; it did not cap this. So one
+                // peer holding ONE mapped MIK can still mint distinct
+                // address-keyed entries by rotating the address field.
+                //
+                // What bounds it today: check_mik_limits, immediately below,
+                // caps the RATE per (peer, MIK). What is NOT bounded: the total
+                // number of entries, since each accepted rotation adds one and
+                // the superseded address key is never reclaimed.
+                //
+                // Why it is not fixed in this PR: the obvious gate — refuse to
+                // create in append_sample — contradicts that function's
+                // documented contract (append_sample_unregistered_registers) and
+                // was measured to redden 9 tests. The real fix is address-key
+                // reclamation on rotation, or a per-peer cap on distinct
+                // addresses per MIK, and both are their own change with their
+                // own tests.
                 if (!g_dna_sample_limiter.check_mik_limits(peer_id, mik, now_sec)) return;
                 auto result = g_node_context.dna_registry->append_sample(*dna);
                 if (result == digital_dna::IDNARegistry::RegisterResult::UPDATED ||

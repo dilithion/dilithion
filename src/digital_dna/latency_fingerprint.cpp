@@ -273,8 +273,35 @@ double LatencyFingerprint::distance(const LatencyFingerprint& a, const LatencyFi
         total_distance += std::abs(ma - mb);
         matched++;
     }
-    if (matched == 0) return 1000.0;  // No comparable seeds = maximum distance
+    // No comparable seeds. This is NOT "maximally far apart" — it is "no
+    // evidence in this dimension", and the two are very different claims.
+    // The sentinel is kept for callers that only need a distance, but every
+    // scoring caller MUST gate on comparable_seed_count() first; treating this
+    // as a real distance is what let an attacker opt out of the latency
+    // discriminator by serializing zeros (H-1 / HIGH-C).
+    if (matched == 0) return 1000.0;
     return total_distance / static_cast<double>(matched);
+}
+
+size_t LatencyFingerprint::comparable_seed_count(const LatencyFingerprint& a,
+                                                 const LatencyFingerprint& b) {
+    const size_t n = std::min(a.seed_stats.size(), b.seed_stats.size());
+    size_t matched = 0;
+    for (size_t i = 0; i < n; i++) {
+        // Same predicate as distance()'s loop, deliberately duplicated rather
+        // than shared: if these two ever disagree the gate stops matching the
+        // thing it gates, silently. Keep them in lockstep.
+        if (a.seed_stats[i].median_ms == 0.0 || b.seed_stats[i].median_ms == 0.0) continue;
+        matched++;
+    }
+    return matched;
+}
+
+bool LatencyFingerprint::has_any_measurement() const {
+    for (const auto& s : seed_stats) {
+        if (s.median_ms > 0.0) return true;
+    }
+    return false;
 }
 
 std::string LatencyFingerprint::to_json() const {

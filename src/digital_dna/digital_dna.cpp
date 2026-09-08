@@ -691,8 +691,14 @@ std::vector<std::pair<DigitalDNA, SimilarityScore>> DigitalDNARegistry::find_sim
 SimilarityScore DigitalDNARegistry::compare(const DigitalDNA& a, const DigitalDNA& b) const {
     SimilarityScore score;
 
-    // Core v2.0 dimensions (always available)
-    score.latency_similarity = calculate_latency_similarity(a.latency, b.latency);
+    // Core v2.0 dimensions.
+    // Latency is scored only when the two fingerprints share at least one
+    // comparable seed — see SimilarityScore::has_latency for why counting the
+    // no-overlap case as a real score was an attacker opt-out.
+    score.has_latency = LatencyFingerprint::comparable_seed_count(a.latency, b.latency) > 0;
+    score.latency_similarity = score.has_latency
+        ? calculate_latency_similarity(a.latency, b.latency)
+        : 0.0;
     score.timing_similarity = calculate_timing_similarity(a.timing, b.timing);
 
     // Perspective may return -1.0 if both have no peer data (e.g. after deserialization)
@@ -750,7 +756,8 @@ SimilarityScore DigitalDNARegistry::compute_combined_score(SimilarityScore score
     };
 
     // Independent dimensions: full weight (1.0 each)
-    add(score.latency_similarity, 1.0);         // L: geographic
+    if (score.has_latency)
+        add(score.latency_similarity, 1.0);     // L: geographic (skipped if no comparable seed)
     if (score.has_perspective)
         add(score.perspective_similarity, 1.0); // P: network topology (skipped if no peer data)
 
@@ -787,8 +794,11 @@ SimilarityScore DigitalDNARegistry::compute_combined_score(SimilarityScore score
     if (score.has_behavioral)
         add(score.behavioral_similarity, 1.0);     // BP: activity patterns
 
+    // 1 = timing, the only dimension scored unconditionally. Latency used to be
+    // the second unconditional one and is now gated like the rest.
     score.dimensions_scored = static_cast<uint32_t>(
-        2 + (score.has_perspective ? 1 : 0) +
+        1 + (score.has_latency ? 1 : 0) +
+        (score.has_perspective ? 1 : 0) +
         (score.has_memory ? 1 : 0) + (score.has_clock_drift ? 1 : 0) +
         (score.has_bandwidth ? 1 : 0) + (score.has_thermal ? 1 : 0) +
         (score.has_behavioral ? 1 : 0));

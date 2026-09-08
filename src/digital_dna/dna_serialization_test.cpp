@@ -726,6 +726,73 @@ static void test_latency_distance_roundtrip() {
           "Offset medians -> NOT the 1000.0 no-data sentinel");
 }
 
+// ============ Test 19: the latency availability gate (HIGH-C) ============
+// Pins the attacker opt-out the fresh pass found, and pins it in BOTH
+// directions so neither half can rot silently.
+//
+// The defect: latency was averaged into combined_score UNCONDITIONALLY at
+// weight 1.0. Two fingerprints with no comparable seed pair produce
+// distance() == 1000.0, hence latency_similarity == exp(-10) ~= 0. So "we
+// share no measurement" was scored identically to "these nodes are maximally
+// far apart", and four zero doubles on the wire bought a free ~0 at full
+// weight -- pulling a Sybil pair's combined_score BELOW an honest pair's.
+//
+// Concretely, and this is the number that matters: two identities with NO
+// latency data and an IDENTICAL timing signature used to score
+// (0 + 1.0) / 2 = 0.50, which sits just under SUSPICIOUS_THRESHOLD (0.55).
+// Identical in every dimension anyone measured, and not flagged.
+static void test_latency_gate_flags_identical_identities() {
+    std::cout << "\n[Test 19] Latency availability gate (HIGH-C)\n";
+
+    // Two distinct identities, no latency measurements, same timing.
+    DigitalDNA a, b;
+    for (size_t i = 0; i < a.address.size(); ++i) {
+        a.address[i] = static_cast<uint8_t>(0x40 + i);
+        b.address[i] = static_cast<uint8_t>(0x80 + i);
+    }
+    a.mik_identity = a.address;
+    b.mik_identity = b.address;
+    a.is_valid = b.is_valid = true;
+    a.timing.iterations_per_second = 100000.0;
+    b.timing.iterations_per_second = 100000.0;
+    // seed_stats deliberately left EMPTY -- this is the attacker's shape.
+
+    DigitalDNARegistry reg;
+    SimilarityScore s = reg.compare(a, b);
+
+    CHECK(!s.has_latency,
+          "no comparable seed pair -> latency dimension unavailable");
+    CHECK(s.combined_score >= SimilarityScore::SUSPICIOUS_THRESHOLD,
+          "identical-in-every-measured-dimension pair MUST be suspicious "
+          "(pre-fix this scored 0.50 and escaped the 0.55 threshold)");
+
+    // The gate must not fire when there IS a shared measurement: a real
+    // fingerprint pair keeps scoring latency, or the fix would have bought its
+    // green by disabling the dimension outright.
+    a.latency.seed_stats.resize(2);
+    b.latency.seed_stats.resize(2);
+    a.latency.seed_stats[0].median_ms = 10.0;
+    a.latency.seed_stats[1].median_ms = 20.0;
+    b.latency.seed_stats[0].median_ms = 10.0;
+    b.latency.seed_stats[1].median_ms = 20.0;
+    SimilarityScore s2 = reg.compare(a, b);
+    CHECK(s2.has_latency, "two real medians -> latency dimension IS available");
+    CHECK(s2.latency_similarity > 0.99,
+          "identical medians -> latency similarity ~1.0");
+    CHECK(LatencyFingerprint::comparable_seed_count(a.latency, b.latency) == 2,
+          "both positions comparable");
+
+    // One side zeroed at a position: that position drops out, the other stays.
+    b.latency.seed_stats[1].median_ms = 0.0;
+    CHECK(LatencyFingerprint::comparable_seed_count(a.latency, b.latency) == 1,
+          "a zeroed position is not comparable; the remaining one still is");
+    CHECK(a.latency.has_any_measurement(), "a has real measurements");
+
+    LatencyFingerprint empty;
+    CHECK(!empty.has_any_measurement(),
+          "an all-zero fingerprint carries no measurement");
+}
+
 int main() {
     std::cout << "Digital DNA Serialization & Persistence Tests\n";
     std::cout << "=============================================\n";
@@ -748,6 +815,7 @@ int main() {
     test_dna_commitment_in_scriptsig();
     test_dna_commitment_absent();
     test_latency_distance_roundtrip();
+    test_latency_gate_flags_identical_identities();
 
     std::cout << "\n=============================================\n";
     std::cout << "Results: " << tests_passed << " passed, " << tests_failed << " failed\n";
