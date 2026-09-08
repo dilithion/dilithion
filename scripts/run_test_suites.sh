@@ -107,6 +107,33 @@ set -u
 # only -- so a PR that deleted the CSRF block in server.cpp would merge GREEN,
 # which is the exact hole the negative controls were written to close. A gate that
 # does not run on the PR that breaks it is not a gate. Cost is ~6s.
+#
+# QUARANTINE LIFTED 2026-09-07: miner_tests and wallet_tests. Same root cause as
+# rpc_tests -- the HARNESS never performed setup that production performs, the
+# code correctly refused, and the SUITE was quarantined for it. Measured on
+# Linux (WSL Ubuntu-24.04 = the platform every runs-on in ci.yml uses), N=20
+# with exit-code histograms via scripts/measure_suite_stability.sh:
+#     miner_tests    BEFORE PASS=0 FAIL=20 (1x20)   AFTER PASS=20 FAIL=0 (0x20)
+#     wallet_tests   BEFORE PASS=0 FAIL=20 (1x20)   AFTER PASS=20 FAIL=0 (0x20)
+# Deterministic failures, not hangs -- which is why the quarantines were lifted
+# rather than their timeouts raised.
+#
+# miner_tests had TWO harness defects and the controller was right about both:
+#   (a) randomx_init_for_hashing was never called (0 calls here, 1 in
+#       integration_tests.cpp, which passes the identical assertions);
+#   (b) CreateEasyTarget() built an all-0xFF target, which MINE-008
+#       (miner/controller.cpp:170-181) explicitly rejects as unachievable, so
+#       StartMining returned false. The old reason said "the mining controller
+#       does not start under the test harness" -- it starts fine; the harness
+#       was handing it an input the product had learned to refuse.
+# wallet_tests: no chainparams init (its own error said so), plus a fee
+# expectation of 1000 ions against MIN_RELAY_FEE=10000 (amount.h:26 -- NOT
+# MIN_RELAY_TX_FEE in consensus/fees.h, which has the same value and does not
+# gate this path; cite the one that fires).
+#
+# TIER: both are fast, not full, for the reason rpc_tests is. A suite that only
+# runs nightly does not gate the PR that breaks it. Measured cost: miner_tests
+# 19s (it mines for real), wallet_tests under 1s.
 ROSTER='
 fast|rpc_auth_tests|120|
 fast|rpc_host_header_tests|60|
@@ -150,8 +177,8 @@ fast|chain_case_2_5_equivalence_tests|180|UNTRIAGED: scenario_2 (connect-replace
 fast|vdf_consensus_test|300|
 fast|vdf_lottery_test|300|
 fast|rpc_tests|300|
-full|miner_tests|900|PRE-EXISTING, UNOWNED: 4 assertions fail -- "Failed to start mining", "No hashes computed", "No block found", "No hashes after mining". The mining controller does not start under the test harness. Flagged before F4; still unowned.
-full|wallet_tests|300|STALE TEST (likely): 4 assertions fail on coin selection / minimum relay fee / coinbase maturity -- e.g. builds a tx at 0.00001000 DIL against a 0.00010000 DIL minimum. Expectations predate the current fee and maturity rules.
+fast|wallet_tests|300|
+fast|miner_tests|900|
 full|integration_tests|600|
 full|connman_tests|600|SUSPECTED REAL: high-load throughput test loses messages (pop_count != NUM_MESSAGES, connman_tests.cpp:552). Message loss under load in CConnman is not a stale expectation.
 full|tx_relay_tests|600|WINDOWS-ONLY teardown hang (re-scoped 2026-08-15): all 6 tests PASS, then the process never exits on Windows/MSYS2 (exit 124 at 600s; teardown-path, post-J1/F6). LINUX CONFIRMATION DONE: under TSan on Linux (WSL, gcc, -fsanitize=thread) the binary runs all tests AND EXITS CLEANLY, zero data-race warnings -- so the hang is a Windows-specific teardown path (likely winsock/thread-join semantics), not a portable logic bug. Do NOT lift the quarantine on Windows by raising the timeout; needs a Windows-teardown owner. Linux CI can run this suite ungated.
