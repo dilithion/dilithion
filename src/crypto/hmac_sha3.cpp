@@ -43,8 +43,16 @@ void HMAC_SHA3_256(const uint8_t* key, size_t key_len,
         uint8_t key_hash[32];
         SHA3_256(key, key_len, key_hash);
         std::memcpy(key_block, key_hash, 32);
-    } else {
-        // Otherwise use key directly (padded with zeros)
+    } else if (key_len > 0) {
+        // Otherwise use key directly (padded with zeros).
+        //
+        // The key_len > 0 guard is required, not cosmetic. The validation above
+        // deliberately ACCEPTS key == nullptr when key_len == 0, and memcpy
+        // declares both pointer arguments __attribute__((nonnull)) even when n
+        // is 0 -- so memcpy(dst, nullptr, 0) is undefined behaviour by the
+        // standard regardless of it copying nothing in practice. key_block is
+        // already zeroed by the memset above, so skipping the call is exactly
+        // equivalent for every accepted input.
         std::memcpy(key_block, key, key_len);
     }
 
@@ -64,7 +72,12 @@ void HMAC_SHA3_256(const uint8_t* key, size_t key_len,
         size_t inner_len = SHA3_256_BLOCKSIZE + data_len;
         std::vector<uint8_t> inner_data(inner_len);
         std::memcpy(inner_data.data(), ipad_key, SHA3_256_BLOCKSIZE);
-        std::memcpy(inner_data.data() + SHA3_256_BLOCKSIZE, data, data_len);
+        // Same guard as the key copy above: data == nullptr is accepted when
+        // data_len == 0, and memcpy(dst, nullptr, 0) is UB (nonnull-attribute).
+        // Nothing is copied either way, so the digest is unchanged.
+        if (data_len > 0) {
+            std::memcpy(inner_data.data() + SHA3_256_BLOCKSIZE, data, data_len);
+        }
 
         SHA3_256(inner_data.data(), inner_len, inner_hash);
     }
@@ -114,8 +127,12 @@ void HMAC_SHA3_512(const uint8_t* key, size_t key_len,
         uint8_t key_hash[64];
         SHA3_512(key, key_len, key_hash);
         std::memcpy(key_block, key_hash, 64);
-    } else {
-        // Otherwise use key directly (padded with zeros)
+    } else if (key_len > 0) {
+        // See the SHA3-256 variant above: the key_len > 0 guard avoids
+        // memcpy(dst, nullptr, 0), which is UB even though it copies nothing.
+        // This is the site UBSan reported first (hmac_sha3.cpp:119) once the
+        // gate was able to fail; the 256-bit variant has the identical bug and
+        // is fixed too, since halt_on_error=1 stops at the first finding.
         std::memcpy(key_block, key, key_len);
     }
 
@@ -136,7 +153,12 @@ void HMAC_SHA3_512(const uint8_t* key, size_t key_len,
         size_t inner_len = SHA3_512_BLOCKSIZE + data_len;
         std::vector<uint8_t> inner_data(inner_len);
         std::memcpy(inner_data.data(), ipad_key, SHA3_512_BLOCKSIZE);
-        std::memcpy(inner_data.data() + SHA3_512_BLOCKSIZE, data, data_len);
+        // The site UBSan moved to (hmac_sha3.cpp:152) once the key copy was
+        // guarded: data == nullptr with data_len == 0 is an accepted input and
+        // memcpy(dst, nullptr, 0) is UB. Skipping the copy is exactly equivalent.
+        if (data_len > 0) {
+            std::memcpy(inner_data.data() + SHA3_512_BLOCKSIZE, data, data_len);
+        }
 
         SHA3_512(inner_data.data(), inner_len, inner_hash);
 

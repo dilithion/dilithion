@@ -648,17 +648,70 @@ void CRPCServer::Stop() {
         m_ssl_connections.clear();
     }
 
-    // Shutdown and close server socket
-    if (m_serverSocket != INVALID_SOCKET) {
+    // Shutdown and close server socket.
+    //
+    // EXCHANGE, not load-then-close-the-local. Claiming the fd and publishing
+    // INVALID_SOCKET in one atomic step is what makes the close EXACTLY ONCE.
+    //
+    // A load/close/store trio is not merely weaker here -- it is worse than the
+    // plain `int` this PR replaced. With three separate reads of the member (the
+    // shape still live in the untouched twin at websocket.cpp:109-116, which
+    // ⚠️ THIS FUNCTION CALLS at server.cpp:635-637 -- so the twin is not a
+    // distant illustration, it is driven from inside this very teardown, and
+    // every reachability argument made here propagates straight into it) a second
+    // concurrent caller could re-read INVALID_SOCKET at the close and skip it,
+    // so a double close needed an unlucky interleaving. Loading ONCE into a
+    // local and closing THAT makes it certain: both callers hold the same live
+    // fd in their own frame and both close it. Reachable -- Stop() runs from
+    // main (node/dilithion-node.cpp:8862), from a POSIX signal handler
+    // (:2366 -> :529) and from SetConsoleCtrlHandler (:2386), on separate
+    // threads, and `if (!m_running)` above is check-then-act so both get past it.
+    //
+    // This does NOT reintroduce the early-return regression that an earlier
+    // revision of this PR was reverted for. That one came from exchanging
+    // m_running and returning bool, which let the LOSER return before the
+    // teardown and allowed ~CRPCServer to destroy thread objects under a live
+    // join(). Stop() is void and there is no early return after the m_running
+    // check, so both callers still traverse the whole teardown. This exchange
+    // is on the SOCKET only and changes nothing about the joins.
+    //
+    // ⚠️ DO NOT read that as "the joins are therefore safe". An earlier draft
+    // of this comment said joinable() makes the second pass a no-op. THAT IS
+    // FALSE and it blessed UB as safe: joinable() at the join below stays TRUE
+    // for the entire duration of the first caller's join(), so both threads
+    // enter it -- and concurrent join() on one std::thread is a data race on
+    // the thread object, while m_workerThreads.clear() destroys objects the
+    // other caller is holding by reference in its range-for.
+    //
+    // That hazard is PRE-EXISTING and this PR neither causes nor fixes it. It
+    // belongs to the RPC-lifecycle register row with Stop() re-entrancy. The
+    // point of writing it here is that the three blocks in this function are
+    // NOT equally safe and a reader should not generalise from one to another:
+    //   SSL block     idempotent -- mutex + clear
+    //   socket block  idempotent -- this exchange
+    //   join block    NOT idempotent
+    // A comment claiming otherwise is how the original hole in this file
+    // survived review, so it does not get to happen twice.
+    //
+    // Ordering: m_running = false above is sequenced-before this release
+    // exchange, so any thread observing INVALID_SOCKET here must also observe
+    // m_running == false -- ServerThread breaks out rather than spinning in the
+    // accept() retry.
+    const int serverSock = m_serverSocket.exchange(INVALID_SOCKET,
+                                                   std::memory_order_acq_rel);
+    if (serverSock != INVALID_SOCKET) {
         // Shutdown the socket to unblock accept() call
         #ifdef _WIN32
-        shutdown(m_serverSocket, SD_BOTH);
+        shutdown(serverSock, SD_BOTH);
         #else
-        shutdown(m_serverSocket, SHUT_RDWR);
+        shutdown(serverSock, SHUT_RDWR);
         #endif
 
-        closesocket(m_serverSocket);
-        m_serverSocket = INVALID_SOCKET;
+        closesocket(serverSock);
+        // No store: the exchange already published INVALID_SOCKET, and did so
+        // BEFORE the close rather than after -- which also narrows the window
+        // in which ServerThread can still load a live fd this thread is about
+        // to destroy.
     }
 
     // RPC-002: Wake up all worker threads so they can exit
@@ -718,7 +771,11 @@ void CRPCServer::ServerThread() {
         // Accept client connection
         struct sockaddr_in clientAddr;
         socklen_t clientLen = sizeof(clientAddr);
-        int clientSocket = accept(m_serverSocket, (struct sockaddr*)&clientAddr, &clientLen);
+        // ONE acquire-load, then use the local. Pairs with Stop()'s
+        // release-store of INVALID_SOCKET. Loading inside the accept() call
+        // argument list would be a second, independent read.
+        const int listenSock = m_serverSocket.load(std::memory_order_acquire);
+        int clientSocket = accept(listenSock, (struct sockaddr*)&clientAddr, &clientLen);
 
         if (clientSocket == INVALID_SOCKET) {
             if (m_running) {

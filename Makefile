@@ -476,8 +476,39 @@ BOOST_RPC_WEBSOCKET_TEST_SOURCE := src/test/rpc_websocket_tests.cpp
 # Targets
 # ============================================================================
 
-.PHONY: all clean install help tests test depends
+.PHONY: all clean install help tests test depends check-tip-notify-drain
 .DEFAULT_GOAL := all
+
+# P2P-14/15 structural guard. Asserts the tip-notification drain invariant that
+# the cs_main <-> cs_headers fix rests on — chiefly that TipNotifyDrain is still
+# declared BEFORE ActivateBestChain's cs_main guard, since reverse-order
+# destruction is the entire mechanism and swapping those two lines silently
+# restores the deadlock with every test still green.
+#
+# Wired here deliberately: a check nobody runs is not a check.
+check-tip-notify-drain:
+	@bash scripts/check-tip-notify-drain.sh
+
+# P2P-14/15 TSan lock-inversion gate — MANUAL, Linux-only, ~4 min.
+#
+# Deliberately NOT a prerequisite of tests-fast/tests-full, and that is stated
+# here rather than left to be discovered: it needs a TSAN=1 build, a Linux
+# toolchain and `setarch -R` (ASLR off, or TSan aborts before main). Wiring it
+# into the default test tiers would break every Windows/MSYS2 build.
+#
+# It DOES now have an invocable target, because the sibling guard's own rule
+# applies to it: a check with zero callers is not a check, it is a file. Run it
+# by hand on Linux, and in any CI job that already has a TSan toolchain:
+#
+#     make TSAN=1 -j8 p2p14_lock_inversion_tsan_tests
+#     make check-p2p14-tsan
+#
+# It exits non-zero if either arm hangs, reports a lock-order inversion, or
+# fails the positive control (i.e. if the harness did no work).
+.PHONY: check-p2p14-tsan
+check-p2p14-tsan:
+	@bash scripts/run_p2p14_lock_inversion_tsan.sh
+
 
 # Default target: build main binaries and utilities
 all: dilithion-node dilv-node genesis_gen check-wallet-balance
@@ -518,6 +549,11 @@ inspect_db: $(CORE_OBJECTS) $(OBJ_DIR)/tools/inspect_db.o $(DILITHIUM_OBJECTS) $
 	@echo "$(COLOR_BLUE)[LINK]$(COLOR_RESET) $@"
 	@$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS) $(LIBS)
 	@echo "$(COLOR_GREEN)✓ inspect_db built successfully$(COLOR_RESET)"
+
+vdf_history_check: $(CORE_OBJECTS) $(OBJ_DIR)/tools/vdf_history_check.o $(DILITHIUM_OBJECTS) $(CHIAVDF_OBJECTS)
+	@echo "$(COLOR_BLUE)[LINK]$(COLOR_RESET) $@"
+	@$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS) $(LIBS)
+	@echo "$(COLOR_GREEN)✓ vdf_history_check built successfully$(COLOR_RESET)"
 
 # Phase 5 Day 5: leveldb state-hash tool for V2 byte-equivalence testing.
 # Computes SHA3-256 of sorted (key,value) entries; comparing two outputs
@@ -606,10 +642,17 @@ tests-build: $(TEST_SUITES_ALL)
 tests: tests-build
 	@bash scripts/run_test_suites.sh all
 
-tests-fast: $(TEST_SUITES_FAST)
+# P2P-14/15: check-tip-notify-drain is a PREREQUISITE, not a suggestion. It is
+# wired into the target CI actually runs because a guard with zero callers is
+# not a guard — it is a file. It runs FIRST: it is a sub-second grep, and if the
+# drain invariant is broken there is no point running the suites.
+tests-fast: check-tip-notify-drain $(TEST_SUITES_FAST)
+	@bash scripts/test_run_test_suites_timeout.sh
+	@bash scripts/test_run_test_suites_staleness.sh
+	@bash scripts/test_run_test_suites_args.sh
 	@bash scripts/run_test_suites.sh fast
 
-tests-full: $(TEST_SUITES_FULL)
+tests-full: check-tip-notify-drain $(TEST_SUITES_FULL)
 	@bash scripts/run_test_suites.sh full
 
 phase1_test: $(CORE_OBJECTS) $(OBJ_DIR)/test/phase1_simple_test.o $(DILITHIUM_OBJECTS) $(CHIAVDF_OBJECTS)
@@ -763,6 +806,15 @@ shutdown_disarm_ownership_tests: $(OBJ_DIR)/test/shutdown_disarm_ownership_tests
 	@$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS)
 	@echo "$(COLOR_GREEN)✓ shutdown_disarm_ownership_tests built successfully$(COLOR_RESET)"
 
+# The --only= selector decides WHICH TEST CASES RUN across the roster, so a
+# defect in it does not produce a red suite -- it produces a green one covering
+# less than the roster claims. It links against nothing but its own header, so
+# it costs a second and gates on every PR.
+test_only_selector_selftest: $(OBJ_DIR)/test/test_only_selector_selftest.o
+	@echo "$(COLOR_BLUE)[LINK]$(COLOR_RESET) $@"
+	@$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS)
+	@echo "$(COLOR_GREEN)✓ test_only_selector_selftest built successfully$(COLOR_RESET)"
+
 mik_registration_persistence_tests: $(CORE_OBJECTS) $(OBJ_DIR)/test/mik_registration_persistence_tests.o $(DILITHIUM_OBJECTS) $(CHIAVDF_OBJECTS)
 	@echo "$(COLOR_BLUE)[LINK]$(COLOR_RESET) $@"
 	@$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS) $(LIBS)
@@ -899,6 +951,11 @@ chain_case_2_5_equivalence_tests: $(CORE_OBJECTS) $(OBJ_DIR)/test/chain_case_2_5
 	@echo "$(COLOR_GREEN)✓ chain_case_2_5_equivalence_tests built successfully$(COLOR_RESET)"
 
 # Phase 5 Day 4 V1: chain_work bit-equivalence smoke test.
+p2p14_lock_inversion_tsan_tests: $(CORE_OBJECTS) $(OBJ_DIR)/test/p2p14_lock_inversion_tsan_tests.o $(DILITHIUM_OBJECTS) $(CHIAVDF_OBJECTS)
+	@echo "$(COLOR_BLUE)[LINK]$(COLOR_RESET) $@"
+	@$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS) $(LIBS)
+	@echo "$(COLOR_GREEN)+ p2p14_lock_inversion_tsan_tests built successfully$(COLOR_RESET)"
+
 chain_work_smoke_tests: $(CORE_OBJECTS) $(OBJ_DIR)/test/chain_work_smoke_tests.o $(DILITHIUM_OBJECTS) $(CHIAVDF_OBJECTS)
 	@echo "$(COLOR_BLUE)[LINK]$(COLOR_RESET) $@"
 	@$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS) $(LIBS)
@@ -1139,6 +1196,7 @@ BOOST_TEST_OBJECTS := $(OBJ_DIR)/test/test_dilithion.o \
 	$(OBJ_DIR)/test/coinstatsindex_tests.o \
 	$(OBJ_DIR)/test/coinstatsindex_integration_tests.o \
 	$(OBJ_DIR)/test/mempool_persist_tests.o \
+	$(OBJ_DIR)/test/mempool_shutdown_wakeup_tests.o \
 	$(OBJ_DIR)/test/testmempoolaccept_tests.o \
 	$(OBJ_DIR)/test/rpc_small_cluster_tests.o \
 	$(OBJ_DIR)/test/undo_data_tests.o \
