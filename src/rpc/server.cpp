@@ -1198,18 +1198,51 @@ void CRPCServer::HandleClient(int clientSocket) {
     std::string method;
     std::string rawPath;
     {
-        size_t methodEnd = request.find(' ');
-        if (methodEnd != std::string::npos) {
-            method = request.substr(0, methodEnd);
-            size_t pathStart = methodEnd + 1;
-            size_t pathEnd = request.find(' ', pathStart);
-            if (pathEnd != std::string::npos) {
-                rawPath = request.substr(pathStart, pathEnd - pathStart);
+        // MEDIUM-3 fold: the parse is bounded to the REQUEST LINE, not the
+        // whole buffer. MAX_REQUEST_SIZE is 2 MB (:948) and this runs BEFORE
+        // auth, so `request.find(' ', pathStart)` could previously mint a
+        // multi-megabyte rawPath out of a header body and hand it to
+        // PercentDecode + a vector<string> segment split, pre-auth, on every
+        // worker thread. The normaliser was written against CHttpServer's 4 KB
+        // read (http_server.cpp:329).
+        //
+        // MEDIUM-1 fold: three tokens are REQUIRED. A one-space line
+        // ("GET /favicon.ico\r\nHost:...") or a double-space one
+        // ("GET  /wallet HTTP/1.1") used to leave rawPath empty, which
+        // normalised to "/" and hit the wallet branch. CHttpServer::ParseRequest
+        // (http_server.cpp:627) requires three tokens and 404s those same bytes;
+        // this is the parity the PR claims, now actually held.
+        const size_t lineEnd = request.find("\r\n");
+        const std::string requestLine =
+            request.substr(0, lineEnd == std::string::npos ? request.size() : lineEnd);
+
+        // A legitimate request line is bounded; anything longer is not one.
+        static constexpr size_t MAX_REQUEST_LINE = 8192;
+        if (requestLine.size() <= MAX_REQUEST_LINE) {
+            const size_t methodEnd = requestLine.find(' ');
+            if (methodEnd != std::string::npos) {
+                const size_t pathStart = methodEnd + 1;
+                const size_t pathEnd = requestLine.find(' ', pathStart);
+                // Three tokens: method SP target SP version. A missing version
+                // token leaves method/rawPath empty and the request is treated
+                // as malformed below.
+                if (pathEnd != std::string::npos && pathEnd > pathStart) {
+                    const std::string version = requestLine.substr(pathEnd + 1);
+                    if (!version.empty()) {
+                        method = requestLine.substr(0, methodEnd);
+                        rawPath = requestLine.substr(pathStart, pathEnd - pathStart);
+                    }
+                }
             }
         }
     }
     const api::NormalizedPath norm = api::NormalizeRequestPath(rawPath);
     const std::string rawQuery = api::ExtractRawQuery(rawPath);
+    // HIGH-1 fold: the wallet/REST/other decision now comes from
+    // api::ClassifyRequest, the same function the wallet-gate test links and
+    // drives. It used to be spelled out inline here, so no test could observe
+    // it and the "parity sweep" compared two hand-written models to each other.
+    const api::RequestKind kind = api::ClassifyRequest(method, rawPath);
 
     // Serve miner dashboard at GET /miner
     if (request.find("GET /miner") == 0) {
@@ -1233,8 +1266,7 @@ void CRPCServer::HandleClient(int clientSocket) {
     // Only a GET to a successfully-normalized wallet path reaches the token-minting
     // page; a malformed (!norm.ok) path is rejected fail-closed below. A JSON-RPC
     // POST to "/" is method-gated out here and flows on to CSRF/auth/RPC unchanged.
-    if (method == "GET" && norm.ok &&
-        (norm.path == "/wallet" || norm.path == "/wallet.html" || norm.path == "/")) {
+    if (kind == api::RequestKind::Wallet) {
         // ====================================================================
         // C-01b (F-003) — HARD SAFETY NET: the wallet UI is a desktop affordance,
         // not a seed feature. On a --public-api node (all-interfaces bind) it is
@@ -1525,10 +1557,21 @@ void CRPCServer::HandleClient(int clientSocket) {
     // that NormalizeRequestPath could not safely canonicalize (malformed percent
     // escape, embedded NUL, or a `..` that traverses above root) must NOT fall
     // through to REST dispatch or the JSON-RPC handler — it is rejected here, the
-    // same fail-closed posture CHttpServer takes (Send404 on !norm.ok). The /miner,
-    // wallet and OPTIONS branches above are exact raw-prefix matches that a
-    // malformed target cannot satisfy, and a legitimate JSON-RPC POST targets "/"
-    // (which normalizes cleanly), so this rejects only genuinely malformed targets.
+    // same fail-closed posture CHttpServer takes (Send404 on !norm.ok).
+    //
+    // CORRECTION (fresh pass 2026-09-07, LOW-1) — the previous version of this
+    // comment claimed the /miner, /js/, /favicon.ico and OPTIONS branches above
+    // "are exact raw-prefix matches that a malformed target cannot satisfy".
+    // THAT IS FALSE: those branches match RAW BYTES and sit ABOVE this check, so
+    // `GET /miner%zz` still serves the dashboard even though its target does not
+    // normalise. The reachable consequence is bounded — those branches serve
+    // static HTML/JS with no secret and no token — but the comment asserted a
+    // safety property the code does not have, which is worse than saying
+    // nothing. The wallet branch is NOT in that set: it now classifies through
+    // api::ClassifyRequest, which returns Malformed before Wallet.
+    //
+    // A legitimate JSON-RPC POST targets "/" and normalises cleanly, so this
+    // rejects only genuinely malformed targets that reached this far.
     if (!norm.ok) {
         if (m_logger) {
             m_logger->LogSecurityEvent("PATH_REJECTED", clientIP, "",
@@ -1561,7 +1604,7 @@ void CRPCServer::HandleClient(int clientSocket) {
     // but the handler still receives its query — e.g. /api/v1/balance/ADDR?... ).
     if (m_restAPI) {
         // Check if this is a REST API request (canonical-path classification).
-        if (CRestAPI::IsRESTRequest(norm.path)) {
+        if (kind == api::RequestKind::Rest) {
             // Dispatch path = canonical path with the raw query re-attached.
             const std::string dispatchPath =
                 rawQuery.empty() ? norm.path : (norm.path + "?" + rawQuery);

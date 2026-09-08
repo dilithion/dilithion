@@ -75,6 +75,39 @@ bool IsSensitiveSurface(const std::string& normalizedPath);
 // stripped path. It can never influence the sensitivity classification.
 std::string ExtractRawQuery(const std::string& rawPath);
 
+/**
+ * The REST prefix rule, defined ONCE.
+ *
+ * CRestAPI::IsRESTRequest delegates here. Before this it carried its own copy
+ * of `path.find("/api/v1/") == 0`, and the wallet-gate test carried a THIRD
+ * copy in a hand-written model -- three definitions of one rule, which is how a
+ * "parity sweep" ended up comparing two identical models to each other instead
+ * of to the product (fresh pass 2026-09-07, HIGH-1).
+ */
+bool IsRestPath(const std::string& normalizedPath);
+
+/// How CRPCServer::HandleClient routes a request line.
+enum class RequestKind {
+    Malformed,  // target did not normalise -> 400, fail-closed
+    Wallet,     // GET of a canonical wallet path -> token-minting page (gated)
+    Rest,       // /api/v1/* -> CRestAPI
+    Other,      // everything else -> CSRF/auth/JSON-RPC
+};
+
+/**
+ * Classify a request line the way HandleClient does.
+ *
+ * THIS IS THE PRODUCTION DECISION, not a model of it. It lives here rather than
+ * inside HandleClient so a test can link it: the wallet-gate test links three
+ * objects, and rpc/server.o would drag the entire node in. The previous test
+ * therefore re-implemented the classification twice and asserted the two copies
+ * agreed -- f(x) == f(x), which no production change can break.
+ *
+ * @param method   HTTP method token, verbatim
+ * @param rawPath  request target, verbatim (may be empty on a malformed line)
+ */
+RequestKind ClassifyRequest(const std::string& method, const std::string& rawPath);
+
 } // namespace api
 
 #endif // DILITHION_API_HTTP_PATH_GATE_H
