@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
+# MERGE NOTE: the roster gained a fifth ARGS field, so these injected
+# rows carry a trailing pipe. A 4-field row is now a ROSTER ERROR and the
+# runner exits 2 before running anything -- which reads as every arm
+# failing for its own reason rather than as one format mismatch.
 # Self-test for run_test_suites.sh's TIMEOUT classification.
 #
 # WHY THIS FILE EXISTS. The runner classified a timed-out suite by matching exit
@@ -58,6 +62,23 @@ echo "== drive the REAL runner against binaries that really hang / really fail =
 drive() {                       # drive <script-body> <timeout> ; echoes row + counts
   local body="$1" tmo="$2" d
   d="$(mktemp -d)"
+  # A source tree, because THE STALENESS GUARD IN THIS SAME RUNNER REFUSES TO
+  # RUN WITHOUT ONE UNDER CI -- deliberately, so the guard can never silently
+  # disable itself. Without these, every arm below fails under GITHUB_ACTIONS
+  # with the runner exiting FATAL before it runs anything, while passing
+  # locally where the CI variable is unset. That is exactly how this file
+  # failed the gcc-Release leg on the branch that introduced the guard, and it
+  # is a CI-ONLY reproduction: 9/0 locally, 3/6 with GITHUB_ACTIONS=true.
+  #
+  # Sources are back-dated a minute: the guard compares with -le on purpose
+  # (same-second mtimes are not "demonstrably newer"), and one-second
+  # filesystem granularity would otherwise mark the fake binary STALE.
+  mkdir -p "$d/src"
+  printf 'int main(){return 0;}
+' > "$d/src/fake.cpp"
+  printf 'all:
+' > "$d/Makefile"
+  touch -d "@$(( $(date +%s) - 60 ))" "$d/src/fake.cpp" "$d/Makefile"
   printf '%s' "$body" > "$d/fake_suite"
   chmod +x "$d/fake_suite"
   # REPLACE the roster, do not prepend to it. An earlier version inserted the
@@ -66,7 +87,7 @@ drive() {                       # drive <script-body> <timeout> ; echoes row + c
   # made "a hung suite makes the runner exit non-zero" VACUOUS -- deleting the
   # TIMEOUT arm's FAILED increment still passed. With a one-row roster the
   # counts mean what they say.
-  awk -v row="fast|fake_suite|${tmo}|" '
+  awk -v row="fast|fake_suite|${tmo}||" '
     /^ROSTER=.$/ { print; print row; skip=1; next }
     skip && /^.$/ { print; skip=0; next }
     skip { next }
