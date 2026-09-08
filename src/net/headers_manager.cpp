@@ -25,6 +25,7 @@
 #include <core/chainparams.h>
 #include <net/banman.h>   // v4.1: MisbehaviorType for header checkpoint enforcement
 #include <net/peers.h>    // v4.1: CPeerManager::Misbehaving (already pulled by net/net.h but explicit for clarity)
+#include <net/port/maybe_punish_node.h>  // LP-10 §3: HeaderRejectReason/Weight (was only transitive)
 #include <api/metrics.h>  // Fork detection metrics
 #include <algorithm>
 #include <chrono>
@@ -679,6 +680,33 @@ bool CHeadersManager::ProcessHeadersWithDoSProtection(NodeId peer, const std::ve
     auto result = sync_state->ProcessNextHeaders(headers, true);
 
     if (!result.success) {
+        // LP-10 §3 — THE PUNISHMENT HALF, wired.
+        //
+        // net/port/maybe_punish_node.h has defined
+        // HeaderRejectReason::InsufficientChainWork ("PRESYNC ended below
+        // MIN_CHAIN_WORK — weight 50") since the port, with ZERO PRODUCERS: its
+        // only exercise was a mapping assertion in a unit test. So a peer that
+        // failed the work gate was dropped silently and paid nothing, and could
+        // reconnect and repeat it for free. Rejecting without scoring is half a
+        // gate.
+        //
+        // Fires ONLY on insufficient work, never on the other !success paths
+        // (invalid headers, commitment mismatch) — those have their own reasons
+        // and their own weights, and punishing them under this one would
+        // mislabel the peer's offence in the score log.
+        if (result.insufficient_chain_work) {
+            m_gate_punished_peers.fetch_add(1, std::memory_order_relaxed);
+            if (g_node_context.peer_manager) {
+                g_node_context.peer_manager->Misbehaving(
+                    peer,
+                    ::dilithion::net::port::HeaderRejectWeight(
+                        ::dilithion::net::port::HeaderRejectReason::InsufficientChainWork),
+                    MisbehaviorType::INVALID_BLOCK_HEADER);
+            }
+            LogPrintf(NET, WARN,
+                "[HeadersManager] peer=%d PRESYNC below minimum chain work; scored "
+                "(HeaderRejectReason::InsufficientChainWork)\n", static_cast<int>(peer));
+        }
         std::lock_guard<std::mutex> lock(cs_headers);
         mapHeadersSyncStates.erase(peer);
         return false;

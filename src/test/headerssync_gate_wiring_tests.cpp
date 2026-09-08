@@ -121,6 +121,51 @@ void test_ineligible_peer_takes_the_ungated_route_by_design()
     std::cout << " OK (routed=0, as A-12 decided)" << std::endl;
 }
 
+// ARM 3 — THE PUNISHMENT HALF. A peer whose PRESYNC ends BELOW the threshold
+// must be SCORED, not merely dropped. HeaderRejectReason::InsufficientChainWork
+// had zero producers since the port: its only exercise was a mapping assertion
+// in a unit test, so a failing peer paid nothing and could reconnect and repeat
+// the attempt for free. Rejecting without scoring is half a gate.
+void test_below_threshold_peer_is_scored_not_just_dropped()
+{
+    std::cout << "  test_below_threshold_peer_is_scored_not_just_dropped..." << std::flush;
+    using namespace dilithion::consensus;
+
+    // A threshold far above anything this peer can demonstrate, so PRESYNC ends
+    // below it. (At the regtest default of zero this arm cannot exist at all --
+    // see deliverable 0b.)
+    uint256 unreachable = GenesisWork();
+    for (int i = 0; i < 5000; ++i)
+        unreachable = AddChainWork(unreachable, ComputeChainWork(0x1d00ffff));
+
+    CHeadersManager mgr(unreachable);
+    const NodeId peer = 23;
+    REQUIRE(mgr.InitializeDoSProtectedSync(peer, mgr.GetMinimumChainWork()));
+
+    const long long before = mgr.GetGatePunishedPeerCount();
+    // Empty batch drives the PRESYNC work decision without needing valid PoW.
+    const std::vector<CBlockHeader> no_more_headers;
+    REQUIRE(!mgr.ProcessHeadersWithDoSProtection(peer, no_more_headers));
+    const long long scored = mgr.GetGatePunishedPeerCount() - before;
+
+    if (scored <= 0) {
+        std::cerr << "\n  FAIL peer was dropped but NOT scored (scored=" << scored
+                  << "). InsufficientChainWork still has no producer." << std::endl;
+        std::abort();
+    }
+
+    // NON-VACUITY: a peer that CLEARS the threshold must not be scored, or the
+    // counter would just be counting calls.
+    CHeadersManager ok_mgr(GenesisWork());
+    const NodeId ok_peer = 24;
+    REQUIRE(ok_mgr.InitializeDoSProtectedSync(ok_peer, ok_mgr.GetMinimumChainWork()));
+    const long long ok_before = ok_mgr.GetGatePunishedPeerCount();
+    REQUIRE(ok_mgr.ProcessHeadersWithDoSProtection(ok_peer, no_more_headers));
+    REQUIRE(ok_mgr.GetGatePunishedPeerCount() == ok_before);
+
+    std::cout << " OK (scored=" << scored << ", clearing peer unscored)" << std::endl;
+}
+
 }  // namespace
 
 int main()
@@ -138,6 +183,7 @@ int main()
     std::cout << "headerssync_gate_wiring_tests" << std::endl;
     test_live_path_routes_an_eligible_peer_through_the_gate();
     test_ineligible_peer_takes_the_ungated_route_by_design();
+    test_below_threshold_peer_is_scored_not_just_dropped();
     std::cout << "headerssync_gate_wiring_tests: ALL PASS" << std::endl;
     return 0;
 }

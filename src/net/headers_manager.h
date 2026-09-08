@@ -156,6 +156,17 @@ public:
     }
 
     /**
+     * LP-10 §3: how many peers the gate SCORED for insufficient chain work.
+     * The punishment half had zero producers since the port — rejecting a peer
+     * without scoring it lets the same peer reconnect and repeat the attempt
+     * for free, which is half a gate. This counter is the observable for that
+     * arm, and is incremented only on the insufficient-work path.
+     */
+    long long GetGatePunishedPeerCount() const {
+        return m_gate_punished_peers.load(std::memory_order_relaxed);
+    }
+
+    /**
      * @brief Validate a single header against its parent
      *
      * @param header Header to validate
@@ -980,6 +991,9 @@ private:
     //! header path. Atomic: written by the header processor thread, read by
     //! tests and diagnostics without cs_headers.
     std::atomic<long long> m_gate_routed_batches{0};
+
+    //! LP-10 §3: peers scored for InsufficientChainWork by the gate.
+    std::atomic<long long> m_gate_punished_peers{0};
 
     /**
      * @brief Background header processor thread main loop
