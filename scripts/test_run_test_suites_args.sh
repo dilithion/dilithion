@@ -63,6 +63,12 @@ sandbox() {               # sandbox <exit-code> <roster-row>...
     } > "$d/fake_suite"
     chmod +x "$d/fake_suite"
     cp "$d/fake_suite" "$d/other_suite"
+    # Back-date the sources by a minute. #185's staleness guard compares with
+    # -le on purpose (same-second mtimes are not "demonstrably newer"), and
+    # one-second filesystem granularity means a binary written in the same
+    # second as its source reads as STALE and is NOT RUN -- which fails every
+    # arm here for a reason that has nothing to do with ARGS.
+    touch -d "@$(( $(date +%s) - 60 ))" "$d/src/fake.cpp" "$d/Makefile"
     touch "$d/fake_suite" "$d/other_suite"
     local rows; rows="$(printf '%s\n' "$@")"
     awk -v rows="$rows" '

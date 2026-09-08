@@ -159,6 +159,33 @@ set -u
 # only -- so a PR that deleted the CSRF block in server.cpp would merge GREEN,
 # which is the exact hole the negative controls were written to close. A gate that
 # does not run on the PR that breaks it is not a gate. Cost is ~6s.
+#
+# QUARANTINE LIFTED 2026-09-07: miner_tests and wallet_tests. Same root cause as
+# rpc_tests -- the HARNESS never performed setup that production performs, the
+# code correctly refused, and the SUITE was quarantined for it. Measured on
+# Linux (WSL Ubuntu-24.04 = the platform every runs-on in ci.yml uses), N=20
+# with exit-code histograms via scripts/measure_suite_stability.sh:
+#     miner_tests    BEFORE PASS=0 FAIL=20 (1x20)   AFTER PASS=20 FAIL=0 (0x20)
+#     wallet_tests   BEFORE PASS=0 FAIL=20 (1x20)   AFTER PASS=20 FAIL=0 (0x20)
+# Deterministic failures, not hangs -- which is why the quarantines were lifted
+# rather than their timeouts raised.
+#
+# miner_tests had TWO harness defects and the controller was right about both:
+#   (a) randomx_init_for_hashing was never called (0 calls here, 1 in
+#       integration_tests.cpp, which passes the identical assertions);
+#   (b) CreateEasyTarget() built an all-0xFF target, which MINE-008
+#       (miner/controller.cpp:170-181) explicitly rejects as unachievable, so
+#       StartMining returned false. The old reason said "the mining controller
+#       does not start under the test harness" -- it starts fine; the harness
+#       was handing it an input the product had learned to refuse.
+# wallet_tests: no chainparams init (its own error said so), plus a fee
+# expectation of 1000 ions against MIN_RELAY_FEE=10000 (amount.h:26 -- NOT
+# MIN_RELAY_TX_FEE in consensus/fees.h, which has the same value and does not
+# gate this path; cite the one that fires).
+#
+# TIER: both are fast, not full, for the reason rpc_tests is. A suite that only
+# runs nightly does not gate the PR that breaks it. Measured cost: miner_tests
+# 19s (it mines for real), wallet_tests under 1s.
 ROSTER='
 fast|rpc_auth_tests|120||
 fast|rpc_host_header_tests|60||
@@ -203,8 +230,8 @@ fast|chain_case_2_5_equivalence_tests|180|UNTRIAGED: scenario_2 (connect-replace
 fast|vdf_consensus_test|300||
 fast|vdf_lottery_test|300||
 fast|rpc_tests|300||
-full|miner_tests|900|PRE-EXISTING, UNOWNED: 4 assertions fail -- "Failed to start mining", "No hashes computed", "No block found", "No hashes after mining". The mining controller does not start under the test harness. Flagged before F4; still unowned.|
-full|wallet_tests|300|STALE TEST (likely): 4 assertions fail on coin selection / minimum relay fee / coinbase maturity -- e.g. builds a tx at 0.00001000 DIL against a 0.00010000 DIL minimum. Expectations predate the current fee and maturity rules.|
+fast|miner_tests|900||
+fast|wallet_tests|300||
 full|integration_tests|600||
 full|connman_tests|600|SUSPECTED REAL: high-load throughput test loses messages (pop_count != NUM_MESSAGES, connman_tests.cpp:552). Message loss under load in CConnman is not a stale expectation.|
 full|tx_relay_tests|600|WINDOWS-ONLY teardown hang (re-scoped 2026-08-15): all 6 tests PASS, then the process never exits on Windows/MSYS2 (exit 124 at 600s; teardown-path, post-J1/F6). LINUX CONFIRMATION DONE: under TSan on Linux (WSL, gcc, -fsanitize=thread) the binary runs all tests AND EXITS CLEANLY, zero data-race warnings -- so the hang is a Windows-specific teardown path (likely winsock/thread-join semantics), not a portable logic bug. Do NOT lift the quarantine on Windows by raising the timeout; needs a Windows-teardown owner. Linux CI can run this suite ungated.|
@@ -382,7 +409,50 @@ PARTIAL=0
 LIVE=0
 DEGRADED=0
 RAN=0
+STALE=0
 TOTAL_SEC=0
+
+# Reference for the staleness guard below: the NEWEST source file, not HEAD's
+# commit time.
+#
+# The first version of this compared the binary against HEAD's commit time. That
+# is ONE-DIRECTIONAL and overclaimed: it catches "binary older than the commit",
+# but happily passes a binary built two hours ago from a DIFFERENT tree onto an
+# older-dated HEAD, and passes an UNCOMMITTED source edit entirely -- the case a
+# developer hits most. It also inherited the committer clock: a forward-skewed
+# timestamp on a push event marked every row STALE by 0h, and no rebuild could
+# clear it, because rebuilding cannot move a commit's date.
+#
+# Source mtime is the real dependency. A binary older than a file it is built
+# from is stale, whatever git thinks, and no clock but this filesystem's is
+# involved.
+HAVE_MAKE=0
+command -v make >/dev/null 2>&1 && [ -f Makefile ] && HAVE_MAKE=1
+
+SRC_REF=""
+if [ -d src ]; then
+    SRC_REF="$(find src Makefile -type f \( -name '*.cpp' -o -name '*.h' -o -name 'Makefile' \) \
+                 -printf '%T@\n' 2>/dev/null | sort -rn | head -1)"
+    SRC_REF="${SRC_REF%%.*}"
+fi
+case "${SRC_REF:-}" in (''|*[!0-9]*) SRC_REF=0 ;; esac
+if [ "$SRC_REF" -le 0 ]; then
+    # A guard with no reference is a guard that is off. Where that costs most,
+    # refuse rather than shrug -- this is the silent-disable the guard exists to
+    # prevent, turned on itself.
+    if [ -n "${GITHUB_ACTIONS:-}${CI:-}" ] || [ -d src ]; then
+        echo "========================================================================"
+        echo "FATAL: the STALENESS GUARD could not determine a source reference time."
+        echo "  src/ present=$([ -d src ] && echo yes || echo no)  CI=${GITHUB_ACTIONS:-}${CI:-}"
+        echo "  Refusing to run: with no reference every PASS below would be"
+        echo "  unverifiable, and an unverifiable PASS is exactly what this guard"
+        echo "  exists to stop."
+        echo "========================================================================"
+        exit 2
+    fi
+    echo "  WARNING: no source tree found -- the STALENESS GUARD IS OFF for this"
+    echo "           run. A PASS below does not prove the binaries match the source."
+fi
 
 echo "========================================================================"
 echo "Standalone test suites — tier: $TIER"
@@ -438,6 +508,78 @@ EOF
         continue
     fi
 
+    # ---------------------------------------------------------------------
+    # STALENESS GUARD. A PASS from a binary older than the code is worthless,
+    # and -- this is the whole problem -- it is TEXTUALLY IDENTICAL to a real
+    # one. Measured incident (2026-09-07, r8): 54 suites reported PASS on
+    # binaries built two to four days before the merge under test. Nothing in
+    # the output distinguished that run from a genuine one.
+    #
+    # It happens because `make` builds the node binaries and `make tests`
+    # builds the roster: run the runner directly, or after a partial build,
+    # and you test yesterday's code while reading today's green.
+    #
+    # A stale binary is NEVER a PASS. It is [STALE] and counted INCOMPLETE,
+    # and it fails the run -- because "the gate did not actually execute" is
+    # worse than a red, not better ([[lesson_absence_of_failure_is_not_evidence]]).
+    # PRIMARY ORACLE: ask make. `make -q <binary>` exits 0 when the target is
+    # up to date and non-zero when it needs remaking -- which is exactly the
+    # question, answered by the real .d dependency graph.
+    #
+    # The tree-wide mtime comparison this replaces was too blunt: make relinks
+    # PER dependency graph, so after editing one header an incremental
+    # `make tests-fast` correctly leaves unrelated suites untouched -- and a
+    # newest-source-in-the-tree reference then marks every one of them STALE.
+    # Worse, the remedy the message printed could not clear it, because those
+    # binaries did not need rebuilding in the first place.
+    #
+    # The mtime comparison is kept ONLY as a fallback for when make cannot
+    # answer (no make on PATH, or a Makefile that cannot evaluate here). It uses
+    # -le, not -lt: a binary with the SAME mtime as a source it depends on is
+    # not demonstrably newer than it, and one-second filesystem granularity
+    # makes that a real case rather than a pedantic one.
+    #
+    # OUT OF THE REFERENCE, deliberately: depends/ (Dilithium and chiavdf
+    # objects link into every suite, so any touch there would mark the whole
+    # roster stale), and .c/.cc/.hpp -- the suites are .cpp/.h. make -q knows
+    # about all of them properly, which is the point of preferring it.
+    #
+    # A stale binary is NEVER a PASS. It is [STALE], counted INCOMPLETE, and it
+    # fails the run -- "the gate did not actually execute" is worse than a red,
+    # not better ([[lesson_absence_of_failure_is_not_evidence]]).
+    stale_reason=""
+    # Only trust make when it demonstrably HAS A RULE for this target. `make -q`
+    # returns 0 for an existing file with no rule -- "up to date" because
+    # nothing claims otherwise -- so a suite the Makefile does not name would be
+    # silently passed by the oracle. Caught by this file's own sandbox, which
+    # has no rule for its fake suite: the guard reported PASS on a deliberately
+    # back-dated binary until this check was added.
+    mq=99
+    if [ "$HAVE_MAKE" -eq 1 ] && grep -q "^${suite}:" Makefile 2>/dev/null; then
+        make -q "$suite" >/dev/null 2>&1; mq=$?
+    fi
+    # make -q: 0 = up to date, 1 = needs remaking, 2 = it could not answer
+    # (no rule for this target, evaluation error). Only 1 means STALE. Treating
+    # 2 as stale would mark every suite the Makefile does not name -- a wrong
+    # answer dressed as a strict one -- so 2 falls through to the mtime check.
+    if [ "$mq" -eq 1 ]; then
+        stale_reason="make reports $suite out of date against its own dependency graph"
+    elif [ "$mq" -ne 0 ] && [ "$SRC_REF" -gt 0 ]; then
+        bin_mtime="$(stat -c %Y "$bin" 2>/dev/null || stat -f %m "$bin" 2>/dev/null || echo 0)"
+        if [ "$bin_mtime" -gt 0 ] && [ "$bin_mtime" -le "$SRC_REF" ]; then
+            age=$(( (SRC_REF - bin_mtime) / 60 ))
+            stale_reason="binary not newer than the newest source (by ${age}min); make could not answer, used mtime fallback"
+        fi
+    fi
+    if [ -n "$stale_reason" ]; then
+        printf '  [STALE     ] %-52s %s -- NOT RUN\n' "$suite" "$stale_reason"
+        RESULTS="${RESULTS}STALE|${suite}|0|${stale_reason}\n"
+        STALE=$((STALE + 1))
+        FAILED=$((FAILED + 1))
+        [ "$FAIL_FAST" -eq 1 ] && break
+        continue
+    fi
+
     log="$LOGDIR/$suite.log"
     start=$(date +%s)
     timeout --preserve-status -k 10 "$timeout" "$bin" ${args_arr[@]+"${args_arr[@]}"} >"$log" 2>&1
@@ -475,9 +617,67 @@ EOF
     if [ "$rc" -eq 0 ]; then
         printf '  [PASS      ] %-52s %4ds%s\n' "$suite" "$elapsed" "$args_note"
         RESULTS="${RESULTS}PASS|${suite}|${elapsed}|${detail}\n"
-    elif [ "$rc" -eq 124 ] || [ "$rc" -eq 137 ]; then
-        printf '  [TIMEOUT   ] %-52s %4ds  (limit %ss)%s\n' "$suite" "$elapsed" "$timeout" "$args_note"
-        RESULTS="${RESULTS}TIMEOUT|${suite}|${elapsed}|exceeded ${timeout}s\n"
+    # 143 is the one that actually happens here, and its absence meant EVERY
+    # HANG WAS REPORTED AS A TEST FAILURE.
+    #
+    # `timeout --preserve-status` (line ~207) deliberately returns the command's
+    # signal-derived status instead of timeout's own 124 — that is what the flag
+    # is for. A SIGTERM'd child is 128+15 = 143, so the common timeout never
+    # matched this branch and fell through to [FAIL] with "exit 143". Measured on
+    # this machine rather than read from the man page:
+    #
+    #   timeout --preserve-status -k 10 1 sleep 30   -> 143   (SIGTERM honoured)
+    #   timeout -k 10 1 sleep 30                     -> 124   (no --preserve-status)
+    #   ... with SIGTERM trapped and ignored         -> 137   (SIGKILL after -k)
+    #
+    # Why it matters beyond the label: a hang and a genuine assertion failure have
+    # completely different causes, and the RESULTS row drives the summary. Every
+    # TIMEOUT row was being emitted as FAIL|...|exit 143, so a suite that hung
+    # looked like a suite whose tests broke, and the TIMEOUT count was structurally
+    # always zero.
+    #
+    # 124 is currently unreachable while --preserve-status is set; it is kept so
+    # that removing that flag does not silently re-open the same hole in reverse.
+    #
+    # PLATFORM NOTE, corrected. An earlier revision of this comment attributed
+    # exit 124 to Windows/MSYS2, citing the tx_relay_tests roster row ("exit 124
+    # at 600s"). That attribution was never reproduced and is now contradicted:
+    # measured under this runner's exact flags, native PING.EXE returns 143 on
+    # both MSYS flavours, and 124 appears only WITHOUT --preserve-status -- a
+    # flag that predates the roster note. So the roster row most likely records
+    # a pre---preserve-status observation, not a platform difference. Both codes
+    # stay matched because either can occur depending on the flag, but 124 is
+    # NOT claimed to be "the Windows one".
+    # The exit code alone does NOT identify a hang. 143 is SIGTERM and 137 is
+    # SIGKILL from ANY source: a suite that raises SIGTERM on itself, or one the
+    # OOM killer takes, produces the same code as one `timeout` killed -- and
+    # would be filed as a hang that never happened. `elapsed` was already
+    # measured and simply never consulted.
+    #
+    # THE TOLERANCE IS 2 SECONDS -- not 15, and not zero. Both extremes were
+    # tried and both were wrong, so the reasoning is recorded here rather than
+    # left to be re-derived:
+    #
+    #   15s (first attempt) was BACKWARDS in effect. Subtracting a large slack
+    #   only widens the window in which a self-inflicted signal is mistaken for
+    #   a hang: a self-TERM at 46s under a 60s limit would have been filed as
+    #   TIMEOUT, which is the very confusion this check exists to remove.
+    #
+    #   0s is too tight to be safe. I observed a genuine hang under a 20s limit
+    #   report elapsed=19s and get classified FAIL. A later 47-sample run did
+    #   NOT reproduce that, so the mechanism is NOT the whole-second rounding I
+    #   first claimed -- treat the 19s as unexplained scheduling jitter rather
+    #   than a rounding law. Either way a threshold with zero margin turns any
+    #   such jitter into a misfiled hang, and the cost of 2s of margin is
+    #   nothing.
+    #
+    # 2s covers that sampling artefact and nothing else: it still rejects the
+    # 46s-under-60 self-TERM by a 12-second margin. This matters most for the
+    # crash-injection and shutdown suites, which kill themselves by design.
+    elif { [ "$rc" -eq 124 ] || [ "$rc" -eq 137 ] || [ "$rc" -eq 143 ]; } \
+         && [ "$elapsed" -ge $(( timeout > 2 ? timeout - 2 : 0 )) ]; then
+        printf '  [TIMEOUT   ] %-52s %4ds  (limit %ss, exit %s)\n' "$suite" "$elapsed" "$timeout" "$rc"
+        RESULTS="${RESULTS}TIMEOUT|${suite}|${elapsed}|exceeded ${timeout}s (exit ${rc})\n"
         FAILED=$((FAILED + 1))
         echo "  ---- tail of $log ----"
         tail -n 30 "$log" | sed 's/^/  | /'
@@ -502,10 +702,17 @@ printf '%b' "$RESULTS" | while IFS='|' read -r status suite secs detail; do
     printf '  %-12s %-52s %4ss %s\n' "$status" "$suite" "$secs" "$detail"
 done
 echo "------------------------------------------------------------------------"
-echo "  ran=$RAN  failed=$FAILED  quarantined=$QUARANTINED  degraded=$DEGRADED  wall=${TOTAL_SEC}s"
-# The roster census, separate from the run counts. `quarantined=N` alone cannot
-# distinguish a suite that runs in PART from one that does not run at all, and
-# conflating them is how partial coverage gets read as full coverage.
+echo "  ran=$RAN  failed=$FAILED  quarantined=$QUARANTINED  degraded=$DEGRADED  stale=$STALE  wall=${TOTAL_SEC}s"
+if [ "$STALE" -gt 0 ]; then
+    echo "  ------------------------------------------------------------------"
+    echo "  $STALE suite(s) were NOT RUN: their binaries are out of date."
+    echo "  Those rows are INCOMPLETE, not passes. Rebuild the named suites"
+    echo "  (make <suite>, or make tests-build for all of them) and re-run"
+    echo "  before reading anything above as a result."
+fi
+# The roster census, separate from the run counts. `quarantined=N` alone
+# cannot distinguish a suite that runs in PART from one that does not run at
+# all, and conflating them is how partial coverage gets read as full coverage.
 echo "  roster census: live=$LIVE  partial=$PARTIAL  quarantined=$QUARANTINED"
 if [ "$PARTIAL" -gt 0 ]; then
     echo "  ($PARTIAL suite(s) ran a REDUCED scope — see the partial: reason beside each above)"
