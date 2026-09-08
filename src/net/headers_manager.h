@@ -746,7 +746,17 @@ private:
     };
 
     //! Per-peer DoS-protected header sync state (Bitcoin Core two-phase)
-    std::map<NodeId, std::unique_ptr<HeadersSyncState>> mapHeadersSyncStates;
+    // LP-10 §2.1b: SHARED ownership, deliberately, not unique.
+    //
+    // ProcessHeadersWithDoSProtection must call ProcessNextHeaders (header
+    // validation, expensive) WITHOUT holding cs_headers, or it serialises the
+    // header path. But OnPeerDisconnected erases from this map under cs_headers
+    // from the net thread. With unique_ptr, a disconnect concurrent with that
+    // call destroys the object mid-dereference -- a use-after-free, not merely a
+    // race. A shared_ptr lets a caller take a reference under the lock, release
+    // the lock, and keep the state alive for the duration of the call even if
+    // the map entry is erased underneath it.
+    std::map<NodeId, std::shared_ptr<HeadersSyncState>> mapHeadersSyncStates;
 
     /**
      * @struct HeaderWithChainWork

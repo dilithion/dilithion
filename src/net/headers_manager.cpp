@@ -638,23 +638,48 @@ bool CHeadersManager::ProcessHeadersWithDoSProtection(NodeId peer, const std::ve
         }
     }
 
-    // Check if peer has active HeadersSyncState
-    auto it = mapHeadersSyncStates.find(peer);
-    if (it == mapHeadersSyncStates.end()) {
+    // LP-10 §2.1b — LOCK DISCIPLINE. Everything below used to touch
+    // mapHeadersSyncStates with NO lock held (the guard above is scoped and
+    // released), while OnPeerDisconnected erases from the same map under
+    // cs_headers on the net thread. A disconnect concurrent with the
+    // ProcessNextHeaders call below destroyed the state mid-dereference: a
+    // use-after-free, not merely a race. Fixed before wiring, not after,
+    // because wiring this into the live header path is what would have made it
+    // reachable.
+    //
+    // The shape: take a SHARED reference under the lock, drop the lock, then do
+    // the expensive call. A concurrent erase now only drops the map's
+    // reference; the local one keeps the object alive for the duration.
+    std::shared_ptr<HeadersSyncState> sync_state;
+    {
+        std::lock_guard<std::mutex> lock(cs_headers);
+        auto it = mapHeadersSyncStates.find(peer);
+        if (it == mapHeadersSyncStates.end()) {
+            // No DoS-protected session for this peer.
+            // NOTE: ProcessHeaders takes cs_headers itself and cs_headers is a
+            // NON-RECURSIVE std::mutex, so it must be called AFTER this scope
+            // closes -- never from inside it.
+            sync_state = nullptr;
+        } else {
+            sync_state = it->second;
+            if (!sync_state || sync_state->GetState() == HeadersSyncState::State::FINAL) {
+                mapHeadersSyncStates.erase(peer);
+                sync_state = nullptr;
+            }
+        }
+    }
+    if (!sync_state) {
         return ProcessHeaders(peer, headers);
     }
 
-    HeadersSyncState* sync_state = it->second.get();
-    if (!sync_state || sync_state->GetState() == HeadersSyncState::State::FINAL) {
-        mapHeadersSyncStates.erase(peer);
-        return ProcessHeaders(peer, headers);
-    }
-
-
-    // Process through HeadersSyncState
+    // Process through HeadersSyncState. Deliberately OUTSIDE cs_headers: this
+    // validates headers and is expensive, and holding the global header lock
+    // across it would serialise the header path. Safe now only because
+    // sync_state is a shared_ptr taken above.
     auto result = sync_state->ProcessNextHeaders(headers, true);
 
     if (!result.success) {
+        std::lock_guard<std::mutex> lock(cs_headers);
         mapHeadersSyncStates.erase(peer);
         return false;
     }
@@ -711,8 +736,10 @@ bool CHeadersManager::ProcessHeadersWithDoSProtection(NodeId peer, const std::ve
 
     }
 
-    // Check if sync is complete
+    // Check if sync is complete. Erase under the lock: this is a map mutation,
+    // and it previously ran unlocked (LP-10 §2.1b).
     if (sync_state->GetState() == HeadersSyncState::State::FINAL) {
+        std::lock_guard<std::mutex> lock(cs_headers);
         mapHeadersSyncStates.erase(peer);
     }
 
@@ -813,7 +840,7 @@ bool CHeadersManager::InitializeDoSProtectedSync(NodeId peer, const uint256& min
     }
 
     // Create the state — Phase 3: pass the chain-agnostic proof checker.
-    auto state = std::make_unique<HeadersSyncState>(
+    auto state = std::make_shared<HeadersSyncState>(  // LP-10 §2.1b: shared, see the map decl
         peer,
         params,
         chainStartHash,
