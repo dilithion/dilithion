@@ -145,9 +145,17 @@ jobs:
         # hd_wallet_standalone_tests is deliberately NOT named below and never
         # should have been: it is a standalone main(), not a Boost suite (zero
         # BOOST_AUTO_TEST macros), so its name in a --run_test filter was always
-        # a NO-OP. It reads as an exclusion and excludes nothing. It runs via
-        # the roster instead. The same dead name is still in the four swallowed
-        # filters and should go with them.
+        # a NO-OP. It reads as an exclusion and excludes nothing.
+        #
+        # Where it DOES run: nowhere yet. It is a standalone binary that no
+        # roster names on this branch or on main. #188 rosters it -- quarantined
+        # until this PR lands, then live. An earlier draft of this comment said
+        # "it runs via the roster instead", which was not true of any tree that
+        # exists; a comment asserting coverage that does not exist is the same
+        # defect class this PR is fixing.
+        #
+        # The same dead name is still in the four swallowed filters and should
+        # go with them.
         ./test_dilithion --log_level=test_suite --report_level=short
         echo "Boost unit tests completed (HD wallet suites now INCLUDED and gating)"
 
