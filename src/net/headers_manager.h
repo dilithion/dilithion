@@ -144,29 +144,6 @@ public:
     uint256 GetMinimumChainWork() const;
 
     /**
-     * LP-10 §3: how many header batches the live path routed through the
-     * DoS-protected gate. This is the WIRING observable — acceptance arms must
-     * prove the gate was REACHED from the real header route, not that
-     * HeadersSyncState behaves correctly in isolation, which is the defect this
-     * whole mission exists to close. Before §3 this counter is necessarily 0
-     * because the path had no production caller at all.
-     */
-    long long GetGateRoutedBatchCount() const {
-        return m_gate_routed_batches.load(std::memory_order_relaxed);
-    }
-
-    /**
-     * LP-10 §3: how many peers the gate SCORED for insufficient chain work.
-     * The punishment half had zero producers since the port — rejecting a peer
-     * without scoring it lets the same peer reconnect and repeat the attempt
-     * for free, which is half a gate. This counter is the observable for that
-     * arm, and is incremented only on the insufficient-work path.
-     */
-    long long GetGatePunishedPeerCount() const {
-        return m_gate_punished_peers.load(std::memory_order_relaxed);
-    }
-
-    /**
      * @brief Validate a single header against its parent
      *
      * @param header Header to validate
@@ -986,14 +963,6 @@ private:
 
     //! Flag indicating header processor thread should run
     std::atomic<bool> m_processor_running{false};
-
-    //! LP-10 §3: batches routed through the DoS-protected gate by the live
-    //! header path. Atomic: written by the header processor thread, read by
-    //! tests and diagnostics without cs_headers.
-    std::atomic<long long> m_gate_routed_batches{0};
-
-    //! LP-10 §3: peers scored for InsufficientChainWork by the gate.
-    std::atomic<long long> m_gate_punished_peers{0};
 
     /**
      * @brief Background header processor thread main loop

@@ -133,12 +133,6 @@ public:
         bool success = false;
         //! Whether to request more headers from this peer
         bool request_more = false;
-        //! LP-10: PRESYNC ended BELOW the minimum chain work, as opposed to any
-        //! other failure. Without this the caller cannot tell "insufficient
-        //! work" from "sent us garbage", and the punishment half of the gate
-        //! (HeaderRejectReason::InsufficientChainWork) has no way to fire for
-        //! the right reason. Defaults false so an unset path cannot punish.
-        bool insufficient_chain_work = false;
     };
 
     /**

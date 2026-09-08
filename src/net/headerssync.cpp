@@ -111,9 +111,6 @@ HeadersSyncState::ProcessingResult HeadersSyncState::ProcessNextHeaders(
             } else {
                 std::cout << "[HeadersSyncState] Peer " << m_id
                           << " insufficient chain work in PRESYNC" << std::endl;
-                // LP-10: tell the caller WHY, so the punishment half can fire
-                // for this reason and only this reason.
-                result.insufficient_chain_work = true;
                 Finalize();
             }
         } else if (m_download_state == State::REDOWNLOAD) {

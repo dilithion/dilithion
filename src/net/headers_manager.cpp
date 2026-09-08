@@ -25,7 +25,6 @@
 #include <core/chainparams.h>
 #include <net/banman.h>   // v4.1: MisbehaviorType for header checkpoint enforcement
 #include <net/peers.h>    // v4.1: CPeerManager::Misbehaving (already pulled by net/net.h but explicit for clarity)
-#include <net/port/maybe_punish_node.h>  // LP-10 §3: HeaderRejectReason/Weight (was only transitive)
 #include <api/metrics.h>  // Fork detection metrics
 #include <algorithm>
 #include <chrono>
@@ -680,33 +679,6 @@ bool CHeadersManager::ProcessHeadersWithDoSProtection(NodeId peer, const std::ve
     auto result = sync_state->ProcessNextHeaders(headers, true);
 
     if (!result.success) {
-        // LP-10 §3 — THE PUNISHMENT HALF, wired.
-        //
-        // net/port/maybe_punish_node.h has defined
-        // HeaderRejectReason::InsufficientChainWork ("PRESYNC ended below
-        // MIN_CHAIN_WORK — weight 50") since the port, with ZERO PRODUCERS: its
-        // only exercise was a mapping assertion in a unit test. So a peer that
-        // failed the work gate was dropped silently and paid nothing, and could
-        // reconnect and repeat it for free. Rejecting without scoring is half a
-        // gate.
-        //
-        // Fires ONLY on insufficient work, never on the other !success paths
-        // (invalid headers, commitment mismatch) — those have their own reasons
-        // and their own weights, and punishing them under this one would
-        // mislabel the peer's offence in the score log.
-        if (result.insufficient_chain_work) {
-            m_gate_punished_peers.fetch_add(1, std::memory_order_relaxed);
-            if (g_node_context.peer_manager) {
-                g_node_context.peer_manager->Misbehaving(
-                    peer,
-                    ::dilithion::net::port::HeaderRejectWeight(
-                        ::dilithion::net::port::HeaderRejectReason::InsufficientChainWork),
-                    MisbehaviorType::INVALID_BLOCK_HEADER);
-            }
-            LogPrintf(NET, WARN,
-                "[HeadersManager] peer=%d PRESYNC below minimum chain work; scored "
-                "(HeaderRejectReason::InsufficientChainWork)\n", static_cast<int>(peer));
-        }
         std::lock_guard<std::mutex> lock(cs_headers);
         mapHeadersSyncStates.erase(peer);
         return false;
@@ -3501,39 +3473,7 @@ void CHeadersManager::HeaderProcessorThread()
             std::cout << "[HeadersManager] Processing " << pending.headers.size()
                       << " headers from peer " << pending.peer_id << std::endl;
 
-        // ====================================================================
-        // LP-10 §3 — THE PRESYNC CHAIN-WORK GATE, WIRED.
-        //
-        // This is the first production call site of the DoS-protected path.
-        // Until now InitializeDoSProtectedSync and ProcessHeadersWithDoSProtection
-        // had ZERO callers, so nMinimumChainWork was read into a member nothing
-        // used and the checks in headerssync.cpp were unreachable.
-        //
-        // WHY HERE. This is the live route (SetHeadersHandler ->
-        // QueueRawHeadersForProcessing -> HeaderProcessorThread -> here), and
-        // crucially cs_headers is NOT held at this point: the raw-queue lock
-        // above is scoped and released before this line. Both
-        // ShouldUseDoSProtection and ProcessHeadersWithDoSProtection take
-        // cs_headers themselves, and it is a NON-RECURSIVE std::mutex —
-        // calling them from anywhere holding it self-deadlocks. See the two
-        // BLOCKER-3 instances in the mission contract; this path has already
-        // produced that bug twice.
-        //
-        // POLICY (contract A-12, decided 2026-09-08): the gate applies ONLY to
-        // peers that trip ShouldUseDoSProtection — i.e. the IBD-ish cases it
-        // was designed for. It is deliberately NOT a work floor on every header
-        // message, which would reject ordinary tip announcements to an
-        // already-synced node. The consequence is an accepted, documented
-        // residual: a peer that does not trip that predicate takes the ungated
-        // path, bounded by the rate limit, MAX_HEADERS_BUFFER and
-        // PruneOrphanedHeaders rather than by chain work.
-        bool success;
-        if (ShouldUseDoSProtection(pending.peer_id)) {
-            m_gate_routed_batches.fetch_add(1, std::memory_order_relaxed);
-            success = ProcessHeadersWithDoSProtection(pending.peer_id, pending.headers);
-        } else {
-            success = QueueHeadersForValidation(pending.peer_id, pending.headers);
-        }
+        bool success = QueueHeadersForValidation(pending.peer_id, pending.headers);
 
         // Decrement active workers and notify pause waiter if needed
         if (--m_active_workers == 0 && m_processing_paused.load()) {
