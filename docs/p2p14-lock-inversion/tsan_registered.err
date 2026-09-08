@@ -1,0 +1,40 @@
+[Chain] selection path: LEGACY (Cases 1/2/2.5/3, default)
+[Chain] ERROR: pdb is nullptr! Cannot write best block!
+==================
+WARNING: ThreadSanitizer: lock-order-inversion (potential deadlock) (pid=1173)
+  Cycle in lock order graph: M0 (0x7264000016c0) => M1 (0x7fffffffda80) => M0
+
+  Mutex M1 acquired here while holding mutex M0 in main thread:
+    #0 pthread_mutex_lock ../../../../src/libsanitizer/tsan/tsan_interceptors_posix.cpp:1341 (libtsan.so.2+0x59a13) (BuildId: 2a13a7710e361d06f7babbea53065ca2be93f738)
+    #1 CChainState::HasBlockIndex(uint256 const&) const <null> (p2p14_lock_inversion_tsan_tests+0xa93db) (BuildId: eb52fd99aa536557ddc07cb7b92979201af54e57)
+    #2 dilithion::consensus::port::ChainSelectorAdapter::ProcessNewHeader(CBlockHeader const&) <null> (p2p14_lock_inversion_tsan_tests+0xf7abb) (BuildId: eb52fd99aa536557ddc07cb7b92979201af54e57)
+    #3 CHeadersManager::ProcessHeaders(int, std::vector<CBlockHeader, std::allocator<CBlockHeader> > const&) <null> (p2p14_lock_inversion_tsan_tests+0x258ca6) (BuildId: eb52fd99aa536557ddc07cb7b92979201af54e57)
+    #4 main <null> (p2p14_lock_inversion_tsan_tests+0x92cad) (BuildId: eb52fd99aa536557ddc07cb7b92979201af54e57)
+
+  Mutex M0 previously acquired by the same thread here:
+    #0 pthread_mutex_lock ../../../../src/libsanitizer/tsan/tsan_interceptors_posix.cpp:1341 (libtsan.so.2+0x59a13) (BuildId: 2a13a7710e361d06f7babbea53065ca2be93f738)
+    #1 CHeadersManager::ProcessHeaders(int, std::vector<CBlockHeader, std::allocator<CBlockHeader> > const&) <null> (p2p14_lock_inversion_tsan_tests+0x258193) (BuildId: eb52fd99aa536557ddc07cb7b92979201af54e57)
+    #2 main <null> (p2p14_lock_inversion_tsan_tests+0x92cad) (BuildId: eb52fd99aa536557ddc07cb7b92979201af54e57)
+
+  Mutex M0 acquired here while holding mutex M1 in thread T2:
+    #0 pthread_mutex_lock ../../../../src/libsanitizer/tsan/tsan_interceptors_posix.cpp:1341 (libtsan.so.2+0x59a13) (BuildId: 2a13a7710e361d06f7babbea53065ca2be93f738)
+    #1 CHeadersManager::OnBlockActivated(CBlockHeader const&, uint256 const&) <null> (p2p14_lock_inversion_tsan_tests+0x2548ff) (BuildId: eb52fd99aa536557ddc07cb7b92979201af54e57)
+    #2 std::_Function_handler<void (CBlockIndex const*), main::{lambda(CBlockIndex const*)#1}>::_M_invoke(std::_Any_data const&, CBlockIndex const*&&) <null> (p2p14_lock_inversion_tsan_tests+0x559206) (BuildId: eb52fd99aa536557ddc07cb7b92979201af54e57)
+    #3 CChainState::NotifyTipUpdate(CBlockIndex const*) <null> (p2p14_lock_inversion_tsan_tests+0xa2ac8) (BuildId: eb52fd99aa536557ddc07cb7b92979201af54e57)
+    #4 CChainState::ActivateBestChain(CBlockIndex*, CBlock const&, bool&) <null> (p2p14_lock_inversion_tsan_tests+0xae7cd) (BuildId: eb52fd99aa536557ddc07cb7b92979201af54e57)
+    #5 std::thread::_State_impl<std::thread::_Invoker<std::tuple<main::{lambda()#2}> > >::_M_run() <null> (p2p14_lock_inversion_tsan_tests+0x55943b) (BuildId: eb52fd99aa536557ddc07cb7b92979201af54e57)
+    #6 <null> <null> (libstdc++.so.6+0xecdb3) (BuildId: 753c6c8608b61d4e67be8f0c890e03e0aa046b8b)
+
+  Mutex M1 previously acquired by the same thread here:
+    #0 pthread_mutex_lock ../../../../src/libsanitizer/tsan/tsan_interceptors_posix.cpp:1341 (libtsan.so.2+0x59a13) (BuildId: 2a13a7710e361d06f7babbea53065ca2be93f738)
+    #1 CChainState::ActivateBestChain(CBlockIndex*, CBlock const&, bool&) <null> (p2p14_lock_inversion_tsan_tests+0xad3b1) (BuildId: eb52fd99aa536557ddc07cb7b92979201af54e57)
+    #2 std::thread::_State_impl<std::thread::_Invoker<std::tuple<main::{lambda()#2}> > >::_M_run() <null> (p2p14_lock_inversion_tsan_tests+0x55943b) (BuildId: eb52fd99aa536557ddc07cb7b92979201af54e57)
+    #3 <null> <null> (libstdc++.so.6+0xecdb3) (BuildId: 753c6c8608b61d4e67be8f0c890e03e0aa046b8b)
+
+  Thread T2 (tid=1176, running) created by main thread at:
+    #0 pthread_create ../../../../src/libsanitizer/tsan/tsan_interceptors_posix.cpp:1022 (libtsan.so.2+0x5ac1a) (BuildId: 2a13a7710e361d06f7babbea53065ca2be93f738)
+    #1 std::thread::_M_start_thread(std::unique_ptr<std::thread::_State, std::default_delete<std::thread::_State> >, void (*)()) <null> (libstdc++.so.6+0xeceb0) (BuildId: 753c6c8608b61d4e67be8f0c890e03e0aa046b8b)
+    #2 <null> <null> (libc.so.6+0x2a1c9) (BuildId: 328820b908de8ea1ef79afa8995e302e819163d7)
+
+SUMMARY: ThreadSanitizer: lock-order-inversion (potential deadlock) (/mnt/c/tmp/tsan-p2p14/p2p14_lock_inversion_tsan_tests+0xa93db) (BuildId: eb52fd99aa536557ddc07cb7b92979201af54e57) in CChainState::HasBlockIndex(uint256 const&) const
+==================
