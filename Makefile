@@ -648,6 +648,7 @@ tests: tests-build
 # drain invariant is broken there is no point running the suites.
 tests-fast: check-tip-notify-drain $(TEST_SUITES_FAST)
 	@bash scripts/test_run_test_suites_timeout.sh
+	@bash scripts/test_run_test_suites_staleness.sh
 	@bash scripts/run_test_suites.sh fast
 
 tests-full: check-tip-notify-drain $(TEST_SUITES_FULL)
