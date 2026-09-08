@@ -195,6 +195,20 @@ CBlockIndex* CChainState::GetBlockIndex(const uint256& hash) {
     return nullptr;
 }
 
+bool CChainState::GetBlockHeightByHash(const uint256& hash, int& heightOut) const {
+    // P2P-14/15 §0.3-POST. Read AND dereference inside one lock scope, so no
+    // pointer escapes for a caller to use after the lock is gone. See the
+    // header for why GetBlockIndex's pointer return is unsafe for this caller.
+    std::lock_guard<std::recursive_mutex> lock(cs_main);
+
+    auto it = mapBlockIndex.find(hash);
+    if (it == mapBlockIndex.end() || it->second == nullptr) {
+        return false;
+    }
+    heightOut = it->second->nHeight;  // dereferenced under the lock, copied out
+    return true;
+}
+
 bool CChainState::HasBlockIndex(const uint256& hash) const {
     // CRITICAL-1 FIX: Acquire lock before accessing shared state
     std::lock_guard<std::recursive_mutex> lock(cs_main);
@@ -370,6 +384,14 @@ bool CChainState::MaybeAnchorVdfGrace(CBlockIndex* p) {
 }
 
 bool CChainState::ActivateBestChain(CBlockIndex* pindexNew, const CBlock& block, bool& reorgOccurred) {
+    // P2P-14/15: DECLARATION ORDER IS LOAD-BEARING. `drain` is declared BEFORE
+    // the lock_guard, so C++ destroys it AFTER the guard — i.e. the tip
+    // callbacks fire with cs_main already released, which is what breaks the
+    // cs_main ↔ cs_headers cycle. Reversing these two lines silently restores
+    // the deadlock. It also covers every return path in this function, of which
+    // there are many, without a goto or a wrapper.
+    TipNotifyDrain drain(*this);
+
     // CRITICAL-1 FIX: Acquire lock before accessing shared state
     // This protects pindexTip, mapBlockIndex, and all chain operations
     std::lock_guard<std::recursive_mutex> lock(cs_main);
@@ -2115,11 +2137,27 @@ bool CChainState::DisconnectTip(CBlockIndex* pindex, bool force_skip_utxo) {
     }
 
     // BUG #56 FIX: Notify block disconnect callbacks (wallet update)
-    // NOTE: cs_main is NOT held during these callbacks. The cs_main scope
-    // ends at line ~1425 above ("cs_main released here"); the disconnect
-    // callbacks fire afterwards. (Compare with ConnectTip, where cs_main
-    // IS held during its callbacks -- see line ~1283.) The wallet has its
-    // own lock (cs_wallet).
+    //
+    // ⚠️ CORRECTED BY P2P-14/15 (port-review L6/M1). This used to assert
+    // "cs_main is NOT held during these callbacks", reasoning that an inner
+    // cs_main scope had ended above. THAT IS FALSE ON THE REORG PATH:
+    //
+    //   cs_main is a RECURSIVE mutex. DisconnectTip is called from
+    //   ActivateBestChain (chain.cpp:777, :1087, :1176, :1249), which holds
+    //   cs_main at FUNCTION scope. An inner scope ending decrements the
+    //   recursion count; it does not release the mutex while an outer frame
+    //   holds it. So on every reorg these callbacks fire WITH cs_main HELD.
+    //
+    // This is the third instance of the same recursive-mutex mis-reasoning
+    // found in this blast radius, and it is the exact shape of the defect
+    // P2P-14/15 fixed for the TIP callback — a consumer that takes its own
+    // lock here creates a cs_main → <consumer lock> edge.
+    //
+    // The behaviour is NOT changed here: rerouting the block connect/disconnect
+    // callback families through a deferred drain is a separate contract with
+    // its own consumers (wallet, txindex, coinstatsindex, ZMQ) to audit. Only
+    // the false claim is removed, so nobody builds on it. The wallet's own
+    // cs_wallet does not make the ordering safe — it is what would deadlock.
     for (size_t i = 0; i < m_blockDisconnectCallbacks.size(); ++i) {
         try {
             m_blockDisconnectCallbacks[i](block, disconnectHeight, disconnectHash);
@@ -2514,23 +2552,84 @@ void CChainState::RegisterTipUpdateCallback(TipUpdateCallback callback) {
 }
 
 void CChainState::NotifyTipUpdate(const CBlockIndex* pindex) {
-    // NOTE: Caller must already hold cs_main lock
-    // This is always called from within ActivateBestChain which holds the lock
+    // NOTE: Caller must already hold cs_main lock.
+    // All four call sites are inside ActivateBestChain, which owns the guard.
+    //
+    // P2P-14/15: this SNAPSHOTS and returns. It does not invoke callbacks —
+    // invoking them here is what created the cs_main → cs_headers edge that
+    // closes the deadlock cycle (docs/p2p14-lock-inversion/). The pointer is
+    // dereferenced HERE, under the lock, and never leaves this function.
 
     if (pindex == nullptr) {
         return;
     }
 
-    // Execute all registered callbacks with exception handling
-    for (size_t i = 0; i < m_tipCallbacks.size(); ++i) {
-        try {
-            m_tipCallbacks[i](pindex);
-        } catch (const std::exception& e) {
-            std::cerr << "[Chain] ERROR: Tip callback " << i << " threw exception: " << e.what() << std::endl;
-            // Continue executing other callbacks even if one fails
-        } catch (...) {
-            std::cerr << "[Chain] ERROR: Tip callback " << i << " threw unknown exception" << std::endl;
-            // Continue executing other callbacks even if one fails
+    m_pendingTipNotifications.push_back(
+        PendingTipNotification{pindex->header, pindex->GetBlockHash()});
+
+    // UNDRAINED-QUEUE CANARY.
+    //
+    // All four NotifyTipUpdate call sites (chain.cpp:684, :749, :803, :1324)
+    // are inside ActivateBestChain, which declares the one TipNotifyDrain. So
+    // the queue is bounded by the notifications of a single activation — a
+    // handful — and is emptied before that function returns.
+    //
+    // The failure this guards is a FUTURE one: someone adds a fifth call site
+    // in a scope with no TipNotifyDrain. That notification would be queued and
+    // never fired, so a tip update would be silently dropped and the queue
+    // would grow without bound. Both halves of that are invisible — no crash,
+    // no failing test, just a consumer that stops being told about new tips.
+    //
+    // Growth is the observable symptom, so watch it rather than trusting the
+    // structure to stay as it is. This is a loud log, not an assert: dropping
+    // a node in production over a bookkeeping leak would be a worse failure
+    // than the leak.
+    constexpr size_t kPendingTipNotificationWarnThreshold = 64;
+    if (m_pendingTipNotifications.size() > kPendingTipNotificationWarnThreshold) {
+        std::cerr << "[Chain] WARNING: " << m_pendingTipNotifications.size()
+                  << " undrained tip notifications. A NotifyTipUpdate call site is "
+                     "almost certainly queueing in a scope with no TipNotifyDrain "
+                     "— tip updates are being silently dropped. See P2P-14/15."
+                  << std::endl;
+    }
+}
+
+void CChainState::DrainTipNotifications() {
+    // Fires the snapshots taken by NotifyTipUpdate, with cs_main NOT held.
+    // See the header for why "the guard ended" genuinely means "the mutex is
+    // free" here, and for the two facts that would invalidate it.
+
+    std::vector<PendingTipNotification> toFire;
+    std::vector<TipUpdateCallback> callbacks;
+    {
+        // Brief re-acquisition to move the queue out. Both the queue AND the
+        // callback vector are copied under the lock: RegisterTipUpdateCallback
+        // mutates m_tipCallbacks under cs_main, so iterating it unlocked would
+        // be a data race — the exact class of defect this change exists to fix.
+        std::lock_guard<std::recursive_mutex> lock(cs_main);
+        if (m_pendingTipNotifications.empty()) {
+            return;
+        }
+        toFire.swap(m_pendingTipNotifications);
+        callbacks = m_tipCallbacks;
+    }
+
+    // cs_main is released. Consumers may now take their own locks (cs_headers)
+    // without inverting against it.
+    //
+    // Ordering: notifications fire in the order they were queued, and the queue
+    // is only appended under cs_main, so per-activation order is preserved.
+    for (const auto& notification : toFire) {
+        for (size_t i = 0; i < callbacks.size(); ++i) {
+            try {
+                callbacks[i](notification.header, notification.hash);
+            } catch (const std::exception& e) {
+                std::cerr << "[Chain] ERROR: Tip callback " << i << " threw exception: " << e.what() << std::endl;
+                // Continue executing other callbacks even if one fails
+            } catch (...) {
+                std::cerr << "[Chain] ERROR: Tip callback " << i << " threw unknown exception" << std::endl;
+                // Continue executing other callbacks even if one fails
+            }
         }
     }
 }

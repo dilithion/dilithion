@@ -998,11 +998,25 @@ void CHeadersManager::OnBlockActivated(const CBlockHeader& header, const uint256
         } else {
             // Parent not in mapHeaders (compact block arrived without header pipeline).
             // Look up actual height from chainstate block index.
-            // Safe: cs_main is already held (called from ConnectTip→NotifyTipUpdate),
-            // and cs_main is a recursive_mutex.
-            CBlockIndex* pindex = g_chainstate.GetBlockIndex(hash);
-            if (pindex) {
-                height = pindex->nHeight;
+            //
+            // P2P-14/15 §0.3-POST: this USED to read
+            //     CBlockIndex* pindex = g_chainstate.GetBlockIndex(hash);
+            //     if (pindex) { height = pindex->nHeight; }
+            // with the comment "Safe: cs_main is already held (called from
+            // ConnectTip→NotifyTipUpdate), and cs_main is a recursive_mutex."
+            //
+            // That guarantee is GONE. The tip callback now fires AFTER cs_main
+            // is released — that is the whole point of the fix — so this ran
+            // with a raw pointer from a function that takes and releases the
+            // lock, dereferenced outside it. That is exactly the race LP10
+            // measured under TSan at 6353bc33.
+            //
+            // Snapshotting the callback's own parameters did not cover this:
+            // it is a SECOND, internal pointer. Read the value under the lock
+            // instead, so nothing escapes the lock scope.
+            int lookedUpHeight = 0;
+            if (g_chainstate.GetBlockHeightByHash(hash, lookedUpHeight)) {
+                height = lookedUpHeight;
             }
         }
     }
@@ -1085,8 +1099,28 @@ std::vector<uint256> CHeadersManager::GetLocator(const uint256& hashTip)
 {
     // DEADLOCK FIX: Get chainstate tip BEFORE acquiring cs_headers
     // to avoid cs_headers/cs_main lock order inversion.
-    // (OnBlockActivated holds cs_main and wants cs_headers;
-    //  GetLocatorImpl would hold cs_headers and want cs_main via GetTip)
+    //
+    // ⚠️ RATIONALE CORRECTED BY P2P-14/15. This used to read "(OnBlockActivated
+    // holds cs_main and wants cs_headers; GetLocatorImpl would hold cs_headers
+    // and want cs_main via GetTip)". The first half is NO LONGER TRUE —
+    // OnBlockActivated now runs with cs_main released, which is the entire point
+    // of that change. Left uncorrected it would be a stale safety rationale
+    // justifying live code: exactly the shape this mission excavated 100 lines
+    // above (the "cs_main is already held" comment at the GetBlockIndex deref).
+    //
+    // The pre-fetch is still CORRECT and still wanted, for the surviving half:
+    // GetLocatorImpl holds cs_headers, and calling GetTip() under it would take
+    // cs_main beneath cs_headers. Hoisting it keeps that edge out.
+    //
+    // ⚠️ RESIDUAL, NOT FIXED HERE (red-team H-2 / port-review L9): pTip is a raw
+    // CBlockIndex* obtained from a take-and-release accessor, and the walk below
+    // (GetAncestor, pprev/pskip) dereferences it with cs_main NOT held — the same
+    // released-pointer class this contract fixes at one call site and scopes OUT
+    // for the other ~205 (dilithion-strategy 794e27b,
+    // missions/lp10-chainstate-pointer-api/CENSUS_both_producers.tsv). It is
+    // LP10's class and its root cause is upstream of the call sites: runtime
+    // eviction exists only because nMinimumChainWork was zeroed. Recorded here
+    // so the next reader does not mistake this line for audited-safe.
     CBlockIndex* pTip = g_chainstate.GetTip();
     int chainstateHeight = (pTip && pTip->nHeight > 0) ? pTip->nHeight : 0;
 
