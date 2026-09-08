@@ -489,6 +489,27 @@ BOOST_RPC_WEBSOCKET_TEST_SOURCE := src/test/rpc_websocket_tests.cpp
 check-tip-notify-drain:
 	@bash scripts/check-tip-notify-drain.sh
 
+# P2P-14/15 TSan lock-inversion gate — MANUAL, Linux-only, ~4 min.
+#
+# Deliberately NOT a prerequisite of tests-fast/tests-full, and that is stated
+# here rather than left to be discovered: it needs a TSAN=1 build, a Linux
+# toolchain and `setarch -R` (ASLR off, or TSan aborts before main). Wiring it
+# into the default test tiers would break every Windows/MSYS2 build.
+#
+# It DOES now have an invocable target, because the sibling guard's own rule
+# applies to it: a check with zero callers is not a check, it is a file. Run it
+# by hand on Linux, and in any CI job that already has a TSan toolchain:
+#
+#     make TSAN=1 -j8 p2p14_lock_inversion_tsan_tests
+#     make check-p2p14-tsan
+#
+# It exits non-zero if either arm hangs, reports a lock-order inversion, or
+# fails the positive control (i.e. if the harness did no work).
+.PHONY: check-p2p14-tsan
+check-p2p14-tsan:
+	@bash scripts/run_p2p14_lock_inversion_tsan.sh
+
+
 # Default target: build main binaries and utilities
 all: dilithion-node dilv-node genesis_gen check-wallet-balance
 	@echo "$(COLOR_GREEN)✓ Build complete!$(COLOR_RESET)"
