@@ -1,0 +1,15 @@
+TSAN_SYMS_DYNAMIC=33  LIBTSAN_LINKED=1
+================ ARM: registered ================
+EXIT=0
+INVERSION_REPORTS=0
+[p2p14-tsan] EDGE-A ProcessHeaders accepted=200  EDGE-B callback fired=200
+[p2p14-tsan] REACH forward-edge: threadA headers landed=200/200 (>0 means ProcessNewHeader ran under cs_headers)
+================ ARM: unregistered ================
+EXIT=0
+INVERSION_REPORTS=0
+[p2p14-tsan] EDGE-A ProcessHeaders accepted=200  EDGE-B callback fired=0
+[p2p14-tsan] REACH forward-edge: threadA headers landed=200/200 (>0 means ProcessNewHeader ran under cs_headers)
+================ SUMMARY ================
+registered   EXIT=0
+unregistered EXIT=0
+SCRIPT_EXIT=0

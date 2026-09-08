@@ -1167,13 +1167,22 @@ bool CNetMessageProcessor::ProcessGetDataMessage(int peer_id, CDataStream& strea
                 timestamps.push_back(now);
             }
         }
-        // dilv-dedup-livelock-fix (F-009 BLOCKER-1): Misbehaving() takes cs_peers (via GetPeer),
-        // and the eviction/disconnect path takes cs_peers and then, via OnPeerDisconnected →
-        // CleanupPeerRateLimitState, the rate-limit mutexes. Calling Misbehaving WHILE holding
-        // cs_getdata_rate inverts that order → a reachable {cs_getdata_rate, cs_peers} AB-BA
-        // deadlock (GETDATA-storm peer + inbound-at-limit eviction). INVARIANT: never call
-        // Misbehaving (or anything that acquires cs_peers) while holding a rate-limit mutex —
-        // decide under the lock, penalize after release (the Part B dedup branch does the same).
+        // dilv-dedup-livelock-fix (F-009 BLOCKER-1). INVARIANT, and it is ORDER-BASED so that it
+        // cannot expire: the rate-limit mutexes sit LAST in the global lock order (see net.h), so
+        // never call Misbehaving — or anything else that acquires cs_peers — while holding one.
+        // Decide under the lock, penalize after releasing it (the Part B dedup branch does the same).
+        //
+        // ⚠️ RESTATED BY P2P-14/15 (port-review MEDIUM-3). This used to justify the invariant with a
+        // SCENARIO: "the eviction/disconnect path takes cs_peers and then, via OnPeerDisconnected →
+        // CleanupPeerRateLimitState, the rate-limit mutexes". **That scenario no longer occurs** —
+        // DisconnectNodes now dispatches after releasing cs_vNodes, and EvictPeersIfNeeded releases
+        // cs_peers before dispatching. The invariant is UNCHANGED and still required; only its
+        // stated reason was tied to a construction that has since been removed.
+        //
+        // This matters more than a stale comment usually would: a reader who checks the cited AB-BA,
+        // finds it gone, and concludes the invariant is obsolete would have a documented licence to
+        // move Misbehaving back inside cs_getdata_rate — re-creating a real inversion. An order-based
+        // statement does not rot when a call path changes; a scenario-based one does.
         if (getdata_rate_breached) {
             peer_manager.Misbehaving(peer_id, 2, MisbehaviorType::GETDATA_RATE_EXCEEDED);  // Reduced from 10 - IBD sync is legitimate
             return false;

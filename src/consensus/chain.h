@@ -267,8 +267,66 @@ private:
 
     // Bug #40 fix: Callback mechanism for tip updates
     // Allows HeadersManager and other components to be notified when chain tip changes
-    using TipUpdateCallback = std::function<void(const CBlockIndex*)>;
+    //
+    // P2P-14/15 (2026-09-07): the callback passes VALUES, not a CBlockIndex*.
+    //
+    // It used to be `std::function<void(const CBlockIndex*)>`, fired from inside
+    // ActivateBestChain with cs_main HELD. That produced two distinct defects:
+    //
+    //   1. LOCK-ORDER CYCLE. The registered consumer is CHeadersManager::
+    //      OnBlockActivated, which takes cs_headers — so cs_main → cs_headers.
+    //      The reverse edge, cs_headers → cs_main, exists on the header-processing
+    //      path (ProcessHeaders holds cs_headers and reaches AddBlockIndex /
+    //      EvictLowestWorkNotOnBestChain, both of which take cs_main). TSan
+    //      CONSTRUCTS the resulting deadlock: docs/p2p14-lock-inversion/ —
+    //      registered arm 2 lock-order-inversions, unregistered arm 0.
+    //
+    //   2. POINTER LIFETIME. Handing a raw CBlockIndex* to a callback that runs
+    //      after the lock is released is a use-after-free waiting to happen:
+    //      CBlockIndex objects ARE destroyed at runtime (mapBlockIndex.erase in
+    //      EvictLowestWorkNotOnBestChain), and the headers thread itself drives
+    //      that eviction. Eviction spares the active chain, so the tip is safe
+    //      only until a reorg makes it non-active.
+    //
+    // Passing copies closes BOTH: there is no pointer to outlive the lock, so the
+    // fire can move outside cs_main and the cycle has no edge to close on.
+    //
+    // Values, not a pointer. Do not "optimise" this back to a CBlockIndex* — that
+    // reintroduces defect 2 silently and defect 1 the moment a consumer takes a
+    // lock. Add a field to the snapshot instead.
+    //
+    // ⚠️ CONTRACT CHANGE FOR EVERY CONSUMER, PRESENT AND FUTURE (red-team H-3).
+    // Before this change, callbacks fired INSIDE cs_main, so they were mutually
+    // exclusive and totally ordered for free: one mutex serialised activations
+    // and their notifications together. Firing after release DECOUPLES them.
+    //
+    //   * Two threads can be inside the callback list SIMULTANEOUSLY. A
+    //     consumer must now be re-entrant.
+    //   * A later tip's callback can COMPLETE BEFORE an earlier tip's. A
+    //     consumer that tracks "best" must be monotonic on its own and must not
+    //     assume delivery order matches activation order.
+    //   * Per-activation order IS preserved (the queue is appended under
+    //     cs_main and drained in order) — that is a narrower guarantee than it
+    //     sounds, and it is NOT cross-activation ordering.
+    //   * A thread can return from ActivateBestChain with its own notification
+    //     not yet delivered, because another thread's drain may have swapped
+    //     the queue out. Almost always delivered before return; never
+    //     guaranteed. Do not build a barrier on it.
+    //
+    // The current consumer (CHeadersManager::OnBlockActivated) is safe under
+    // this: its writes are idempotent and its best-header update is
+    // work-monotone. That is a property of TODAY's consumer, not a guarantee of
+    // the mechanism — which is why it is written here rather than assumed.
+    using TipUpdateCallback = std::function<void(const CBlockHeader&, const uint256&)>;
     std::vector<TipUpdateCallback> m_tipCallbacks;
+
+    // Snapshot of one tip update, taken under cs_main and fired after release.
+    struct PendingTipNotification {
+        CBlockHeader header;
+        uint256 hash;
+    };
+    // Written by NotifyTipUpdate under cs_main; drained by TipNotifyDrain.
+    std::vector<PendingTipNotification> m_pendingTipNotifications;
 
     // BUG #56 FIX: Block connect/disconnect callbacks (Bitcoin Core pattern)
     // Allows wallet to be notified when blocks are connected/disconnected
@@ -605,6 +663,30 @@ public:
     CBlockIndex* GetBlockIndex(const uint256& hash);
 
     /**
+     * P2P-14/15 §0.3-POST: read a block's height BY VALUE, under cs_main.
+     *
+     * GetBlockIndex above acquires cs_main, releases it, and hands back a raw
+     * pointer. Every caller that dereferences that pointer without separately
+     * holding cs_main is racing the eviction path — the shape LP10 measured
+     * under TSan at 6353bc33 ("a mutex on one side buys nothing").
+     *
+     * CHeadersManager::OnBlockActivated did exactly that, and got away with it
+     * ONLY because its caller (ConnectTip → NotifyTipUpdate) still held cs_main
+     * — a dependency its own comment relied on. The P2P-14/15 fix fires that
+     * callback with cs_main RELEASED, which removed the guarantee. Snapshotting
+     * the callback's parameters does NOT cover this: it is a second, internal
+     * pointer.
+     *
+     * So: return the value, never the pointer. The read and the dereference
+     * happen inside one lock scope.
+     *
+     * @param hash      block to look up
+     * @param heightOut set to the block's height on success, untouched on failure
+     * @return true if the block index exists
+     */
+    bool GetBlockHeightByHash(const uint256& hash, int& heightOut) const;
+
+    /**
      * Check if block index exists in memory
      */
     bool HasBlockIndex(const uint256& hash) const;
@@ -901,9 +983,62 @@ private:
      * Notify registered callbacks of tip update (Bug #40)
      * Called after tip successfully updated in ActivateBestChain
      *
-     * @param pindex New chain tip
+     * P2P-14/15: this no longer INVOKES the callbacks. It snapshots the tip's
+     * header and hash into m_pendingTipNotifications; TipNotifyDrain fires them
+     * after cs_main is released. Caller must hold cs_main (all four call sites
+     * are inside ActivateBestChain, which owns the guard).
+     *
+     * @param pindex New chain tip — read here, never handed to a callback.
      */
     void NotifyTipUpdate(const CBlockIndex* pindex);
+
+    /**
+     * P2P-14/15: fire the pending tip notifications with cs_main NOT held.
+     *
+     * Declare a TipNotifyDrain BEFORE the cs_main lock_guard in any scope that
+     * calls NotifyTipUpdate. C++ destroys locals in reverse declaration order,
+     * so the drain runs AFTER the guard has released the mutex.
+     *
+     * WHY THAT IS SUFFICIENT HERE, and what would break it (measured 2026-09-07,
+     * f47b9b24) — cs_main is a RECURSIVE mutex, so "the guard ended" does not by
+     * itself mean "the mutex is free". It is free here because:
+     *   - cs_main is PRIVATE (chain.h, `private:` section), so no external caller
+     *     can hold it. Every ActivateBestChain caller measured [held: -]:
+     *     block_processing.cpp:945/:1468, block_validation_queue.cpp:402,
+     *     fork_manager.cpp:722, chain_selector_impl.cpp:213.
+     *   - No CChainState method calls ActivateBestChain, so it never nests.
+     *
+     * IF EITHER CEASES TO BE TRUE — cs_main is exposed, or ActivateBestChain
+     * becomes reachable from another CChainState method — this drain fires with
+     * cs_main still held by an outer frame, the fix silently becomes a no-op, and
+     * the deadlock returns while every test still passes. Re-check both before
+     * changing either.
+     */
+    void DrainTipNotifications();
+
+    /** RAII: drains pending tip notifications when it goes out of scope. */
+    class TipNotifyDrain {
+    public:
+        explicit TipNotifyDrain(CChainState& chainstate) : m_chainstate(chainstate) {}
+        ~TipNotifyDrain() {
+            // Destructors are implicitly noexcept, so ANY exception escaping
+            // here calls std::terminate and kills the node. DrainTipNotifications
+            // catches what the callbacks throw, but not what its own lock
+            // acquisition or vector allocation can throw. Killing a node over a
+            // notification-bookkeeping failure would be a far worse outcome than
+            // the failure itself. (Red-team M-4.)
+            try {
+                m_chainstate.DrainTipNotifications();
+            } catch (...) {
+                // Deliberately swallowed: see above. Not silent — the drain
+                // logs per-callback failures itself.
+            }
+        }
+        TipNotifyDrain(const TipNotifyDrain&) = delete;
+        TipNotifyDrain& operator=(const TipNotifyDrain&) = delete;
+    private:
+        CChainState& m_chainstate;
+    };
 };
 
 #endif // DILITHION_CONSENSUS_CHAIN_H
