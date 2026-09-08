@@ -322,7 +322,28 @@ private:
     // Code holding cs_peers or cs_nodes must NEVER call CConnman methods that acquire cs_vNodes
     // (e.g., GetNode, PushMessage(int)). Violating this causes ABBA deadlock.
     mutable std::mutex cs_vNodes;
-    int m_next_node_id = 1;
+    // P2P-14/15 red-team HIGH-2 (pre-existing race, fixed here because it is one
+    // line and it invalidates another fix's stated premise).
+    //
+    // This was a plain `int` incremented as a non-atomic read-modify-write from
+    // three sites with INCONSISTENT lock state:
+    //     connman.cpp:413   ConnectNode (outbound)          INSIDE cs_vNodes
+    //     connman.cpp:1294  SocketHandler inbound accept    OUTSIDE cs_vNodes  <-- LIVE path
+    //     connman.cpp:559   AcceptConnection                OUTSIDE (dead code)
+    //
+    // Two threads interleaving the load can mint TWO LIVE CNodes WITH THE SAME
+    // node_id. That is not cosmetic: node_refs[id] and peers[id] are keyed on it
+    // (peers.cpp), so the second registration silently overwrites the first —
+    // GetNode() then hands the wrong CNode to Misbehaving / PeriodicMaintenance,
+    // and RemoveNode(id) erases the shared entry, leaving the survivor
+    // unreachable with its dedup/rate-limit maps never cleaned. That unbounded-map
+    // growth is exactly what peers.cpp:1763 says is prevented "because Node IDs
+    // are monotonic (never reused, connman m_next_node_id)" — this race is what
+    // breaks that premise.
+    //
+    // std::atomic makes operator++ atomic at all three sites with no change to
+    // any lock discipline.
+    std::atomic<int> m_next_node_id{1};
 
     // Listen socket (socket_t for cross-platform compatibility)
     socket_t m_listen_socket = static_cast<socket_t>(-1);
