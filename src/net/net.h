@@ -335,13 +335,38 @@ void SendRejectMessage(int peer_id, const std::string& command, const std::strin
 // ThreadSocketHandler sweep (connman.cpp) can call them — they were previously
 // file-local to net.cpp and so were never wired to those paths.
 //
-// LOCK ORDER (dilv-dedup-livelock NEW-1 + F-009 BLOCKER-1 fix). The four relevant
-// mutex classes and their global acquisition order:
-//     cs_vNodes  →  cs_peers  →  {cs_getdata_rate, cs_headers_rate, cs_served_blocks}
+// LOCK ORDER (dilv-dedup-livelock NEW-1 + F-009 BLOCKER-1 fix; EXTENDED by
+// P2P-14/15, 2026-09-07, PR #183). Global acquisition order:
+//
+//     cs_headers → cs_vNodes → cs_peers → cs_nodes
+//                → {cs_getdata_rate, cs_headers_rate, cs_served_blocks}
+//                → block_tracker.m_mutex
+//
+// ⚠️ cs_headers's POSITION IS RATIFIED HERE, BY P2P-14/15 — it is not inherited.
+// Before that change NO document in src/net ordered cs_headers against cs_vNodes
+// or cs_peers: this block omitted it entirely, and block_tracker.h:480 wrote
+// {cs_vNodes, cs_peers, cs_headers} as an UNORDERED SET, which constrains none of
+// the three against each other. Both directions existed in live code, which is
+// what made the deadlock possible. ABOVE was chosen because six existing sites
+// already hold it that way (headers_manager.cpp:351/498/530/674/2917/2987, via
+// Misbehaving and PushMessage) against one that did not — the disconnect
+// dispatch, which this change fixed. That is a CHOICE justified by cost, not a
+// rule recovered from somewhere else. Do not re-cite it as pre-existing.
+//
+// ⚠️ cs_main has NO position in this order. Both cs_headers → cs_main and
+// cs_main → cs_headers existed on live paths (P2P-14/15); the latter is now
+// gone, but cs_main is a chainstate-private mutex and belongs to a different
+// hierarchy. A documented order the code violates is worse than an
+// acknowledged gap — do not write cs_main in here to make the diagram tidy.
+//
+// ⚠️ A CNode* obtained from CConnman is NOT lifetime-safe outside cs_vNodes.
+// GetNode() returns a raw pointer after releasing the lock (connman.cpp:597).
+//
 // CleanupPeerRateLimitState acquires the three rate-limit mutexes (last in the order),
-// so it is safe to call from OnPeerDisconnected even though the eviction/disconnect
-// callers hold cs_vNodes and/or cs_peers across the dispatch (AcceptConnection →
-// EvictPeersIfNeeded → DispatchPeerDisconnected → OnPeerDisconnected).
+// so it is safe to call from OnPeerDisconnected. NOTE (corrected by P2P-14/15): the
+// disconnect dispatch is NO LONGER made while holding cs_vNodes/cs_peers —
+// CConnman::DisconnectNodes detaches under cs_vNodes and dispatches after
+// releasing it, precisely so that cs_headers is not acquired beneath them.
 // The ONLY way this inverts is if some path takes a rate-limit mutex and THEN cs_peers.
 // cs_peers is reached via CPeerManager::Misbehaving → GetPeer. INVARIANT (enforced):
 // no code calls Misbehaving (or otherwise acquires cs_peers) while holding any
