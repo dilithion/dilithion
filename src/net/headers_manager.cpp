@@ -758,12 +758,48 @@ bool CHeadersManager::InitializeDoSProtectedSync(NodeId peer, const uint256& min
         chainStartHeight = 0;
     }
 
+    // LP-10 §2.0: the CUMULATIVE work at the chain start must be handed to
+    // HeadersSyncState, or its accumulator starts at zero while its start point
+    // is our local tip -- see the constructor comment. Read it from mapHeaders,
+    // which stores "accumulated PoW from genesis" per header.
+    //
+    // NOTE ON LOCKING: we already hold cs_headers (taken at the top of this
+    // function) and it is a NON-RECURSIVE std::mutex, so this must NOT call
+    // GetBestHeaderChainWork() -- that takes cs_headers itself and would
+    // self-deadlock. Read the map directly. (LP-10 red-team BLOCKER-3 names the
+    // wider lock discipline problem on this path; this is one instance of it.)
+    uint256 chainStartWork;
+    auto itWork = mapHeaders.find(chainStartHash);
+    if (itWork != mapHeaders.end()) {
+        chainStartWork = itWork->second.chainWork;
+    } else if (chainStartHeight == 0) {
+        // Genesis is not necessarily in mapHeaders (it is not received over the
+        // wire). Its cumulative work is its own block work.
+        chainStartWork = ::dilithion::consensus::ComputeChainWork(
+            Dilithion::g_chainParams ? Dilithion::g_chainParams->genesisNBits : 0);
+    }
+
+    // FAIL CLOSED. Passing zero for an unknown start would silently reinstate
+    // the exact defect §2.0 exists to remove, and it would present as a stalled
+    // sync rather than an error. Refusing to start DoS-protected sync leaves the
+    // peer on the ordinary path instead of on a gate that cannot pass.
+    if (chainStartWork.IsNull()) {
+        LogPrintf(NET, WARN,
+            "[HeadersManager] DoS-protected sync NOT started for peer=%d: no chain work "
+            "known for start hash %s at height %lld. Refusing to seed the PRESYNC "
+            "accumulator with zero.\n",
+            static_cast<int>(peer), chainStartHash.GetHex().c_str(),
+            static_cast<long long>(chainStartHeight));
+        return false;
+    }
+
     // Create the state — Phase 3: pass the chain-agnostic proof checker.
     auto state = std::make_unique<HeadersSyncState>(
         peer,
         params,
         chainStartHash,
         chainStartHeight,
+        chainStartWork,     // LP-10 §2.0: was implicitly zero
         minimum_work,
         m_proof_checker.get()
     );

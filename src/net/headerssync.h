@@ -150,11 +150,27 @@ public:
      *                      preserves pre-Phase-3 behaviour for tests that
      *                      don't wire a checker.
      */
+    /**
+     * @param chain_start_work CUMULATIVE chain work at chain_start_hash,
+     *   i.e. work from genesis up to AND INCLUDING that block.
+     *
+     *   LP-10 §2.0 (2026-09-08). This parameter did not exist and the
+     *   accumulator was memset to zero, while chain_start is our LOCAL TIP, not
+     *   genesis. The gate then asked "has this peer supplied a whole threshold's
+     *   worth of NEW work beyond our tip?" instead of "does this chain exceed
+     *   the absolute minimum?" -- never true on a non-fresh node, so PRESYNC
+     *   would never reach REDOWNLOAD and header sync would stall. Upstream seeds
+     *   from chain_start->nChainWork; this restores that.
+     *
+     *   There is deliberately NO DEFAULT. A defaulted zero is exactly the bug,
+     *   and it would reappear silently at any future call site.
+     */
     HeadersSyncState(
         NodeId peer_id,
         const HeadersSyncParams& params,
         const uint256& chain_start_hash,
         int64_t chain_start_height,
+        const uint256& chain_start_work,
         const uint256& minimum_work,
         const ::dilithion::net::IHeaderProofChecker* proof_checker = nullptr
     );
