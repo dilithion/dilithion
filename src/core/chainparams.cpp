@@ -109,7 +109,13 @@ ChainParams ChainParams::Mainnet() {
     // comment-asserts-a-state defect this mission exists to close, and it was
     // caught here by review rather than by a reader trusting it.]
     //
-    // LP-10 (2026-09-07), PROPOSED — NOT YET RATIFIED BY A DECISION ROW.
+    // LP-10 — APPROVED, decision row D-DIL-2026-09-07-2
+    // (dilithion-strategy 00-context/DECISION_REGISTER.md). That row records the
+    // approving words verbatim, the route by which they were given, the scope
+    // (the wiring sub-contract at strategy 3a97237), and this value's
+    // provenance. Cite the ROW, never a person: the row is what a future reader
+    // can check, and it says these are DoS-gate thresholds, not a consensus
+    // rule — a re-measure at a higher checkpoint is a NEW row, not an edit.
     // Measured chain work at DIL's most recent checkpoint, height 54000
     // (hash 0000000bb44c964b4e3c6fec8c15941738cd74b434bafbfe4aadce898140b993,
     // see checkpoints below). Derived by summing ComputeChainWork(nBits) over
@@ -551,7 +557,13 @@ ChainParams ChainParams::DilV() {
     // Mainnet() marker: a stale lead above a contradicting assignment is the
     // defect this mission exists to close.]
     //
-    // LP-10 (2026-09-07), PROPOSED — NOT YET RATIFIED BY A DECISION ROW.
+    // LP-10 — APPROVED, decision row D-DIL-2026-09-07-2
+    // (dilithion-strategy 00-context/DECISION_REGISTER.md). That row records the
+    // approving words verbatim, the route by which they were given, the scope
+    // (the wiring sub-contract at strategy 3a97237), and this value's
+    // provenance. Cite the ROW, never a person: the row is what a future reader
+    // can check, and it says these are DoS-gate thresholds, not a consensus
+    // rule — a re-measure at a higher checkpoint is a NEW row, not an edit.
     // Measured chain work at DilV's most recent checkpoint, height 67000
     // (hash c929e38f1709c04c3174627edfe03c57eefdc36846d9d74ab32f899979205eff,
     // see checkpoints below). Summed with ComputeChainWork/AddChainWork over

@@ -54,6 +54,25 @@ namespace NetProtocol {
 class CHeadersManager {
 public:
     CHeadersManager();
+
+    /**
+     * LP-10 deliverable 0b — ARMING THE PRESYNC GATE FOR TESTS.
+     *
+     * The default constructor reads nMinimumChainWork from g_chainParams, and
+     * regtest and testnet are both deliberately ZERO (regtest chains are a
+     * handful of blocks; a non-zero production default there would stop them
+     * syncing). With no way to supply a threshold, every acceptance arm for the
+     * gate is VACUOUS: at threshold zero `ChainWorkGreaterOrEqual(anything, 0)`
+     * is unconditionally true, so "a chain below the threshold" cannot exist and
+     * a reject test rejects nothing.
+     *
+     * This overload takes the threshold as an EXPLICIT DEPENDENCY instead of
+     * reading ambient global state. It is not a test-only back door: an injected
+     * parameter is the better design either way, production keeps the
+     * chainparams-reading default, and no production default changes.
+     */
+    explicit CHeadersManager(const uint256& minimum_chain_work);
+
     ~CHeadersManager();  // Explicit destructor for proper cleanup order
 
     // Disable copying
@@ -111,6 +130,18 @@ public:
      * @return true if state created successfully
      */
     bool InitializeDoSProtectedSync(NodeId peer, const uint256& minimum_work);
+
+    /**
+     * LP-10 deliverable 0b: the armed threshold, made OBSERVABLE.
+     *
+     * Acceptance arm A-4 requires proof that the value REACHED the gate, not
+     * merely that it was configured. Without an accessor the only externally
+     * visible evidence is a std::cout in headerssync.cpp, and an assertion on a
+     * debug print is a log-string assertion. This is the observable to assert
+     * against, and it is also what a §3 wiring call site should pass into
+     * InitializeDoSProtectedSync.
+     */
+    uint256 GetMinimumChainWork() const;
 
     /**
      * @brief Validate a single header against its parent

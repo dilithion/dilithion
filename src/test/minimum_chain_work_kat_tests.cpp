@@ -3,10 +3,12 @@
 //
 // LP-10 (2026-09-07): known-answer tests pinning nMinimumChainWork.
 //
-// A KAT pins what a constant IS. It does not, and must not, assert who chose
-// it or that anyone ratified it -- the values here are marked PROPOSED in
-// chainparams.cpp and carry no decision-row citation because no decision row
-// exists yet.
+// A KAT pins what a constant IS. It does not, and must not, assert who chose it
+// or that anyone ratified it. The approval lives in decision row
+// D-DIL-2026-09-07-2 (dilithion-strategy 00-context/DECISION_REGISTER.md) and is
+// cited from chainparams.cpp; this suite deliberately asserts nothing about it.
+// If the row were withdrawn tomorrow these assertions would all still be
+// correct, because they are about arithmetic, not authority.
 //
 // ⚠️ WHAT THIS SUITE DOES *NOT* PROVE.
 // It does not prove the gate works, because as of this commit the gate is not

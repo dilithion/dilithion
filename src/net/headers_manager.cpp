@@ -82,6 +82,25 @@ static bool CheckpointCheckHeader(int height, const uint256& headerHash) {
     return true;  // no checkpoint at this height
 }
 
+// LP-10 deliverable 0b: explicit-threshold construction. Delegates to the
+// production constructor so there is exactly ONE initialisation path (a second
+// copy would drift, and the genesis/mapHeaders seeding below is load-bearing),
+// then overrides the one value. nMinimumChainWork is write-once at construction
+// and read-only afterwards, so no lock is involved here or in the accessor.
+CHeadersManager::CHeadersManager(const uint256& minimum_chain_work)
+    : CHeadersManager()
+{
+    nMinimumChainWork = minimum_chain_work;
+}
+
+uint256 CHeadersManager::GetMinimumChainWork() const
+{
+    // Deliberately NOT taking cs_headers: the field is write-once at
+    // construction, and a lock here would be a deadlock hazard for any caller
+    // that already holds it (cs_headers is a non-recursive std::mutex).
+    return nMinimumChainWork;
+}
+
 CHeadersManager::CHeadersManager()
     : nBestHeight(-1)
 {
