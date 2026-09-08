@@ -1003,6 +1003,13 @@ genesis_all_networks_tests: $(CORE_OBJECTS) $(OBJ_DIR)/test/genesis_all_networks
 	@echo "$(COLOR_GREEN)✓ genesis_all_networks_tests built successfully$(COLOR_RESET)"
 
 # Phase 5 Day 5: regtest mode scaffold smoke test.
+# LP-10 A-9 (2026-09-08): TSan harness, concurrent-disconnect UAF. Build with
+# make TSAN=1 headerssync_disconnect_race_tsan  (Linux/WSL only; not MSYS2).
+headerssync_disconnect_race_tsan: $(CORE_OBJECTS) $(OBJ_DIR)/test/headerssync_disconnect_race_tsan.o $(DILITHIUM_OBJECTS) $(CHIAVDF_OBJECTS)
+	@echo "$(COLOR_BLUE)[LINK]$(COLOR_RESET) $@"
+	@$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS) $(LIBS)
+	@echo "$(COLOR_GREEN)✓ headerssync_disconnect_race_tsan built successfully$(COLOR_RESET)"
+
 # LP-10 deliverable 0b (2026-09-08): gate arming + armed-value reaches the gate.
 headerssync_gate_arming_tests: $(CORE_OBJECTS) $(OBJ_DIR)/test/headerssync_gate_arming_tests.o $(DILITHIUM_OBJECTS) $(CHIAVDF_OBJECTS)
 	@echo "$(COLOR_BLUE)[LINK]$(COLOR_RESET) $@"
