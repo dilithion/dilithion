@@ -3473,7 +3473,39 @@ void CHeadersManager::HeaderProcessorThread()
             std::cout << "[HeadersManager] Processing " << pending.headers.size()
                       << " headers from peer " << pending.peer_id << std::endl;
 
-        bool success = QueueHeadersForValidation(pending.peer_id, pending.headers);
+        // ====================================================================
+        // LP-10 §3 — THE PRESYNC CHAIN-WORK GATE, WIRED.
+        //
+        // This is the first production call site of the DoS-protected path.
+        // Until now InitializeDoSProtectedSync and ProcessHeadersWithDoSProtection
+        // had ZERO callers, so nMinimumChainWork was read into a member nothing
+        // used and the checks in headerssync.cpp were unreachable.
+        //
+        // WHY HERE. This is the live route (SetHeadersHandler ->
+        // QueueRawHeadersForProcessing -> HeaderProcessorThread -> here), and
+        // crucially cs_headers is NOT held at this point: the raw-queue lock
+        // above is scoped and released before this line. Both
+        // ShouldUseDoSProtection and ProcessHeadersWithDoSProtection take
+        // cs_headers themselves, and it is a NON-RECURSIVE std::mutex —
+        // calling them from anywhere holding it self-deadlocks. See the two
+        // BLOCKER-3 instances in the mission contract; this path has already
+        // produced that bug twice.
+        //
+        // POLICY (contract A-12, decided 2026-09-08): the gate applies ONLY to
+        // peers that trip ShouldUseDoSProtection — i.e. the IBD-ish cases it
+        // was designed for. It is deliberately NOT a work floor on every header
+        // message, which would reject ordinary tip announcements to an
+        // already-synced node. The consequence is an accepted, documented
+        // residual: a peer that does not trip that predicate takes the ungated
+        // path, bounded by the rate limit, MAX_HEADERS_BUFFER and
+        // PruneOrphanedHeaders rather than by chain work.
+        bool success;
+        if (ShouldUseDoSProtection(pending.peer_id)) {
+            m_gate_routed_batches.fetch_add(1, std::memory_order_relaxed);
+            success = ProcessHeadersWithDoSProtection(pending.peer_id, pending.headers);
+        } else {
+            success = QueueHeadersForValidation(pending.peer_id, pending.headers);
+        }
 
         // Decrement active workers and notify pause waiter if needed
         if (--m_active_workers == 0 && m_processing_paused.load()) {
