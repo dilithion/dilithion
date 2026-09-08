@@ -2,6 +2,7 @@
 // Distributed under the MIT software license
 
 #include <wallet/wallet.h>
+#include <core/chainparams.h>
 #include <crypto/sha3.h>
 
 #include <iostream>
@@ -434,7 +435,19 @@ bool TestTransactionCreation() {
 
     // Create transaction
     CAmount amount_to_send = 50000000;  // 0.5 DLT
-    CAmount fee = 1000;
+    // STALE EXPECTATION, fixed with the cite that actually FIRES. 1000 ions =
+    // 0.00001000 DIL, an order of magnitude below MIN_RELAY_FEE = 10000
+    // (amount.h:26), so CreateTransaction refused at wallet.cpp:4677 with
+    // "Fee below minimum relay fee". The expectation predates the fee policy.
+    //
+    // Note there are TWO similarly-named constants with the same value:
+    // MIN_RELAY_FEE (amount.h:26) and MIN_RELAY_TX_FEE (consensus/fees.h:20).
+    // Only the first one gates this path -- cite the one that fires, or the
+    // next person changes the other and wonders why nothing moves.
+    // Use the wallet's own estimator rather than a fresh hardcoded number --
+    // a literal here would go stale again the next time policy moves, and the
+    // sibling test at :538 in this same file was ALREADY migrated to it.
+    CAmount fee = CWallet::EstimateFee();
     CTransactionRef tx;
     std::string error;
     unsigned int current_height = 200;
@@ -684,6 +697,19 @@ int main() {
     cout << "Post-Quantum Transaction System" << endl;
     cout << "======================================" << endl;
     cout << endl;
+
+    // THE OTHER QUARANTINE CAUSE. Without this the suite fails with its own
+    // message -- "Transaction creation failed: Chain parameters not
+    // initialized" -- because CreateTransaction reaches consensus code that
+    // needs g_chainParams. Production initialises it at startup
+    // (dilithion-node.cpp:2249-2255); this harness never did. Same shape as
+    // rpc_tests (auth+permissions) and miner_tests (RandomX): the code
+    // correctly refuses to run uninitialised and the SUITE was quarantined for
+    // it. Regtest is the lightest of the three parameter sets.
+    if (Dilithion::g_chainParams == nullptr) {
+        Dilithion::g_chainParams =
+            new Dilithion::ChainParams(Dilithion::ChainParams::Regtest());
+    }
 
     bool allPassed = true;
 

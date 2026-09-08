@@ -3375,9 +3375,13 @@ load_genesis_block:  // Bug #29: Label for automatic retry after blockchain wipe
         std::cout << "  [OK] Block fetcher initialized (max 16 blocks in-flight)" << std::endl;
 
         // Bug #40 fix: Register HeadersManager callback for chain tip updates
-        g_chainstate.RegisterTipUpdateCallback([](const CBlockIndex* pindex) {
-            if (g_node_context.headers_manager && pindex) {
-                g_node_context.headers_manager->OnBlockActivated(pindex->header, pindex->GetBlockHash());
+        // P2P-14/15: takes the header and hash BY VALUE. The callback used to
+        // receive a CBlockIndex* and dereference it here; that pointer is now
+        // gone by construction, so this consumer can take cs_headers (inside
+        // OnBlockActivated) without inverting against cs_main.
+        g_chainstate.RegisterTipUpdateCallback([](const CBlockHeader& header, const uint256& hash) {
+            if (g_node_context.headers_manager) {
+                g_node_context.headers_manager->OnBlockActivated(header, hash);
             }
         });
         std::cout << "  [OK] Chain tip callback registered for HeadersManager" << std::endl;
