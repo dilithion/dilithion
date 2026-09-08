@@ -263,9 +263,67 @@ while IFS='|' read -r tier suite timeout reason; do
     if [ "$rc" -eq 0 ]; then
         printf '  [PASS      ] %-52s %4ds\n' "$suite" "$elapsed"
         RESULTS="${RESULTS}PASS|${suite}|${elapsed}|\n"
-    elif [ "$rc" -eq 124 ] || [ "$rc" -eq 137 ]; then
-        printf '  [TIMEOUT   ] %-52s %4ds  (limit %ss)\n' "$suite" "$elapsed" "$timeout"
-        RESULTS="${RESULTS}TIMEOUT|${suite}|${elapsed}|exceeded ${timeout}s\n"
+    # 143 is the one that actually happens here, and its absence meant EVERY
+    # HANG WAS REPORTED AS A TEST FAILURE.
+    #
+    # `timeout --preserve-status` (line ~207) deliberately returns the command's
+    # signal-derived status instead of timeout's own 124 — that is what the flag
+    # is for. A SIGTERM'd child is 128+15 = 143, so the common timeout never
+    # matched this branch and fell through to [FAIL] with "exit 143". Measured on
+    # this machine rather than read from the man page:
+    #
+    #   timeout --preserve-status -k 10 1 sleep 30   -> 143   (SIGTERM honoured)
+    #   timeout -k 10 1 sleep 30                     -> 124   (no --preserve-status)
+    #   ... with SIGTERM trapped and ignored         -> 137   (SIGKILL after -k)
+    #
+    # Why it matters beyond the label: a hang and a genuine assertion failure have
+    # completely different causes, and the RESULTS row drives the summary. Every
+    # TIMEOUT row was being emitted as FAIL|...|exit 143, so a suite that hung
+    # looked like a suite whose tests broke, and the TIMEOUT count was structurally
+    # always zero.
+    #
+    # 124 is currently unreachable while --preserve-status is set; it is kept so
+    # that removing that flag does not silently re-open the same hole in reverse.
+    #
+    # PLATFORM NOTE, corrected. An earlier revision of this comment attributed
+    # exit 124 to Windows/MSYS2, citing the tx_relay_tests roster row ("exit 124
+    # at 600s"). That attribution was never reproduced and is now contradicted:
+    # measured under this runner's exact flags, native PING.EXE returns 143 on
+    # both MSYS flavours, and 124 appears only WITHOUT --preserve-status -- a
+    # flag that predates the roster note. So the roster row most likely records
+    # a pre---preserve-status observation, not a platform difference. Both codes
+    # stay matched because either can occur depending on the flag, but 124 is
+    # NOT claimed to be "the Windows one".
+    # The exit code alone does NOT identify a hang. 143 is SIGTERM and 137 is
+    # SIGKILL from ANY source: a suite that raises SIGTERM on itself, or one the
+    # OOM killer takes, produces the same code as one `timeout` killed -- and
+    # would be filed as a hang that never happened. `elapsed` was already
+    # measured and simply never consulted.
+    #
+    # THE TOLERANCE IS 2 SECONDS -- not 15, and not zero. Both extremes were
+    # tried and both were wrong, so the reasoning is recorded here rather than
+    # left to be re-derived:
+    #
+    #   15s (first attempt) was BACKWARDS in effect. Subtracting a large slack
+    #   only widens the window in which a self-inflicted signal is mistaken for
+    #   a hang: a self-TERM at 46s under a 60s limit would have been filed as
+    #   TIMEOUT, which is the very confusion this check exists to remove.
+    #
+    #   0s is too tight to be safe. I observed a genuine hang under a 20s limit
+    #   report elapsed=19s and get classified FAIL. A later 47-sample run did
+    #   NOT reproduce that, so the mechanism is NOT the whole-second rounding I
+    #   first claimed -- treat the 19s as unexplained scheduling jitter rather
+    #   than a rounding law. Either way a threshold with zero margin turns any
+    #   such jitter into a misfiled hang, and the cost of 2s of margin is
+    #   nothing.
+    #
+    # 2s covers that sampling artefact and nothing else: it still rejects the
+    # 46s-under-60 self-TERM by a 12-second margin. This matters most for the
+    # crash-injection and shutdown suites, which kill themselves by design.
+    elif { [ "$rc" -eq 124 ] || [ "$rc" -eq 137 ] || [ "$rc" -eq 143 ]; } \
+         && [ "$elapsed" -ge $(( timeout > 2 ? timeout - 2 : 0 )) ]; then
+        printf '  [TIMEOUT   ] %-52s %4ds  (limit %ss, exit %s)\n' "$suite" "$elapsed" "$timeout" "$rc"
+        RESULTS="${RESULTS}TIMEOUT|${suite}|${elapsed}|exceeded ${timeout}s (exit ${rc})\n"
         FAILED=$((FAILED + 1))
         echo "  ---- tail of $log ----"
         tail -n 30 "$log" | sed 's/^/  | /'
