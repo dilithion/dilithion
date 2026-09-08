@@ -46,7 +46,20 @@ fi
 # 2. Exactly ONE TipNotifyDrain instantiation. More than one means a second
 #    drain point exists and this guard's reasoning no longer holds; zero means
 #    the fix has been reverted and every notification leaks.
-drains=$(grep -c "TipNotifyDrain drain(" "$CHAIN_CPP" 2>/dev/null)
+# ⚠️ TYPE-coupled, not NAME-coupled (confirmation-read MEDIUM-3, demonstrated).
+#
+# This used to be `grep -c "TipNotifyDrain drain("` — it counted only
+# instantiations literally named `drain` and constructed with `(`. A reviewer
+# mutation placed a SECOND drain named `d2` INSIDE a cs_main scope at
+# chain.cpp:2018 — which fires the callbacks with cs_main HELD and restores the
+# exact deadlock this branch removes — and this check printed
+# "PASS: ... exactly one TipNotifyDrain". The guard's stated claim was not the
+# property it enforced, in the line the branch itself calls the most fragile in
+# the fix.
+#
+# Now matches any identifier and both `(` and `{` initialisation, so a second
+# drain under any name is counted wherever it appears.
+drains=$(grep -cE 'TipNotifyDrain[[:space:]]+[A-Za-z_][A-Za-z0-9_]*[[:space:]]*[({]' "$CHAIN_CPP" 2>/dev/null)
 if [ "$drains" -ne 1 ]; then
     echo "FAIL: expected exactly 1 TipNotifyDrain instantiation in $CHAIN_CPP, found $drains"
     echo "      (0 = fix reverted, notifications leak; >1 = re-verify the reasoning in this script)"
@@ -58,7 +71,7 @@ fi
 #    these two lines are swapped the drain fires while cs_main is still held and
 #    the deadlock returns -- silently, with every test still green. This is the
 #    single most fragile line in the fix.
-drain_line=$(grep -n "TipNotifyDrain drain(" "$CHAIN_CPP" | head -1 | cut -d: -f1)
+drain_line=$(grep -nE "TipNotifyDrain[[:space:]]+[A-Za-z_][A-Za-z0-9_]*[[:space:]]*[({]" "$CHAIN_CPP" | head -1 | cut -d: -f1)
 abc_line=$(grep -n "bool CChainState::ActivateBestChain" "$CHAIN_CPP" | head -1 | cut -d: -f1)
 if [ -n "$drain_line" ] && [ -n "$abc_line" ]; then
     guard_line=$(awk -v s="$abc_line" 'NR>s && /lock_guard<std::recursive_mutex> lock\(cs_main\)/ {print NR; exit}' "$CHAIN_CPP")
@@ -102,7 +115,9 @@ for hdr in src/net/connman.h src/net/peers.h src/consensus/chain.h; do
         fail=1
         continue
     fi
-    if grep -qE '^\s*friend\b' "$hdr"; then
+    # LOW-2: match `friend` ANYWHERE on the line — `public: friend class X;`
+    # escaped the old ^\s*friend anchor (reviewer mutation M11).
+    if grep -qE '(^|[[:space:]:{])friend[[:space:]]' "$hdr"; then
         echo "FAIL: $hdr introduces a 'friend' declaration."
         echo "      The cs_headers edge census is 'complete by construction' ONLY while"
         echo "      cs_vNodes / cs_peers / cs_main are unreachable outside their own class."
@@ -113,7 +128,9 @@ for hdr in src/net/connman.h src/net/peers.h src/consensus/chain.h; do
 done
 
 # A public accessor handing out one of the mutexes breaks the premise the same way.
-if grep -nE '(std::)?(recursive_)?mutex\s*&\s*[A-Za-z_]+\s*\(' \
+# LOW-2: match BOTH `&` and `*`. A mutex handed out by POINTER escaped the
+# original reference-only regex (reviewer mutation M12 survived it).
+if grep -nE '(std::)?(recursive_)?mutex[[:space:]]*[&*][[:space:]]*[A-Za-z_][A-Za-z0-9_]*[[:space:]]*\(' \
         src/net/connman.h src/net/peers.h src/consensus/chain.h 2>/dev/null; then
     echo "FAIL: a header above appears to expose a mutex by reference."
     echo "      Same premise break as a friend declaration — see CENSUS §1."

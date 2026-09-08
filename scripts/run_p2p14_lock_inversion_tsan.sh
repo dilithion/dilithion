@@ -77,6 +77,45 @@ echo "unregistered EXIT=${rc_unregistered}"
 # NOTE FOR THE RED BASELINE: on an UNFIXED tree this script is now EXPECTED to
 # exit 1 — that is correct and is what makes it a regression test rather than a
 # demonstration. Do not "fix" that by relaxing this check.
+# ---------------------------------------------------------------------------
+# POSITIVE CONTROL (confirmation-read MEDIUM-1).
+#
+# The preflight above proves the TSan RUNTIME IS LINKED. It does NOT prove the
+# code under test was INSTRUMENTED, and it does not prove the harness did any
+# work. A reviewer demonstrated this: a three-line printf stub with no locks at
+# all, compiled with -fsanitize=thread, passed the preflight, ran clean, and
+# earned a full green "RESULT: PASS - both arms clean, zero inversions".
+#
+# The script's own header warns about exactly that ("a TSan build that silently
+# lost its instrumentation runs clean and looks identical to a pass") and then
+# implemented a weaker check than the one it described.
+#
+# So: require POSITIVE PROOF that the harness reached both edges. The registered
+# arm must report EDGE-B fired > 0 (the reverse edge into cs_headers actually
+# ran) and a non-zero forward-edge reach. An inert or uninstrumented binary
+# cannot produce those counters. Zero reachability is now a FAILURE, not a pass.
+reach_fail=0
+reg_out="/tmp/p2p14_registered.out"
+if [ -f "$reg_out" ]; then
+    edge_b=$(grep -oE 'callback fired=[0-9]+' "$reg_out" 2>/dev/null | grep -oE '[0-9]+' | head -1)
+    reach=$(grep -oE 'landed=[0-9]+' "$reg_out" 2>/dev/null | grep -oE '[0-9]+' | head -1)
+    edge_b=${edge_b:-0}
+    reach=${reach:-0}
+    echo "POSITIVE CONTROL: registered arm EDGE-B fired=${edge_b}  forward-edge landed=${reach}"
+    if [ "$edge_b" -eq 0 ]; then
+        echo "FAIL: registered arm never fired the tip callback — the reverse edge was NOT exercised."
+        echo "      A green result here would mean the harness did no work, not that the fix holds."
+        reach_fail=1
+    fi
+    if [ "$reach" -eq 0 ]; then
+        echo "FAIL: forward edge never reached — ProcessNewHeader did not run under cs_headers."
+        reach_fail=1
+    fi
+else
+    echo "FAIL: ${reg_out} missing — cannot prove the harness reached either edge"
+    reach_fail=1
+fi
+
 fail=0
 for arm in registered unregistered; do
     err="/tmp/p2p14_${arm}.err"
@@ -100,7 +139,7 @@ for arm in registered unregistered; do
     fi
 done
 
-if [ "$fail" -ne 0 ]; then
+if [ "$fail" -ne 0 ] || [ "$reach_fail" -ne 0 ]; then
     echo "RESULT: FAIL — the cs_headers lock-order cycle is present on this tree"
     exit 1
 fi
