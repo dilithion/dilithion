@@ -636,6 +636,19 @@ $(TEST_SUITES_ALL): | libzmq
 
 .PHONY: tests tests-build tests-fast tests-full
 
+# A-010 review LOW (a8, 2026-09-08): scripts/census_test_mains.sh had ZERO
+# callers -- an orphaned script inside the change that registers orphaned
+# suites. Giving it a target is the whole point: a diagnostic nobody can invoke
+# by name is one nobody runs.
+#
+# Not a roster row: it censuses SOURCE, it is not a test binary, and it must
+# never gate a PR. `make census-mains` is the documented way to re-derive the
+# assert()-behind-an-abort exposure after any roster change.
+.PHONY: census-mains
+census-mains:
+	@bash scripts/census_test_mains.sh --summary
+
+
 tests-build: $(TEST_SUITES_ALL)
 	@echo "$(COLOR_GREEN)✓ All test suites built (NOT run — use 'make tests')$(COLOR_RESET)"
 
