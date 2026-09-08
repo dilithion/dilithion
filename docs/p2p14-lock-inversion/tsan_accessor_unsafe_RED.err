@@ -1,0 +1,37 @@
+==================
+WARNING: ThreadSanitizer: data race (pid=140352)
+  Write of size 4 at 0x724400000104 by thread T2 (mutexes: write M0):
+    #0 CChainState::AddBlockIndex(uint256 const&, std::unique_ptr<CBlockIndex, std::default_delete<CBlockIndex> >) <null> (p2p14_lock_inversion_tsan_tests+0xb3fe4) (BuildId: 8fe161120f2af5fbc55793c303250cf8977f44d7)
+    #1 std::thread::_State_impl<std::thread::_Invoker<std::tuple<main::{lambda()#2}> > >::_M_run() <null> (p2p14_lock_inversion_tsan_tests+0x55aa2d) (BuildId: 8fe161120f2af5fbc55793c303250cf8977f44d7)
+    #2 <null> <null> (libstdc++.so.6+0xecdb3) (BuildId: 753c6c8608b61d4e67be8f0c890e03e0aa046b8b)
+
+  Previous read of size 4 at 0x724400000104 by thread T1:
+    #0 std::thread::_State_impl<std::thread::_Invoker<std::tuple<main::{lambda()#1}> > >::_M_run() <null> (p2p14_lock_inversion_tsan_tests+0x55a2ce) (BuildId: 8fe161120f2af5fbc55793c303250cf8977f44d7)
+    #1 <null> <null> (libstdc++.so.6+0xecdb3) (BuildId: 753c6c8608b61d4e67be8f0c890e03e0aa046b8b)
+
+  Location is heap block of size 320 at 0x724400000000 allocated by main thread:
+    #0 operator new(unsigned long) ../../../../src/libsanitizer/tsan/tsan_new_delete.cpp:64 (libtsan.so.2+0xa6fae) (BuildId: 2a13a7710e361d06f7babbea53065ca2be93f738)
+    #1 std::__detail::_MakeUniq<CBlockIndex>::__single_object std::make_unique<CBlockIndex>() <null> (p2p14_lock_inversion_tsan_tests+0x55acb0) (BuildId: 8fe161120f2af5fbc55793c303250cf8977f44d7)
+    #2 main <null> (p2p14_lock_inversion_tsan_tests+0x91860) (BuildId: 8fe161120f2af5fbc55793c303250cf8977f44d7)
+
+  Mutex M0 (0x7fffffffda10) created at:
+    #0 pthread_mutex_lock ../../../../src/libsanitizer/tsan/tsan_interceptors_posix.cpp:1341 (libtsan.so.2+0x59a13) (BuildId: 2a13a7710e361d06f7babbea53065ca2be93f738)
+    #1 CChainState::AddBlockIndex(uint256 const&, std::unique_ptr<CBlockIndex, std::default_delete<CBlockIndex> >) <null> (p2p14_lock_inversion_tsan_tests+0xb3dab) (BuildId: 8fe161120f2af5fbc55793c303250cf8977f44d7)
+    #2 main <null> (p2p14_lock_inversion_tsan_tests+0x9193f) (BuildId: 8fe161120f2af5fbc55793c303250cf8977f44d7)
+
+  Thread T2 (tid=140355, running) created by main thread at:
+    #0 pthread_create ../../../../src/libsanitizer/tsan/tsan_interceptors_posix.cpp:1022 (libtsan.so.2+0x5ac1a) (BuildId: 2a13a7710e361d06f7babbea53065ca2be93f738)
+    #1 std::thread::_M_start_thread(std::unique_ptr<std::thread::_State, std::default_delete<std::thread::_State> >, void (*)()) <null> (libstdc++.so.6+0xeceb0) (BuildId: 753c6c8608b61d4e67be8f0c890e03e0aa046b8b)
+    #2 __libc_start_call_main ../sysdeps/nptl/libc_start_call_main.h:58 (libc.so.6+0x2a1c9) (BuildId: 328820b908de8ea1ef79afa8995e302e819163d7)
+
+  Thread T1 (tid=140354, running) created by main thread at:
+    #0 pthread_create ../../../../src/libsanitizer/tsan/tsan_interceptors_posix.cpp:1022 (libtsan.so.2+0x5ac1a) (BuildId: 2a13a7710e361d06f7babbea53065ca2be93f738)
+    #1 std::thread::_M_start_thread(std::unique_ptr<std::thread::_State, std::default_delete<std::thread::_State> >, void (*)()) <null> (libstdc++.so.6+0xeceb0) (BuildId: 753c6c8608b61d4e67be8f0c890e03e0aa046b8b)
+    #2 __libc_start_call_main ../sysdeps/nptl/libc_start_call_main.h:58 (libc.so.6+0x2a1c9) (BuildId: 328820b908de8ea1ef79afa8995e302e819163d7)
+
+SUMMARY: ThreadSanitizer: data race (/tmp/a8tsan/p2p14_lock_inversion_tsan_tests+0xb3fe4) (BuildId: 8fe161120f2af5fbc55793c303250cf8977f44d7) in CChainState::AddBlockIndex(uint256 const&, std::unique_ptr<CBlockIndex, std::default_delete<CBlockIndex> >)
+==================
+ThreadSanitizer: reported 1 warnings
+[p2p14-tsan] arm=accessor-unsafe  tip callback NOT registered
+[p2p1415-accessor] arm=accessor-unsafe  pattern=GetBlockIndex + deref AFTER release (pre-fix)
+[p2p1415-accessor] reads=11668 writes=4000
