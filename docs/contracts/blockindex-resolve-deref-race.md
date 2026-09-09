@@ -31,7 +31,27 @@ Before that instant it is naked.
 | `src/node/dilithion-node.cpp:6622 → :6650` | same shape |
 | `src/node/dilv-node.cpp:6431 → :6459` | same shape |
 
-All four are **pre-existing** — they predate #129 and are not introduced by it.
+| `src/node/block_validation_queue.cpp` — `QueueBlock` | `GetBlockIndex(block.hashPrevBlock)` then `pParent->nStatus`, across a `cs_main` release. Found by the #129 non-author reader **in that PR's own file**. |
+
+All five are **pre-existing** — they predate #129 and are not introduced by it.
+
+## ⚠️ THE LIST ABOVE IS A FLOOR, NOT A CENSUS — and enumerating it is deliverable 0
+
+#129 first said "four more sites". The reader then found a fifth *in the file #129
+was editing*. That is the `a-fix-aimed-at-a-site-leaves-siblings` defect committed
+while citing the lesson, and it means a hand-listed set must not be trusted as
+complete a third time.
+
+There are **~61 `GetBlockIndex(` call sites** across `block_processing.cpp` (13),
+`block_validation_queue.cpp` (10), `dilithion-node.cpp` (14), `dilv-node.cpp` (12),
+`ibd_coordinator.cpp` (9), `headers_manager.cpp` (1) and `orphan_manager.cpp` (1),
+and they have never been swept for this shape.
+
+**Deliverable 0, before any fix:** a mechanical, grep-driven enumeration of every
+`GetBlockIndex(` call whose result is dereferenced or stored after the call
+returns — script-generated with its output committed, not another hand count. The
+fix list is then whatever that census produces. A site is cleared only by a written
+reason it cannot race, never by absence from a list somebody typed.
 
 ## Reachability, stated correctly
 
