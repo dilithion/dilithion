@@ -52,8 +52,27 @@ bool CBlockValidationQueue::Start() {
     // forgets it produces no error and no test failure; the pin just silently
     // never applies, and the queue path's safety argument loses its first link.
     //
-    // Assert it at the one moment it becomes load-bearing. Debug-only by
-    // construction, which is why the test objects force -UNDEBUG (see Makefile).
+    // ⚠️ A RUNTIME CHECK, NOT ONLY AN assert (external panel, grok). An assert is
+    // compiled out under NDEBUG, so in a production build a third wiring that
+    // forgot to register would fail SILENTLY — which is the exact failure this
+    // check exists to prevent, surviving in the exact build where it matters most.
+    // "Debug-only" would have made this guard theatre.
+    //
+    // Refuse to start rather than run unpinned: a queue whose blocks and parents
+    // can be evicted mid-validation is a liveness hazard under cap pressure, and
+    // starting anyway would hide a wiring bug behind intermittent stalls that look
+    // like network problems. Failing here is loud, immediate and attributable.
+    if (!m_chainstate.HasPendingBlockHashProvider()) {
+        std::cerr << "[ValidationQueue] FATAL: no PendingBlockHashProvider registered. "
+                  << "Eviction cannot pin queued/in-flight blocks or their parents, so "
+                  << "the queue path has no liveness pin. Register the provider in the "
+                  << "node wiring BEFORE starting the queue. Refusing to start."
+                  << std::endl;
+        m_watchdog.Stop();   // started above; do not leak it on this path
+        return false;
+    }
+    // Kept as well: in a debug build this aborts at the wiring site with the
+    // message attached, which is faster to diagnose than a false return.
     assert(m_chainstate.HasPendingBlockHashProvider() &&
            "PR #129: no PendingBlockHashProvider registered — eviction cannot pin "
            "queued/in-flight blocks or their parents, so the queue path's liveness "
@@ -543,15 +562,30 @@ bool CBlockValidationQueue::ProcessBlock(const QueuedBlock& queued_block) {
         // a scheduled chain halt — see the advisory-cap note below.
         //
         // ORDERING IS LOAD-BEARING: we run eviction BEFORE looking up this block's
-        // parent, and we resolve the parent by hash AFTER eviction. Eviction
-        // (clause (d)) pins all pending blocks' ancestors, but this block is not
-        // yet in mapBlockIndex (provider lookup misses it), so its parent is NOT
-        // pinned via this block. If we had captured pprev before eviction and
-        // eviction then freed the parent, that raw pointer would dangle — a NEW
-        // UAF. By resolving the parent only after eviction, we never hold a
-        // pre-eviction parent pointer across the eviction, and a parent freed by
-        // the cascade is observed as a clean null (fail-closed), exactly like the
+        // parent, and we resolve the parent by hash AFTER eviction. If we had
+        // captured pprev before eviction and eviction then freed the parent, that
+        // raw pointer would dangle — a NEW UAF. Resolving only after eviction
+        // means we never hold a pre-eviction parent pointer across the eviction,
+        // and a freed parent is observed as a clean null, exactly like the
         // BLOCKER-1 by-hash discipline.
+        //
+        // ⚠️ THE PARENT IS NOW PINNED TOO, AND THIS NOTE USED TO DENY IT. It read:
+        // "clause (d) pins all pending blocks' ancestors, but this block is not yet
+        // in mapBlockIndex (provider lookup misses it), so its parent is NOT pinned
+        // via this block." That was TRUE when written and is FALSE as of the
+        // round-2 fold: GetPendingBlockHashes now reports each pending block's
+        // hashPrevBlock, so clause (d) pins the parent BY HASH whether or not the
+        // child has an index entry — which is precisely this create-path case.
+        //
+        // Corrected rather than left standing, because a stale DENIAL is the
+        // dangerous direction: it reads as licence to remove the pin, and the next
+        // edit re-opens a hole that is currently closed. (External panel, grok.)
+        //
+        // The ordering above is still load-bearing and is NOT redundant with the
+        // pin: pinning stops the cascade freeing the parent, while resolve-after-
+        // evict is what makes a parent that was ALREADY gone — evicted before this
+        // block was ever queued — show up as a null instead of a stale pointer.
+        // Two different failures; keep both.
         // THE CAP IS ADVISORY HERE TOO — this must never reject a block.
         //
         // The version this replaces failed closed, and that was the single most

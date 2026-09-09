@@ -1289,6 +1289,104 @@ void test_high1_concurrent_evictor_cannot_free_unlinked_parent()
 }
 
 // ============================================================================
+// ============================================================================
+// Test 14 — the UNINDEXED queued child. Its parent must be pinned SOLELY by the
+// reported hashPrevBlock (external panel round 3, grok LOW).
+//
+// WHY THIS ARM DID NOT EXIST. Tests 9 and 10 both start with Q already in
+// mapBlockIndex, so clause (d)'s ancestor WALK does the pinning and the parent
+// hash is never load-bearing. The case round 2 actually fixed is the opposite
+// one: a queued block the create path has NOT yet indexed. There, the walk never
+// runs — `mapBlockIndex.find(h)` misses and the loop `continue`s — so before the
+// fix the parent was pinned by nothing at all and the create path could evict the
+// very parent it was about to resolve.
+//
+// The negative control is the whole test. Reporting only the child (the pre-fix
+// provider) MUST still free the parent; reporting the parent hash too MUST keep
+// it. Without the control, a green result cannot distinguish "the fix works" from
+// "nothing was evictable anyway".
+// ============================================================================
+void test_round2_unindexed_child_parent_pinned_by_hash_only()
+{
+    std::cout << "  test_round2_unindexed_child_parent_pinned_by_hash_only..." << std::flush;
+
+    for (int arm = 0; arm < 2; ++arm) {
+        const bool report_parent = (arm == 1);
+
+        CChainState chainstate;
+        ::dilithion::consensus::port::ChainSelectorAdapter adapter(chainstate);
+
+        uint256 null_hash;
+        std::memset(null_hash.data, 0, 32);
+        auto A = MakeHeader(null_hash, 0x1d00ffff, 1700000000, 0);
+        assert(adapter.ProcessNewHeader(A));
+        const uint256 hashA = A.GetHash();
+
+        // Active chain A -> M1 -> M2 (tip): pinned by clause (a).
+        uint256 prev = hashA;
+        uint256 hashM2;
+        for (int i = 1; i <= 2; ++i) {
+            auto M = MakeHeader(prev, 0x1d00ffff, 1700000000 + i,
+                                static_cast<uint8_t>(0x10 + i));
+            assert(adapter.ProcessNewHeader(M));
+            prev = M.GetHash();
+            hashM2 = prev;
+        }
+        CBlockIndex* idxM2 = chainstate.GetBlockIndex(hashM2);
+        assert(idxM2 != nullptr);
+        chainstate.SetTip(idxM2);
+
+        // Off-chain F, an unpinned leaf: NOT on the active chain, not a
+        // candidate, and not HAVE_DATA-without-validity, so (a), (b) and (c) all
+        // decline to pin it. Only clause (d) can.
+        auto F = MakeHeader(hashA, 0x1d00ffff, 1700000500, 0xF0);
+        assert(adapter.ProcessNewHeader(F));
+        const uint256 hashF = F.GetHash();
+        assert(chainstate.GetBlockIndex(hashF) != nullptr);
+
+        // Q is the queued child and is DELIBERATELY NEVER ADDED to mapBlockIndex
+        // — this is the create-path state, before the index entry exists.
+        auto Q = MakeHeader(hashF, 0x1d00ffff, 1700000501, 0xF1);
+        const uint256 hashQ = Q.GetHash();
+        assert(chainstate.GetBlockIndex(hashQ) == nullptr);  // the whole point
+
+        // The provider models GetPendingBlockHashes. Pre-fix it returned the
+        // child only; post-fix it returns the child AND its hashPrevBlock.
+        chainstate.RegisterPendingBlockHashProvider(
+            [hashQ, hashF, report_parent]() -> std::set<uint256> {
+                std::set<uint256> out{hashQ};
+                if (report_parent) out.insert(hashF);
+                return out;
+            });
+
+        // A, M1, M2 (pinned) + F = 4. Ask to drain to 3, which can only be met by
+        // freeing F.
+        assert(chainstate.GetBlockIndexSize() == 4);
+        chainstate.EvictLowestWorkLeafNotPinned(3);
+
+        CBlockIndex* idxF_after = chainstate.GetBlockIndex(hashF);
+        if (report_parent) {
+            // THE PROPERTY: the parent survives although its child has no entry,
+            // so the pin came from the reported hash and nothing else.
+            assert(idxF_after != nullptr);
+            assert(chainstate.GetBlockIndexSize() == 4);
+        } else {
+            // NEGATIVE CONTROL: the pre-fix provider frees the parent. If this
+            // ever stops failing, the test above has stopped proving anything.
+            assert(idxF_after == nullptr);
+            assert(chainstate.GetBlockIndexSize() == 3);
+        }
+
+        // Active chain intact in both arms.
+        assert(chainstate.GetBlockIndex(hashA) != nullptr);
+        assert(chainstate.GetBlockIndex(hashM2) != nullptr);
+
+        chainstate.RegisterPendingBlockHashProvider(nullptr);
+    }
+
+    std::cout << " OK\n";
+}
+
 int main()
 {
     std::cout << "Phase 6 PR6.1 — HeadersManager → chain_selector wiring tests\n";
@@ -1310,11 +1408,12 @@ int main()
         test_medium2_provider_unrelated_hash_does_not_overpin();
         test_blocker1_queue_path_cap_is_advisory();
         test_high1_concurrent_evictor_cannot_free_unlinked_parent();
+        test_round2_unindexed_child_parent_pinned_by_hash_only();
     } catch (const std::exception& e) {
         std::cerr << "\nFAILED: " << e.what() << "\n";
         return 1;
     }
 
-    std::cout << "\nAll 13 PR6.1 wiring tests passed.\n";
+    std::cout << "\nAll 14 PR6.1 wiring tests passed.\n";
     return 0;
 }

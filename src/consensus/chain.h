@@ -945,11 +945,29 @@ public:
      * unbounded store. Caught by the non-author reader.)
      *
      * WHAT BOUNDS THE PINNED SET, since an advisory cap makes it the real memory
-     * floor: both m_setBlockIndexCandidates.insert sites (chain.cpp:761 and
-     * :3109, a complete census) are gated by IsBlockACandidateForActivation, so
-     * header spam CANNOT grow it — pinning an entry costs a fully validated block
-     * at the real difficulty. If that gate ever admits header-only entries, the
-     * advisory cap becomes remotely exhaustible.
+     * floor: every m_setBlockIndexCandidates.insert — there are exactly two, the
+     * useNewPath arm of the connect path and RecomputeCandidates() — is gated by
+     * IsBlockACandidateForActivation, which requires
+     * >= BLOCK_VALID_TRANSACTIONS. Header spam CANNOT grow the pinned set.
+     *
+     * WHAT IT DOES COST, stated at the weaker true value: PoW-valid BLOCK DATA at
+     * the fork point's difficulty, pinned only TRANSIENTLY until activation
+     * resolves the entry. NOT "a fully validated block at the real difficulty",
+     * which is what this paragraph used to claim and which overstates the barrier
+     * — MarkBlockReceived() (block_index.h) sets BLOCK_HAVE_DATA and raises
+     * validity to BLOCK_VALID_TRANSACTIONS in ONE op ON RECEIPT, and the
+     * connect-path insert runs before ConnectTip has ruled on the block. The
+     * "not remotely exhaustible" conclusion survives; the margin is smaller than
+     * the old wording implied, so size the pinned set with the weaker number.
+     *
+     * If that gate ever admits header-only entries, the advisory cap becomes
+     * remotely exhaustible and this argument has to be redone.
+     *
+     * (Cited BY SYMBOL. This paragraph previously gave line numbers — chain.cpp:761
+     * and :3109 — which had drifted TWICE within this PR by the time a reviewer
+     * read them. The chain.cpp twin of this text was corrected first and this
+     * header copy was missed, which is the same leaves-siblings shape the PR keeps
+     * producing; both are now symbol-cited so neither can drift again.)
      *
      * ALGORITHM: build an in-degree map over mapBlockIndex (how many entries
      * name each node as pprev), build the pinned set, then evict eligible
