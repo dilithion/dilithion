@@ -237,6 +237,67 @@ private:
     std::map<const CBlockIndex*, size_t> m_inDegree;
     std::set<CBlockIndex*, LeafWorkOrder> m_evictableLeaves;
 
+    // ========================================================================
+    // DEFERRED RECLAMATION — the graveyard.
+    //
+    // WHAT IT IS FOR. 62 call sites resolve a CBlockIndex* under cs_main and use
+    // it after the lock is released (census: scripts/census_blockindex_pointer_
+    // windows.py). Guarding all 62 is a fix aimed at consumers when the defect has
+    // ONE producer: eviction is the only runtime free. Eviction now UNLINKS
+    // immediately — out of mapBlockIndex, the leaf index, the in-degree map and
+    // the candidate set, so a by-hash re-resolve returns null exactly as today —
+    // and the MEMORY is released only at a point where no thread can still hold a
+    // pointer to it. Every one of those 62 windows then points at memory that
+    // stays valid for the duration of the call.
+    //
+    // ⚠️ THIS IS NOT SUFFICIENT ON ITS OWN, AND THE ORDER MATTERS.
+    //   * A grace period protects a pointer held by a THREAD.
+    //   * It does NOTHING for a pointer stored in the GRAPH: if an interior node X
+    //     is freed while a child C has C->pprev == X, deferring the free only
+    //     moves WHEN C->pprev dangles, because C->pprev is not transient.
+    // Leaf-only eviction (#129) is what makes an entry safe to free AT ALL; this
+    // makes the timing safe. Both are required and neither substitutes.
+    //
+    // WHY AN EPOCH AND NOT A TIMER. A wall-clock grace is an assumption about
+    // worst-case call duration, and the ProcessBlock path alone contains a LevelDB
+    // write — milliseconds, bounded above by nothing in this repo. A stalled VM, a
+    // slow disk or a debugger silently violates it and the failure is a
+    // use-after-free. An epoch bound is a proof: each participating thread bumps
+    // its counter at a point where it provably holds no CBlockIndex*, and an entry
+    // is freed only once EVERY registered thread has moved past the epoch in which
+    // it was unlinked. See docs/contracts/deferred-reclamation-quiescence-proof.md
+    // for the thread-by-thread table of those points.
+    struct GraveyardEntry {
+        std::unique_ptr<CBlockIndex> node;   // owned, unlinked, not yet freed
+        uint64_t unlinked_epoch;             // global epoch at unlink time
+    };
+    std::vector<GraveyardEntry> m_graveyard;
+
+    // Bumped by each participating thread at its call boundary; the drain frees
+    // entries older than the minimum across all of them.
+    std::atomic<uint64_t> m_globalEpoch{1};
+
+public:
+    /**
+     * Bump this thread's epoch. Called at the boundary where the calling thread
+     * provably holds no CBlockIndex* — see the quiescence proof for which point
+     * that is per thread. Cheap: one relaxed atomic store into a thread-local.
+     */
+    void EpochCheckpoint();
+
+    /**
+     * Free graveyard entries that every participating thread has moved past.
+     * Safe to call from anywhere; takes cs_main. Returns the number freed.
+     */
+    size_t DrainGraveyard();
+
+    /** Test/diagnostic: how many entries are unlinked but not yet freed. */
+    size_t GraveyardSize() const {
+        std::lock_guard<std::recursive_mutex> lock(cs_main);
+        return m_graveyard.size();
+    }
+private:
+
     // Maintain the two structures above. Called only from AddBlockIndex and the
     // evictor's erase; both hold cs_main.
     void LeafIndexOnInsert(CBlockIndex* pnew);

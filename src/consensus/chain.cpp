@@ -346,6 +346,138 @@ bool CChainState::HasBlockIndex(const uint256& hash) const {
 // and the nChainWork-immutability census that make this correct.
 // ============================================================================
 
+// ============================================================================
+// DEFERRED RECLAMATION. See chain.h for why this exists and why it needs
+// leaf-only eviction alongside it, and the quiescence proof doc for the
+// thread-by-thread table of checkpoint points.
+// ============================================================================
+
+namespace {
+
+// Per-thread epoch. A thread that has never checkpointed reads 0, which is
+// treated as "may hold anything" so nothing is ever freed on its account — the
+// safe direction. A thread only becomes a participant by checkpointing at least
+// once, which is exactly the point at which it starts making promises.
+//
+// The registry is a plain vector of pointers to the thread-locals plus a mutex.
+// It is written once per thread (first checkpoint) and read on every drain.
+struct EpochRegistry {
+    std::mutex mu;
+    std::vector<std::atomic<uint64_t>*> slots;
+};
+
+EpochRegistry& Registry()
+{
+    static EpochRegistry r;
+    return r;
+}
+
+thread_local std::atomic<uint64_t>* t_epoch_slot = nullptr;
+
+std::atomic<uint64_t>* MyEpochSlot()
+{
+    if (t_epoch_slot == nullptr) {
+        // Leaked deliberately: the slot must outlive the thread, because a drain
+        // on another thread may read it after this one exits. One machine word
+        // per participating thread, bounded by the thread count, freed at exit.
+        // Reclaiming it would need the very lifetime machinery this file exists
+        // to provide.
+        auto* slot = new std::atomic<uint64_t>(0);
+        {
+            std::lock_guard<std::mutex> lk(Registry().mu);
+            Registry().slots.push_back(slot);
+        }
+        t_epoch_slot = slot;
+    }
+    return t_epoch_slot;
+}
+
+}  // namespace
+
+void CChainState::EpochCheckpoint()
+{
+    // Publish "I am now at the current global epoch, and I hold no CBlockIndex*".
+    // acquire on the read / release on the store: a drain that observes this value
+    // must also observe everything this thread did before the checkpoint.
+    const uint64_t now = m_globalEpoch.load(std::memory_order_acquire);
+    MyEpochSlot()->store(now, std::memory_order_release);
+}
+
+size_t CChainState::DrainGraveyard()
+{
+    std::lock_guard<std::recursive_mutex> lock(cs_main);
+    if (m_graveyard.empty()) return 0;
+
+    // The minimum epoch across every registered thread. A thread sitting at 0 has
+    // never checkpointed, so it makes no promise and pins the whole graveyard —
+    // the SAFE direction, and it is why this returns 0 rather than freeing
+    // optimistically during startup before any thread has reached a boundary.
+    uint64_t safe_epoch = m_globalEpoch.load(std::memory_order_acquire);
+    {
+        std::lock_guard<std::mutex> lk(Registry().mu);
+        for (std::atomic<uint64_t>* slot : Registry().slots) {
+            const uint64_t v = slot->load(std::memory_order_acquire);
+            if (v < safe_epoch) safe_epoch = v;
+        }
+    }
+    if (safe_epoch == 0) return 0;   // some thread has never checkpointed
+
+    size_t freed = 0;
+    std::vector<GraveyardEntry> keep;
+    keep.reserve(m_graveyard.size());
+
+    for (auto& e : m_graveyard) {
+        // FREE WHEN EVERY THREAD HAS REACHED THE UNLINK EPOCH, NOT PASSED IT.
+        //
+        // ⚠️ This was `>=` and that is an off-by-one in the one rule the whole
+        // mechanism rests on, so it is worth stating exactly. A thread's slot
+        // holds the epoch at which it last stood at a boundary HOLDING NOTHING.
+        // If that value is >= the epoch in which the entry was unlinked, then at
+        // that boundary the thread held no pointer, and everything it has acquired
+        // since was resolved from a map the entry had already left. So reaching
+        // the unlink epoch is sufficient; requiring a strictly greater one meant
+        // nothing was ever freed until an unrelated later eviction bumped the
+        // counter again — the test caught it as "freed 0 after the checkpoint".
+        if (e.unlinked_epoch > safe_epoch) {
+            keep.push_back(std::move(e));   // some thread may still hold it
+            continue;
+        }
+
+        // ---- INVARIANTS AT THE MOMENT OF THE ACTUAL FREE ------------------
+        // Asserted, not argued. Each is a property the design depends on, and
+        // each would otherwise fail silently and much later.
+        CBlockIndex* n = e.node.get();
+
+        // (1) pnext is set only for active-chain members, and active-chain
+        //     ancestors are pinned by eviction clause (a), so an entry with pnext
+        //     set is never evictable. A walk from a graveyard entry therefore
+        //     terminates immediately rather than re-entering the live map.
+        ConsensusInvariant(n->pnext == nullptr);
+
+        // (2) pskip is inert repo-wide (only ever assigned nullptr or copied; no
+        //     BuildSkip exists). If BuildSkip is ever implemented this fires,
+        //     which is the point — it is a tripwire on a future change, not a
+        //     restatement of today.
+        ConsensusInvariant(n->pskip == nullptr);
+
+        // (3) NOTHING LIVE MAY STILL NAME IT AS pprev. Guaranteed by leaf-only
+        //     eviction (an entry with a surviving child has in-degree >= 1 and is
+        //     not a leaf), and asserted here rather than inherited — this
+        //     assertion is what makes the dependency on #129 visible if anyone
+        //     ever weakens it. O(n) and debug-only in spirit; the graveyard is
+        //     small and drains are rare relative to inserts.
+        for (const auto& kv : mapBlockIndex) {
+            ConsensusInvariant(kv.second->pprev != n);
+        }
+
+        e.node.reset();   // the actual free
+        ++freed;
+    }
+
+    m_graveyard.swap(keep);
+    return freed;
+}
+
 bool CChainState::LeafWorkOrder::operator()(const CBlockIndex* a,
                                             const CBlockIndex* b) const
 {
@@ -895,7 +1027,19 @@ bool CChainState::EvictLowestWorkLeafNotPinned(size_t target_max) {
         // "second and last" this used to claim.
         LeafIndexOnErase(victim);
 
-        mapBlockIndex.erase(victim_key);   // unique_ptr frees CBlockIndex
+        // UNLINK NOW, FREE LATER. Previously `mapBlockIndex.erase()` destroyed the
+        // CBlockIndex here, which is what makes the 62 resolve-then-use windows a
+        // use-after-free. The entry leaves every structure immediately — so a
+        // by-hash re-resolve returns null exactly as before, and nothing reachable
+        // from the map points at it — but the memory is handed to the graveyard
+        // and released only once every participating thread has passed this epoch.
+        {
+            auto node = std::move(mapBlockIndex[victim_key]);
+            mapBlockIndex.erase(victim_key);
+            m_graveyard.push_back(GraveyardEntry{
+                std::move(node),
+                m_globalEpoch.fetch_add(1, std::memory_order_acq_rel) + 1});
+        }
         evicted_any = true;
     }
 
