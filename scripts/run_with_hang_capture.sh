@@ -56,6 +56,19 @@ CMD_NAME="$(basename "$1")"
 #
 # Snapshotting removes both failure modes and still detects PID reuse: a
 # recycled PID running something else will not match the comm we recorded.
+# NO /proc, NO WATCHDOG -- and it must SAY SO rather than run inert.
+# MSYS2/Git Bash has no /proc/<pid>/comm, so EXPECT_COMM comes back empty, the
+# guard can never match, and the watchdog silently never fires: measured on
+# Windows as an 8s hang against a 2s budget returning rc=0 with no artifact.
+# An instrument that quietly does nothing on a whole platform is worse than one
+# that is absent, because its silence is read as "no hang happened".
+if [ ! -r "/proc/$CMD_PID/comm" ]; then
+    echo "run_with_hang_capture: no /proc/<pid>/comm on this platform (MSYS2/Git Bash?)." >&2
+    echo "run_with_hang_capture: the hang watchdog CANNOT ARM here; running the command unwatched." >&2
+    echo "run_with_hang_capture: a missing hang artifact from this run means nothing." >&2
+    wait "$CMD_PID"
+    exit $?
+fi
 EXPECT_COMM="$(cat /proc/$CMD_PID/comm 2>/dev/null || true)"
 
 (
@@ -76,6 +89,16 @@ EXPECT_COMM="$(cat /proc/$CMD_PID/comm 2>/dev/null || true)"
             done
             # gdb gets its OWN timeout: if it stalls on attach we ride to the job
             # ceiling and learn nothing, which is the failure this exists to end.
+            #
+            # ATTACH IS FROM A SIBLING SUBSHELL, not a parent, so it needs
+            # kernel.yama.ptrace_scope=0. ci.yml's "Install hang-capture
+            # tooling" step sets exactly that (`sudo sysctl -w
+            # kernel.yama.ptrace_scope=0`) alongside installing gdb, which is
+            # why attach succeeds there. Run this script OUTSIDE that workflow
+            # and a restrictive ptrace_scope will refuse the attach -- the
+            # artifact then says CAPTURE INCOMPLETE and the wchan table is the
+            # only stack evidence, which is the intended degradation rather
+            # than a silent one.
             echo "=== gdb: thread map + all backtraces ==="
             gdb_out="$(timeout -k 10 180 gdb -p "$CMD_PID" -batch \
                         -ex 'info threads' -ex 'thread apply all bt 25' 2>&1)"

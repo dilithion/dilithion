@@ -24,6 +24,16 @@ chk(){ if [ "$2" = "$3" ]; then echo "   PASS  $1"; P=$((P+1)); else echo "   FA
 
 [ -f "$RUNNER" ] || { echo "FAIL: runner not found at $RUNNER" >&2; exit 1; }
 
+# PLATFORM GATE. The watchdog needs /proc/<pid>/comm; MSYS2/Git Bash has none,
+# so run_with_hang_capture.sh correctly refuses to arm and runs the command
+# UNWATCHED. That makes the hang arms below not merely fail but BLOCK -- their
+# fixture sleeps 300s with nothing to kill it, three times over, and
+# `make tests-fast` on Windows would hang for a quarter of an hour before going
+# red. Skip them with a printed reason instead: a SKIP that says why is honest,
+# a hang that eventually fails is not.
+HAVE_PROC=0
+if [ -r "/proc/$$/comm" ]; then HAVE_PROC=1; fi
+
 mk() {   # mk <name> <body>
     local d="$1" name="$2" body="$3"
     printf '%s' "$body" > "$d/$name"
@@ -55,6 +65,9 @@ rm -rf "$d"
 
 echo
 echo "== A HANG MUST FAIL THE STEP -- the property the whole instrument rests on =="
+if [ "$HAVE_PROC" -eq 0 ]; then
+  echo "   SKIP  no /proc on this platform -- the watchdog cannot arm here, so these arms would block, not test"
+else
 d="$(mktemp -d)"
 mk "$d" hangs '#!/usr/bin/env bash
 sleep 300
@@ -79,9 +92,13 @@ if [ -s "$art" ]; then
         || { echo "   FAIL  artifact missing its header"; F=$((F+1)); }
 fi
 rm -rf "$d"
+fi
 
 echo
 echo "== an INCOMPLETE capture must say so, not look like a capture =="
+if [ "$HAVE_PROC" -eq 0 ]; then
+  echo "   SKIP  no /proc on this platform -- the watchdog cannot arm here, so these arms would block, not test"
+else
 # LOW-3. An artifact that exists is not the same as evidence obtained: a gdb
 # that cannot attach (ptrace_scope, not installed, a 180s stall) previously left
 # a file that looked like a successful capture and merely contained an error
@@ -106,9 +123,13 @@ if [ -s "$art" ]; then
         || { echo "   FAIL  a failed gdb attach reads as a successful capture"; F=$((F+1)); }
 fi
 rm -rf "$d"
+fi
 
 echo
 echo "== the watchdog must not outlive the command (a stray sleep holds the step open) =="
+if [ "$HAVE_PROC" -eq 0 ]; then
+  echo "   SKIP  no /proc on this platform -- the watchdog cannot arm here, so these arms would block, not test"
+else
 d="$(mktemp -d)"
 mk "$d" quick2 '#!/usr/bin/env bash
 exit 0
@@ -127,6 +148,7 @@ sleep 1
 leaked=$(pgrep -fc "sleep $BUDGET_MARK" 2>/dev/null); leaked=${leaked:-0}
 chk "no watchdog sleep is left behind after a fast command" "$leaked" "0"
 rm -rf "$d"
+fi
 
 echo
 echo "== the BUDGET arithmetic (ci_hang_budget.sh), which was also untestable inline =="
@@ -151,6 +173,38 @@ if [ -f "$B" ]; then
   esac
 else
   echo "   SKIP  ci_hang_budget.sh not present"
+fi
+
+echo
+echo "== the job ceiling must agree between ci.yml and the budget script =="
+# THIS ARM EXISTS BECAUSE THE 'SINGLE SOURCE' FIX WAS A BLOCKER.
+#
+# `timeout-minutes: ${{ env.JOB_CEILING_MIN }}` looks like it removes the
+# duplication. At job level GitHub accepts only the github / needs / strategy /
+# matrix / vars / inputs contexts there, so `env` is a WORKFLOW PARSE ERROR --
+# "Unrecognized named-value: 'env'" -- and GitHub then runs ZERO JOBS. The
+# document is structurally valid YAML, so a parser cannot see it; only an actual
+# run can. Merged, main would have had no CI at all.
+#
+# So the two literals stay and this arm ENFORCES their agreement, which is what
+# the expression was only pretending to do.
+CI_YML="$HERE/../.github/workflows/ci.yml"
+BUD="$HERE/ci_hang_budget.sh"
+if [ -f "$CI_YML" ] && [ -f "$BUD" ]; then
+  ci_min=$(awk '/^  build-and-test:/{f=1} f && /^    timeout-minutes:/{print $2; exit}' "$CI_YML")
+  sc_min=$(grep -oE 'JOB_CEILING_MIN:-[0-9]+' "$BUD" | head -1 | sed 's/.*://; s/^-//')
+  # (`cut -d- -f3` returned empty here: "JOB_CEILING_MIN:-45" has ONE dash, so
+  # field 3 does not exist. An extraction that silently yields "" makes the
+  # comparison below compare 45 against nothing and report a mismatch that is
+  # not real -- the arm would have cried wolf on every run.)
+  chk "ci.yml build-and-test ceiling ($ci_min) == budget script default ($sc_min)" "$ci_min" "$sc_min"
+  # And it must be a literal, not an expression GitHub will refuse.
+  case "$ci_min" in
+    ''|*[!0-9]*) echo "   FAIL  build-and-test timeout-minutes is not a plain integer: '$ci_min'"; F=$((F+1)) ;;
+    *)           chk "and it is a literal integer, not an \${{ }} expression" yes yes ;;
+  esac
+else
+  echo "   SKIP  ci.yml or ci_hang_budget.sh not reachable from here"
 fi
 
 echo

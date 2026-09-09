@@ -42,14 +42,22 @@ jobs:
     # 30 -> 45: the gcc/Release leg now also links and RUNS the standalone test
     # suites (make tests-fast). Measured locally: ~8s to link 45 suite binaries
     # on top of an already-built tree, ~55s to run the 31 live fast-tier suites.
-    env:
-      JOB_CEILING_MIN: 45
-    # LOW-1: the ceiling is defined ONCE. It used to appear here as a literal
-    # and again as `CEILING_SEC=$(( 45 * 60 ))` inside the watchdog, so a change
-    # to one silently desynchronised the other -- and the watchdog would then
-    # arm against a ceiling that no longer exists, which is the failure mode it
-    # was written to avoid.
-    timeout-minutes: ${{ env.JOB_CEILING_MIN }}
+    # LOW-1: the ceiling appears here and as JOB_CEILING_MIN's default in
+    # scripts/ci_hang_budget.sh, and the two MUST agree -- if they drift, the
+    # watchdog arms against a ceiling that no longer exists, which is the exact
+    # failure it was written to avoid.
+    #
+    # An `env`-expression tried to make this a single source and DOES NOT WORK:
+    # `timeout-minutes` at job level accepts only the github / needs / strategy
+    # / matrix / vars / inputs contexts, so `${{ env.JOB_CEILING_MIN }}` is a
+    # WORKFLOW PARSE ERROR -- "Unrecognized named-value: 'env'" -- and GitHub
+    # then runs ZERO JOBS. A YAML parser cannot see this: the document is
+    # structurally valid and only GitHub's context rules reject it, which is
+    # why it survived a parse-based check and was caught by an actual run.
+    #
+    # So the literal stays, and the agreement is ENFORCED instead of assumed:
+    # test_run_with_hang_capture.sh greps both and fails if they differ.
+    timeout-minutes: 45
 
     strategy:
       fail-fast: false
@@ -242,7 +250,7 @@ jobs:
         #      above that code named the failure it did not prevent.
         #
         # Both are fixed and pinned by scripts/test_run_with_hang_capture.sh
-        # (13 arms, including "a hang MUST fail the step" and "an incomplete
+        # (17 arms, including "a hang MUST fail the step" and "an incomplete
         # gdb capture must say so").
         BUDGET_SEC=$(bash scripts/ci_hang_budget.sh)
         ./scripts/run_with_hang_capture.sh "$BUDGET_SEC" test-hang-artifacts \
