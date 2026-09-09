@@ -31,6 +31,7 @@ HeadersSyncState::HeadersSyncState(
       m_params(params),
       m_chain_start_hash(chain_start_hash),
       m_chain_start_height(chain_start_height),
+      m_chain_start_work(chain_start_work),   // LP-10 A-2: RETAIN it; see the header
       m_minimum_required_work(minimum_work),
       m_commit_offset(std::random_device{}() % params.commitment_period),
       m_max_commitments(0),
@@ -116,7 +117,7 @@ HeadersSyncState::ProcessingResult HeadersSyncState::ProcessNextHeaders(
             if (ChainWorkGreaterOrEqual(m_current_chain_work, m_minimum_required_work)) {
                 std::cout << "[HeadersSyncState] Peer " << m_id
                           << " PRESYNC complete, transitioning to REDOWNLOAD" << std::endl;
-                m_download_state = State::REDOWNLOAD;
+                EnterRedownloadPhase();   // LP-10 A-2: reseeds all five fields
                 result.success = true;
                 result.request_more = true;  // Request headers again for phase 2
             } else {
@@ -147,7 +148,7 @@ HeadersSyncState::ProcessingResult HeadersSyncState::ProcessNextHeaders(
             std::cout << "[HeadersSyncState] Peer " << m_id
                       << " sufficient work demonstrated at height " << m_current_height
                       << ", transitioning to REDOWNLOAD" << std::endl;
-            m_download_state = State::REDOWNLOAD;
+            EnterRedownloadPhase();   // LP-10 A-2: reseeds all five fields
         }
 
         result.success = true;
@@ -215,6 +216,43 @@ uint32_t HeadersSyncState::GetPresyncTime() const {
 // ============================================================================
 // Phase 1: PRESYNC - Build Commitments
 // ============================================================================
+
+// LP-10 A-2 / blocker 2 — the reseed block upstream performs at this transition
+// (bitcoin-v28.0/src/headerssync.cpp:166-172), which our port dropped entirely.
+//
+// WHAT GOES WRONG WITHOUT IT. PRESYNC stores commitments at ABSOLUTE heights
+// (m_current_height starts at chain_start_height) while REDOWNLOAD checks them at
+// BUFFER-RELATIVE ones (m_redownload_buffer_last_height started at 0). The two
+// phases evaluate the SAME `% commitment_period == m_commit_offset` predicate at
+// heights offset by chain_start_height, so they agree ONLY when
+// chain_start_height is an exact multiple of the period — a 1-in-584 accident.
+// Every other start height checks commitments against the wrong headers and,
+// composed with the mismatch penalty, rejects honest peers.
+//
+// MEASURED (A-2): with a 54,000 start height REDOWNLOAD failed; with 53,728
+// (= 584 x 92) it passed, on the SAME binary and the SAME headers. After this
+// reseed both pass.
+//
+// The anchor fields matter as much as the height: without them the first
+// redownloaded header's hashPrevBlock was taken from the PEER's own header
+// (making the peer choose the anchor) and m_redownload_buffer_last_hash was left
+// null, which made the continuity check unreachable for that first header.
+// Blocker 2 and the "unanchored first header" note were ONE missing block.
+void HeadersSyncState::EnterRedownloadPhase()
+{
+    m_redownloaded_headers.clear();
+    m_redownload_buffer_last_height     = m_chain_start_height;
+    m_redownload_buffer_first_prev_hash = m_chain_start_hash;
+    m_redownload_buffer_last_hash       = m_chain_start_hash;
+    // The fifth field. Only expressible because m_chain_start_work is retained --
+    // m_current_chain_work has absorbed every PRESYNC header by now, so it is NOT
+    // a substitute. Reseeding here also RESTORES correctness after any PRESYNC
+    // mutation, which the constructor's value alone could not do: that value was
+    // correct at this point only by accident, since nothing happened to touch it.
+    m_redownload_chain_work             = m_chain_start_work;
+
+    m_download_state = State::REDOWNLOAD;
+}
 
 bool HeadersSyncState::ValidateAndStoreHeadersCommitments(
     const std::vector<CBlockHeader>& headers)
