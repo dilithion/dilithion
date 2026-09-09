@@ -222,8 +222,11 @@ bool CChainState::AddBlockIndex(const uint256& hash, std::unique_ptr<CBlockIndex
             // MAINTAINED RATHER THAN INVARIANT-KILLED, and the choice is
             // deliberate. No production caller adopts: ProcessNewHeader rejects
             // orphans, so pprev is null only for genesis, and this arm is
-            // defence-in-depth that add_block_index_flag_merge_tests Case 5
-            // exercises on purpose. Turning it into a hard invariant failure would
+            // defence-in-depth. (An earlier version of this comment said
+            // add_block_index_flag_merge_tests "Case 5" exercises it. IT DOES NOT:
+            // Case 5 merges a null pprev with a null pprev, which never enters
+            // this arm -- its own note says so. Corrected rather than left, since
+            // a false citation is how a reviewer concludes a path is covered.) Turning it into a hard invariant failure would
             // convert a tolerated, currently-harmless case into a NODE ABORT the
             // first time some future orphan-handling change reached it. Three
             // lines of maintenance make it correct whether or not it ever fires;
@@ -274,11 +277,16 @@ bool CChainState::AddBlockIndex(const uint256& hash, std::unique_ptr<CBlockIndex
     //     the two OPERATIONS someone had in mind rather than for every mutation.
     //     The grep that finds all four:
     //       mapBlockIndex MEMBERSHIP  ->  grep 'mapBlockIndex\s*\(\.\(insert\|emplace\|erase\|clear\)\|\[\)'
-    //           chain.cpp:107   Cleanup()          clear()   -> clear both structures
-    //           chain.cpp:232   AddBlockIndex      insert    -> LeafIndexOnInsert
-    //           chain.cpp:757   evictor            erase()   -> LeafIndexOnErase
+    //           Cleanup()                     clear()  -> clear both structures
+    //           AddBlockIndex                 insert   -> LeafIndexOnInsert
+    //           EvictLowestWorkLeafNotPinned  erase()  -> LeafIndexOnErase
     //       pprev GRAPH of a LIVE member  ->  grep '\->pprev\s*='
-    //           chain.cpp:167   AddBlockIndex      merge-adopt -> in-degree + leaf erase
+    //           AddBlockIndex merge arm       adopt    -> in-degree + leaf erase
+    //     (BY SYMBOL, NOT BY LINE. This block cited :107/:232/:757/:167; by the
+    //      time a reviewer read it the actual lines were :108/:268/:890/:203. All
+    //      four drifted inside this PR, which is the third time line cites have
+    //      gone stale here -- a stale cite in a safety census sends the next
+    //      person to innocent code.)
     //     A pprev written on a NEW index BEFORE AddBlockIndex (block_processing.cpp and
     //     friends) is NOT a maintenance site: the entry is not in the map yet, and
     //     LeafIndexOnInsert reads its pprev when it arrives. Only mutations of an entry

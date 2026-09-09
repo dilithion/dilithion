@@ -100,8 +100,23 @@ for t in "${TARGETS[@]}"; do
     # status (143 = SIGTERM, 137 = SIGKILL; NOT 124 — see
     # lesson_timeout_exit_codes_143), so those are treated as failures explicitly
     # rather than trusted to be non-zero.
+    # ELAPSED TIME, NOT JUST THE EXIT CODE (round-6 confirming reader, measured).
+    # A suite that CATCHES SIGTERM and exits 0 promptly is reported PASS by any
+    # rc-only check — the deadline fired, the run did not complete on its own
+    # terms, and the exit code says success. So the wall clock is the authority:
+    # if it took at least the deadline, it FAILED, whatever it returned.
+    __t0=$(date +%s)
     timeout -k 30 --preserve-status "${SUITE_TIMEOUT:-600}" ./"$t" > "/tmp/${t}.out" 2>&1
     rc=$?
+    __elapsed=$(( $(date +%s) - __t0 ))
+    if [ "$__elapsed" -ge "${SUITE_TIMEOUT:-600}" ]; then
+        printf '   FAIL  %-52s DEADLINE: ran %ss >= %ss limit (rc=%s)
+'                "$t" "$__elapsed" "${SUITE_TIMEOUT:-600}" "$rc"
+        echo "         rc=0 here would mean the suite CAUGHT the kill signal and"
+        echo "         exited cleanly — that is still a deadline failure."
+        fail=$((fail + 1))
+        continue
+    fi
     if [ "$rc" -eq 143 ] || [ "$rc" -eq 137 ] || [ "$rc" -eq 124 ]; then
         printf '   FAIL  %-52s DEADLINE EXPIRED after %ss (rc=%s)
 '                "$t" "${SUITE_TIMEOUT:-600}" "$rc"
