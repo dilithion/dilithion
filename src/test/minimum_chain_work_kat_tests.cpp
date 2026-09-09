@@ -33,14 +33,17 @@
 //
 // ⚠️ SEEDING IS FIXED IN THIS COMMIT (LP-10 §2.0), and this comment used to say
 // otherwise. These thresholds are ABSOLUTE sums from genesis; HeadersSyncState
-// formerly zeroed its accumulator while starting from the LOCAL TIP, which would
-// have stalled header sync on any node whose tip already carried a threshold's
-// worth of work. Precisely: the old comparison failed whenever the RECEIVED
-// SUFFIX carried less than a full threshold, however much our tip already had --
-// "any non-fresh node" and "any node past the threshold" were both overclaims.
-// It now takes a REQUIRED
-// chain_start_work and seeds from it. Flagged by all three external seats as
-// same-commit comment rot -- the defect this mission polices.
+// formerly zeroed its accumulator while starting from the LOCAL TIP, so the old
+// comparison FAILED WHENEVER THE RECEIVED SUFFIX CARRIED LESS THAN A FULL
+// THRESHOLD OF WORK, however much our own tip already had. It now takes a
+// REQUIRED chain_start_work and seeds from it.
+//
+// (This paragraph is stated once, positively, because its previous three
+// revisions each ASSERTED a tip-based claim and then retracted it in the next
+// sentence -- "any node with history", "any non-fresh node", "any node whose tip
+// carries a threshold". Assert-then-retract is the same stale-lead shape as an
+// outright wrong comment: a reader who stops at the first sentence gets the
+// wrong invariant. Flagged across five external rounds.)
 //
 // This suite pins the constants and the UNITS so that when the wiring lands,
 // the numbers it enforces are the measured ones.

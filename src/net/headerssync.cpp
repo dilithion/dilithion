@@ -48,12 +48,20 @@ HeadersSyncState::HeadersSyncState(
     // ChainWorkGreaterOrEqual(m_current_chain_work, m_minimum_required_work)
     // ask "has this peer supplied a whole threshold's worth of NEW work beyond
     // our tip?" rather than "does this chain exceed the absolute minimum?".
-    // Against an absolute, from-genesis nMinimumChainWork that is never true on
-    // a node whose local tip already carries a threshold's worth of work
-    // (NOT "any node with history" -- a node just past genesis can still receive
-    // enough new work to pass; the defect is demanding a FULL threshold of
-    // ADDITIONAL work): PRESYNC never reaches REDOWNLOAD,
+    // Against an absolute, from-genesis nMinimumChainWork that is FALSE WHENEVER
+    // THE RECEIVED SUFFIX CARRIES LESS THAN A FULL THRESHOLD OF WORK, however
+    // much our own tip already has: PRESYNC never reaches REDOWNLOAD,
     // pow_validated_headers stays empty, and header sync stalls.
+    //
+    // (Three earlier wordings of this sentence were wrong in the same direction
+    // -- "any node with history", then "any non-fresh node", then "any node
+    // whose tip already carries a threshold". All three are refuted by the same
+    // counterexample: a node at or past the threshold still PASSES if the peer
+    // supplies a full threshold of NEW work. This site was the FIFTH sibling of
+    // that fix, found by all three external seats after the .h twin, the seeding
+    // suite and the KAT had already been corrected -- the same
+    // fix-the-named-site-miss-the-siblings defect, five times over. The
+    // invariant is about the SUFFIX, never about our tip.)
     //
     // Upstream Core seeds from chain_start->nChainWork. Both accumulators are
     // seeded, not just m_current_chain_work, so the REDOWNLOAD tally is on the
