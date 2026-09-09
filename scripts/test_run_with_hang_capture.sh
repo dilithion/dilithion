@@ -235,7 +235,7 @@ if [ -d "$WF" ] && git -C "$HERE/.." rev-parse --git-dir >/dev/null 2>&1; then
   for inv in $(grep -rh -v '^[[:space:]]*#' "$WF" \
                | grep -oE '\./scripts/[A-Za-z0-9._-]+\.sh' | sed 's|^\./||' | sort -u); do
     seen=$((seen + 1))
-    mode=$(git -C "$HERE/.." ls-files -s -- "$inv" 2>/dev/null | awk '{print $1}')
+    mode=$(git -C "$HERE/.." ls-tree HEAD -- "$inv" 2>/dev/null | awk '{print $1}')
     [ "$mode" = "100755" ] && continue
     grep -rqF "chmod +x $inv" "$WF" && continue
     echo "      $inv is mode ${mode:-UNTRACKED} in the index and no workflow chmods it"
@@ -251,10 +251,19 @@ echo "== the extracted scripts keep their executable bit in the index =="
 # Belt to the brace above. `bash <script>` makes the mode bit unnecessary, but a
 # future edit that switches back to `./` should find the bit already there.
 # A Windows commit that silently drops it reddens HERE rather than in CI.
+#
+# IT READS HEAD, NOT THE INDEX, AND THAT DISTINCTION IS THE WHOLE ARM.
+# The first version read `git ls-files -s` (the index) and would have passed
+# while the pushed commit was still 100644. On this repo core.fileMode=false, so
+# the working tree carries no bit to read; `git commit --only -- <paths>` then
+# re-reads those paths from the working tree and commits 644 even though
+# `git update-index --chmod=+x` had just put 755 in the index. That happened
+# here, once, and the index-reading arm did not notice. What a runner checks out
+# is HEAD, so HEAD is what has to be asserted.
 if git -C "$HERE/.." rev-parse --git-dir >/dev/null 2>&1; then
   for s in scripts/run_with_hang_capture.sh scripts/test_run_with_hang_capture.sh; do
-    m=$(git -C "$HERE/.." ls-files -s -- "$s" | awk '{print $1}')
-    chk "$s is 100755 in the index" "${m:-MISSING}" 100755
+    m=$(git -C "$HERE/.." ls-tree HEAD -- "$s" | awk '{print $1}')
+    chk "$s is 100755 in HEAD (what a fresh checkout gets)" "${m:-MISSING}" 100755
   done
 else
   echo "   SKIP  not a git checkout"
