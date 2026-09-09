@@ -22,7 +22,8 @@
 # Exit code: 0 = every arm as expected AND mutant killed AND control green.
 # Anything else = FAIL, with the first failing assertion printed.
 #
-# Needs: bash, coreutils timeout, mktemp. Runs anywhere (MSYS2 included); the
+# Needs: bash + coreutils only (timeout, mktemp, cksum, wc) — no diffutils.
+# Runs anywhere (MSYS2 included); the
 # wrapper's `hostname -I` and `ulimit` may complain on non-Linux — harmless.
 
 set -u
@@ -76,7 +77,10 @@ expect_loop() {
 mutant_check() {
     local wrapper="$1" binary="$2" tmp; tmp="$(mktemp -d)"
     sed 's/\[ "\$EXIT_CODE" -eq 1 \]; then/[ "$EXIT_CODE" -ne 1 ]; then/' "$wrapper" > "$tmp/mutant.sh"
-    if cmp -s "$wrapper" "$tmp/mutant.sh"; then
+    # cksum, not cmp: cmp is diffutils and absent on a stock MSYS2 (measured
+    # 2026-09-10); a missing cmp returns 127, which reads as "files differ" and
+    # silently disarms this guard.
+    if [ "$(cksum < "$wrapper")" = "$(cksum < "$tmp/mutant.sh")" ]; then
         fail "mutant: sed did not change the file — the branch text moved; update this check"
         return
     fi
