@@ -166,7 +166,16 @@ if [ -f "$B" ]; then
     *) echo "   FAIL  a spent budget armed silently -- a missing artifact would read as no-hang"; F=$((F+1)) ;;
   esac
   # No clock at all -> must not silently arm against a wrong elapsed time.
-  err=$(JOB_CEILING_MIN=45 bash "$B" 2>&1 >/dev/null)
+  #
+  # `env -u` IS LOAD-BEARING: THIS ARM DID NOT ESTABLISH ITS OWN PRECONDITION.
+  # ci.yml:83 writes JOB_START_EPOCH into $GITHUB_ENV, which makes it a job-wide
+  # variable for every later step -- including the one that runs this self-test.
+  # Merely NOT SETTING it here leaves the runner's value inherited, so the
+  # "missing clock" case was never actually constructed and the arm failed in CI
+  # while passing on every developer machine, where no such variable exists.
+  # An arm that assumes an absence instead of creating it is testing the
+  # environment, not the code.
+  err=$(env -u JOB_START_EPOCH JOB_CEILING_MIN=45 bash "$B" 2>&1 >/dev/null)
   case "$err" in
     *"JOB_START_EPOCH not set"*) chk "a missing job clock is called out, not assumed" yes yes ;;
     *) echo "   FAIL  a missing JOB_START_EPOCH was silently tolerated"; F=$((F+1)) ;;
