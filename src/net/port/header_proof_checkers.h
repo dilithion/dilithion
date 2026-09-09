@@ -68,6 +68,31 @@ public:
         if (!header.IsVDFBlock()) return false;        // wrong chain type
         if (header.vdfProofHash.IsNull()) return false;
         if (header.vdfOutput.IsNull()) return false;
+
+        // LP-10 A-2 / blocker 4 — nBits SANITY, added because its absence was a
+        // complete break of the header-sync work gate on DilV.
+        //
+        // MEASURED: this function used to examine only the version flag and two
+        // non-null fields, all peer-chosen, and never looked at nBits. Compose
+        // that with ComputeChainWork saturating to MAX on a zero MANTISSA
+        // (chain_work.h:44-47) and ONE fabricated header -- VDF version, two
+        // arbitrary non-null VDF fields, nBits = 0x1e000000 -- was worth maximum
+        // chain work and satisfied DilV's MEASURED nMinimumChainWork by itself:
+        // "sufficient work demonstrated at HEIGHT 1". The same single header with
+        // honest nBits did NOT open the gate, so the saturation was the cause.
+        //
+        // DIL was never exposed to this, and the reason is worth stating because
+        // it is not reassuring: RandomXHeaderProofChecker calls CheckProofOfWork,
+        // which rejects a zero TARGET (pow.cpp:139-149). The protection was an
+        // incidental consequence of that check, not a design decision, and it is
+        // one refactor away from being lost. So the guard belongs HERE too, at the
+        // chain-specific seam, not only in the caller.
+        //
+        // Note ChainWorkContribution below feeds the same nBits into
+        // ComputeChainWork, so a checker that validates the proof but not the
+        // work input is only half a checker.
+        if ((header.nBits & 0x00FFFFFFu) == 0) return false;
+
         // Full VDF verification deferred to CheckVDFProof at ConnectBlock —
         // the proof bytes aren't in the header layout.
         return true;

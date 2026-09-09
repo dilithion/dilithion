@@ -14,6 +14,44 @@
 #include <iostream>
 #include <random>
 
+namespace {
+
+// LP-10 A-2 / blocker 1 — reject nBits values that make chain-work accounting
+// meaningless, in BOTH phases.
+//
+// THE EXPLOIT THIS CLOSES, measured on DilV before this check existed:
+//   ComputeChainWork (consensus/chain_work.h:44-47) SATURATES to 0xFF..FF when
+//   the MANTISSA is zero. 0x1e000000 qualifies -- a non-zero WORD with a zero
+//   mantissa -- so it slipped past the old `nBits == 0` guard. One header with
+//   that nBits was therefore worth MAXIMUM possible chain work and satisfied
+//   DilV's measured nMinimumChainWork on its own: "sufficient work demonstrated
+//   at HEIGHT 1". The honest-nBits control did NOT open the gate, so the
+//   saturation was the cause and nothing else.
+//
+//   `nBits == 0` is the exact shape #189 proved insufficient in the census
+//   generator, where a 0x1e000000 hole passed until the gate was tightened to
+//   test the mantissa. Same defect, second location.
+//
+// WHY HERE AND NOT IN ComputeChainWork: that helper is shared consensus code used
+// for the real chain's work accounting. Changing its saturation behaviour is a
+// consensus change and out of scope. This rejects the input instead.
+//
+// CALLED FROM BOTH PHASES DELIBERATELY. PRESYNC had the weak guard; REDOWNLOAD
+// had NO nBits check at all while still accumulating work from the peer's raw
+// nBits. Guarding one and not the other is the sibling shape this mission keeps
+// hitting.
+bool NBitsIsSaneForWorkAccounting(uint32_t nBits)
+{
+    // Zero mantissa is the saturation trigger, and the only one:
+    // ComputeChainWork's other paths clamp rather than saturate.
+    if ((nBits & 0x00FFFFFFu) == 0) return false;
+    // A zero word is a subset of the above, kept explicit for readers.
+    if (nBits == 0) return false;
+    return true;
+}
+
+}  // namespace
+
 // ============================================================================
 // Constructor
 // ============================================================================
@@ -325,8 +363,9 @@ bool HeadersSyncState::ValidateAndProcessSingleHeader(const CBlockHeader& header
     }
 
     // 3. Basic sanity checks
-    if (header.nBits == 0) {
-        std::cerr << "[HeadersSyncState] Zero nBits" << std::endl;
+    if (!NBitsIsSaneForWorkAccounting(header.nBits)) {
+        std::cerr << "[HeadersSyncState] Rejecting header with unusable nBits 0x"
+                  << std::hex << header.nBits << std::dec << std::endl;
         return false;
     }
 
@@ -343,6 +382,19 @@ bool HeadersSyncState::ValidateAndProcessSingleHeader(const CBlockHeader& header
 // ============================================================================
 
 bool HeadersSyncState::ValidateAndStoreRedownloadedHeader(const CBlockHeader& header) {
+    // 0. LP-10 A-2 / blocker 1 — nBits sanity, BEFORE anything uses it.
+    //
+    // This phase previously had NO nBits check of any kind while still
+    // accumulating chain work from the peer's raw nBits below (m_redownload_chain_work).
+    // PRESYNC had the weak `nBits == 0` guard and this path had nothing, so a
+    // saturating nBits rejected in phase 1 would have been accepted in phase 2 --
+    // a guard present at one site and absent at its sibling.
+    if (!NBitsIsSaneForWorkAccounting(header.nBits)) {
+        std::cerr << "[HeadersSyncState] REDOWNLOAD: unusable nBits 0x"
+                  << std::hex << header.nBits << std::dec << std::endl;
+        return false;
+    }
+
     // 1. Phase 3: route through IHeaderProofChecker if injected (same
     // pattern as ValidateAndProcessSingleHeader above).
     uint256 hash = header.GetHash();
