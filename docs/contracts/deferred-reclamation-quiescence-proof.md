@@ -3,6 +3,12 @@
 **Branch:** `fix/blockindex-deferred-reclamation`, cut from `0f6837d0` (#129's head).
 **Mandatory reader:** LP10 (A-5 owner).
 
+> **LEAF-ONLY EVICTION IS WHAT MAKES AN ENTRY SAFE TO FREE AT ALL. Deferred
+> reclamation only makes the TIMING safe.** A grace period protects a pointer held by
+> a THREAD; it does nothing for a pointer stored in the GRAPH. That is the whole
+> reason this is based on #129 rather than on `main`, and it is the first thing to
+> read here.
+
 ---
 
 ## ⚠️ BASE: THIS IS CUT FROM #129, NOT FROM `main`, AND THAT IS NOT A PREFERENCE
@@ -48,23 +54,50 @@ I would argue against.
 
 ## The threads that can hold a `CBlockIndex*`
 
-Censused from every `std::thread` spawned in production `src/`, filtered to those whose
-code reaches `GetBlockIndex(` / `GetTip(` / `LookupBlockIndex(`:
+Every `std::thread` spawned in production `src/`, filtered to those whose code
+reaches `GetBlockIndex(` / `GetTip(` / `LookupBlockIndex(`. Counts are from the
+tree-wide census (`census_blockindex_pointer_windows.py`), not from a hand list.
 
-| # | thread | where it resolves | call-boundary (where it provably holds none) |
-|---|---|---|---|
-| 1 | **P2P message handler** | `block_processing.cpp` (13 sites) | top of each message dispatch |
-| 2 | **Header validation thread** | `headers_manager.cpp` (5 sites) | top of each `ProcessHeaders` batch |
-| 3 | **Hash worker pool** (`m_hash_workers`, N = cores) | computes RandomX hashes; **does not resolve index pointers** | n/a — see below |
-| 4 | **Validation worker** (`m_worker`) | `block_validation_queue.cpp` (9 sites) | top of each `ProcessBlock` iteration |
-| 5 | **IBD coordinator** | `ibd_coordinator.cpp` (20 sites) | top of each coordinator tick |
-| 6 | **RPC/HTTP worker pool** (`m_workers`) | `rpc/server.cpp` (24), `rpc/rest_api.cpp` (1) | top of each RPC request |
-| 7 | **Main loop** | `dilithion-node.cpp` / `dilv-node.cpp` | top of each loop iteration |
-| 8 | **Cached-stats thread** | `api/cached_stats.cpp` | reads via RPC-style accessors; treat as (6) |
+| # | thread | spawn site | resolves | the point at which it provably holds none |
+|---|---|---|---|---|
+| 1 | P2P message handler | node main loop | `block_processing.cpp` (13) | top of each message dispatch |
+| 2 | Header validation | `headers_manager` validation thread | `headers_manager.cpp` (1) | top of each `ProcessHeaders` batch |
+| 3 | **Hash worker pool** (`m_hash_workers`, `hardware_concurrency`) | `headers_manager.h:911` | **none — takes header bytes, returns hashes** | n/a, and see the note below |
+| 4 | Validation worker | `block_validation_queue` `m_worker` | `block_validation_queue.cpp` (9) | top of each `ProcessBlock` iteration |
+| 5 | IBD coordinator | node main loop | `ibd_coordinator.cpp` (9) | top of each coordinator tick |
+| 6 | **RPC server** | `rpc/server.cpp:604` `m_serverThread` | `rpc/server.cpp` (6) | **completion of each request** — see below |
+| 7 | **RPC cleanup** | `rpc/server.cpp:614` `m_cleanupThread` | none observed | n/a |
+| 8 | **TxIndex sync** | `index/tx_index.cpp:559` `SyncLoop` | `tx_index.cpp` (4) | top of each height iteration |
+| 9 | **CoinStatsIndex sync** | `index/coinstatsindex.cpp:657` `SyncLoop` | `coinstatsindex.cpp` (4) | top of each height iteration |
+| 10 | Node main loop | `dilithion-node` / `dilv-node` | those files (26) | top of each loop iteration |
+| 11 | Cached stats | `api/cached_stats.cpp` | via RPC-style accessors | treat as (6) |
 
-**Thread 3 is listed to be excluded explicitly, not omitted.** The hash workers take
+**Thread 3 is listed to be EXCLUDED explicitly, not omitted.** The hash workers take
 header bytes and return hashes; they never touch `mapBlockIndex`. If that ever changes
-they must be added here — an omission would be invisible.
+they must be added here — an omission would be invisible, which is why the row exists.
+
+**Threads 6 and 7 have no "iteration".** RPC is request/response, so the boundary is
+request completion rather than a loop top. That is still a well-defined point — a
+handler cannot hold a pointer resolved during a request that has returned — but it
+means the epoch bump belongs at the dispatch boundary, not in a loop.
+
+**Threads 8 and 9 were flagged as "long-running loops over historical blocks — exactly
+the long-hold shape". Measured, they are not.** Both resolve and dereference within
+two to three lines (`tx_index.cpp:229-232`, `:240-243`: resolve, null-check,
+`GetBlockHash()`, done) and retain nothing across an iteration. `tx_index.cpp:564-567`
+documents the opposite discipline explicitly — `m_mutex` must NOT be held across chain
+reads. So they are ordinary short windows at a high repetition rate, not long holds. The
+concern was reasonable and the code does not have that shape.
+
+**Thread 4 is covered twice over, and the second cover is the stronger one.** A queued
+block and its parent are reported by `GetPendingBlockHashes` and pinned by eviction
+clause (d), so eviction cannot free them while they are queued — **the queue path is
+protected by PINNING, not by grace.** That is what answers LP10's drain rule ("refuse to
+free while an entry enqueued before the epoch is in flight"): the pin makes the situation
+unreachable rather than merely survivable. It is also why the `queued_block.pindex`
+escape (`block_validation_queue.cpp:151` → `:166` → `:172` → the worker) is not a live
+UAF on this base, though it remains one on `main`, where neither the pin nor the by-hash
+re-resolve exists.
 
 ## The scheme: epoch counter, not a timer
 
