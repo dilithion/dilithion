@@ -65,8 +65,8 @@ enum class HeaderRejectReason {
     InvalidProof,                  // CheckHeaderProof returned false (PoW or VDF sanity) — weight 100
     InvalidHeaderFields,           // nBits == 0 or nVersion <= 0 — weight 50
     NonContinuousChain,            // hashPrevBlock mismatch — weight 20
-    InsufficientChainWork,         // PRESYNC ended below MIN_CHAIN_WORK — weight 50
-    RedownloadCommitmentMismatch,  // Q6=B: weight 100 (adversarial signal)
+    InsufficientChainWork,         // PRESYNC ended below MIN_CHAIN_WORK — weight 0 (honest-emittable)
+    RedownloadCommitmentMismatch,  // weight 0 — a REORG emits this; see HeaderRejectWeight below
     MemoryBoundExceeded,           // m_max_commitments cap hit — weight 20
     FutureTimestamp,               // wall-clock guard — weight 50
 };
@@ -90,17 +90,49 @@ MapHeaderRejectToMisbehaviorType(HeaderRejectReason reason)
     return T::UnknownMessage;  // unreachable; switch covers all values
 }
 
-// Special-case weights where DefaultWeight()'s coarse policy doesn't
-// reflect the granular reason. Q6=B: REDOWNLOAD commitment mismatch is
-// adversarial (peer sent us headers, we computed commitments, peer
-// then redownloaded different headers — active deception, not passive
-// validation failure). Bump it to 100 (immediate ban) regardless of the
-// underlying MisbehaviorType's default 50.
+// Special-case weights where DefaultWeight()'s coarse policy doesn't reflect
+// the granular reason.
+//
+// ⚠️ LP-10 A-2 / blocker 3 — TWO reasons now score ZERO, and this reverses an
+// earlier decision (Q6=B). Both were NEW POLICY WITH NO UPSTREAM COUNTERPART.
+// Measured by ENUMERATION, not by count: Bitcoin Core v28.0 net_processing.cpp
+// has 21 Misbehaving() call sites; NONE is for a low-work chain and NONE is for
+// a commitment mismatch. Core logs "Ignoring low-work chain (height=%u) from
+// peer=%d" and, on a !success return from ProcessNextHeaders, resets
+// m_headers_sync and erases the peer's presync stats. No scoring, no ban.
+//
+// WHY, under Will's standing rule (2026-07-05): ban only on a signal an HONEST
+// peer CANNOT emit; throttle or stop-serving otherwise.
+//
+//   InsufficientChainWork  — a chain below the threshold is indistinguishable
+//     from an honest peer on a losing fork, or one with nothing more to give.
+//
+//   RedownloadCommitmentMismatch — was 100 ("immediate ban") on the reasoning
+//     that a peer changing its story is distinguishable. IT IS NOT. A peer that
+//     REORGS between PRESYNC and REDOWNLOAD changes its story HONESTLY and emits
+//     exactly this signal: we record commitments against its phase-1 chain, then
+//     RE-REQUEST headers in phase 2 (headerssync.cpp NextHeadersRequestLocator)
+//     and compare against the OLD chain's commitments. The phase-1 window is
+//     thousands of headers — minutes, on 30s/45s block chains. Banning here is
+//     the honest-indistinguishable-signal misport, except we would have been
+//     INVENTING the ban rather than porting one.
+//
+// TO BAN HONESTLY HERE (prerequisite, not a task): record the tip the peer
+// ANNOUNCED in phase 1 and compare it in phase 2. A mismatch under an UNCHANGED
+// announced tip is the signal an honest peer cannot emit — a reorg changes the
+// announced tip, deception does not. That state does not exist today.
+//
+// A mismatch is a reason to distrust THIS SYNC ATTEMPT, not this PEER: the
+// caller resets the sync and stops syncing from that peer for this attempt.
+//
+// Status: PROPOSED (COORD ruling 2026-09-10, dissent adopted). No D- row yet, so
+// this comment cites the MEASUREMENT and the doctrine, never a ratification.
 constexpr int HeaderRejectWeight(HeaderRejectReason reason)
 {
     switch (reason) {
+        case HeaderRejectReason::InsufficientChainWork:
         case HeaderRejectReason::RedownloadCommitmentMismatch:
-            return 100;  // Q6=B override
+            return 0;  // honest-emittable: stop syncing, do not score
         default:
             return ::dilithion::net::port::DefaultWeight(
                 MapHeaderRejectToMisbehaviorType(reason));
