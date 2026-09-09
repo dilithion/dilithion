@@ -310,7 +310,7 @@ full|randomx_mode_test|1800||
 full|large_pages_optin_test|2100||
 full|wallet_encryption_at_rest_tests|300||
 full|batch_verifier_race_tests|300|TSAN-ONLY, and this is a vacuity quarantine rather than a failure. It PASSES without TSan (exit 0, 3.69s CPU) -- which is the problem: the race it exists to catch is only observable under -fsanitize=thread, so a plain PASS here would report coverage it does not have. Run it as the `batch_verifier_race_tests:` recipe documents: make TSAN=1 batch_verifier_race_tests. Its paired control batch_verifier_race_control is deliberately NOT rostered -- see the comment above the roster.|
-full|four_node_test|900|NOT A UNIT TEST: the target runs scripts/four_node_local.sh, which stands up a live 4-node regtest mesh (smoke 10 180). It needs ports, datadirs and ~3 minutes, and a failure means "the environment could not host a mesh" as often as "the code is wrong". Rostering it live would make every PR depend on local networking. It is registered here so it is COUNTED rather than invisible; run it deliberately with `make four_node_test`.|
+full|four_node_test|900|NOBUILD: this target is not a binary at all -- it is a PHONY whose recipe RUNS scripts/four_node_local.sh, standing up a live 4-node regtest mesh (smoke 10 180). That matters mechanically, not just descriptively: a quarantined row is still BUILT so it cannot rot, and "building" this one EXECUTES the mesh. Rostering it without NOBUILD made the CI build step run a 4-node harness and fail (Makefile:1154, Error 2, full-tier leg) -- caught by CI on the first push, which is the system working. NOBUILD keeps it COUNTED in the register while excluding it from --list, so nothing builds or runs it. Run it deliberately: make four_node_test.|
 '
 
 # ---------------------------------------------------------------------------
@@ -459,7 +459,15 @@ EOF
 fi
 
 if [ "$LIST_ONLY" -eq 1 ]; then
-    # NOBUILD: entries are excluded — their source does not compile, so adding
+    # NOBUILD: entries are excluded from the build list. TWO reasons qualify,
+    # and the second was learned the hard way on this branch:
+    #   1. the source no longer compiles, so building it breaks everyone;
+    #   2. "building" the target DOES something -- four_node_test is a PHONY
+    #      whose recipe stands up a live 4-node mesh. A quarantined row is still
+    #      BUILT so it cannot rot, so without NOBUILD the CI build step RAN the
+    #      mesh and failed.
+    # Either way the row stays in the register and is counted; it just does not
+    # reach the build list. Their source does not compile, so adding
     # them to the build list would break the build for everyone. partial: rows
     # are INCLUDED: they run, so they must be built.
     rows | grep -v '|NOBUILD:' | cut -d'|' -f2 | tr '\n' ' '
