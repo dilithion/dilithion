@@ -182,13 +182,31 @@ void test_header_reject_reason_maps_exhaustively()
     std::cout << " OK\n";
 }
 
-void test_header_reject_weights_match_q6()
+void test_header_reject_weights_honest_signals_score_zero()
 {
-    std::cout << "  test_header_reject_weights_match_q6..." << std::flush;
+    std::cout << "  test_header_reject_weights_honest_signals_score_zero..." << std::flush;
     using R = HeaderRejectReason;
-    // Q6=B override: REDOWNLOAD-commitment-mismatch bumped to 100.
-    assert(HeaderRejectWeight(R::RedownloadCommitmentMismatch) == 100);
-    // Other categories: defer to DefaultWeight.
+
+    // ⚠️ THIS TEST PREVIOUSLY PINNED THE OPPOSITE VALUE (Q6=B, weight 100) and
+    // was renamed rather than deleted, so the reversal is visible in history.
+    // LP-10 A-2 blocker 3 reversed it: both of these are signals an HONEST peer
+    // CAN emit, and Will's standing rule (2026-07-05) bans only on signals an
+    // honest peer CANNOT emit.
+    //
+    //   InsufficientChainWork -- indistinguishable from an honest peer on a
+    //     losing fork, or one with nothing more to give.
+    //   RedownloadCommitmentMismatch -- a peer that REORGS between PRESYNC and
+    //     REDOWNLOAD emits exactly this: commitments recorded against the
+    //     phase-1 chain, phase 2 re-requests and compares against the OLD ones.
+    //
+    // Measured by ENUMERATION: Core v28.0 net_processing.cpp has 21 Misbehaving()
+    // sites; none is for a low-work chain and none is for a commitment mismatch.
+    assert(HeaderRejectWeight(R::RedownloadCommitmentMismatch) == 0);
+    assert(HeaderRejectWeight(R::InsufficientChainWork) == 0);
+
+    // THE DISCRIMINATING HALF. Zeroing the two honest-emittable reasons must not
+    // quietly disarm the scorer: signals an honest peer genuinely cannot emit
+    // keep their weight. Without these, "everything scores 0" would pass.
     assert(HeaderRejectWeight(R::InvalidProof) == 100);  // InvalidPoW default
     assert(HeaderRejectWeight(R::MemoryBoundExceeded) == 20);  // OversizedMessage default
     assert(HeaderRejectWeight(R::NonContinuousChain) == 20);   // NonContinuousHeaders default
@@ -236,7 +254,7 @@ int main()
 
         std::cout << "\n--- MaybePunishNodeFor* enum bridges ---" << std::endl;
         test_header_reject_reason_maps_exhaustively();
-        test_header_reject_weights_match_q6();
+        test_header_reject_weights_honest_signals_score_zero();
         test_block_and_tx_reject_reasons_map_exhaustively();
 
         std::cout << "\n=== All Phase 3 HeaderProofChecker Tests Passed (10 tests) ===" << std::endl;
