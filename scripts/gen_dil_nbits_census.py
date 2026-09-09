@@ -105,8 +105,14 @@ def main():
             nbits = int(body, 16)
         except ValueError:
             die("line %d: unparseable nBits: %r" % (lineno, tok))
-        if nbits == 0:
-            die("line %d: nBits is zero (would saturate work to MAX)" % lineno)
+        # The MANTISSA, not the whole word. 0x1e000000 is non-zero, is inside the
+        # consensus window, and has mantissa 0 -- ComputeChainWork saturates to
+        # MAX work on it, which is precisely the failure this check exists to
+        # stop. Checking `nbits == 0` let that straight through. Found by an
+        # external seat; verified by hand that 0x1e000000 passed the old gate.
+        if (nbits & 0xFFFFFF) == 0:
+            die("line %d: nBits %s has a ZERO MANTISSA (would saturate work to "
+                "MAX)" % (lineno, tok))
         if nbits > 0xFFFFFFFF:
             die("line %d: nBits does not fit in 32 bits: %r" % (lineno, tok))
         # Consensus bounds from src/consensus/pow.h (MIN_DIFFICULTY_BITS /

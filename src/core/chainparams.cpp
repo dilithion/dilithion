@@ -151,16 +151,24 @@ ChainParams ChainParams::Mainnet() {
     // itself near-dead -- its only non-internal call site (:2536) is a fallback
     // taken when the async validation thread fails to start.
     //
-    // ⚠️ AND WIRING THIS VALUE IS NOT A ONE-LINE CHANGE. The threshold above is
-    // an ABSOLUTE sum from genesis, but HeadersSyncState starts its accumulator
-    // at ZERO (headerssync.cpp:42-44) from the LOCAL TIP, not genesis
-    // (InitializeDoSProtectedSync :752-753 uses hashBestHeader). Upstream seeds
-    // it from chain_start->nChainWork; this port does not. Comparing an
-    // absolute threshold against a tip-relative accumulator would demand a peer
-    // supply a whole checkpoint's worth of NEW work beyond our tip, which never
-    // happens -- header sync would stall on any non-fresh node. The accumulator
-    // seeding must be fixed, or this value redefined as relative, BEFORE the
-    // gate is wired. (Found by red-team, 2026-09-07; not by me.)
+    // SEEDING: FIXED IN THIS COMMIT (LP-10 §2.0). The threshold above is an
+    // ABSOLUTE sum from genesis. HeadersSyncState formerly zeroed its work
+    // accumulator while starting from the LOCAL TIP, which would have demanded a
+    // peer supply a whole checkpoint's worth of NEW work beyond our tip -- never
+    // true, so header sync would have stalled on any non-fresh node.
+    //
+    // That is no longer the case here: the constructor now takes a REQUIRED
+    // chain_start_work (no default -- a defaulted zero is exactly the bug) and
+    // seeds both accumulators from it, and InitializeDoSProtectedSync reads the
+    // cumulative work from mapHeaders, falling back to genesis work, and FAILS
+    // CLOSED rather than seeding zero. Upstream does the same
+    // (bitcoin-v28.0 headerssync.cpp:26-32, m_current_chain_work(chain_start->nChainWork)).
+    //
+    // ⚠️ This paragraph previously stated the defect as UNFIXED and was left
+    // unchanged when the fix landed in this same commit -- caught by all three
+    // external review seats. A comment asserting a state the code no longer has
+    // is the exact defect this mission exists to close, and a wiring PR would
+    // have copied it. What remains before wiring is CALL SITES, not seeding.
     //
     // Landing the constant now so the measurement is not lost; the
     // reject/accept test belongs with that wiring and must assert the WIRING,

@@ -821,8 +821,17 @@ bool CHeadersManager::InitializeDoSProtectedSync(NodeId peer, const uint256& min
     } else if (chainStartHeight == 0) {
         // Genesis is not necessarily in mapHeaders (it is not received over the
         // wire). Its cumulative work is its own block work.
-        chainStartWork = ::dilithion::consensus::ComputeChainWork(
-            Dilithion::g_chainParams ? Dilithion::g_chainParams->genesisNBits : 0);
+        // NOT `g_chainParams ? genesisNBits : 0`. A zero nBits has a zero
+        // mantissa, and ComputeChainWork SATURATES to MAX work on that -- so the
+        // IsNull() fail-closed check below would PASS and PRESYNC would start
+        // already above any threshold. That is fail-OPEN wearing a fail-closed
+        // comment, in the one function whose whole point is refusing to seed
+        // wrong. Found by two external seats. Leave chainStartWork null instead
+        // and let the refusal below fire.
+        if (Dilithion::g_chainParams != nullptr) {
+            chainStartWork = ::dilithion::consensus::ComputeChainWork(
+                Dilithion::g_chainParams->genesisNBits);
+        }
     }
 
     // FAIL CLOSED. Passing zero for an unknown start would silently reinstate

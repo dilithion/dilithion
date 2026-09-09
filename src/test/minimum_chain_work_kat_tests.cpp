@@ -26,10 +26,12 @@
 // LP-10 exists to close. That test belongs with the wiring, and must assert the
 // WIRING.
 //
-// ⚠️ AND SEE chainparams.cpp: wiring is NOT a one-line change. These thresholds
-// are ABSOLUTE sums from genesis, while HeadersSyncState zeroes its accumulator
-// (headerssync.cpp:42-44) and starts from the LOCAL TIP. Comparing the two
-// would stall header sync on any non-fresh node.
+// ⚠️ SEEDING IS FIXED IN THIS COMMIT (LP-10 §2.0), and this comment used to say
+// otherwise. These thresholds are ABSOLUTE sums from genesis; HeadersSyncState
+// formerly zeroed its accumulator while starting from the LOCAL TIP, which would
+// have stalled header sync on any non-fresh node. It now takes a REQUIRED
+// chain_start_work and seeds from it. Flagged by all three external seats as
+// same-commit comment rot -- the defect this mission polices.
 //
 // This suite pins the constants and the UNITS so that when the wiring lands,
 // the numbers it enforces are the measured ones.
