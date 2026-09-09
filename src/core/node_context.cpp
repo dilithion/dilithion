@@ -315,7 +315,25 @@ void NodeContext::Reset() {
     orphan_manager.reset();
     block_fetcher.reset();
     block_tracker.reset();  // IBD Redesign
-    // PR #129: clear the provider before destroying the queue (see Shutdown()).
+    // PR #129 round-2 (external panel, gpt6 HIGH): STOP THE WORKER BEFORE
+    // DEREGISTERING ITS PIN.
+    //
+    // This used to clear the provider first and then reset the queue, relying on
+    // the destructor's Stop() to join the worker. That leaves a window in which
+    // the worker is still inside ProcessBlock — cs_main released across ops, the
+    // in-flight block reachable by eviction — while its ONLY eviction pin has
+    // already been torn down. The block and its parent become evictable at the
+    // exact moment the code is about to resolve and use them.
+    //
+    // Shutdown() already had the correct order (Stop, then clear, then reset).
+    // Reset() did not. One fix, applied at one of two sibling teardown paths —
+    // so the order here is now identical to Shutdown()'s, deliberately.
+    //
+    // Stop() joins the worker thread, so once it returns nothing is in flight and
+    // removing the provider cannot strand anybody.
+    if (validation_queue) {
+        validation_queue->Stop();
+    }
     g_chainstate.RegisterPendingBlockHashProvider(nullptr);
     validation_queue.reset();  // Phase 2: Reset validation queue
     dna_registry.reset();  // Digital DNA

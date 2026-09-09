@@ -504,7 +504,8 @@ void test_evict_never_frees_referenced_parent()
 // the eviction pin clause (c) (`have_data && !fully_validated`) does NOT pin it
 // (verified below). It is also not yet a m_setBlockIndexCandidates member during
 // the cs_main-released wait, so clause (b) does not pin it either: it is an
-// evictable, in-degree-0 leaf — and the lowered 500K cap CAN free it.
+// evictable, in-degree-0 leaf — and eviction CAN free it at any configured cap
+// (this PR lowers none; header spam drives the map to the cap regardless).
 //
 // The fix that closes the UAF is block_validation_queue.cpp:363:
 //   pindex = m_chainstate.GetBlockIndex(blockHash);   // re-resolve by hash

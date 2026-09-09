@@ -356,11 +356,24 @@ bool CChainState::EvictLowestWorkLeafNotPinned(size_t target_max) {
     //     plus each one's pprev ancestors.
     //
     //     This is ADDITIVE liveness defense. It does NOT replace the worker's
-    //     by-hash re-resolve, which remains the authoritative correctness path:
-    //     pinning guards against EVICTION, not against the AddBlockIndex
-    //     flag-merge that can still destroy a specific unique_ptr and re-home the
-    //     canonical pointer for a hash. The cached QueuedBlock::pindex must stay
-    //     unread regardless of this pin (see the landmine ledger below).
+    //     by-hash re-resolve, which remains the authoritative correctness path —
+    //     but NOT for the reason this comment used to give.
+    //
+    //     ⚠️ CORRECTED (external panel round 2). It read: "pinning guards against
+    //     EVICTION, not against the AddBlockIndex flag-merge that can still
+    //     destroy a specific unique_ptr and re-home the canonical pointer for a
+    //     hash." AddBlockIndex does no such thing: its merge branch mutates the
+    //     EXISTING object in place and discards the incoming pindex, so the
+    //     mapped unique_ptr is never replaced and the address is stable. Pinned
+    //     by test_height_one_header_then_data_sequence
+    //     (add_block_index_flag_merge_tests.cpp), which asserts the pointer is
+    //     identical across a merge.
+    //
+    //     THE REAL REASON the re-resolve is mandatory: the cached
+    //     QueuedBlock::pindex was captured BEFORE this pin was established and
+    //     before any of it was checked, so it is a pointer of unknown provenance.
+    //     The re-resolve reads the pointer the pin actually protects. That is a
+    //     narrower claim than the old one and it is true.
     //
     //     Lock order: we already hold cs_main; the provider returns HASHES only
     //     (a pure read of queue state under the queue's own mutex), establishing
@@ -368,9 +381,23 @@ bool CChainState::EvictLowestWorkLeafNotPinned(size_t target_max) {
     //     and pprev walk below run under the cs_main we hold.
     if (m_pendingBlockHashProvider) {
         const std::set<uint256> pending = m_pendingBlockHashProvider();
+        // ⚠️ THE `continue` BELOW USED TO BE A HOLE, and the comment above used to
+        // claim it was not (external panel round 2: gpt6 HIGH, kimi MEDIUM, found
+        // independently). The walk starts at find(h), so a pending block that is
+        // NOT YET INDEXED — precisely the create-path case — pinned NOTHING: its
+        // ancestor walk never ran and its parent stayed evictable. The create path
+        // could therefore evict the very parent it was about to resolve. Safety
+        // held (resolve-after-evict sees a clean null, never a dangling pointer);
+        // LIVENESS did not — a valid competing fork stalls under cap pressure.
+        //
+        // Closed at the SOURCE rather than here: GetPendingBlockHashes now reports
+        // each pending block's hashPrevBlock as well, so the parent is pinned by
+        // HASH whether or not the child has an entry yet, and the walk below then
+        // covers the rest of that parent's chain. The `continue` is now what it
+        // always read as — a benign miss for a hash with no index entry.
         for (const uint256& h : pending) {
             auto it = mapBlockIndex.find(h);
-            if (it == mapBlockIndex.end()) continue;  // already gone / never indexed
+            if (it == mapBlockIndex.end()) continue;  // no entry for this hash yet
             // Pin the pending block AND walk its pprev chain (the cascade target),
             // using the same cycle-guarded idiom as clause (b). Stop as soon as we
             // reach an already-pinned ancestor (active chain / candidate) or null.
@@ -400,9 +427,12 @@ bool CChainState::EvictLowestWorkLeafNotPinned(size_t target_max) {
     //       queue's pending/in-flight blocks and their pprev ancestors so a
     //       cascade does not free a queued block's parent and stall fork
     //       adoption. Clause (d) is defense-in-depth for liveness — it does NOT
-    //       license re-reading the cached pindex (the flag-merge in AddBlockIndex
-    //       can still re-home the canonical pointer even for a pinned hash), so
-    //       the by-hash re-resolve remains mandatory.
+    //       license re-reading the cached pindex, so the by-hash re-resolve
+    //       remains mandatory. (The parenthetical here used to say the flag-merge
+    //       "can still re-home the canonical pointer even for a pinned hash".
+    //       That is FALSE — the merge mutates in place; see the correction at
+    //       clause (d) above. The re-resolve is mandatory because the cached
+    //       pointer predates the pin, not because the merge moves anything.)
     //   * block_index.h:17  CBlockIndex::pskip — INERT (never assigned; no
     //       BuildSkip exists). pskip is NOT counted in the in-degree map, so a
     //       node referenced only via some other node's pskip would be a freeable

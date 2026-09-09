@@ -1,8 +1,24 @@
 // Copyright (c) 2026 The Dilithion Core developers
 // Distributed under the MIT software license
 //
-// regtest_cap_rejection_tests — the mapBlockIndex cap rejects valid headers on
-// regtest at ordinary chain heights, with no attacker involved.
+// regtest_cap_rejection_tests — a linear chain longer than the mapBlockIndex cap
+// must be accepted in full.
+//
+// ⚠️ READ THE TWO SIDES BEFORE READING THE NARRATION BELOW. This file documents a
+// defect that exists on `main` and is FIXED on this branch, so the same source
+// behaves differently depending on where you build it:
+//
+//   on origin/main          EXIT 1 — the header at height 1000 is REJECTED
+//                           (index size 1000, cap 1000). The narration below
+//                           describes THIS.
+//   on this branch          EXIT 0 — 1002 headers accepted, an advisory NOTE on
+//                           stderr, nothing rejected. The cap no longer gates
+//                           chain progress.
+//
+// The assertion is written as the PROPERTY a node must have, not as the bug, so
+// it is red where the bug is and green where it is not — and it stays meaningful
+// as a regression guard rather than needing to be inverted when the fix lands.
+// Everything below describing a rejection is describing main.
 //
 // THE FINDING. Eviction is the only path that frees a CBlockIndex at runtime,
 // and it fires on one purely count-based condition

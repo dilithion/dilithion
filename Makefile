@@ -1371,7 +1371,20 @@ $(OBJ_DIR)/test/fuzz:
 # `-UNDEBUG` last on the command line makes the property hold by construction
 # instead of by inspection. Scoped to test objects only: whether production
 # builds keep asserts is a separate policy decision and is not changed here.
-$(OBJ_DIR)/test/%.o: CXXFLAGS += -UNDEBUG
+#
+# ⚠️ `override` IS THE LOAD-BEARING WORD, and its absence made the first version
+# of this line useless against the very vector the comment above names. A
+# variable set on the command line beats every assignment in the makefile,
+# INCLUDING a target-specific `+=`. Measured:
+#
+#   sub:          CXXFLAGS += -UNDEBUG   ->  make CXXFLAGS=cmdline  =>  "cmdline"
+#   sub2: override CXXFLAGS += -UNDEBUG  ->  make CXXFLAGS=cmdline  =>  "cmdline -UNDEBUG"
+#
+# So without `override`, `make CXXFLAGS=-DNDEBUG` silently dropped the -UNDEBUG
+# and voided all 23 assert-only suites — the exact scenario two paragraphs up.
+# A guard that does not cover the case its own comment cites is worse than none,
+# because the comment stops anyone looking again.
+$(OBJ_DIR)/test/%.o: override CXXFLAGS += -UNDEBUG
 
 # Compile C++ source files
 $(OBJ_DIR)/%.o: src/%.cpp | $(OBJ_DIR)/attestation $(OBJ_DIR)/consensus $(OBJ_DIR)/consensus/port $(OBJ_DIR)/core $(OBJ_DIR)/crypto $(OBJ_DIR)/db $(OBJ_DIR)/dfmp $(OBJ_DIR)/index $(OBJ_DIR)/kernel $(OBJ_DIR)/miner $(OBJ_DIR)/net $(OBJ_DIR)/net/port $(OBJ_DIR)/node $(OBJ_DIR)/primitives $(OBJ_DIR)/rpc $(OBJ_DIR)/wallet $(OBJ_DIR)/util $(OBJ_DIR)/api $(OBJ_DIR)/vdf $(OBJ_DIR)/digital_dna $(OBJ_DIR)/script $(OBJ_DIR)/policy $(OBJ_DIR)/tools $(OBJ_DIR)/x402 $(OBJ_DIR)/zmq $(OBJ_DIR)/test

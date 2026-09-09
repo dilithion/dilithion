@@ -45,6 +45,20 @@ bool CBlockValidationQueue::Start() {
     // (skipping is impossible - breaks blockchain connectivity since Block N+1's parent is Block N)
     m_watchdog.Start();
 
+    // PR #129 round-2 (external panel, kimi): the worker is about to rely on
+    // eviction clause (d) pinning its queued and in-flight blocks. That pin is
+    // delivered by a provider registered in the NODE WIRING
+    // (dilithion-node.cpp / dilv-node.cpp), not by this class — so a wiring that
+    // forgets it produces no error and no test failure; the pin just silently
+    // never applies, and the queue path's safety argument loses its first link.
+    //
+    // Assert it at the one moment it becomes load-bearing. Debug-only by
+    // construction, which is why the test objects force -UNDEBUG (see Makefile).
+    assert(m_chainstate.HasPendingBlockHashProvider() &&
+           "PR #129: no PendingBlockHashProvider registered — eviction cannot pin "
+           "queued/in-flight blocks or their parents, so the queue path's liveness "
+           "pin is absent. Register it in the node wiring before starting the queue.");
+
     m_running.store(true);
     m_worker = std::thread(&CBlockValidationQueue::ValidationWorker, this);
     return true;
@@ -174,6 +188,9 @@ bool CBlockValidationQueue::QueueBlock(int peer_id, const CBlock& block, int exp
         m_queue.push(queued_block);
         m_queued_heights.insert(expected_height);  // O(1) lookup for IsHeightQueued
         m_queued_hashes.insert(blockHash);          // PR #129 MEDIUM-2: pin source
+        // PR #129 round-2: the PARENT too, so clause (d) can pin it by hash even
+        // while this block itself is not yet in mapBlockIndex (the create path).
+        m_queued_parent_hashes.insert(block.hashPrevBlock);
     }
     queue_depth = GetQueueDepth();  // SSOT FIX #3: Reuse variable, don't redeclare
 
@@ -250,6 +267,25 @@ std::set<uint256> CBlockValidationQueue::GetPendingBlockHashes() const {
     if (m_has_inflight) {
         pending.insert(m_inflight_hash);
     }
+    // PR #129 round-2 (external panel, found independently by gpt6 and kimi):
+    // report each pending block's PARENT as well.
+    //
+    // Clause (d) pins a pending block and walks its pprev ancestors, but the walk
+    // begins at mapBlockIndex.find(h) and CONTINUEs on a miss. A queued block that
+    // is not yet indexed — the create-path case — therefore pinned nothing at all,
+    // so the create path could evict the very parent it was about to resolve.
+    // Emitting the parent hash pins it directly, independently of whether the
+    // child has an index entry yet, and clause (d)'s existing ancestor walk then
+    // covers the rest of that parent's chain.
+    //
+    // These are HASHES, not pointers, so a parent that genuinely does not exist
+    // simply misses the map and pins nothing — the same benign no-op as before.
+    for (const uint256& p : m_queued_parent_hashes) {
+        pending.insert(p);
+    }
+    if (m_has_inflight_parent) {
+        pending.insert(m_inflight_parent_hash);
+    }
     return pending;
 }
 
@@ -277,6 +313,14 @@ void CBlockValidationQueue::ValidationWorker() {
                 m_queue.pop();
                 m_queued_heights.erase(queued_block.expected_height);  // O(1) removal for IsHeightQueued
                 m_queued_hashes.erase(queued_block.hash);              // PR #129 MEDIUM-2
+                // PR #129 round-2: drop ONE instance of this block's parent.
+                // erase(find(x)) NOT erase(x): several queued blocks can share a
+                // parent, and multiset::erase(key) removes EVERY equal element,
+                // which would unpin a parent the other siblings still need.
+                {
+                    auto pit = m_queued_parent_hashes.find(queued_block.block.hashPrevBlock);
+                    if (pit != m_queued_parent_hashes.end()) m_queued_parent_hashes.erase(pit);
+                }
                 // PR #129 MEDIUM-2: hand the block to the in-flight slot ATOMICALLY
                 // with its removal from m_queue, still under m_queue_mutex. This
                 // closes the gap between "no longer queued" and "ProcessBlock has
@@ -286,6 +330,13 @@ void CBlockValidationQueue::ValidationWorker() {
                 // ancestors rather than freeing them.
                 m_inflight_hash = queued_block.hash;
                 m_has_inflight = true;
+                // PR #129 round-2: carry the parent into the in-flight slot in the
+                // SAME m_queue_mutex scope. The parent pin must not lapse in the
+                // instant between leaving the queued multiset and entering the
+                // in-flight slot — that gap is the whole reason the block hash
+                // itself is handed over atomically here.
+                m_inflight_parent_hash = queued_block.block.hashPrevBlock;
+                m_has_inflight_parent = true;
                 has_block = true;
 
                 // SSOT FIX #3: Update queue depth in stats
@@ -312,6 +363,7 @@ void CBlockValidationQueue::ValidationWorker() {
         {
             std::lock_guard<std::mutex> lock(m_queue_mutex);
             m_has_inflight = false;
+            m_has_inflight_parent = false;   // PR #129 round-2
         }
         auto end_time = std::chrono::steady_clock::now();
         auto validation_time = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -385,7 +437,8 @@ bool CBlockValidationQueue::ProcessBlock(const QueuedBlock& queued_block) {
     // BLOCKER-1 (PR #129 re-red-team): do NOT trust queued_block.pindex. The
     // cached raw pointer was captured at QueueBlock() time, then cs_main was
     // released for the duration of async validation. While the entry waited,
-    // EvictLowestWorkLeafNotPinned (now firing at the lowered 500K cap) could
+    // EvictLowestWorkLeafNotPinned (which fires at whatever cap is configured --
+    // this PR changes none; header spam can drive the map to any cap) could
     // have freed that index if it was an unpinned leaf — making the cached
     // pointer dangle, which then flowed into ActivateBestChain → use-after-free.
     // ALWAYS re-resolve by hash. LOW-b (PR #129 re-red-team): this function does
@@ -438,6 +491,19 @@ bool CBlockValidationQueue::ProcessBlock(const QueuedBlock& queued_block) {
     //   2. A PINNED ENTRY IS NEVER FREED. EvictLowestWorkLeafNotPinned only erases
     //      entries absent from the pinned set.
     //   3. A MERGE DOES NOT MOVE IT, per the in-place mutation above.
+    //      PINNED BY AN EXECUTABLE TEST, not only by reading:
+    //      src/test/add_block_index_flag_merge_tests.cpp,
+    //      test_height_one_header_then_data_sequence — it inserts a header-only
+    //      entry, captures the pointer, performs a flag-merge add, re-resolves by
+    //      hash and asserts `h1After == h1Before` (the same CBlockIndex object),
+    //      plus pprev preservation. If a future change ever replaces the mapped
+    //      unique_ptr instead of mutating it, that test goes red and this link
+    //      fails loudly rather than silently.
+    //
+    //      Link (1) has a construction but NO executable test — see Start(),
+    //      which asserts a provider is registered, and the retitled Test 7 note
+    //      in headers_manager_to_chain_selector_wiring_tests.cpp for what is
+    //      still uncovered on the production queue path.
     //
     // 1 and 2 exclude free-by-eviction; 3 excludes free-by-replacement; together
     // they are the address stability the panel asked for. The re-resolve remains

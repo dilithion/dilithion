@@ -1166,6 +1166,26 @@ public:
      */
     void RegisterPendingBlockHashProvider(PendingBlockHashProvider provider);
 
+    /**
+     * PR #129 round-2 (external panel, kimi): is a pending-hash provider wired?
+     *
+     * The queue path's safety argument has three links, and the FIRST is "the
+     * in-flight block's hash is pinned for the whole of ProcessBlock" — which is
+     * delivered entirely by eviction clause (d) reading this provider. If nobody
+     * registers one, that link is VOID and the argument silently degrades to the
+     * by-hash re-resolve alone. Nothing would fail; eviction would simply stop
+     * pinning queued work.
+     *
+     * Registration currently lives in the node wiring (dilithion-node.cpp,
+     * dilv-node.cpp), NOT in CBlockValidationQueue itself, so a future wiring that
+     * forgets is a silent regression. This accessor exists so the queue can assert
+     * the link it depends on rather than assume it.
+     */
+    bool HasPendingBlockHashProvider() const {
+        std::lock_guard<std::recursive_mutex> lock(cs_main);
+        return static_cast<bool>(m_pendingBlockHashProvider);
+    }
+
     // ============================================================
     // Phase 5: chain-selection helpers (PR5.1 declarations only)
     // ============================================================
