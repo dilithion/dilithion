@@ -500,7 +500,15 @@ jobs:
         cd depends/randomx
         mkdir -p build
         cd build
-        cmake .. -DCMAKE_CXX_FLAGS="--coverage" -DCMAKE_C_FLAGS="--coverage"
+        # -fprofile-update=atomic HERE TOO. The main build below already carries
+        # it, with a comment explaining why -- but RandomX was left on plain
+        # --coverage, and RandomX is the most heavily threaded code in the tree.
+        # That is exactly where the torn counters land:
+        #   geninfo: ERROR: Unexpected negative count '-3184421' for branch 1
+        #   of depends/randomx/src/superscalar_program.hpp:47
+        # which fails the whole coverage leg. The lesson had been learned once
+        # and applied to one of the three builds.
+        cmake .. -DCMAKE_CXX_FLAGS="--coverage -fprofile-update=atomic" -DCMAKE_C_FLAGS="--coverage -fprofile-update=atomic"
         make -j$(nproc)
 
     - name: Build Dilithium library
@@ -522,7 +530,7 @@ jobs:
         fi
         cd depends/dilithium/ref
         make clean || true
-        CFLAGS="--coverage -O0 -g -DDILITHIUM_MODE=3" make -j$(nproc)
+        CFLAGS="--coverage -fprofile-update=atomic -O0 -g -DDILITHIUM_MODE=3" make -j$(nproc)
 
     - name: Build with coverage
       run: |

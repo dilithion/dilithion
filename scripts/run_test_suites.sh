@@ -186,6 +186,53 @@ set -u
 # TIER: both are fast, not full, for the reason rpc_tests is. A suite that only
 # runs nightly does not gate the PR that breaks it. Measured cost: miner_tests
 # 19s (it mines for real), wallet_tests under 1s.
+#
+# ORPHAN REGISTRATION 2026-09-08/09. Twenty-seven Makefile test targets were
+# named by no roster row -- built by nothing, run by nothing, invoked by no
+# workflow.
+#
+# THE COUNT MOVED THREE TIMES AND THAT IS THE REAL FINDING. An audit said 24,
+# my census said 18, a second reader found 9 more. Nobody was careless: each
+# method drew a different boundary (one compared against `--list all`, which
+# drops NOBUILD rows and so MANUFACTURES orphans; one matched only targets
+# linking $(OBJ_DIR)/test/, missing the ones under digital_dna/, vdf/ and
+# miner/). A fourth hand count would have produced a fourth number, so the
+# census is now a MACHINE CHECK -- scripts/check_roster_completeness.sh, wired
+# into the roster self-tests, fails on any unrostered test target. The roster
+# cannot silently drift again and nobody has to be careful.
+#
+# NAME TRAP worth one line: wallet_load_guard_test (script-driven, run by CI)
+# and wallet_load_guard_tests (compiled suite, rostered) are DIFFERENT tests
+# one character apart. Seeing the plural in the roster and ticking off the
+# singular is a mistake that has already cost a reviewer a step.
+# Every verdict below was MEASURED by executing the binary once on Linux/WSL
+# (the platform every runs-on: in ci.yml uses) against binaries newer than HEAD
+# (staleness checked: 16 built, 0 stale), with hangs classified by CPU TIME
+# rather than by silence:
+#
+#   14 PASS   -> registered live (12 fast, 1 full, 1 was already the selftest)
+#    1 FAIL   -> hd_wallet_standalone_tests, diagnosed, fixed in PR #187
+#    1 NOBUILD-> difficulty_determinism_test does not link
+#    1 vacuous-> batch_verifier_race_tests passes without TSan and proves nothing
+#    1 hang   -> batch_verifier_race_control, BY DESIGN, see below
+#
+# TWO TARGETS ARE DELIBERATELY NOT ROSTERED, and both would be wrong to add:
+#
+#   batch_verifier_race_control -- the Makefile's `batch_verifier_race_control:` recipe says it
+#     "deterministically HANGS -- proving the harness is a real discriminator".
+#     Its hang is the point. Rostering it would file a working control as a
+#     defect, and the verdict would look genuine. It also served as the positive
+#     control for the census instrument: 0.03s CPU over 114s wall is
+#     unambiguously blocked, which is what licenses calling
+#     wallet_encryption_at_rest_tests (71.5s CPU over 75s wall) real work.
+#
+#   genesis_gen -- a TOOL that generates a genesis block, not a gated test.
+#
+# The corrected denominator is 18, not the 23 first reported: comparing Makefile
+# targets against `--list all` manufactures orphans, because --list deliberately
+# drops NOBUILD rows. net_tests came out "orphaned" that way while carrying a
+# roster row with a written reason. Compare against the ROSTER, not the derived
+# build list.
 ROSTER='
 fast|rpc_auth_tests|120||
 fast|rpc_host_header_tests|60||
@@ -232,6 +279,27 @@ fast|vdf_lottery_test|300||
 fast|rpc_tests|300||
 fast|miner_tests|900||
 fast|wallet_tests|300||
+fast|test_authenticated_encryption|60||
+fast|test_iv_reuse_detection|60||
+fast|test_secure_allocator|60||
+fast|dfmp_v34_test|60||
+fast|fork_staging_legacy_path_tests|60||
+fast|ipv6_smoke_tests|60||
+fast|legacy_block_arrival_chainsel_gate_tests|120||
+fast|phase_9_telemetry_rpc_tests|120||
+fast|port_fork_staging_tests|60||
+fast|registration_manager_tests|120||
+fast|regtest_chainparams_smoke|60||
+fast|v4_2_time_decay_cooldown_tests|60||
+fast|hd_wallet_standalone_tests|120|FIXED IN PR #187, quarantined only until it merges. DIAGNOSED, not unknown: all its HD expectations predate the BUG #115 pre-generation, so external_idx is off by exactly HD_GAP_LIMIT - 1 = 19 (measured by probe: expected 1, actual 20). 10 tests run, 9 pass, 1 fails -- no assert() here, so that count is a real total and not a floor. NOTE the ci.yml exclusion reason for this suite ("GetNewHDAddress() hangs in CI (BUG-77) ... Likely blocking on /dev/random") is a MISDIAGNOSIS: there is no /dev/random path in src/ or depends/dilithium/, and it fails in 2s with 2.29s of CPU rather than hanging. Lift this row when #187 merges.|
+fast|difficulty_determinism_test|60|NOBUILD: does not LINK. undefined reference to GetDataDir(Dilithion::Network) and GetDataDir(bool) from chainparams.o -- a missing object in its Makefile link line, not a code defect. Needs a Makefile fix before it can be rostered; the source is fine.|
+fast|dna_p2p_test|120||
+fast|verification_test|120||
+fast|vdf_test|120||
+fast|vdf_miner_test|120||
+fast|asert_test|60||
+fast|eda_test|60||
+fast|dna_history_test|120|SUSPECTED REAL, measured on this branch: 2 of ~19 checks fail -- "Update 1 succeeds" and "Update 2 succeeds" (UpdateDNA returns false). The ODD part, and why this needs a DNA owner rather than an expectation bump: every assertion ABOUT the effect of those updates passes -- history has 1 then 2 entries, archived IPS values are right, ordering and persistence across a DB reopen are right. So the write happens and the return value says it did not. Either the return is wrong or the test asserts the wrong contract; both are real. No assert() here, so 2-of-19 is a true count, not a floor.|
 full|integration_tests|600||
 full|connman_tests|600|SUSPECTED REAL: high-load throughput test loses messages (pop_count != NUM_MESSAGES, connman_tests.cpp:552). Message loss under load in CConnman is not a stale expectation.|
 full|tx_relay_tests|600|WINDOWS-ONLY teardown hang (re-scoped 2026-08-15): all 6 tests PASS, then the process never exits on Windows/MSYS2 (exit 124 at 600s; teardown-path, post-J1/F6). LINUX CONFIRMATION DONE: under TSan on Linux (WSL, gcc, -fsanitize=thread) the binary runs all tests AND EXITS CLEANLY, zero data-race warnings -- so the hang is a Windows-specific teardown path (likely winsock/thread-join semantics), not a portable logic bug. Do NOT lift the quarantine on Windows by raising the timeout; needs a Windows-teardown owner. Linux CI can run this suite ungated.|
@@ -240,6 +308,9 @@ full|dfmp_mik_tests|600||
 full|net_tests|600|NOBUILD: source no longer compiles. References a removed global g_peer_manager and calls CNetMessageProcessor::CreateVersionMessage() with a signature that no longer exists. Needs a P2P owner to port the harness forward.|
 full|randomx_mode_test|1800||
 full|large_pages_optin_test|2100||
+full|wallet_encryption_at_rest_tests|300||
+full|batch_verifier_race_tests|300|TSAN-ONLY, and this is a vacuity quarantine rather than a failure. It PASSES without TSan (exit 0, 3.69s CPU) -- which is the problem: the race it exists to catch is only observable under -fsanitize=thread, so a plain PASS here would report coverage it does not have. Run it as the `batch_verifier_race_tests:` recipe documents: make TSAN=1 batch_verifier_race_tests. Its paired control batch_verifier_race_control is deliberately NOT rostered -- see the comment above the roster.|
+full|four_node_test|900|NOBUILD: this target is not a binary at all -- it is a PHONY whose recipe RUNS scripts/four_node_local.sh, standing up a live 4-node regtest mesh (smoke 10 180). That matters mechanically, not just descriptively: a quarantined row is still BUILT so it cannot rot, and "building" this one EXECUTES the mesh. Rostering it without NOBUILD made the CI build step run a 4-node harness and fail (Makefile:1154, Error 2, full-tier leg) -- caught by CI on the first push, which is the system working. NOBUILD keeps it COUNTED in the register while excluding it from --list, so nothing builds or runs it. Run it deliberately: make four_node_test.|
 '
 
 # ---------------------------------------------------------------------------
@@ -388,7 +459,15 @@ EOF
 fi
 
 if [ "$LIST_ONLY" -eq 1 ]; then
-    # NOBUILD: entries are excluded — their source does not compile, so adding
+    # NOBUILD: entries are excluded from the build list. TWO reasons qualify,
+    # and the second was learned the hard way on this branch:
+    #   1. the source no longer compiles, so building it breaks everyone;
+    #   2. "building" the target DOES something -- four_node_test is a PHONY
+    #      whose recipe stands up a live 4-node mesh. A quarantined row is still
+    #      BUILT so it cannot rot, so without NOBUILD the CI build step RAN the
+    #      mesh and failed.
+    # Either way the row stays in the register and is counted; it just does not
+    # reach the build list. Their source does not compile, so adding
     # them to the build list would break the build for everyone. partial: rows
     # are INCLUDED: they run, so they must be built.
     rows | grep -v '|NOBUILD:' | cut -d'|' -f2 | tr '\n' ' '

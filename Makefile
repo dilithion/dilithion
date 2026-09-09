@@ -636,6 +636,19 @@ $(TEST_SUITES_ALL): | libzmq
 
 .PHONY: tests tests-build tests-fast tests-full
 
+# A-010 review LOW (a8, 2026-09-08): scripts/census_test_mains.sh had ZERO
+# callers -- an orphaned script inside the change that registers orphaned
+# suites. Giving it a target is the whole point: a diagnostic nobody can invoke
+# by name is one nobody runs.
+#
+# Not a roster row: it censuses SOURCE, it is not a test binary, and it must
+# never gate a PR. `make census-mains` is the documented way to re-derive the
+# assert()-behind-an-abort exposure after any roster change.
+.PHONY: census-mains
+census-mains:
+	@bash scripts/census_test_mains.sh --summary
+
+
 tests-build: $(TEST_SUITES_ALL)
 	@echo "$(COLOR_GREEN)✓ All test suites built (NOT run — use 'make tests')$(COLOR_RESET)"
 
@@ -647,6 +660,7 @@ tests: tests-build
 # not a guard — it is a file. It runs FIRST: it is a sub-second grep, and if the
 # drain invariant is broken there is no point running the suites.
 tests-fast: check-tip-notify-drain $(TEST_SUITES_FAST)
+	@bash scripts/check_roster_completeness.sh
 	@bash scripts/test_run_test_suites_timeout.sh
 	@bash scripts/test_run_test_suites_staleness.sh
 	@bash scripts/test_run_test_suites_args.sh
@@ -1079,11 +1093,6 @@ dna_history_test: $(CORE_OBJECTS) $(OBJ_DIR)/digital_dna/dna_history_test.o $(DI
 	@echo "$(COLOR_BLUE)[LINK]$(COLOR_RESET) $@"
 	@$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS) $(LIBS)
 	@echo "$(COLOR_GREEN)✓ dna_history_test built successfully$(COLOR_RESET)"
-
-dna_monitor_test: $(CORE_OBJECTS) $(OBJ_DIR)/digital_dna/dna_monitor_test.o $(DILITHIUM_OBJECTS) $(CHIAVDF_OBJECTS)
-	@echo "$(COLOR_BLUE)[LINK]$(COLOR_RESET) $@"
-	@$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS) $(LIBS)
-	@echo "$(COLOR_GREEN)✓ dna_monitor_test built successfully$(COLOR_RESET)"
 
 verification_test: $(CORE_OBJECTS) $(OBJ_DIR)/digital_dna/verification_test.o $(DILITHIUM_OBJECTS) $(CHIAVDF_OBJECTS)
 	@echo "$(COLOR_BLUE)[LINK]$(COLOR_RESET) $@"
