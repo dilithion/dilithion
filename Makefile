@@ -883,6 +883,11 @@ evict_cost_bench: $(CORE_OBJECTS) $(OBJ_DIR)/tools/evict_cost_bench.o $(DILITHIU
 	@$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS) $(LIBS)
 	@echo "$(COLOR_GREEN)â evict_cost_bench built successfully$(COLOR_RESET)"
 
+leaf_index_invariant_tests: $(CORE_OBJECTS) $(OBJ_DIR)/test/leaf_index_invariant_tests.o $(DILITHIUM_OBJECTS) $(CHIAVDF_OBJECTS)
+	@echo "$(COLOR_BLUE)[LINK]$(COLOR_RESET) $@"
+	@$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS) $(LIBS)
+	@echo "$(COLOR_GREEN)✓ leaf_index_invariant_tests built successfully$(COLOR_RESET)"
+
 queue_parent_pin_publication_tests: $(CORE_OBJECTS) $(OBJ_DIR)/test/queue_parent_pin_publication_tests.o $(DILITHIUM_OBJECTS) $(CHIAVDF_OBJECTS)
 	@echo "$(COLOR_BLUE)[LINK]$(COLOR_RESET) $@"
 	@$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS) $(LIBS)
@@ -1522,8 +1527,29 @@ libzmq-clean:
 	@rm -rf depends/libzmq/build depends/libzmq/build-windows
 
 # Include auto-generated header dependency files (-MMD -MP)
-# These ensure that changing any .h file triggers recompilation of all .cpp files that include it
--include $(wildcard $(OBJ_DIR)/**/*.d $(OBJ_DIR)/*.d)
+# These ensure that changing any .h file triggers recompilation of all .cpp files
+# that include it.
+#
+# ⚠️ `$(wildcard .../**/*.d)` DOES NOT RECURSE, AND THE MISS IS SILENT.
+# GNU make's $(wildcard) is glob, not globstar: `**` behaves as a single `*`, so
+# `$(OBJ_DIR)/**/*.d` matched exactly ONE directory level. Measured on a populated
+# tree: 153 .d files exist, the old pattern matched 148, and the 5 it missed were
+# all two levels deep — build/obj/consensus/port (chain_selector_impl, the adapter
+# every consensus change touches) and build/obj/net/port.
+#
+# Those objects therefore had NO header dependency tracking. Editing a header they
+# include did not rebuild them, and because the miss is silent the result is not a
+# build error but a MIXED-LAYOUT BINARY: objects compiled against different
+# definitions of the same class, linked together.
+#
+# That is exactly how it presented. Adding two members to CChainState rebuilt
+# chain.o and left chain_selector_impl.o at its previous layout; the next run
+# threw std::system_error("Invalid argument") from a std::lock_guard inside
+# ProcessNewHeader, because it was locking cs_main at the wrong offset. A mutex
+# error with no mutex bug — the kind of thing that gets blamed on threading for a
+# day. `find` is used instead of `wildcard` because it actually recurses.
+DEPFILES := $(shell find $(OBJ_DIR) -name '*.d' 2>/dev/null)
+-include $(DEPFILES)
 
 # ============================================================================
 # Utility Targets

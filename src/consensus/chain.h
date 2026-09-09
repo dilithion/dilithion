@@ -111,6 +111,91 @@ private:
     // Smart pointers ensure automatic cleanup, preventing memory leaks
     std::map<uint256, std::unique_ptr<CBlockIndex>> mapBlockIndex;
 
+    // ========================================================================
+    // EVICTABLE-LEAF SIDE INDEX (PR #129 round 4) — O(log n) victim selection.
+    //
+    // WHY. The evictor used to rebuild an index-sized in-degree map on EVERY
+    // call and then rescan the whole map once PER VICTIM. Measured at a 500,000
+    // entry index that is 485 ms of cs_main hold and 43 MB transient against
+    // main's 211 ms / 20 MB — 2.31x worse — on a path an attacker reaches by
+    // spamming headers to the cap (src/tools/evict_cost_bench.cpp, CON-27).
+    //
+    // ── THE LEAF LEMMA, which is what makes this cheap and correct ───────────
+    // in_degree[X] = number of entries in mapBlockIndex naming X as pprev.
+    // X is a LEAF iff in_degree[X] == 0.
+    //
+    //   A LEAF CAN NEVER BE PINNED TRANSITIVELY.
+    //
+    // Proof: the pin set is built by walking pprev ANCESTORS of pinned roots.
+    // If X were a strict ancestor of any entry E in the map, then the entry one
+    // step from X toward E names X as its pprev and is itself in the map, so
+    // in_degree[X] >= 1 and X is not a leaf. Contrapositive: a leaf is never a
+    // strict ancestor of anything, so no ancestor walk can reach it.
+    //
+    // Therefore a leaf is pinned ONLY by being DIRECTLY in a pin set, and the
+    // four clauses collapse to four direct tests with no walk at all:
+    //   (a) active chain    -> X == pindexTip          (any other active-chain
+    //                          entry has an active child, so is not a leaf)
+    //   (b) candidates      -> m_setBlockIndexCandidates.count(X)
+    //   (c) data-not-valid  -> a flag test on X itself (never transitive)
+    //   (d) pending         -> pending.count(X->GetBlockHash())  (snapshot taken
+    //                          once per call, not per candidate)
+    //
+    // So selection is: take the lowest-work leaf, apply four O(1)/O(log n)
+    // tests, evict or skip. The number skipped is bounded by
+    // 1 + (candidate leaves) + (pending), and a candidate costs PoW-bearing
+    // block data to create, so it is not an attacker-controlled quantity.
+    //
+    // ── THE SORT KEY MUST NOT MUTATE IN PLACE ───────────────────────────────
+    // Ordering is by (nChainWork, hash). A key that changes while the element
+    // sits in a std::set is silent ordering corruption, not a crash — and
+    // nChainWork is NOT serialised (it reads back zero from the DB; see
+    // lesson_a_default_value_read_back_may_never_have_been_stored), so "it is
+    // recomputed later" was a live hazard worth checking rather than assuming.
+    //
+    // CENSUSED, whole tree, every assignment shape: 10 non-test writers of
+    // nChainWork — chain_selector_impl.cpp:412, block_index.cpp (2 ctors, the
+    // copy-assign, and BuildChainWork's two arms), the two genesis sites in
+    // dilithion-node/dilv-node, and the 8 BuildChainWork() call sites. EVERY ONE
+    // writes BEFORE its entry reaches AddBlockIndex — verified per site by
+    // locating the AddBlockIndex that follows it. AddBlockIndex's merge branch
+    // does NOT write nChainWork; it ConsensusInvariant-ASSERTS the incoming and
+    // existing values are equal, which enforces the immutability rather than
+    // relying on it. No DB-load path inserts and then recomputes.
+    //
+    // Conclusion: nChainWork is immutable for the lifetime of an entry's
+    // membership in mapBlockIndex, so it is a legal set key. If that ever stops
+    // being true, this index must be re-keyed on write or rebuilt after the
+    // recompute — it will NOT fail loudly on its own.
+    //
+    // MAINTENANCE IS EXACTLY TWO SITES (this is the whole surface):
+    //   insert(X): X is new, so it is a leaf -> add X. X->pprev gains a child
+    //              -> remove X->pprev.
+    //   erase(X):  remove X. X->pprev loses a child -> if its in-degree hits 0,
+    //              add X->pprev.
+    // ========================================================================
+    struct LeafWorkOrder {
+        // Lowest work first, hash as the tiebreak so the order is total and
+        // deterministic. ChainWorkGreaterThan, never memcmp/operator< — chainWork
+        // is not memcmp-comparable.
+        bool operator()(const CBlockIndex* a, const CBlockIndex* b) const;
+    };
+    std::map<const CBlockIndex*, size_t> m_inDegree;
+    std::set<CBlockIndex*, LeafWorkOrder> m_evictableLeaves;
+
+    // Maintain the two structures above. Called only from AddBlockIndex and the
+    // evictor's erase; both hold cs_main.
+    void LeafIndexOnInsert(CBlockIndex* pnew);
+    void LeafIndexOnErase(CBlockIndex* pgone);
+
+    // Debug-only: recompute in-degree and the leaf set from scratch and compare.
+    // Used by the invariant test; not called in production.
+public:
+    bool LeafIndexMatchesBruteForce() const;
+    bool IsLeafPinnedDirect(const CBlockIndex* leaf,
+                            const std::set<uint256>& pending) const;
+private:
+
     // Active chain tip (block with most cumulative work)
     CBlockIndex* pindexTip;
 
