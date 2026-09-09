@@ -23,6 +23,7 @@ HeadersSyncState::HeadersSyncState(
     const HeadersSyncParams& params,
     const uint256& chain_start_hash,
     int64_t chain_start_height,
+    const uint256& chain_start_work,
     const uint256& minimum_work,
     const ::dilithion::net::IHeaderProofChecker* proof_checker
 )
@@ -39,9 +40,39 @@ HeadersSyncState::HeadersSyncState(
       m_download_state(State::PRESYNC),
       m_proof_checker(proof_checker)
 {
-    // Initialize chain work to zero
-    memset(m_current_chain_work.data, 0, 32);
-    memset(m_redownload_chain_work.data, 0, 32);
+    // LP-10 §2.0 (2026-09-08): SEED the accumulators from the chain start.
+    //
+    // These were memset to zero. chain_start is our LOCAL TIP (see
+    // CHeadersManager::InitializeDoSProtectedSync, which passes hashBestHeader),
+    // not genesis, so a zeroed accumulator made
+    // ChainWorkGreaterOrEqual(m_current_chain_work, m_minimum_required_work)
+    // ask "has this peer supplied a whole threshold's worth of NEW work beyond
+    // our tip?" rather than "does this chain exceed the absolute minimum?".
+    // Against an absolute, from-genesis nMinimumChainWork that is FALSE WHENEVER
+    // THE RECEIVED SUFFIX CARRIES LESS THAN A FULL THRESHOLD OF WORK, however
+    // much our own tip already has: PRESYNC never reaches REDOWNLOAD,
+    // pow_validated_headers stays empty, and header sync stalls.
+    //
+    // (Three earlier wordings of this sentence were wrong in the same direction
+    // -- "any node with history", then "any non-fresh node", then "any node
+    // whose tip already carries a threshold". All three are refuted by the same
+    // counterexample: a node at or past the threshold still PASSES if the peer
+    // supplies a full threshold of NEW work. This site was the FIFTH sibling of
+    // that fix, found by all three external seats after the .h twin, the seeding
+    // suite and the KAT had already been corrected -- the same
+    // fix-the-named-site-miss-the-siblings defect, five times over. The
+    // invariant is about the SUFFIX, never about our tip.)
+    //
+    // Upstream Core seeds from chain_start->nChainWork. Both accumulators are
+    // seeded, not just m_current_chain_work, so the REDOWNLOAD tally is on the
+    // same absolute scale as the PRESYNC one.
+    //
+    // Caller contract: chain_start_work is cumulative work INCLUDING
+    // chain_start_hash. The caller must fail closed rather than pass zero for
+    // an unknown start -- a zero here is indistinguishable from the bug this
+    // replaces.
+    m_current_chain_work = chain_start_work;
+    m_redownload_chain_work = chain_start_work;
 
     // Generate random salt for commitment hashing
     // This prevents attackers from precomputing commitment collisions

@@ -101,12 +101,90 @@ ChainParams ChainParams::Mainnet() {
     // Moved from 20160 to 18500 to stop ongoing chain degradation.
     params.compactEncodingFixHeight = 18500;
 
-    // Phase 3 port: HeadersSync PRESYNC chain-work gate. Zero for now
-    // (preserves pre-port behaviour where this gate was hardcoded zero in
-    // CHeadersManager). A non-zero value can be set in a follow-up after
-    // smoke-testing that a fresh node successfully clears the threshold
-    // against a live seed. Q7 plan recommendation deferred to Phase 4.
-    params.nMinimumChainWork = uint256();
+    // Phase 3 port: HeadersSync PRESYNC chain-work gate.
+    // [SUPERSEDED 2026-09-07 — this block used to read "Zero for now ... a
+    // non-zero value can be set in a follow-up". A non-zero value IS set
+    // below. Left as a marker rather than deleted, because a stale lead
+    // sentence sitting above a contradicting assignment is exactly the
+    // comment-asserts-a-state defect this mission exists to close, and it was
+    // caught here by review rather than by a reader trusting it.]
+    //
+    // LP-10 — APPROVED, decision row D-DIL-2026-09-07-2
+    // (dilithion-strategy 00-context/DECISION_REGISTER.md). That row records the
+    // approving words verbatim, the route by which they were given, the scope
+    // (the wiring sub-contract at strategy 3a97237), and this value's
+    // provenance. Cite the ROW, never a person: the row is what a future reader
+    // can check, and it says these are DoS-gate thresholds, not a consensus
+    // rule — a re-measure at a higher checkpoint is a NEW row, not an edit.
+    // Measured chain work at DIL's most recent checkpoint, height 54000
+    // (hash 0000000bb44c964b4e3c6fec8c15941738cd74b434bafbfe4aadce898140b993,
+    // see checkpoints below). Derived by summing ComputeChainWork(nBits) over
+    // heights 0..54000 from a read-only seed dump, through the SAME production
+    // helpers the node uses (consensus/chain_work.h), never by reading
+    // nChainWork back from storage -- the block index does not serialize that
+    // field, so a read-back yields a zero meaning "not stored".
+    // Controls: checkpoint hash matched; sum verified strictly below the tip
+    // chain work reported by two seeds; a mutated nBits moved the sum.
+    // Margin: tip work is 1.38x this value, so the gate rejects a header chain
+    // claiming less than ~73% of current chain work. DIL retargets on roughly
+    // half of all blocks (25,992 distinct nBits over 54,001), so this is a
+    // genuine cumulative-work threshold.
+    //
+    // ⚠️ UNITS: NEVER copy a value from a Bitcoin Core chainparams file into
+    // this field. ComputeChainWork here yields 2^(320-8*size)/mantissa; Core
+    // yields 2^(280-8*size)/mantissa. Our work unit is 2^40 times Core's for
+    // the same nBits -- a Core constant would be wrong by a factor of ~10^12.
+    // Ordering and ratios are unaffected, so consensus comparisons are fine.
+    //
+    // ⚠️ INERT UNTIL THE GATE IS WIRED. Precisely (round 3, all three external
+    // seats): CHeadersManager's DEFAULT constructor DOES read this value in
+    // production and store it in a member -- so "nothing reads it" is false.
+    // What is true is that NO NODE DECISION is made from it: not RPC, not IBD,
+    // not chain selection, not logging. Earlier revisions of this comment said
+    // "assigned and never read" and then "never read IN PRODUCTION"; both were
+    // wrong in the same direction, which is why the distinction is now spelled
+    // out rather than compressed.
+    // The only PRODUCTION path that would carry it
+    // into HeadersSyncState -- InitializeDoSProtectedSync /
+    // ProcessHeadersWithDoSProtection -- has zero PRODUCTION call sites (the
+    // LP-10 suites call both), so
+    // mapHeadersSyncStates is never populated and the chain-work comparisons at
+    // headerssync.cpp:85/:115 are unreachable.
+    //
+    // The LIVE header path is NOT ProcessHeaders: it is the node's
+    // SetHeadersHandler lambda -> QueueRawHeadersForProcessing (:3317) ->
+    // HeaderProcessorThread (:3350) -> QueueHeadersForValidation (:2514), and
+    // that path applies no chain-work threshold either. ProcessHeaders is
+    // itself near-dead -- its only non-internal call site (:2536) is a fallback
+    // taken when the async validation thread fails to start.
+    //
+    // SEEDING: FIXED IN THIS COMMIT (LP-10 §2.0). The threshold above is an
+    // ABSOLUTE sum from genesis. HeadersSyncState formerly zeroed its work
+    // accumulator while starting from the LOCAL TIP, which would have demanded a
+    // peer supply a whole checkpoint's worth of NEW work beyond our tip.
+    // (Round-2 qualification: "stalls on ANY non-fresh node" was too strong --
+    // a node just past genesis can still receive enough new work to pass. The
+    // defect is demanding a FULL threshold of ADDITIONAL work, which stalls an
+    // otherwise-sufficient chain.)
+    //
+    // That is no longer the case here: the constructor now takes a REQUIRED
+    // chain_start_work (no default -- a defaulted zero is exactly the bug) and
+    // seeds both accumulators from it, and InitializeDoSProtectedSync reads the
+    // cumulative work from mapHeaders, falling back to genesis work, and FAILS
+    // CLOSED rather than seeding zero. Upstream does the same
+    // (bitcoin-v28.0 headerssync.cpp:26-32, m_current_chain_work(chain_start->nChainWork)).
+    //
+    // ⚠️ This paragraph previously stated the defect as UNFIXED and was left
+    // unchanged when the fix landed in this same commit -- caught by all three
+    // external review seats. A comment asserting a state the code no longer has
+    // is the exact defect this mission exists to close, and a wiring PR would
+    // have copied it. What remains before wiring is CALL SITES, not seeding.
+    //
+    // Landing the constant now so the measurement is not lost; the
+    // reject/accept test belongs with that wiring and must assert the WIRING,
+    // not HeadersSyncState in isolation.
+    params.nMinimumChainWork = uint256S(
+        "000000000000000000000000000000000000000000028c85dd20c10003e46900");
 
     // Phase 4 port: outbound connection class targets. DIL has 240s blocks
     // where propagation latency is well-absorbed; Bitcoin defaults are fine.
@@ -328,6 +406,15 @@ ChainParams ChainParams::Testnet() {
     params.timestampValidationHeight = 0;
 
     // Phase 3 port: testnet has no PRESYNC chain-work gate.
+    //
+    // LP-10 (2026-09-07): DELIBERATELY LEFT AT ZERO. The DIL and DilV values
+    // are measurements of those specific chains; there is no equivalent
+    // measurement for testnet, and a value invented for it would be a
+    // fabricated constant on a consensus-relevant field. Testnet is also reset
+    // and re-launched, so any fixed threshold would lock honest nodes out of
+    // the next incarnation. Regtest inherits this zero (it copies Testnet and
+    // overrides only what it needs), which is correct: regtest chains are a
+    // handful of blocks and must never be gated on accumulated work.
     params.nMinimumChainWork = uint256();
 
     // Phase 4 port: outbound class targets — testnet uses DIL defaults.
@@ -482,10 +569,47 @@ ChainParams ChainParams::DilV() {
     // Timestamp validation: active from genesis
     params.timestampValidationHeight = 0;
 
-    // Phase 3 port: DilV starts with no PRESYNC chain-work gate; the
-    // gate value can be tightened in Phase 4 after telemetry confirms
-    // typical fresh-node IBD work accumulation against live seeds.
-    params.nMinimumChainWork = uint256();
+    // Phase 3 port: DilV PRESYNC chain-work gate.
+    // [SUPERSEDED 2026-09-07 — this block used to read "DilV starts with no
+    // PRESYNC chain-work gate". A value IS set below. Same reason as the
+    // Mainnet() marker: a stale lead above a contradicting assignment is the
+    // defect this mission exists to close.]
+    //
+    // LP-10 — APPROVED, decision row D-DIL-2026-09-07-2
+    // (dilithion-strategy 00-context/DECISION_REGISTER.md). That row records the
+    // approving words verbatim, the route by which they were given, the scope
+    // (the wiring sub-contract at strategy 3a97237), and this value's
+    // provenance. Cite the ROW, never a person: the row is what a future reader
+    // can check, and it says these are DoS-gate thresholds, not a consensus
+    // rule — a re-measure at a higher checkpoint is a NEW row, not an edit.
+    // Measured chain work at DilV's most recent checkpoint, height 67000
+    // (hash c929e38f1709c04c3174627edfe03c57eefdc36846d9d74ab32f899979205eff,
+    // see checkpoints below). Summed with ComputeChainWork/AddChainWork over
+    // heights 0..67000 walked from a copy of a live DilV block database; the
+    // walk reached genesis and the block at 67000 hashed byte-identically to
+    // the checkpoint. A mutated nBits moved both the sum and the census.
+    //
+    // ⚠️ WEAKER GATE THAN DIL'S, BY CONSTRUCTION. DilV nBits is 0x1d00ffff on
+    // ALL 255,028 canonical blocks measured -- difficulty has NEVER retargeted,
+    // it sits at powLimit. Chain work is therefore exactly linear in height and
+    // this threshold is arithmetically a minimum-HEIGHT gate. Worth setting,
+    // but it does not buy Bitcoin-equivalent protection: an attacker pays the
+    // same per-block work the honest chain pays, with no retarget ramp. The
+    // margin is also loose -- tip work is 3.81x this value, so it only rejects
+    // chains below ~26% of current work, because checkpoint 67000 is far behind
+    // a tip of 255,027. Adding a fresh DilV checkpoint near the tip is what
+    // would let this be tightened.
+    //
+    // ⚠️ UNITS: see the Mainnet() note -- our work unit is 2^40 times Bitcoin
+    // Core's for the same nBits. Never copy a Core constant into this field.
+    //
+    // ⚠️ INERT UNTIL THE GATE IS WIRED -- see the Mainnet() note for the precise
+    // statement: the value IS read into a member in production and is never used
+    // for any node decision. ("Nothing reads this value" was wrong here too --
+    // the Mainnet note was corrected in round 3 and this sibling was not, which
+    // is the fix-one-site-leave-the-siblings shape this mission keeps hitting.)
+    params.nMinimumChainWork = uint256S(
+        "00000000000000000000000000000000000000000105ba05ba05ba05b9000000");
 
     // Phase 4 port: outbound class targets — DilV's 45s blocks benefit
     // from faster propagation, so bump BlockRelay to 4 (Q4 recommendation).
@@ -796,6 +920,15 @@ ChainParams ChainParams::Regtest() {
     // so cap-saturation tests can exercise eviction without flooding 500K+
     // headers. Override of inherited Testnet value.
     params.nMapBlockIndexCap = 1000;
+
+    // LP-10 (2026-09-07): regtest keeps NO presync chain-work gate, stated
+    // EXPLICITLY. It was previously zero only because Regtest() never assigned
+    // the field and uint256's default constructor memsets -- an absence, not a
+    // decision, and describing an absence as deliberate is the same
+    // inferred-as-measured shape this mission exists to police. Regtest chains
+    // are a handful of blocks, so any non-zero threshold would refuse to sync
+    // them.
+    params.nMinimumChainWork = uint256();
 
     // Phase 8 PR8.0 (2026-05-01): disable the 45s minBlockTimestampGap
     // inherited from Testnet. Regtest inherits Testnet's gap = 45 + height = 0
