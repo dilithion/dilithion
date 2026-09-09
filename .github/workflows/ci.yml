@@ -51,6 +51,22 @@ jobs:
         build_type: [Debug, Release]
 
     steps:
+    # FIRST STEP, DELIBERATELY, AND BEFORE CHECKOUT.
+    #
+    # `timeout-minutes` is measured from JOB start, but a watchdog inside a
+    # step can only see STEP time -- so the watchdog derives its budget from
+    # how much of the job the build already spent. That subtraction is only as
+    # good as this clock.
+    #
+    # It used to be stamped inside "Set up compiler", 42-68s into the job
+    # (checkout with recursive submodules, then apt). Those seconds were
+    # silently credited back to the watchdog, eroding the 240s capture margin
+    # at exactly the point where the derived budget binds -- a build that has
+    # eaten the ceiling is the case this instrument exists for. Stamping here
+    # costs nothing and removes the error.
+    - name: Stamp job-start clock (hang watchdog budget)
+      run: echo "JOB_START_EPOCH=$(date +%s)" >> $GITHUB_ENV
+
     - name: Checkout code
       uses: actions/checkout@v7
       with:
@@ -80,11 +96,6 @@ jobs:
           echo "CC=gcc" >> $GITHUB_ENV
           echo "CXX=g++" >> $GITHUB_ENV
         fi
-        # Job-start clock for the hang watchdog further down. `timeout-minutes`
-        # is measured from JOB start, but a watchdog inside a step can only see
-        # STEP time -- so the watchdog has to know how much of the job budget
-        # the build already spent, or it fires after the ceiling and is inert.
-        echo "JOB_START_EPOCH=$(date +%s)" >> $GITHUB_ENV
 
     # gdb is needed only on the hang path, but installing it THERE would spend
     # minutes of a budget that is already exhausted, and would fail silently.
@@ -282,7 +293,7 @@ jobs:
           echo "Boost unit tests exited $rc"
           exit "$rc"
         fi
-        echo "✅ Boost unit tests completed (HD wallet tests skipped - BUG-77)"
+        echo "Boost unit tests completed (HD wallet suites INCLUDED and gating)"
 
     # Only produces a file when the hang actually fired; otherwise no-op.
     - name: Upload hang stack (only if the hang fired)
