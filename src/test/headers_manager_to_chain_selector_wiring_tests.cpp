@@ -26,6 +26,7 @@
 #include <primitives/block.h>
 
 #include <cassert>
+#include <chrono>
 #include <cstdint>
 #include <cstring>
 #include <iostream>
@@ -36,6 +37,10 @@
 #include <mutex>     // PR #129 HIGH-1 concurrency regression
 #include <thread>    // PR #129 HIGH-1 concurrency regression
 #include <utility>   // PR #129 HIGH-1: std::pair
+
+// Number of tests actually INVOKED, incremented as each returns. The summary
+// line reports this rather than a hand-typed total — see main().
+static int g_ran = 0;
 
 namespace {
 
@@ -1387,6 +1392,81 @@ void test_round2_unindexed_child_parent_pinned_by_hash_only()
     std::cout << " OK\n";
 }
 
+// ============================================================================
+// Test 15 — the O(1) all-pinned EARLY-OUT, guarded by COST because behaviour
+// cannot distinguish it (PR #129 round 4).
+//
+// The early-out changes no result: an all-pinned index returned false before it
+// existed and returns false after. The ONLY observable difference is what the
+// call costs, so a behavioural assertion here would pass identically with the
+// early-out deleted — a test that cannot fail on the thing it names.
+//
+// So this arm is a coarse COST guard, and the margins are chosen so it is not a
+// flake generator. Measured on this fixture size:
+//     without the early-out : ~95 ms at 100,000 entries (full in-degree rebuild)
+//     with the early-out    : sub-millisecond
+// The threshold below sits ~5x under the pre-fix cost and ~1000x over the
+// post-fix cost. A machine slow enough to fail this legitimately would fail the
+// rest of the suite on wall-clock first.
+//
+// Deliberately NOT asserting "in_degree was not built" — that would need
+// instrumentation in production code to satisfy a test, which is the wrong
+// direction. Cost is the real property; measure the real property.
+// ============================================================================
+void test_round4_all_pinned_early_out_is_cheap()
+{
+    std::cout << "  test_round4_all_pinned_early_out_is_cheap..." << std::flush;
+
+    const size_t N = 100000;
+
+    CChainState chainstate;
+    ::dilithion::consensus::port::ChainSelectorAdapter adapter(chainstate);
+
+    // A linear chain, every entry on the active chain => every entry pinned by
+    // clause (a). This is the steady state of a synced node at its cap.
+    uint256 prev;
+    std::memset(prev.data, 0, 32);
+    uint256 last;
+    for (size_t i = 0; i < N; ++i) {
+        auto h = MakeHeader(i == 0 ? prev : last, 0x1d00ffff,
+                            static_cast<uint32_t>(1700000000 + i),
+                            static_cast<uint8_t>(i & 0xFF));
+        if (!adapter.ProcessNewHeader(h)) { std::cout << " SETUP-FAIL" << std::endl; assert(false); }
+        last = h.GetHash();
+        CBlockIndex* p = chainstate.GetBlockIndex(last);
+        assert(p != nullptr);
+        chainstate.SetTip(p);
+    }
+    assert(chainstate.GetBlockIndexSize() == N);
+
+    const auto t0 = std::chrono::steady_clock::now();
+    const bool evicted = chainstate.EvictLowestWorkLeafNotPinned(N - 1);
+    const auto t1 = std::chrono::steady_clock::now();
+    const long ms = static_cast<long>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count());
+
+    // Behaviour is unchanged and must stay unchanged.
+    assert(!evicted);
+    assert(chainstate.GetBlockIndexSize() == N);
+
+    // THE GUARD. Without the early-out this builds a 100,000-entry in-degree map
+    // first and takes ~95 ms; with it, the call is O(1).
+    if (ms > 20) {
+        std::cout << " FAIL (" << ms << " ms)" << std::endl;
+        std::cerr << "  the all-pinned early-out did not fire: an index that IS the"
+                  << std::endl
+                  << "  active chain must be answered in O(1), not by rebuilding the"
+                  << std::endl
+                  << "  in-degree map. Past saturation this path runs on every header"
+                  << std::endl
+                  << "  under cs_main, so losing it is a remote lock-stall lever."
+                  << std::endl;
+        assert(false);
+    }
+
+    std::cout << " OK (" << ms << " ms for " << N << " all-pinned entries)" << std::endl;
+}
+
 int main()
 {
     std::cout << "Phase 6 PR6.1 — HeadersManager → chain_selector wiring tests\n";
@@ -1394,26 +1474,48 @@ int main()
     std::cout << "   + BLOCKER-1 re-resolve + clause (c) belt + MEDIUM-2 cascade\n";
     std::cout << "   + MEDIUM-2 provider-pin + MEDIUM-1 cap-ceiling, PR #129)\n\n";
 
+    // ONE LIST, ITERATED, SO THE REPORTED COUNT IS THE NUMBER ACTUALLY INVOKED.
+    // Previously these were bare calls and the summary line carried a hand-typed
+    // total. Test 15 was defined and never added to the list while the total was
+    // bumped in the same edit, so the suite printed "All 15 passed" having run 14
+    // — and the mutation that should have reddened it passed clean.
+    const std::vector<void (*)()> tests = {
+        test_pr61_happy_path_n_headers_populate_mapBlockIndex,
+        test_pr61_idempotency_same_header_no_duplicate,
+        test_pr61_orphan_header_rejected,
+        test_pr61_rejected_parent_flood_does_not_grow_mapBlockIndex,
+        test_pr61_cap_saturation_safe_leaf_eviction,
+        test_evict_never_frees_referenced_parent,
+        test_queue_byhash_reresolve_is_uaf_safe_when_leaf_evicted,
+        test_clause_c_belt_pins_havedata_without_validity,
+        test_evict_multipass_cascade_to_zero,
+        test_medium2_provider_pins_queued_block_and_ancestors,
+        test_medium2_provider_unrelated_hash_does_not_overpin,
+        test_blocker1_queue_path_cap_is_advisory,
+        test_high1_concurrent_evictor_cannot_free_unlinked_parent,
+        test_round2_unindexed_child_parent_pinned_by_hash_only,
+        test_round4_all_pinned_early_out_is_cheap,
+    };
+
     try {
-        test_pr61_happy_path_n_headers_populate_mapBlockIndex();
-        test_pr61_idempotency_same_header_no_duplicate();
-        test_pr61_orphan_header_rejected();
-        test_pr61_rejected_parent_flood_does_not_grow_mapBlockIndex();
-        test_pr61_cap_saturation_safe_leaf_eviction();
-        test_evict_never_frees_referenced_parent();
-        test_queue_byhash_reresolve_is_uaf_safe_when_leaf_evicted();
-        test_clause_c_belt_pins_havedata_without_validity();
-        test_evict_multipass_cascade_to_zero();
-        test_medium2_provider_pins_queued_block_and_ancestors();
-        test_medium2_provider_unrelated_hash_does_not_overpin();
-        test_blocker1_queue_path_cap_is_advisory();
-        test_high1_concurrent_evictor_cannot_free_unlinked_parent();
-        test_round2_unindexed_child_parent_pinned_by_hash_only();
+        for (auto fn : tests) {
+            fn();
+            ++g_ran;
+        }
     } catch (const std::exception& e) {
         std::cerr << "\nFAILED: " << e.what() << "\n";
         return 1;
     }
 
-    std::cout << "\nAll 14 PR6.1 wiring tests passed.\n";
+    // COUNT WHAT RAN, NEVER A LITERAL — this line used to read "All 15 ... passed"
+    // as a hard-coded string, and it lied. Test 15 was added, DEFINED, and never
+    // wired into the list above; the count was bumped in the same edit, so the
+    // suite reported 15 passing while 14 ran, and a mutation that should have
+    // reddened it did nothing. A test nobody calls is indistinguishable from a
+    // test that passes, and a hand-maintained tally is what makes it invisible.
+    //
+    // g_ran is incremented by each test as it completes, so the number below is
+    // an observation rather than a claim.
+    std::cout << "\nAll " << g_ran << " PR6.1 wiring tests passed.\n";
     return 0;
 }
