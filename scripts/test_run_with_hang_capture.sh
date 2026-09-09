@@ -208,5 +208,58 @@ else
 fi
 
 echo
+echo "== a workflow must be able to actually EXECUTE the scripts it invokes =="
+# THIS ARM EXISTS BECAUSE ITS ABSENCE COST FOUR RED CI LEGS.
+#
+# ci.yml ran `./scripts/run_with_hang_capture.sh` while that file was tracked
+# 100644 -- the repo is developed on Windows, where the executable bit does not
+# survive a checkout, and 68 of its 69 tracked scripts are 100644 as a result.
+# On the runner that is exit 126, "Permission denied", before a single test ran.
+#
+# WHY NOBODY CAUGHT IT: every local run, mine included, invoked the script as
+# `bash scripts/...`, which needs no mode bit. The instrument could not exhibit
+# the defect class it was meant to cover -- "it parses" is not "it runs", and
+# "bash runs it" is not "the workflow runs it".
+#
+# repo-hygiene.yml already had the answer and was not copied: it has an explicit
+# `chmod +x` step before its `./` call. So the rule below accepts EITHER remedy
+# rather than pinning one style -- it passes repo-hygiene.yml today, and would
+# have failed ci.yml before this fix.
+WF="$HERE/../.github/workflows"
+if [ -d "$WF" ] && git -C "$HERE/.." rev-parse --git-dir >/dev/null 2>&1; then
+  bad=0; seen=0
+  # COMMENTS ARE NOT INVOCATIONS. The first version of this scanned raw text and
+  # counted "2" where only one line actually runs anything -- the other was a
+  # comment in ci.yml that merely NAMES the path. An arm that reddens or greens
+  # on prose is measuring the wrong population, so strip comment lines first.
+  for inv in $(grep -rh -v '^[[:space:]]*#' "$WF" \
+               | grep -oE '\./scripts/[A-Za-z0-9._-]+\.sh' | sed 's|^\./||' | sort -u); do
+    seen=$((seen + 1))
+    mode=$(git -C "$HERE/.." ls-files -s -- "$inv" 2>/dev/null | awk '{print $1}')
+    [ "$mode" = "100755" ] && continue
+    grep -rqF "chmod +x $inv" "$WF" && continue
+    echo "      $inv is mode ${mode:-UNTRACKED} in the index and no workflow chmods it"
+    bad=$((bad + 1))
+  done
+  chk "all $seen ./scripts invocations in workflows run on a fresh checkout" "$bad" 0
+else
+  echo "   SKIP  no workflow directory, or not a git checkout"
+fi
+
+echo
+echo "== the extracted scripts keep their executable bit in the index =="
+# Belt to the brace above. `bash <script>` makes the mode bit unnecessary, but a
+# future edit that switches back to `./` should find the bit already there.
+# A Windows commit that silently drops it reddens HERE rather than in CI.
+if git -C "$HERE/.." rev-parse --git-dir >/dev/null 2>&1; then
+  for s in scripts/run_with_hang_capture.sh scripts/test_run_with_hang_capture.sh; do
+    m=$(git -C "$HERE/.." ls-files -s -- "$s" | awk '{print $1}')
+    chk "$s is 100755 in the index" "${m:-MISSING}" 100755
+  done
+else
+  echo "   SKIP  not a git checkout"
+fi
+
+echo
 echo "   ===== run_with_hang_capture: $P passed, $F failed ====="
 [ "$F" -eq 0 ]

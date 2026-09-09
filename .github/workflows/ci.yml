@@ -249,11 +249,24 @@ jobs:
         #      so the sleep survived holding this step's stdout open. The comment
         #      above that code named the failure it did not prevent.
         #
-        # Both are fixed and pinned by scripts/test_run_with_hang_capture.sh
-        # (17 arms, including "a hang MUST fail the step" and "an incomplete
-        # gdb capture must say so").
+        # Both are fixed and pinned by scripts/test_run_with_hang_capture.sh,
+        # including "a hang MUST fail the step" and "an incomplete gdb capture
+        # must say so". (That comment used to state an arm count. It drifted
+        # within two days of being written, so the number is gone: the arm list
+        # lives in the self-test header, which cannot go stale relative to
+        # itself.)
+        #
+        # INVOKED VIA `bash`, NOT `./`, AND THAT IS LOAD-BEARING. Committed as
+        # `./scripts/run_with_hang_capture.sh`, this line failed on all four
+        # Build and Test legs with "Permission denied", exit 126: the script is
+        # tracked 100644 because the repo is developed on Windows, where the
+        # executable bit does not survive a checkout. 68 of the repo's 69
+        # tracked scripts are 100644, so `bash <script>` is the convention here
+        # -- the line directly above already used it. The mode bit is ALSO set
+        # in the index now, and an arm in the self-test asserts both, but `bash`
+        # is the half that does not depend on a bit Windows keeps dropping.
         BUDGET_SEC=$(bash scripts/ci_hang_budget.sh)
-        ./scripts/run_with_hang_capture.sh "$BUDGET_SEC" test-hang-artifacts \
+        bash scripts/run_with_hang_capture.sh "$BUDGET_SEC" test-hang-artifacts \
           ./test_dilithion --log_level=test_suite --report_level=short
         echo "Boost unit tests completed (HD wallet suites INCLUDED and gating)"
 
