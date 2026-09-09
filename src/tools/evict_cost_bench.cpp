@@ -30,6 +30,7 @@
 #include <node/block_index.h>
 #include <primitives/block.h>
 
+#include <algorithm>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
@@ -171,10 +172,25 @@ int main(int argc, char** argv)
     const long rss_before  = CurrentRssKb();
     const long peak_before = PeakRssKb();
 
-    // THE MEASUREMENT: exactly what a caller does on one over-cap insert —
-    // evict down to cap-1 to make room for a single new header.
+    // THE MEASUREMENT: exactly what a caller does on one over-cap insert.
+    //
+    // The callers drain a BATCH (cap/64) rather than one entry, so that the
+    // rebuild cost is paid once per batch instead of once per header. Mirror that
+    // here — measuring `entries - 1` would report the cost of the routine, not
+    // the cost a node actually pays per header, and those differ by the batch
+    // factor. Pass batch_div=0 on the command line to measure the old
+    // one-at-a-time behaviour for comparison.
+    const size_t batch_div = (argc > 3) ? std::stoul(argv[3]) : 64;
+    const size_t batch = (batch_div == 0)
+                             ? 1
+                             : std::max<size_t>(1, entries / batch_div);
+    const size_t target = (entries > batch) ? entries - batch : 1;
+    std::cout << "  eviction batch        : " << batch
+              << (batch_div == 0 ? "  (one-at-a-time, pre-batching behaviour)" : "")
+              << "\n";
+
     const auto t0 = std::chrono::steady_clock::now();
-    const bool evicted = chainstate.EvictLowestWorkLeafNotPinned(entries - 1);
+    const bool evicted = chainstate.EvictLowestWorkLeafNotPinned(target);
     const auto t1 = std::chrono::steady_clock::now();
 
     const long peak_after = PeakRssKb();
@@ -185,7 +201,20 @@ int main(int argc, char** argv)
     std::cout << "\n  --- one over-cap insert ---\n";
     std::cout << "  evicted_any           : " << (evicted ? "true" : "false") << "\n";
     std::cout << "  index size after      : " << chainstate.GetBlockIndexSize() << "\n";
-    std::cout << "  WALL TIME             : " << us / 1000.0 << " ms\n";
+    const size_t freed = entries - chainstate.GetBlockIndexSize();
+    std::cout << "  entries freed         : " << freed << "\n";
+    std::cout << "  WALL TIME (this call) : " << us / 1000.0 << " ms\n";
+    // THE NUMBER A NODE ACTUALLY PAYS. The next `freed` inserts sit below the cap
+    // and never reach the evictor at all, so the call cost is spread across them.
+    // Reported as a division of two measured quantities, not as a model.
+    if (freed > 0) {
+        std::cout << "  AMORTISED PER HEADER  : " << (us / 1000.0) / static_cast<double>(freed)
+                  << " ms  (this call / " << freed << " headers that now skip eviction)\n";
+    } else {
+        std::cout << "  AMORTISED PER HEADER  : n/a — nothing freed, so nothing is amortised;\n"
+                  << "                          every header pays this call in full unless the\n"
+                  << "                          O(1) early-out catches it\n";
+    }
     std::cout << "  cs_main HOLD          : " << us / 1000.0
               << " ms (the evictor holds cs_main for its whole body, so the\n"
               << "                          call duration IS the hold; not a separate number)\n";

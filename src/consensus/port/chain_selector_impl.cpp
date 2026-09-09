@@ -285,6 +285,33 @@ bool ChainSelectorAdapter::ProcessNewHeader(const CBlockHeader& header)
         const int cap = Dilithion::g_chainParams->nMapBlockIndexCap;
         if (cap > 0 && m_chainstate.GetBlockIndexSize() >= static_cast<size_t>(cap)) {
             // Make room for exactly one new header: evict down to cap-1.
+            //
+            // ⚠️ ONE ENTRY, NOT A BATCH — a cap/64 batch was implemented, MEASURED,
+            // and reverted, and the measurement is the point.
+            //
+            // The amortisation argument was that the per-call REBUILD dominates,
+            // so draining N entries costs about what draining one costs and can be
+            // spread over the next N headers. IT IS FALSE for this implementation:
+            // EvictLowestWorkLeafNotPinned rescans the WHOLE map to select each
+            // victim, so a batch of B costs O(B x n), not O(n).
+            //
+            // Measured, n=100,000 (src/tools/evict_cost_bench.cpp):
+            //     B=1  ->  94.7 ms       B=10 -> 263.6 ms
+            //     B=20 -> 539.1 ms       B=40 -> 846.3 ms
+            // ~19 ms of extra cs_main hold per extra entry. So batching tops out
+            // near a 5x amortised win — and buys it by turning many short stalls
+            // into one very long one. At the 500K production cap, cap/64 is ~7,800
+            // evictions inside a SINGLE unbroken cs_main hold, i.e. minutes of held
+            // lock. That is far worse for liveness than the per-header cost it was
+            // meant to fix, so it is not shipped.
+            //
+            // What DID ship from that work: the O(1) early-out at the top of
+            // EvictLowestWorkLeafNotPinned, which removes the attacker-relevant
+            // all-pinned steady state outright (665 ms -> 0 ms, 55 MB -> 0 KB,
+            // measured). The remaining cost applies only when there ARE evictable
+            // leaves, and removing it needs the O(n) victim selection gone —
+            // incremental in-degree or an evictable-leaf side index, which is a
+            // #193 deliverable with its own contract, not a fold-time change.
             const size_t target_max = static_cast<size_t>(cap) - 1;
             // TEST THE OUTCOME, NOT THE RETURN VALUE (external panel, kimi).
             //

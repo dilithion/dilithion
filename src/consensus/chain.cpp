@@ -227,6 +227,49 @@ bool CChainState::EvictLowestWorkLeafNotPinned(size_t target_max) {
 
     if (mapBlockIndex.empty()) return false;
 
+    // ---- (0) O(1) EARLY-OUT: the index IS the active chain ------------------
+    //
+    // MEASURED REASON THIS EXISTS. At a 500,000-entry index this routine costs
+    // ~665 ms of cs_main hold and ~55 MB of transient allocation PER CALL
+    // (src/tools/evict_cost_bench.cpp). In the all-pinned case it pays all of
+    // that and then returns false, having freed nothing — and that case is not
+    // an edge case, it is the STEADY STATE of any node whose active height has
+    // reached the cap. Past saturation the routine runs on every new header, so
+    // an attacker who spams headers to the cap buys a ~0.66 s global-lock stall
+    // per header. This check removes that entirely.
+    //
+    // THE CONDITION IS PROVABLE, WHICH IS WHY IT IS THIS ONE. Every entry on the
+    // active chain is in mapBlockIndex, so mapBlockIndex.size() >= activeLen
+    // always. If it is also <= activeLen then the two sets are EQUAL: the index
+    // is exactly the active chain, every entry is pinned by clause (a), and no
+    // eligible leaf can exist. Returning false is not an approximation here, it
+    // is the same answer the full path computes.
+    //
+    // ⚠️ A WIDER CONDITION WAS PROPOSED AND IS NOT SOUND — recording it so nobody
+    // re-adds it. The suggestion was
+    //     size() <= activeLen + candidates.size() + pending.size()
+    // on the reasoning that those are all pinned. They are, but they OVERLAP the
+    // active chain rather than extending it: IsBlockACandidateForActivation gates
+    // on validity only, so the active tip and its recent ancestors are normally
+    // candidates too. Counter-example — 100 active entries, 5 candidates all ON
+    // the active chain, 5 unpinned fork leaves, size 105 <= 100 + 5 + 0. The
+    // condition fires and the five leaves are never evicted. Because the cap is
+    // advisory the damage is bounded (the map exceeds its target rather than
+    // anything unsafe), but it would silently weaken the cap under exactly the
+    // fork-spam conditions the cap exists for. Sufficient-and-provable beats
+    // sufficient-looking.
+    //
+    // Not exact, deliberately: an index that is active chain PLUS only pinned
+    // non-chain entries also has nothing evictable and is NOT caught here. That
+    // case falls through to the full path and pays for the answer. This check
+    // buys the common, attacker-relevant case at O(1) and claims nothing more.
+    if (pindexTip != nullptr) {
+        const size_t activeLen = static_cast<size_t>(pindexTip->nHeight) + 1;
+        if (mapBlockIndex.size() <= activeLen) {
+            return false;  // index == active chain; every entry pinned by (a)
+        }
+    }
+
     // ---- (1) Build the in-degree map over the pprev graph -----------------
     // in_degree[node] = number of surviving entries that name `node` as pprev.
     // A node with in_degree 0 is a leaf: no surviving entry references it via
