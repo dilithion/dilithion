@@ -2417,6 +2417,26 @@ CBlockIndex* CChainState::GetTip() const {
     return pindexTip;
 }
 
+std::vector<uint256> CChainState::GetAncestorHashes(const std::vector<int>& heights) const {
+    // P2P-16. The whole point is that the walk happens INSIDE this lock and only
+    // copies leave it. Do not be tempted to return the CBlockIndex*s "for
+    // efficiency" — that reintroduces exactly the use-after-free this replaces.
+    std::vector<uint256> out;
+    out.reserve(heights.size());
+
+    std::lock_guard<std::recursive_mutex> lock(cs_main);
+    for (int h : heights) {
+        uint256 hash;  // null by default = "not on the best chain at that height"
+        if (pindexTip && h >= 0 && h <= pindexTip->nHeight) {
+            if (const CBlockIndex* p = pindexTip->GetAncestor(h)) {
+                hash = p->GetBlockHash();
+            }
+        }
+        out.push_back(hash);
+    }
+    return out;
+}
+
 // ============================================================================
 // Magnet v1a (fork-resistance): canonical node-health signal.
 // OBSERVABILITY ONLY — pure read + report. No fork-choice / reorg / validation

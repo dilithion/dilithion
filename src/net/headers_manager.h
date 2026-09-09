@@ -722,11 +722,35 @@ private:
      * to avoid cs_headers/cs_main deadlock. Pass the pre-fetched tip here.
      *
      * @param hashTip Starting point for locator (unused, uses best chain)
-     * @param pTip Pre-fetched chainstate tip (obtained before cs_headers lock)
+     * @param chainstateHashes P2P-16: height->hash for the chainstate side,
+     *        resolved BY VALUE under cs_main before cs_headers was taken. This
+     *        used to be a raw CBlockIndex* from GetTip(), which releases cs_main
+     *        before returning — the walk then dereferenced it with no lock while
+     *        the header thread could evict that index (use-after-free).
      * @param chainstateHeight Pre-fetched chainstate height
      * @return Vector of block hashes for locator
      */
-    std::vector<uint256> GetLocatorImpl(const uint256& hashTip, CBlockIndex* pTip, int chainstateHeight) const;
+    std::vector<uint256> GetLocatorImpl(const uint256& hashTip,
+                                        const std::map<int, uint256>& chainstateHashes,
+                                        int chainstateHeight) const;
+
+    /**
+     * P2P-16 helper. Best-header height. CALLER MUST HOLD cs_headers.
+     *
+     * Named "...Locked" so a future reader cannot call it from an unlocked
+     * context by accident — the two P2P-16 call sites take a short cs_headers
+     * scope purely to ask this, then release before touching cs_main.
+     */
+    int BestHeaderHeightLocked() const;
+
+    /**
+     * P2P-16 helper. Resolve the chainstate half of a locator to VALUES.
+     *
+     * Takes NO lock itself and MUST be called with cs_headers NOT held: it goes
+     * to the chainstate, which takes cs_main, and cs_main under cs_headers is
+     * the inversion P2P-14/15 closed.
+     */
+    std::map<int, uint256> ResolveChainstateHashes(int startHeight, int chainstateHeight) const;
 
     /**
      * @struct PeerSyncState

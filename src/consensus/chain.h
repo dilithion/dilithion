@@ -615,8 +615,38 @@ public:
     /**
      * Get current chain tip (most work)
      * CRITICAL-1 FIX: Now implemented in .cpp with mutex protection
+     *
+     * ⚠️ RELEASED POINTER. This takes cs_main, reads pindexTip, and RELEASES
+     * cs_main before returning. The CBlockIndex it points at is owned by
+     * mapBlockIndex and can be destroyed by EvictLowestWorkNotOnBestChain the
+     * moment this returns. Dereferencing the result — including a
+     * GetAncestor/pprev walk — with cs_main NOT held is a use-after-free
+     * (register P2P-16). Use GetAncestorHashes() when you need chain data
+     * across a lock-free window; that returns VALUES.
      */
     CBlockIndex* GetTip() const;
+
+    /**
+     * P2P-16: resolve ancestor hashes BY VALUE, under cs_main.
+     *
+     * Answers "what is the block hash at each of these heights on the current
+     * best chain?" in ONE cs_main acquisition, returning copies. The caller
+     * can then hold and use the answers with no lock at all, because there is
+     * no longer a pointer whose target can be freed underneath it.
+     *
+     * This exists because the alternative is not available: callers such as
+     * CHeadersManager build a locator while holding cs_headers, and taking
+     * cs_main under cs_headers is the exact inversion P2P-14/15 closed. So the
+     * lock cannot be extended over the walk — the DATA has to leave the lock
+     * instead of the pointer.
+     *
+     * @param heights  Heights to resolve. Order is preserved.
+     * @return One entry per requested height, in the same order. An entry is
+     *         a NULL uint256 when that height is not on the current best chain
+     *         (above the tip, or below genesis) — callers must handle that, as
+     *         they already had to handle GetAncestor() returning nullptr.
+     */
+    std::vector<uint256> GetAncestorHashes(const std::vector<int>& heights) const;
 
     /**
      * Set chain tip (used during initialization)
