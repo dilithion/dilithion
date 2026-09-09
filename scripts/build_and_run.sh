@@ -78,8 +78,53 @@ echo
 echo "== running =="
 fail=0
 for t in "${TARGETS[@]}"; do
-    ./"$t" > "/tmp/${t}.out" 2>&1
+    # PER-SUITE TIMEOUT (round-5 reader, LOW). Without one, a suite that hangs
+    # hangs this script forever — the reader's arm 2 did exactly that. The roster
+    # runner has had a per-suite timeout since #180; this convenience wrapper did
+    # not, which is the same "the guard exists on the sanctioned path only" shape
+    # that put this script here in the first place.
+    #
+    # --preserve-status is deliberate: without it `timeout` reports 124 and a hang
+    # is indistinguishable from a failure. See lesson_timeout_exit_codes_143.
+    # -k IS LOAD-BEARING (round-5 seats, LOW). Without --kill-after, `timeout`
+    # sends SIGTERM and then WAITS FOREVER for a process that ignores it — so the
+    # timeout that exists to stop a hang can itself hang. -k follows with SIGKILL,
+    # which cannot be ignored. The grace is 30s: long enough for a suite that is
+    # merely slow to flush and exit cleanly, short enough that a wedged one does not
+    # hold the run. (Measured with a 3s grace during development; the shipped value
+    # is 30 -- stating both so the number in the comment matches the code.)
+    #
+    # And a suite that CATCHES SIGTERM and exits 0 would be reported PASS by a
+    # plain exit-code check: the deadline expiring is a FAILURE regardless of what
+    # the process chose to return. --preserve-status gives us the signal-derived
+    # status (143 = SIGTERM, 137 = SIGKILL; NOT 124 — see
+    # lesson_timeout_exit_codes_143), so those are treated as failures explicitly
+    # rather than trusted to be non-zero.
+    # ELAPSED TIME, NOT JUST THE EXIT CODE (round-6 confirming reader, measured).
+    # A suite that CATCHES SIGTERM and exits 0 promptly is reported PASS by any
+    # rc-only check — the deadline fired, the run did not complete on its own
+    # terms, and the exit code says success. So the wall clock is the authority:
+    # if it took at least the deadline, it FAILED, whatever it returned.
+    __t0=$(date +%s)
+    timeout -k 30 --preserve-status "${SUITE_TIMEOUT:-600}" ./"$t" > "/tmp/${t}.out" 2>&1
     rc=$?
+    __elapsed=$(( $(date +%s) - __t0 ))
+    if [ "$__elapsed" -ge "${SUITE_TIMEOUT:-600}" ]; then
+        printf '   FAIL  %-52s DEADLINE: ran %ss >= %ss limit (rc=%s)
+'                "$t" "$__elapsed" "${SUITE_TIMEOUT:-600}" "$rc"
+        echo "         rc=0 here would mean the suite CAUGHT the kill signal and"
+        echo "         exited cleanly — that is still a deadline failure."
+        fail=$((fail + 1))
+        continue
+    fi
+    if [ "$rc" -eq 143 ] || [ "$rc" -eq 137 ] || [ "$rc" -eq 124 ]; then
+        printf '   FAIL  %-52s DEADLINE EXPIRED after %ss (rc=%s)
+'                "$t" "${SUITE_TIMEOUT:-600}" "$rc"
+        echo "         a suite that exceeds its deadline is a FAILURE even if it"
+        echo "         then exits 0 — the run did not complete on its own terms."
+        fail=$((fail + 1))
+        continue
+    fi
     if [ "$rc" -eq 0 ]; then
         printf '   PASS  %-52s\n' "$t"
     else

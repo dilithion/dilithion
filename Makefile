@@ -1527,27 +1527,38 @@ libzmq-clean:
 	@rm -rf depends/libzmq/build depends/libzmq/build-windows
 
 # Include auto-generated header dependency files (-MMD -MP)
-# These ensure that changing any .h file triggers recompilation of all .cpp files
-# that include it.
-#
+# These ensure that changing any .h file triggers recompilation of all .cpp files that include it
 # ⚠️ `$(wildcard .../**/*.d)` DOES NOT RECURSE, AND THE MISS IS SILENT.
+#
 # GNU make's $(wildcard) is glob, not globstar: `**` behaves as a single `*`, so
-# `$(OBJ_DIR)/**/*.d` matched exactly ONE directory level. Measured on a populated
-# tree: 153 .d files exist, the old pattern matched 148, and the 5 it missed were
-# all two levels deep — build/obj/consensus/port (chain_selector_impl, the adapter
-# every consensus change touches) and build/obj/net/port.
+# `$(OBJ_DIR)/**/*.d` matched exactly ONE directory level, so everything two
+# levels deep was invisible to it:
+#     build/obj/consensus/port/   (1 file: chain_selector_impl)
+#     build/obj/net/port/         (4 files)
 #
-# Those objects therefore had NO header dependency tracking. Editing a header they
-# include did not rebuild them, and because the miss is silent the result is not a
-# build error but a MIXED-LAYOUT BINARY: objects compiled against different
-# definitions of the same class, linked together.
+# Measured twice on differently-populated trees: 153 .d present / 148 matched,
+# and 155 / 150. The TOTAL moves with how much has been built, so the durable
+# fact is not a ratio — it is that these two directories were never covered, and
+# they are second-level only because of where the port adapters live.
 #
-# That is exactly how it presented. Adding two members to CChainState rebuilt
-# chain.o and left chain_selector_impl.o at its previous layout; the next run
-# threw std::system_error("Invalid argument") from a std::lock_guard inside
-# ProcessNewHeader, because it was locking cs_main at the wrong offset. A mutex
-# error with no mutex bug — the kind of thing that gets blamed on threading for a
-# day. `find` is used instead of `wildcard` because it actually recurses.
+# Those objects therefore had NO header dependency tracking at all. Editing a
+# header they include did not rebuild them, and because nothing reports the miss
+# the result is not a build error but a MIXED-LAYOUT BINARY: two objects compiled
+# against different definitions of the same class, linked together.
+#
+# HOW IT PRESENTS, because it does not look like a build problem. Adding two
+# members to CChainState rebuilt chain.o and left chain_selector_impl.o at its
+# previous layout. The next run threw
+#     terminate called after throwing an instance of 'std::system_error'
+#       what():  Invalid argument
+# from a std::lock_guard inside ChainSelectorAdapter::ProcessNewHeader — a mutex
+# error with no mutex bug, because that object was locking cs_main at the wrong
+# offset. Time was spent suspecting threading before object mtimes were compared.
+#
+# `find` is used instead of `wildcard` because it actually recurses. Verified by
+# positive control: touch src/consensus/chain.h, and
+# build/obj/consensus/port/chain_selector_impl.o now rebuilds (its mtime moves);
+# before this change it did not.
 DEPFILES := $(shell find $(OBJ_DIR) -name '*.d' 2>/dev/null)
 -include $(DEPFILES)
 

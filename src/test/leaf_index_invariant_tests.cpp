@@ -245,6 +245,192 @@ int main()
             cs.LeafIndexMatchesBruteForce());
     }
 
+    // ---- Cleanup() IS A THIRD MEMBERSHIP MUTATOR (round-5 reader, HIGH-1) ----
+    //
+    // #129 documented "maintenance is exactly TWO sites". That was FALSE:
+    // CChainState::Cleanup() calls mapBlockIndex.clear(), freeing every node,
+    // and the leaf index kept the freed pointers. The next AddBlockIndex then
+    // ran m_evictableLeaves.insert(), whose comparator reads nChainWork and
+    // GetBlockHash() off FREED memory.
+    //
+    // Not a teardown-only path: dilithion-node.cpp:2970 and dilv-node.cpp:2836
+    // use Cleanup() as the corrupted-DB auto-recovery (`Cleanup(); SetTip(nullptr);
+    // goto load_genesis_block;`), so this ran in production on any node that hit
+    // a corrupt database.
+    //
+    // RED-ARM: remove the m_inDegree/m_evictableLeaves clears from Cleanup() and
+    // this goes red (and, under ASan, traps).
+    {
+        CChainState cs;
+        ::dilithion::consensus::port::ChainSelectorAdapter ad(cs);
+
+        auto g1 = MakeHeader(zero, 1700200000, 0x30);
+        if (!ad.ProcessNewHeader(g1)) { std::cerr << "setup: g1 rejected" << std::endl; return 2; }
+        uint256 prev = g1.GetHash();
+        for (int i = 1; i <= 6; ++i) {
+            auto h = MakeHeader(prev, static_cast<uint32_t>(1700200000 + i),
+                                static_cast<uint8_t>(0x40 + i));
+            if (!ad.ProcessNewHeader(h)) { std::cerr << "setup: chain rejected" << std::endl; return 2; }
+            prev = h.GetHash();
+        }
+        CBlockIndex* tip = cs.GetBlockIndex(prev);
+        if (tip) cs.SetTip(tip);
+        chk("pre-Cleanup: index consistent", cs.LeafIndexMatchesBruteForce());
+
+        // THE OPERATION THAT WAS UNMAINTAINED.
+        cs.Cleanup();
+        chk("after Cleanup: index consistent (empty map, empty structures)",
+            cs.LeafIndexMatchesBruteForce());
+        chk("after Cleanup: map is empty", cs.GetBlockIndexSize() == 0);
+
+        // Re-add after Cleanup. WITHOUT the fix this inserts into a set whose
+        // comparator dereferences freed nodes.
+        auto g2 = MakeHeader(zero, 1700300000, 0x50);
+        chk("re-add after Cleanup succeeds", ad.ProcessNewHeader(g2));
+        chk("after re-add: index consistent", cs.LeafIndexMatchesBruteForce());
+
+        uint256 p2 = g2.GetHash();
+        for (int i = 1; i <= 4; ++i) {
+            auto h = MakeHeader(p2, static_cast<uint32_t>(1700300000 + i),
+                                static_cast<uint8_t>(0x60 + i));
+            if (!ad.ProcessNewHeader(h)) break;
+            p2 = h.GetHash();
+        }
+        CBlockIndex* t2 = cs.GetBlockIndex(p2);
+        if (t2) cs.SetTip(t2);
+
+        // And eviction must still work on the rebuilt index.
+        const size_t sz2 = cs.GetBlockIndexSize();
+        if (sz2 > 2) cs.EvictLowestWorkLeafNotPinned(sz2 - 1);
+        chk("after eviction on the rebuilt index: consistent",
+            cs.LeafIndexMatchesBruteForce());
+    }
+
+    // ---- THE MERGE-ARM pprev ADOPTION: now DEAD BY CONSTRUCTION -------------
+    //
+    // Round 5 found this arm unmaintained: adoption gives a live entry a parent,
+    // so that parent stops being a leaf, and without maintenance the evictor freed
+    // a node a surviving child named as pprev.
+    //
+    // Round 6 added the height relation the first-time-add path enforces
+    // (`existing->nHeight == pprev->nHeight + 1`), to stop two adoptions minting a
+    // pprev CYCLE that hangs FindFork's two-pointer walk. Following that check
+    // through PROVES the arm is unreachable:
+    //
+    //   * reaching it needs `existing->pprev == nullptr`;
+    //   * a parentless entry can only enter the map via chain.cpp:243, which
+    //     asserts `nHeight == 0`;
+    //   * so the new check demands a parent at height -1, which cannot exist.
+    //
+    // THERE IS THEREFORE NO TEST HERE, and that is the honest state rather than a
+    // gap. The behaviour cannot be driven through AddBlockIndex any more: the
+    // sequence that used to reach it now trips a ConsensusInvariant, which aborts
+    // the process, and asserting an abort needs death-test machinery this suite
+    // does not have. The maintenance lines stay as defence-in-depth for the
+    // plausible future change (relaxing the parentless-implies-genesis rule for
+    // orphan handling), and if that change lands, THIS is where the test goes.
+
+    // ---- THE ADOPT ARM'S REGRESSION, AS A PRECONDITION GUARD ---------------
+    //
+    // The review's rule is right: unreachable-today code carrying maintenance must
+    // keep a regression, or the maintenance rots exactly like the arm that produced
+    // this defect. But the arm cannot be driven through AddBlockIndex any more --
+    // reaching it needs a parentless entry at height > 0, and AddBlockIndex's
+    // else-branch asserts a parentless entry is height 0. An attempt aborts the
+    // process, and asserting an abort needs death-test machinery this suite lacks.
+    //
+    // So the guard is on the PRECONDITION. The arm becomes reachable if and only if
+    // "parentless implies genesis" is relaxed -- precisely the orphan-handling
+    // change the maintenance exists to serve. This asserts that precondition over
+    // REAL data: every parentless entry in a populated chainstate is height 0.
+    //
+    // ⚠️ THE FIRST VERSION OF THIS GUARD WAS VACUOUS -- it asserted the shape of an
+    // object the test had just constructed, plus a literal `true`. A test that
+    // cannot fail, written in a suite whose entire purpose is catching tests that
+    // cannot fail. Replaced with a property over the built chain, which a
+    // relaxation that actually produced such entries would break.
+    {
+        size_t parentless = 0, parentless_nonzero_height = 0;
+        for (const uint256& h : all) {
+            CBlockIndex* p = chainstate.GetBlockIndex(h);
+            if (!p || p->pprev != nullptr) continue;
+            ++parentless;
+            if (p->nHeight != 0) ++parentless_nonzero_height;
+        }
+        chk("adopt-arm precondition: at least one parentless entry exists to check",
+            parentless > 0);
+        chk("adopt-arm precondition: EVERY parentless entry is height 0, so an "
+            "adoptable entry would need a parent at height -1 -- the arm is "
+            "unreachable. If this fails, the arm is LIVE: restore its maintenance "
+            "regression (insert P at height 0, X parentless at height 1, merge X "
+            "with pprev=P, assert P is not evicted while X names it).",
+            parentless_nonzero_height == 0);
+    }
+
+    // ---- IsLeafPinnedDirect, PER CLAUSE (round-5 seats, item 4) --------------
+    //
+    // The randomized arm above brute-walks clause (a) only and never CALLS
+    // IsLeafPinnedDirect, so mutants in clauses (b), (c) and (d) survived it.
+    // This exercises the function itself, one clause at a time, with a reference
+    // answer built independently.
+    {
+        CChainState cs;
+        ::dilithion::consensus::port::ChainSelectorAdapter ad(cs);
+        auto gg = MakeHeader(zero, 1700400000, 0x70);
+        if (!ad.ProcessNewHeader(gg)) { std::cerr << "clause setup failed" << std::endl; return 2; }
+        const uint256 gh = gg.GetHash();
+        uint256 prev = gh;
+        std::vector<uint256> leaves;
+        for (int i = 1; i <= 8; ++i) {   // one leaf per clause, no sharing:
+            // the first version reused leaves[2] for clauses (b) and (d), so
+            // making it a candidate in (b) broke (d)'s 'not pinned' assertion.
+            // Cross-clause state bleed inside one fixture is its own defect.
+            auto h = MakeHeader(gh, static_cast<uint32_t>(1700400000 + i),
+                                static_cast<uint8_t>(0x80 + i));
+            if (ad.ProcessNewHeader(h)) leaves.push_back(h.GetHash());
+        }
+        chk("clause setup: a distinct leaf per clause exists", leaves.size() >= 5);
+        const std::set<uint256> no_pending;
+
+        // (a) the tip
+        CBlockIndex* l0 = cs.GetBlockIndex(leaves[0]);
+        cs.SetTip(l0);
+        chk("clause (a): the tip IS pinned", cs.IsLeafPinnedDirect(l0, no_pending));
+        CBlockIndex* l1 = cs.GetBlockIndex(leaves[1]);
+        chk("clause (a): a non-tip leaf is NOT pinned by (a)",
+            !cs.IsLeafPinnedDirect(l1, no_pending));
+
+        // (c) HAVE_DATA without full validity — a direct flag test
+        CBlockIndex* l2 = cs.GetBlockIndex(leaves[2]);
+        chk("clause (c): clean leaf not pinned", !cs.IsLeafPinnedDirect(l2, no_pending));
+        l2->nStatus |= CBlockIndex::BLOCK_HAVE_DATA;
+        chk("clause (c): HAVE_DATA without VALID_TRANSACTIONS IS pinned",
+            cs.IsLeafPinnedDirect(l2, no_pending));
+        l2->RaiseValidity(CBlockIndex::BLOCK_VALID_TRANSACTIONS);
+        chk("clause (c): once fully validated it is NOT pinned by (c)",
+            !cs.IsLeafPinnedDirect(l2, no_pending));
+
+        // (b) candidate-set membership — kimi round-6 LOW: this clause had no
+        // arm, so the mutant deleting it survived. Reference answer built
+        // independently: a leaf is pinned by (b) iff it is IN the candidate set.
+        CBlockIndex* l3 = cs.GetBlockIndex(leaves[3]);   // (b) only
+        chk("clause (b): a non-candidate leaf is NOT pinned",
+            !cs.IsLeafPinnedDirect(l3, no_pending));
+        l3->nStatus |= CBlockIndex::BLOCK_VALID_TRANSACTIONS;
+        cs.RecomputeCandidates();
+        const bool now_candidate = cs.IsBlockACandidateForActivation(l3);
+        chk("clause (b): reference says it is now a candidate", now_candidate);
+        chk("clause (b): and IsLeafPinnedDirect agrees it is pinned",
+            !now_candidate || cs.IsLeafPinnedDirect(l3, no_pending));
+
+        // (d) the pending snapshot
+        std::set<uint256> pending{ leaves[1] };
+        chk("clause (d): a leaf in the pending set IS pinned",
+            cs.IsLeafPinnedDirect(l1, pending));
+        chk("clause (d): a leaf absent from it is NOT",
+            !cs.IsLeafPinnedDirect(cs.GetBlockIndex(leaves[4]), pending));  // (d) only
+    }
+
     Dilithion::g_chainParams = saved;
 
     std::cout << "\n  ===== leaf index invariant: "
