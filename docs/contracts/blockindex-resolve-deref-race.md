@@ -111,3 +111,27 @@ Touches `src/` and is not test-only, so **D-DIL-2026-09-08-4 applies**: an exter
 cross-family seat on the raw diff at PR open, plus one independent non-author read.
 Consensus-adjacent and concurrency-touching, so TSan is mandatory rather than
 advisory.
+
+## NOT IN SCOPE HERE: the eviction COST fix — it landed in #129
+
+For a while the plan was for #129 to ship the leaf-only UAF fix and hand the
+performance problem to this PR. It did not work out that way, and the record
+matters so nobody re-opens it:
+
+* #129's leaf-only evictor was **measured at 2.31x main's cost** per over-cap
+  insert at a 500,000-entry index (485.4 ms vs 210.6 ms of `cs_main` hold,
+  43 MB vs 20 MB transient) — on the has-evictable-leaves path an attacker
+  reaches by spamming headers to the cap. That made it merge-blocking: a
+  hardening PR that closes a UAF by making a remote CPU-DoS cheaper is a bad
+  trade.
+* It was fixed **in #129** with an evictable-leaf side index (O(log n) victim
+  selection), landing at **0.008 ms and 0 KB transient**. CON-27 carries the
+  numbers and the method.
+* The reasoning for putting it there rather than here: the algorithm's cost fix
+  belongs with the algorithm and its review. Making a UAF fix depend on THIS
+  PR's bundle — four foreign-file guards, their deadlock argument, the
+  ~61-call census and the cap reduction — is the wrong dependency direction.
+
+**So this contract's scope is unchanged.** Do not add "incremental in-degree" or
+"evictable-leaf side index" as a deliverable here; both are already shipped in
+#129. What remains here is exactly what is listed above.
