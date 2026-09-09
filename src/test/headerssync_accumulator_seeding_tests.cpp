@@ -18,9 +18,11 @@
 //     "does this peer's chain exceed the absolute minimum?"
 //
 // Against an absolute, from-genesis nMinimumChainWork the first question is
-// never true on a node whose tip already carries a threshold's worth of work
-// (not "any node with history" -- see chainparams.cpp): PRESYNC never reaches
-// REDOWNLOAD,
+// false whenever the RECEIVED SUFFIX carries less than a full threshold of work,
+// however much our own tip already has. (Two earlier wordings -- "any node with
+// history", then "any node whose tip carries a threshold" -- were both still
+// overclaims: a peer supplying a full threshold of NEW work passes either way.)
+// PRESYNC never reaches REDOWNLOAD,
 // pow_validated_headers stays empty, and header sync stalls. Found by red-team,
 // not by me, and it would have shipped as "we set two constants".
 //

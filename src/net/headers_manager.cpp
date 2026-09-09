@@ -97,8 +97,10 @@ CHeadersManager::CHeadersManager(const uint256& minimum_chain_work)
 
 uint256 CHeadersManager::GetMinimumChainWork() const
 {
-    // Deliberately NOT taking cs_headers: the field is write-once at
-    // construction, and a lock here would be a deadlock hazard for any caller
+    // Deliberately NOT taking cs_headers: the field is written ONLY DURING
+    // construction and is immutable afterwards (on the delegating path it is
+    // written twice -- see the constructor above; "write-once" was wrong there
+    // and was wrong here, eight lines apart, in the same edit), and a lock here would be a deadlock hazard for any caller
     // that already holds it (cs_headers is a non-recursive std::mutex).
     return nMinimumChainWork;
 }

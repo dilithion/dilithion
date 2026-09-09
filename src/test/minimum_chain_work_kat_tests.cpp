@@ -35,8 +35,10 @@
 // otherwise. These thresholds are ABSOLUTE sums from genesis; HeadersSyncState
 // formerly zeroed its accumulator while starting from the LOCAL TIP, which would
 // have stalled header sync on any node whose tip already carried a threshold's
-// worth of work -- not on "any non-fresh node", which was an overclaim. It now
-// takes a REQUIRED
+// worth of work. Precisely: the old comparison failed whenever the RECEIVED
+// SUFFIX carried less than a full threshold, however much our tip already had --
+// "any non-fresh node" and "any node past the threshold" were both overclaims.
+// It now takes a REQUIRED
 // chain_start_work and seeds from it. Flagged by all three external seats as
 // same-commit comment rot -- the defect this mission polices.
 //
@@ -180,7 +182,8 @@ void test_dil_constant_is_re_derived_from_the_committed_census()
         // The MANTISSA, not the whole word -- the same hole the generator had, one
         // layer down, found by two round-2 seats. 0x1e000000 is non-zero, sits
         // inside the consensus window and has mantissa 0, which saturates
-        // ComputeChainWork to MAX. Sign-bit-set mantissas (0x1ef0c7e6, 1,667
+        // ComputeChainWork to MAX. Sign-bit-set mantissas (0x1ef0c7e6 is 898 of
+        // the 1,667
         // blocks) are LEGITIMATE here and this mask does not touch them.
         REQUIRE((nbits & 0xFFFFFF) != 0);
         for (uint32_t n = 0; n < DIL_NBITS_CENSUS[i].count; ++n)

@@ -158,7 +158,9 @@ public:
      *   accumulator was memset to zero, while chain_start is our LOCAL TIP, not
      *   genesis. The gate then asked "has this peer supplied a whole threshold's
      *   worth of NEW work beyond our tip?" instead of "does this chain exceed
-     *   the absolute minimum?" -- never true on a non-fresh node, so PRESYNC
+     *   the absolute minimum?" -- false whenever the RECEIVED SUFFIX carries
+     *   less than a full threshold of work, however much our tip already has,
+     *   so PRESYNC
      *   would never reach REDOWNLOAD and header sync would stall. Upstream seeds
      *   from chain_start->nChainWork; this restores that.
      *
