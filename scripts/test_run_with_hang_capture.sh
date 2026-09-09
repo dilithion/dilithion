@@ -247,7 +247,7 @@ else
 fi
 
 echo
-echo "== the extracted scripts keep their executable bit in the index =="
+echo "== the extracted scripts keep their executable bit in the COMMIT =="
 # Belt to the brace above. `bash <script>` makes the mode bit unnecessary, but a
 # future edit that switches back to `./` should find the bit already there.
 # A Windows commit that silently drops it reddens HERE rather than in CI.
