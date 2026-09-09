@@ -1,0 +1,158 @@
+#!/usr/bin/env bash
+# Self-test for run_with_hang_capture.sh.
+#
+# WHY IT EXISTS. The watchdog it tests used to be inline YAML in ci.yml, so
+# nothing had ever executed it outside a real CI hang -- an event that fires
+# about 8% of the time. Every property below was therefore an assumption:
+#
+#   * that a hang FAILS the step (if it did not, the instrument would record
+#     the hang and let it merge, and the artifact would be read by nobody);
+#   * that a healthy run is untouched and produces no artifact;
+#   * that a genuine test FAILURE propagates its own status rather than being
+#     laundered into a hang;
+#   * that the PID-reuse guard does not fire on an unrelated process.
+#
+# The arm that carries the most information is the third one: "hang" and "fail"
+# must stay distinguishable, because the whole reason #180 existed is that they
+# had been conflated.
+set -uo pipefail
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
+RUNNER="${1:-$HERE/run_with_hang_capture.sh}"
+P=0; F=0
+chk(){ if [ "$2" = "$3" ]; then echo "   PASS  $1"; P=$((P+1)); else echo "   FAIL  $1 got=$2 want=$3"; F=$((F+1)); fi; }
+
+[ -f "$RUNNER" ] || { echo "FAIL: runner not found at $RUNNER" >&2; exit 1; }
+
+mk() {   # mk <name> <body>
+    local d="$1" name="$2" body="$3"
+    printf '%s' "$body" > "$d/$name"
+    chmod +x "$d/$name"
+}
+
+echo "== a HEALTHY run is untouched and leaves no artifact =="
+d="$(mktemp -d)"
+mk "$d" quickpass '#!/usr/bin/env bash
+exit 0
+'
+bash "$RUNNER" 5 "$d/art" "$d/quickpass" >/dev/null 2>&1
+chk "a passing command exits 0" "$?" "0"
+chk "and produces no hang artifact" "$(ls "$d/art" 2>/dev/null | wc -l)" "0"
+rm -rf "$d"
+
+echo
+echo "== a genuine FAILURE keeps its own exit code and is not called a hang =="
+# #180 exists because a hang was being reported as a test failure. The reverse
+# would be just as bad, and this instrument sits directly on that boundary.
+d="$(mktemp -d)"
+mk "$d" quickfail '#!/usr/bin/env bash
+exit 3
+'
+bash "$RUNNER" 5 "$d/art" "$d/quickfail" >/dev/null 2>&1
+chk "a failing command propagates its exit code verbatim" "$?" "3"
+chk "and is NOT recorded as a hang" "$(ls "$d/art" 2>/dev/null | wc -l)" "0"
+rm -rf "$d"
+
+echo
+echo "== A HANG MUST FAIL THE STEP -- the property the whole instrument rests on =="
+d="$(mktemp -d)"
+mk "$d" hangs '#!/usr/bin/env bash
+sleep 300
+'
+start=$(date +%s)
+bash "$RUNNER" 3 "$d/art" "$d/hangs" >/dev/null 2>&1
+rc=$?
+elapsed=$(( $(date +%s) - start ))
+if [ "$rc" -eq 0 ]; then
+    echo "   FAIL  A HANG WAS GREEN. The instrument would record the hang and let it merge."
+    F=$((F+1))
+else
+    chk "a hang exits non-zero (got $rc)" "yes" "yes"
+fi
+chk "it was killed near the budget, not left to run" "$([ "$elapsed" -lt 60 ] && echo yes || echo no)" "yes"
+art="$d/art/hangs_hang_stack.txt"
+chk "a stack artifact was written" "$([ -s "$art" ] && echo yes || echo no)" "yes"
+if [ -s "$art" ]; then
+    grep -q 'per-thread wchan' "$art" && chk "the artifact carries per-thread wait channels" yes yes \
+        || { echo "   FAIL  artifact missing the wchan section"; F=$((F+1)); }
+    grep -q 'hang, captured' "$art" && chk "and says what it is and when" yes yes \
+        || { echo "   FAIL  artifact missing its header"; F=$((F+1)); }
+fi
+rm -rf "$d"
+
+echo
+echo "== an INCOMPLETE capture must say so, not look like a capture =="
+# LOW-3. An artifact that exists is not the same as evidence obtained: a gdb
+# that cannot attach (ptrace_scope, not installed, a 180s stall) previously left
+# a file that looked like a successful capture and merely contained an error
+# string. It is read weeks later by someone who was not here.
+d="$(mktemp -d)"
+mk "$d" hangs2 '#!/usr/bin/env bash
+sleep 300
+'
+mkdir -p "$d/fakebin"
+printf '#!/usr/bin/env bash\nexit 7\n' > "$d/fakebin/gdb"   # gdb that cannot attach
+chmod +x "$d/fakebin/gdb"
+PATH="$d/fakebin:$PATH" bash "$RUNNER" 3 "$d/art" "$d/hangs2" >/dev/null 2>&1
+rc=$?
+art="$d/art/hangs2_hang_stack.txt"
+chk "the hang still fails the step even when gdb cannot attach" \
+    "$([ "$rc" -ne 0 ] && echo yes || echo no)" "yes"
+chk "an artifact is still written (the wchan table is real evidence)" \
+    "$([ -s "$art" ] && echo yes || echo no)" "yes"
+if [ -s "$art" ]; then
+    grep -q 'CAPTURE INCOMPLETE' "$art" \
+        && chk "and it SAYS the capture is incomplete" yes yes \
+        || { echo "   FAIL  a failed gdb attach reads as a successful capture"; F=$((F+1)); }
+fi
+rm -rf "$d"
+
+echo
+echo "== the watchdog must not outlive the command (a stray sleep holds the step open) =="
+d="$(mktemp -d)"
+mk "$d" quick2 '#!/usr/bin/env bash
+exit 0
+'
+# Count OUR watchdog's sleep specifically, by its exact argument. A bare
+# `pgrep -c sleep` counts every sleep on the machine -- including this test's own
+# -- so it reported a leak that was not there. Measuring the wrong population is
+# how a green arm becomes noise and a red one becomes a wild goose chase.
+#
+# (`pgrep -c` also PRINTS 0 and EXITS 1 when nothing matches, so `|| echo 0`
+# appends a second zero and the comparison gets "0\n0" -- an integer-expression
+# error rather than a result. Same shape as the grep -c trap earlier tonight.)
+BUDGET_MARK=1717
+bash "$RUNNER" "$BUDGET_MARK" "$d/art" "$d/quick2" >/dev/null 2>&1
+sleep 1
+leaked=$(pgrep -fc "sleep $BUDGET_MARK" 2>/dev/null); leaked=${leaked:-0}
+chk "no watchdog sleep is left behind after a fast command" "$leaked" "0"
+rm -rf "$d"
+
+echo
+echo "== the BUDGET arithmetic (ci_hang_budget.sh), which was also untestable inline =="
+B="$HERE/ci_hang_budget.sh"
+if [ -f "$B" ]; then
+  # Plenty of ceiling left -> capped at MAX_BUDGET, not at the ceiling.
+  out=$(JOB_CEILING_MIN=45 JOB_START_EPOCH=$(date +%s) bash "$B" 2>/dev/null)
+  chk "a fresh job is capped at MAX_BUDGET (600), not the ceiling" "$out" "600"
+  # Ceiling nearly spent -> NOT ARMED warning and the floor.
+  out=$(JOB_CEILING_MIN=45 JOB_START_EPOCH=$(( $(date +%s) - 2600 )) bash "$B" 2>/dev/null)
+  chk "a nearly-spent job falls back to MIN_BUDGET (300)" "$out" "300"
+  err=$(JOB_CEILING_MIN=45 JOB_START_EPOCH=$(( $(date +%s) - 2600 )) bash "$B" 2>&1 >/dev/null)
+  case "$err" in
+    *"NOT ARMED"*) chk "and it SAYS the instrument is not armed" yes yes ;;
+    *) echo "   FAIL  a spent budget armed silently -- a missing artifact would read as no-hang"; F=$((F+1)) ;;
+  esac
+  # No clock at all -> must not silently arm against a wrong elapsed time.
+  err=$(JOB_CEILING_MIN=45 bash "$B" 2>&1 >/dev/null)
+  case "$err" in
+    *"JOB_START_EPOCH not set"*) chk "a missing job clock is called out, not assumed" yes yes ;;
+    *) echo "   FAIL  a missing JOB_START_EPOCH was silently tolerated"; F=$((F+1)) ;;
+  esac
+else
+  echo "   SKIP  ci_hang_budget.sh not present"
+fi
+
+echo
+echo "   ===== run_with_hang_capture: $P passed, $F failed ====="
+[ "$F" -eq 0 ]

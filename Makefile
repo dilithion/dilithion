@@ -661,6 +661,7 @@ tests: tests-build
 # drain invariant is broken there is no point running the suites.
 tests-fast: check-tip-notify-drain $(TEST_SUITES_FAST)
 	@bash scripts/check_roster_completeness.sh
+	@bash scripts/test_run_with_hang_capture.sh
 	@bash scripts/test_run_test_suites_timeout.sh
 	@bash scripts/test_run_test_suites_staleness.sh
 	@bash scripts/test_run_test_suites_args.sh
