@@ -135,3 +135,112 @@ matters so nobody re-opens it:
 **So this contract's scope is unchanged.** Do not add "incremental in-degree" or
 "evictable-leaf side index" as a deliverable here; both are already shipped in
 #129. What remains here is exactly what is listed above.
+
+## DELIVERABLE 0 — THE CENSUS (done; regenerate, do not re-type)
+
+Produced by `scripts/census_blockindex_pointer_windows.py`, committed with this
+contract. Re-run it after any change to the five node/net files:
+
+    python3 scripts/census_blockindex_pointer_windows.py [repo-root]
+
+**Why a script.** #129 published "four more sites" as a census; a reviewer found a
+fifth *in the file #129 was editing*. A hand-listed set is not to be trusted a
+third time — the fix list is whatever this produces.
+
+**How it classifies.** For each `GetBlockIndex(` call: bind the result variable,
+find the enclosing function, scan forward for the first USE (`var->`, `*var`,
+escape into a call or a store), and ask whether a `cs_main` holder is in scope at
+BOTH the resolve and that use.
+
+**It is a lexical scanner, not a compiler**, so it is biased to ESCALATE: it never
+clears a site on its own authority. `UNKNOWN` means "could not follow" and is a
+human decision, not a pass. Undercounting is the failure that matters — a site
+wrongly cleared is a use-after-free nobody looks at again.
+
+**Verification of the tool itself:**
+* *GUARDED arm positive-controlled* — run against the `#129` branch (which has 6
+  `MainLockGuard` uses) it reports **5 GUARDED**, exactly `QueueBlock`'s two and
+  `ProcessBlock`'s three. So "0 GUARDED on main" is a finding, not a broken detector.
+* *Wrong-root refusal* — pointed at a directory with no `src/`, it exits 2 rather
+  than reporting zero findings.
+* *Built-in self-check* — every reported `path:line` is re-read and must contain
+  `GetBlockIndex(`; if not it exits 3. RED-armed: reintroducing the original
+  newline-eating `strip_comments` gives **rc=3 and 33 bad locations**; the fixed
+  version gives rc=0 and "all 52 verified". That bug was real and shipped in the
+  first draft — block comments were replaced with `''` instead of their own
+  newlines, shifting every line number after the first `/* */`. It was caught by
+  hand-checking ONE row against the source.
+
+### Result on this branch (main + this contract)
+
+| # | class | file:line | function | var | first use | cs_main in scope |
+|---|---|---|---|---|---|---|
+| 1 | **UNGUARDED** | `src/node/block_processing.cpp:350` | `BlockProcessResult ProcessNewBlock(` | `pParent` | escape@351 | no |
+| 2 | **UNGUARDED** | `src/node/block_processing.cpp:462` | `BlockProcessResult ProcessNewBlock(` | `pParent` | escape@463 | no |
+| 3 | **UNGUARDED** | `src/node/block_processing.cpp:586` | `BlockProcessResult ProcessNewBlock(` | `pParent` | escape@587 | no |
+| 4 | **UNGUARDED** | `src/node/block_processing.cpp:696` | `BlockProcessResult ProcessNewBlock(` | `pindex` | escape@697 | no |
+| 5 | **UNGUARDED** | `src/node/block_processing.cpp:762` | `BlockProcessResult ProcessNewBlock(` | `pParentTS` | deref@763 | no |
+| 6 | **UNGUARDED** | `src/node/block_processing.cpp:795` | `BlockProcessResult ProcessNewBlock(` | `pParent` | escape@796 | no |
+| 7 | **UNGUARDED** | `src/node/block_processing.cpp:894` | `BlockProcessResult ProcessNewBlock(` | `pindex` | deref@895 | no |
+| 8 | **UNGUARDED** | `src/node/block_processing.cpp:1094` | `BlockProcessResult ProcessNewBlock(` | `pprev` | deref@1274 | no |
+| 9 | **UNGUARDED** | `src/node/block_processing.cpp:1293` | `BlockProcessResult ProcessNewBlock(` | `pblockIndexPtr` | deref@1316 | no |
+| 10 | **UNGUARDED** | `src/node/block_processing.cpp:1362` | `BlockProcessResult ProcessNewBlock(` | `forkIndex` | deref@1366 | no |
+| 11 | **UNGUARDED** | `src/node/block_validation_queue.cpp:89` | `bool CBlockValidationQueue::QueueBlock(int peer_id, const CBlock& bloc` | `pParent` | deref@90 | no |
+| 12 | **UNGUARDED** | `src/node/block_validation_queue.cpp:151` | `bool CBlockValidationQueue::QueueBlock(int peer_id, const CBlock& bloc` | `existing` | deref@152 | no |
+| 13 | **UNGUARDED** | `src/node/block_validation_queue.cpp:362` | `bool CBlockValidationQueue::ProcessBlock(const QueuedBlock& queued_blo` | `pprev` | deref@370 | no |
+| 14 | **UNGUARDED** | `src/node/block_validation_queue.cpp:444` | `bool CBlockValidationQueue::ProcessBlock(const QueuedBlock& queued_blo` | `pOrphanParent` | deref@453 | no |
+| 15 | **UNGUARDED** | `src/node/block_validation_queue.cpp:496` | `bool CBlockValidationQueue::ProcessBlock(const QueuedBlock& queued_blo` | `pOrphanIndexRaw` | deref*@506 | no |
+| 16 | **UNGUARDED** | `src/node/dilithion-node.cpp:2758` | `int main(int argc, char* argv[]) {` | `pgenesisIndexPtr` | escape@2766 | no |
+| 17 | **UNGUARDED** | `src/node/dilithion-node.cpp:2852` | `int main(int argc, char* argv[]) {` | `pgenesisIndexPtr` | escape@2858 | no |
+| 18 | **UNGUARDED** | `src/node/dilithion-node.cpp:2909` | `int main(int argc, char* argv[]) {` | `pprev` | deref@2914 | no |
+| 19 | **UNGUARDED** | `src/node/dilithion-node.cpp:3008` | `int main(int argc, char* argv[]) {` | `pblockIndexPtr` | deref@3010 | no |
+| 20 | **UNGUARDED** | `src/node/dilithion-node.cpp:3016` | `int main(int argc, char* argv[]) {` | `pindexTip` | escape@3023 | no |
+| 21 | **UNGUARDED** | `src/node/dilithion-node.cpp:6398` | `int main(int argc, char* argv[]) {` | `pprev` | deref@6407 | no |
+| 22 | **UNGUARDED** | `src/node/dilithion-node.cpp:6427` | `int main(int argc, char* argv[]) {` | `pblockIndexPtr` | escape@6435 | no |
+| 23 | **UNGUARDED** | `src/node/dilithion-node.cpp:6625` | `int main(int argc, char* argv[]) {` | `pprev` | deref@6630 | no |
+| 24 | **UNGUARDED** | `src/node/dilithion-node.cpp:6643` | `int main(int argc, char* argv[]) {` | `pblockIndexPtr` | escape@6647 | no |
+| 25 | **UNGUARDED** | `src/node/dilithion-node.cpp:8722` | `int main(int argc, char* argv[]) {` | `pidx` | deref@8723 | no |
+| 26 | **UNGUARDED** | `src/node/dilv-node.cpp:2615` | `int main(int argc, char* argv[]) {` | `pgenesisIndexPtr` | escape@2623 | no |
+| 27 | **UNGUARDED** | `src/node/dilv-node.cpp:2709` | `int main(int argc, char* argv[]) {` | `pgenesisIndexPtr` | escape@2715 | no |
+| 28 | **UNGUARDED** | `src/node/dilv-node.cpp:2775` | `int main(int argc, char* argv[]) {` | `pprev` | deref@2780 | no |
+| 29 | **UNGUARDED** | `src/node/dilv-node.cpp:2874` | `int main(int argc, char* argv[]) {` | `pblockIndexPtr` | deref@2876 | no |
+| 30 | **UNGUARDED** | `src/node/dilv-node.cpp:2882` | `int main(int argc, char* argv[]) {` | `pindexTip` | escape@2889 | no |
+| 31 | **UNGUARDED** | `src/node/dilv-node.cpp:6424` | `int main(int argc, char* argv[]) {` | `pprev` | deref@6429 | no |
+| 32 | **UNGUARDED** | `src/node/dilv-node.cpp:6442` | `int main(int argc, char* argv[]) {` | `pblockIndexPtr` | escape@6446 | no |
+| 33 | **UNGUARDED** | `src/node/dilv-node.cpp:8358` | `int main(int argc, char* argv[]) {` | `pidx` | deref@8359 | no |
+| 34 | **UNGUARDED** | `src/node/ibd_coordinator.cpp:934` | `void CIbdCoordinator::DownloadBlocks(int header_height, int chain_heig` | `forkIndex` | deref@937 | no |
+| 35 | **UNGUARDED** | `src/node/ibd_coordinator.cpp:1561` | `bool CIbdCoordinator::FetchBlocks() {` | `pindex` | escape@1562 | no |
+| 36 | **UNGUARDED** | `src/node/ibd_coordinator.cpp:1619` | `bool CIbdCoordinator::FetchBlocks() {` | `pParent` | deref@1620 | no |
+| 37 | **UNGUARDED** | `src/node/ibd_coordinator.cpp:1640` | `bool CIbdCoordinator::FetchBlocks() {` | `pParent` | deref@1641 | no |
+| 38 | **UNGUARDED** | `src/node/ibd_coordinator.cpp:1828` | `bool CIbdCoordinator::FetchBlocks() {` | `pindex` | deref@1829 | no |
+| 39 | **UNGUARDED** | `src/node/ibd_coordinator.cpp:1851` | `bool CIbdCoordinator::FetchBlocks() {` | `pParent` | deref@1852 | no |
+| 40 | **UNGUARDED** | `src/node/ibd_coordinator.cpp:2010` | `bool CIbdCoordinator::FetchBlocks() {` | `pindex` | deref@2011 | no |
+| 41 | **UNGUARDED** | `src/node/ibd_coordinator.cpp:2050` | `bool CIbdCoordinator::FetchBlocks() {` | `pParent` | deref@2051 | no |
+| 42 | **NO-WINDOW** | `src/net/orphan_manager.cpp:434` | `uint256 COrphanManager::SelectOrphanForEviction()` | `-` | — | no |
+| 43 | **NO-WINDOW** | `src/node/block_processing.cpp:981` | `BlockProcessResult ProcessNewBlock(` | `pParent` | — | no |
+| 44 | **NO-WINDOW** | `src/node/block_processing.cpp:1006` | `BlockProcessResult ProcessNewBlock(` | `pParentCheck` | — | no |
+| 45 | **NO-WINDOW** | `src/node/block_processing.cpp:1222` | `BlockProcessResult ProcessNewBlock(` | `parent_in_chainstate` | — | no |
+| 46 | **NO-WINDOW** | `src/node/block_validation_queue.cpp:351` | `bool CBlockValidationQueue::ProcessBlock(const QueuedBlock& queued_blo` | `pindex` | — | no |
+| 47 | **NO-WINDOW** | `src/node/block_validation_queue.cpp:383` | `bool CBlockValidationQueue::ProcessBlock(const QueuedBlock& queued_blo` | `pindex` | — | no |
+| 48 | **NO-WINDOW** | `src/node/block_validation_queue.cpp:391` | `bool CBlockValidationQueue::ProcessBlock(const QueuedBlock& queued_blo` | `pindex` | — | no |
+| 49 | **NO-WINDOW** | `src/node/block_validation_queue.cpp:456` | `bool CBlockValidationQueue::ProcessBlock(const QueuedBlock& queued_blo` | `-` | — | no |
+| 50 | **NO-WINDOW** | `src/node/dilithion-node.cpp:6186` | `int main(int argc, char* argv[]) {` | `ourIdx` | — | no |
+| 51 | **NO-WINDOW** | `src/node/dilv-node.cpp:6244` | `int main(int argc, char* argv[]) {` | `ourIdx` | — | no |
+| 52 | **NO-WINDOW** | `src/node/ibd_coordinator.cpp:806` | `void CIbdCoordinator::DownloadBlocks(int header_height, int chain_heig` | `pParent` | — | no |
+
+TOTAL call sites: 52
+  UNGUARDED  41
+  UNKNOWN    0
+  GUARDED    0
+  NO-WINDOW  11
+
+UNGUARDED and UNKNOWN both require a human decision. UNKNOWN is NOT a
+clearance -- it is the scanner saying it could not follow the pointer.
+
+**41 UNGUARDED is the scope of this PR's fix work**, superseding the five
+hand-named sites above — which remain accurate but were never the whole set. The
+four guards this contract was written around are a subset; the deadlock argument
+must cover the population, not the sample.
+
+**0 GUARDED on this branch is expected**: the `MainLockGuard` sites live on #129's
+branch and are not merged. Re-run after #129 lands and the count should move.
