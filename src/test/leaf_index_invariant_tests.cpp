@@ -306,60 +306,29 @@ int main()
             cs.LeafIndexMatchesBruteForce());
     }
 
-    // ---- THE MERGE-ARM pprev ADOPTION (round-5 seats, gpt6 + grok) ----------
+    // ---- THE MERGE-ARM pprev ADOPTION: now DEAD BY CONSTRUCTION -------------
     //
-    // A FOURTH membership mutator. AddBlockIndex's merge arm adopts a previously
-    // null pprev, which changes the pprev graph of a LIVE map member. Without
-    // maintenance the adopted parent keeps in-degree 0 and stays in
-    // m_evictableLeaves, so the evictor frees a node that a surviving child names
-    // as pprev -- the interior-node UAF this PR exists to close.
+    // Round 5 found this arm unmaintained: adoption gives a live entry a parent,
+    // so that parent stops being a leaf, and without maintenance the evictor freed
+    // a node a surviving child named as pprev.
     //
-    // gpt6's accepted sequence, reproduced exactly: insert P and X as parentless
-    // height-0 entries, then merge another X with unchanged height and work and
-    // pprev = P. Every invariant in the merge arm passes, because it checks parent
-    // PRESENCE and not the height relation.
+    // Round 6 added the height relation the first-time-add path enforces
+    // (`existing->nHeight == pprev->nHeight + 1`), to stop two adoptions minting a
+    // pprev CYCLE that hangs FindFork's two-pointer walk. Following that check
+    // through PROVES the arm is unreachable:
     //
-    // RED-ARM: delete the two maintenance lines in the adoption arm and this fails.
-    {
-        CChainState cs;
-
-        auto mk = [](uint8_t tag, CBlockIndex* prev) {
-            auto up = std::make_unique<CBlockIndex>();
-            up->pprev = prev;
-            up->nHeight = 0;                 // gpt6: unchanged height
-            up->nStatus = CBlockIndex::BLOCK_VALID_HEADER;
-            up->nChainWork = uint256();      // gpt6: unchanged work
-            std::memset(up->phashBlock.data, tag, 32);
-            return up;
-        };
-
-        auto upP = mk(0xB1, nullptr);
-        const uint256 hP = upP->GetBlockHash();
-        CBlockIndex* rawP = upP.get();
-        chk("adopt: P added", cs.AddBlockIndex(hP, std::move(upP)));
-
-        auto upX = mk(0xB2, nullptr);        // X, parentless
-        const uint256 hX = upX->GetBlockHash();
-        chk("adopt: X added parentless", cs.AddBlockIndex(hX, std::move(upX)));
-        chk("adopt: index consistent before the merge", cs.LeafIndexMatchesBruteForce());
-
-        // THE MERGE THAT ADOPTS: same hash, same height, same work, pprev = P.
-        auto upX2 = mk(0xB2, rawP);
-        chk("adopt: merging X with pprev=P is accepted",
-            cs.AddBlockIndex(hX, std::move(upX2)));
-
-        // THE ASSERTION. P now has a child, so it must NOT be an evictable leaf.
-        chk("adopt: index consistent AFTER the adoption",
-            cs.LeafIndexMatchesBruteForce());
-
-        // And the evictor must not free P while X names it.
-        CBlockIndex* xIdx = cs.GetBlockIndex(hX);
-        chk("adopt: X actually adopted P", xIdx != nullptr && xIdx->pprev == rawP);
-        cs.EvictLowestWorkLeafNotPinned(1);
-        chk("adopt: P was NOT evicted while X names it as pprev",
-            cs.GetBlockIndex(hP) != nullptr);
-        chk("adopt: index consistent after eviction", cs.LeafIndexMatchesBruteForce());
-    }
+    //   * reaching it needs `existing->pprev == nullptr`;
+    //   * a parentless entry can only enter the map via chain.cpp:243, which
+    //     asserts `nHeight == 0`;
+    //   * so the new check demands a parent at height -1, which cannot exist.
+    //
+    // THERE IS THEREFORE NO TEST HERE, and that is the honest state rather than a
+    // gap. The behaviour cannot be driven through AddBlockIndex any more: the
+    // sequence that used to reach it now trips a ConsensusInvariant, which aborts
+    // the process, and asserting an abort needs death-test machinery this suite
+    // does not have. The maintenance lines stay as defence-in-depth for the
+    // plausible future change (relaxing the parentless-implies-genesis rule for
+    // orphan handling), and if that change lands, THIS is where the test goes.
 
     // ---- IsLeafPinnedDirect, PER CLAUSE (round-5 seats, item 4) --------------
     //
@@ -375,12 +344,15 @@ int main()
         const uint256 gh = gg.GetHash();
         uint256 prev = gh;
         std::vector<uint256> leaves;
-        for (int i = 1; i <= 4; ++i) {
+        for (int i = 1; i <= 8; ++i) {   // one leaf per clause, no sharing:
+            // the first version reused leaves[2] for clauses (b) and (d), so
+            // making it a candidate in (b) broke (d)'s 'not pinned' assertion.
+            // Cross-clause state bleed inside one fixture is its own defect.
             auto h = MakeHeader(gh, static_cast<uint32_t>(1700400000 + i),
                                 static_cast<uint8_t>(0x80 + i));
             if (ad.ProcessNewHeader(h)) leaves.push_back(h.GetHash());
         }
-        chk("clause setup: several sibling leaves exist", leaves.size() >= 3);
+        chk("clause setup: a distinct leaf per clause exists", leaves.size() >= 5);
         const std::set<uint256> no_pending;
 
         // (a) the tip
@@ -401,13 +373,25 @@ int main()
         chk("clause (c): once fully validated it is NOT pinned by (c)",
             !cs.IsLeafPinnedDirect(l2, no_pending));
 
+        // (b) candidate-set membership — kimi round-6 LOW: this clause had no
+        // arm, so the mutant deleting it survived. Reference answer built
+        // independently: a leaf is pinned by (b) iff it is IN the candidate set.
+        CBlockIndex* l3 = cs.GetBlockIndex(leaves[3]);   // (b) only
+        chk("clause (b): a non-candidate leaf is NOT pinned",
+            !cs.IsLeafPinnedDirect(l3, no_pending));
+        l3->nStatus |= CBlockIndex::BLOCK_VALID_TRANSACTIONS;
+        cs.RecomputeCandidates();
+        const bool now_candidate = cs.IsBlockACandidateForActivation(l3);
+        chk("clause (b): reference says it is now a candidate", now_candidate);
+        chk("clause (b): and IsLeafPinnedDirect agrees it is pinned",
+            !now_candidate || cs.IsLeafPinnedDirect(l3, no_pending));
+
         // (d) the pending snapshot
         std::set<uint256> pending{ leaves[1] };
         chk("clause (d): a leaf in the pending set IS pinned",
             cs.IsLeafPinnedDirect(l1, pending));
         chk("clause (d): a leaf absent from it is NOT",
-            !cs.IsLeafPinnedDirect(cs.GetBlockIndex(leaves[0] == leaves[1] ? leaves[2] : leaves[2]),
-                                   pending));
+            !cs.IsLeafPinnedDirect(cs.GetBlockIndex(leaves[4]), pending));  // (d) only
     }
 
     Dilithion::g_chainParams = saved;

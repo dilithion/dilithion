@@ -89,7 +89,10 @@ for t in "${TARGETS[@]}"; do
     # -k IS LOAD-BEARING (round-5 seats, LOW). Without --kill-after, `timeout`
     # sends SIGTERM and then WAITS FOREVER for a process that ignores it — so the
     # timeout that exists to stop a hang can itself hang. -k follows with SIGKILL,
-    # which cannot be ignored.
+    # which cannot be ignored. The grace is 30s: long enough for a suite that is
+    # merely slow to flush and exit cleanly, short enough that a wedged one does not
+    # hold the run. (Measured with a 3s grace during development; the shipped value
+    # is 30 -- stating both so the number in the comment matches the code.)
     #
     # And a suite that CATCHES SIGTERM and exits 0 would be reported PASS by a
     # plain exit-code check: the deadline expiring is a FAILURE regardless of what

@@ -190,6 +190,29 @@ private:
     //                              a surviving child named as pprev — the exact
     //                              interior-node UAF this class exists to close.
     //
+    // TREE-WIDE CENSUS (round-6, kimi MEDIUM): GetBlockIndex returns a NON-CONST
+    // CBlockIndex*, so any translation unit can mutate a live member and evade a
+    // chain.cpp-scoped census. Checked across all of src/ excluding tests:
+    //
+    //   `->pprev =`   16 hits. FIFTEEN are on a FRESH index before AddBlockIndex
+    //                 (chain_selector_impl:410, block_processing:1094,
+    //                 block_validation_queue:749/855, dilithion-node:2735/2824/
+    //                 2909/6410/6637, dilv-node:2592/2681/2775/6446, the bench).
+    //                 The DB-load sites construct make_unique<CBlockIndex> first —
+    //                 verified, not assumed. The SIXTEENTH is chain.cpp:203, the
+    //                 adopt arm, which is the one site that touches a live member
+    //                 and is now unreachable (see below).
+    //   `nChainWork =` 10 hits, ALL before the entry reaches AddBlockIndex; the
+    //                 merge arm ASSERTS equality rather than writing. This is what
+    //                 makes nChainWork legal as a std::set key.
+    //
+    //   ⚠️ ONE SHAPE DOES MUTATE A LIVE MEMBER AND IS NOT A MAINTENANCE SITE:
+    //   `pblockIndex->pprev->pnext = ...` (dilithion-node:2913, dilv-node, the
+    //   connect path). It writes the PARENT's pnext, which is a live map entry —
+    //   but leafness is defined over pprev IN-EDGES only, so pnext cannot change
+    //   in-degree or leaf status. Stated explicitly because "mutates a live
+    //   member" is the alarm shape, and the reason it is harmless is not obvious.
+    //
     // A pprev written on a NEW index BEFORE AddBlockIndex (block_processing.cpp
     // and friends) is NOT a maintenance site: the entry is not in the map yet and
     // LeafIndexOnInsert reads its pprev when it arrives. Only mutations of an

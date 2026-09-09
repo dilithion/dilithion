@@ -165,6 +165,41 @@ bool CChainState::AddBlockIndex(const uint256& hash, std::unique_ptr<CBlockIndex
             // map (same invariant the first-time-add path checks below).
             uint256 parentHash = pindex->pprev->GetBlockHash();
             ConsensusInvariant(mapBlockIndex.count(parentHash) > 0);
+
+            // ⚠️ HEIGHT RELATION, NOT JUST PARENT PRESENCE (round-6, kimi MEDIUM).
+            // The first-time-add path asserts `nHeight == pprev->nHeight + 1`
+            // (:225); this arm asserted only that the parent EXISTS. That gap
+            // mints pprev CYCLES: adopt X->pprev = P and then P->pprev = X, both
+            // at height 0, and every check above passes. The leaf index stays
+            // perfectly consistent — in-degree 1 each, neither is a leaf, nothing
+            // is evictable — so the invariant suite would call it healthy while
+            // FindFork's two-pointer walk spins forever on the cycle. A HANG, not
+            // a corruption, and invisible to every structural check we have.
+            //
+            // The same relation the first-time path enforces, enforced here.
+            //
+            // ⚠️ AND THIS MAKES THE WHOLE ARM UNREACHABLE — a proof, arrived at by
+            // adding the check and then following it through, not a claim made in
+            // advance:
+            //
+            //   * to reach this arm, `existing` must have a NULL pprev;
+            //   * an entry enters the map parentless only through the else-branch
+            //     at :243, which asserts `nHeight == 0` — so existing->nHeight == 0;
+            //   * this check then requires 0 == pprev->nHeight + 1, i.e. a parent
+            //     at height -1. Heights are non-negative.
+            //
+            // So adoption cannot occur, gpt6's cycle sequence cannot occur, and the
+            // arm is dead BY CONSTRUCTION rather than by anyone's assurance that no
+            // caller does it. That is the "unreachable and ENFORCED" outcome the
+            // review originally preferred, reached from the other direction: the
+            // cycle fix proves the unreachability rather than assuming it.
+            //
+            // The maintenance below STAYS. It costs two lines, it is correct if a
+            // future change ever reopens the arm (relaxing :243 for orphan handling
+            // is exactly the plausible change), and an unmaintained-but-unreachable
+            // arm is how this defect got here in the first place.
+            ConsensusInvariant(existing->nHeight == pindex->pprev->nHeight + 1);
+
             existing->pprev = pindex->pprev;
 
             // ⚠️ THIS IS A FOURTH MEMBERSHIP MUTATOR, AND IT WAS UNMAINTAINED
@@ -787,7 +822,21 @@ bool CChainState::EvictLowestWorkLeafNotPinned(size_t target_max) {
     // call can change it — and the entries are put back before returning, so the
     // set is unchanged as seen by anyone else. cs_main is held throughout, so no
     // other thread can observe the intermediate state.
-    std::vector<CBlockIndex*> excluded;
+    // RAII, NOT A TRAILING LOOP (round-6, kimi LOW). Reinstatement used to be a
+    // for-loop near the end of the function, with a ConsensusInvariant and several
+    // allocations between the first exclusion and it. Any future throwing path in
+    // that span would have left the excluded leaves permanently OUT of the index —
+    // a silent, cumulative shrink of the evictable set that no single-call test
+    // could see. A guard makes "they always go back" structural instead of
+    // positional.
+    struct LeafReinstater {
+        std::set<CBlockIndex*, LeafWorkOrder>& set_ref;
+        std::vector<CBlockIndex*> excluded;
+        ~LeafReinstater() {
+            for (CBlockIndex* p : excluded) set_ref.insert(p);
+        }
+    } reinstater{m_evictableLeaves, {}};
+    std::vector<CBlockIndex*>& excluded = reinstater.excluded;
     excluded.reserve(16);
 
     for (;;) {
@@ -848,9 +897,8 @@ bool CChainState::EvictLowestWorkLeafNotPinned(size_t target_max) {
     // the process -- a slow leak of evictability that no test asserting a single
     // call would ever see, which is why LeafIndexMatchesBruteForce is checked
     // after eviction in the invariant suite.
-    for (CBlockIndex* p : excluded) {
-        m_evictableLeaves.insert(p);
-    }
+    // (reinstatement now happens in LeafReinstater's destructor, on every path
+    // including an exception — see the guard's declaration above.)
 
     if (evicted_any) {
         m_chainTipsCacheDirty = true;
