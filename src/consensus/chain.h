@@ -168,11 +168,42 @@ private:
     // being true, this index must be re-keyed on write or rebuilt after the
     // recompute — it will NOT fail loudly on its own.
     //
-    // MAINTENANCE IS EXACTLY TWO SITES (this is the whole surface):
+    // MAINTENANCE IS FOUR SITES — and this block said "EXACTLY TWO" until two
+    // separate reviews found the two it had missed. Both misses were live
+    // use-after-frees, and both were missed the same way: the census looked for
+    // the two OPERATIONS the author had in mind instead of for every mutation.
+    //
+    //   MEMBERSHIP  (grep: mapBlockIndex\.(insert|emplace|erase|clear) or [ ])
+    //     chain.cpp Cleanup()      clear()  -> clear BOTH structures.
+    //                              MISSED FIRST. Freed every node while the leaf
+    //                              index kept the pointers; the next insert's
+    //                              comparator read freed memory. Not teardown-only
+    //                              — it is the corrupted-DB recovery path.
+    //     chain.cpp AddBlockIndex  insert   -> LeafIndexOnInsert.
+    //     chain.cpp evictor        erase()  -> LeafIndexOnErase.
+    //
+    //   pprev GRAPH OF A LIVE MEMBER  (grep: ->pprev\s*=)
+    //     chain.cpp AddBlockIndex  merge-adopt -> in-degree += 1, parent leaves
+    //                              the leaf set. MISSED SECOND. Adoption gives a
+    //                              live entry a parent, so that parent stops being
+    //                              a leaf; unmaintained, the evictor freed a node
+    //                              a surviving child named as pprev — the exact
+    //                              interior-node UAF this class exists to close.
+    //
+    // A pprev written on a NEW index BEFORE AddBlockIndex (block_processing.cpp
+    // and friends) is NOT a maintenance site: the entry is not in the map yet and
+    // LeafIndexOnInsert reads its pprev when it arrives. Only mutations of an
+    // entry ALREADY IN THE MAP need maintenance — that is the distinction the two
+    // misses turned on.
+    //
+    // The per-site effects:
     //   insert(X): X is new, so it is a leaf -> add X. X->pprev gains a child
     //              -> remove X->pprev.
     //   erase(X):  remove X. X->pprev loses a child -> if its in-degree hits 0,
     //              add X->pprev.
+    //   clear():   drop both structures entirely.
+    //   adopt(X):  X gains a pprev -> that parent gains a child -> in-degree += 1
+    //              and it leaves the leaf set.
     // ========================================================================
     struct LeafWorkOrder {
         // Lowest work first, hash as the tiebreak so the order is total and
@@ -1091,13 +1122,32 @@ public:
      * header copy was missed, which is the same leaves-siblings shape the PR keeps
      * producing; both are now symbol-cited so neither can drift again.)
      *
-     * ALGORITHM: build an in-degree map over mapBlockIndex (how many entries
-     * name each node as pprev), build the pinned set, then evict eligible
-     * leaves (in-degree 0, unpinned) lowest-nChainWork first. After erasing a
-     * leaf, decrement its parent's in-degree so the parent may become an
-     * eligible leaf in a later pass. Multi-pass until under cap or no eligible
-     * leaf remains. nChainWork comparisons use ChainWorkGreaterThan (chainWork
-     * is NOT memcmp-comparable). Holds cs_main throughout.
+     * ALGORITHM — REWRITTEN, and this docstring described the OLD one until
+     * round 5 caught it sitting next to the lemma that replaced it. It used to
+     * say "build an in-degree map over mapBlockIndex, build the pinned set, then
+     * evict"; that is the O(n)-per-call routine this PR removed, and a reader
+     * would have taken the cost model from it.
+     *
+     * What it does NOW:
+     *   1. O(1) EARLY-OUT: if mapBlockIndex.size() <= active chain length the
+     *      index IS the active chain, everything is pinned by clause (a), and
+     *      there is nothing to evict. Return immediately, building nothing.
+     *   2. Take ONE snapshot of the pending-block hashes (not one per candidate).
+     *   3. Select from m_evictableLeaves, which is maintained INCREMENTALLY at the
+     *      four sites above and ordered lowest-(work, hash) first — so the victim
+     *      is at begin() and selection is O(log n), not a scan.
+     *   4. Pinnedness is four DIRECT tests (IsLeafPinnedDirect), never an ancestor
+     *      walk: by the leaf lemma a leaf cannot be pinned transitively.
+     *   5. Erase, maintain the index, repeat. A freed leaf's parent may become a
+     *      leaf, and LeafIndexOnErase inserts it the moment its in-degree hits 0,
+     *      so cascades still work with no rescan.
+     *
+     * No in-degree map and no pinned set are BUILT per call any more; both are
+     * standing state. Measured effect at a 500K index: 485 ms and 43 MB of
+     * transient per over-cap insert became 0.008 ms and 0 KB (CON-27).
+     *
+     * nChainWork comparisons use ChainWorkGreaterThan (chainWork is NOT
+     * memcmp-comparable). Holds cs_main throughout.
      *
      * NOT consensus-affecting: an evicted leaf is a non-active-chain tip — never
      * the active chain, a reorg candidate, an ancestor of either, or an in-flight

@@ -69,6 +69,7 @@ void CChainState::Cleanup() {
     //
     // Cleanup() is a THIRD membership mutator. PR #129 documented "maintenance is
     // exactly TWO sites" (AddBlockIndex and the evictor's erase) and that was
+    // wrong TWICE -- see the four-site census at AddBlockIndex. It was
     // FALSE: `mapBlockIndex.clear()` below frees every node, and without these two
     // lines m_inDegree and m_evictableLeaves keep the freed pointers. The very
     // next AddBlockIndex then calls m_evictableLeaves.insert(), whose comparator
@@ -165,6 +166,35 @@ bool CChainState::AddBlockIndex(const uint256& hash, std::unique_ptr<CBlockIndex
             uint256 parentHash = pindex->pprev->GetBlockHash();
             ConsensusInvariant(mapBlockIndex.count(parentHash) > 0);
             existing->pprev = pindex->pprev;
+
+            // ⚠️ THIS IS A FOURTH MEMBERSHIP MUTATOR, AND IT WAS UNMAINTAINED
+            // (round-5 seats, found independently by gpt6 and grok).
+            //
+            // Adoption CHANGES THE pprev GRAPH of a live map member. The adopted
+            // parent has just gained a child, so it is no longer a leaf — but
+            // without the two lines below it stayed in m_evictableLeaves with
+            // in-degree 0, and the evictor would free a node that `existing` names
+            // as pprev. That is the interior-node use-after-free this entire PR
+            // exists to close, reachable through the one mutator the maintenance
+            // census missed.
+            //
+            // gpt6's accepted sequence: insert P and X as parentless height-0
+            // entries, then merge another X with unchanged height and work and
+            // pprev = P. Every invariant above passes — the merge checks parent
+            // PRESENCE, not the height relation — and low-work unpinned P is then
+            // evicted with X->pprev dangling.
+            //
+            // MAINTAINED RATHER THAN INVARIANT-KILLED, and the choice is
+            // deliberate. No production caller adopts: ProcessNewHeader rejects
+            // orphans, so pprev is null only for genesis, and this arm is
+            // defence-in-depth that add_block_index_flag_merge_tests Case 5
+            // exercises on purpose. Turning it into a hard invariant failure would
+            // convert a tolerated, currently-harmless case into a NODE ABORT the
+            // first time some future orphan-handling change reached it. Three
+            // lines of maintenance make it correct whether or not it ever fires;
+            // an abort makes it fatal exactly when someone stops being lucky.
+            m_inDegree[existing->pprev] += 1;
+            m_evictableLeaves.erase(existing->pprev);
         }
         // (existing->pprev != nullptr && pindex->pprev == nullptr): keep
         // existing linkage. The incoming entry simply lacks information
@@ -202,7 +232,23 @@ bool CChainState::AddBlockIndex(const uint256& hash, std::unique_ptr<CBlockIndex
     CBlockIndex* praw = pindex.get();
     mapBlockIndex[hash] = std::move(pindex);
     // PR #129 round 4: keep the evictable-leaf side index in step. This is
-    // ONE of exactly TWO maintenance sites (the other is the evictor's erase);
+    // FOUR MAINTENANCE SITES, censused by SHAPE. This said "exactly TWO" three
+    //     times and was wrong twice over -- it missed Cleanup()'s clear() (round-5
+    //     reader) and the merge arm's pprev adoption (round-5 seats). Both were found by
+    //     other people, and both were missed the same way: the original census looked for
+    //     the two OPERATIONS someone had in mind rather than for every mutation.
+    //     The grep that finds all four:
+    //       mapBlockIndex MEMBERSHIP  ->  grep 'mapBlockIndex\s*\(\.\(insert\|emplace\|erase\|clear\)\|\[\)'
+    //           chain.cpp:107   Cleanup()          clear()   -> clear both structures
+    //           chain.cpp:232   AddBlockIndex      insert    -> LeafIndexOnInsert
+    //           chain.cpp:757   evictor            erase()   -> LeafIndexOnErase
+    //       pprev GRAPH of a LIVE member  ->  grep '\->pprev\s*='
+    //           chain.cpp:167   AddBlockIndex      merge-adopt -> in-degree + leaf erase
+    //     A pprev written on a NEW index BEFORE AddBlockIndex (block_processing.cpp and
+    //     friends) is NOT a maintenance site: the entry is not in the map yet, and
+    //     LeafIndexOnInsert reads its pprev when it arrives. Only mutations of an entry
+    //     ALREADY in the map need maintenance.
+    // This is the INSERT site;
     // LeafIndexMatchesBruteForce() goes false if either is removed.
     LeafIndexOnInsert(praw);
 
@@ -590,6 +636,31 @@ bool CChainState::LeafIndexMatchesBruteForce() const
     for (const CBlockIndex* p : m_evictableLeaves) {
         if (want_leaves.count(p) == 0) return false;
     }
+
+    // ORDER, NOT ONLY MEMBERSHIP (round-5 seats). The checks above compare the SET
+    // of leaves and would pass with the comparator returning anything consistent —
+    // so a mutant that drops the (work, hash) tiebreak, or reverses the work
+    // comparison, survives them. Order is the whole point of the structure: the
+    // evictor takes begin() and calls it the lowest-work victim.
+    //
+    // Walk the set and assert it really is non-decreasing by (work, hash) under
+    // ChainWorkGreaterThan — the same comparison the comparator is supposed to use,
+    // written out here independently so a broken comparator cannot certify itself.
+    const CBlockIndex* prev_leaf = nullptr;
+    for (const CBlockIndex* p : m_evictableLeaves) {
+        if (prev_leaf != nullptr) {
+            if (ChainWorkGreaterThan(prev_leaf->nChainWork, p->nChainWork)) {
+                return false;   // strictly decreasing work: order is wrong
+            }
+            const bool equal_work =
+                !ChainWorkGreaterThan(prev_leaf->nChainWork, p->nChainWork) &&
+                !ChainWorkGreaterThan(p->nChainWork, prev_leaf->nChainWork);
+            if (equal_work && !(prev_leaf->GetBlockHash() < p->GetBlockHash())) {
+                return false;   // equal work but the hash tiebreak is not honoured
+            }
+        }
+        prev_leaf = p;
+    }
     return true;
 }
 
@@ -650,7 +721,8 @@ bool CChainState::EvictLowestWorkLeafNotPinned(size_t target_max) {
     // this PR set out to make safe, on a path an attacker reaches by spamming
     // headers to the cap (CON-27, src/tools/evict_cost_bench.cpp).
     //
-    // m_evictableLeaves is maintained incrementally at exactly two sites
+    // m_evictableLeaves is maintained incrementally at FOUR sites (see the
+    // census at AddBlockIndex; "two" was wrong and hid two real UAFs)
     // (AddBlockIndex and the erase below) and is ordered lowest-work-first, so
     // the victim is at begin() and selection is O(log n) instead of O(n).
     //
@@ -672,21 +744,61 @@ bool CChainState::EvictLowestWorkLeafNotPinned(size_t target_max) {
     // m_evictableLeaves the moment that hits zero. The next iteration therefore
     // sees the parent as a candidate automatically.
     //
-    // Skipped-pinned leaves are remembered for the duration of this call so a
-    // pinned leaf at begin() cannot spin the loop. The count skipped is bounded
-    // by 1 (the tip) + candidate leaves + pending entries; a candidate costs
-    // PoW-bearing block data to create, so it is not attacker-controlled.
+    // Pinned leaves are excluded for the duration of this call so one at begin()
+    // cannot spin the loop.
+    //
+    // THE BOUND ON HOW MANY GET SKIPPED, with the term that was missing (round-5
+    // seats). It is the number of PINNED LEAVES, which is at most:
+    //
+    //     1                       clause (a) — only the tip can be a pinned leaf,
+    //                             since any other active-chain entry has an
+    //                             active-chain child and is therefore not a leaf
+    //   + candidate leaves        clause (b) — each costs PoW-bearing block data
+    //                             at fork-point difficulty to create
+    //   + HAVE_DATA-not-valid     clause (c) — ⚠️ THIS TERM WAS OMITTED. Entries
+    //     leaves                  with block data whose validity has not reached
+    //                             VALID_TRANSACTIONS. Bounded by in-flight block
+    //                             downloads, i.e. by ingress, not by the attacker
+    //                             directly — but it is NOT zero and the old
+    //                             comment read as if the bound had only two terms.
+    //   + pending entries         clause (d) — queued + in-flight blocks and their
+    //                             parents, bounded by MAX_QUEUE_DEPTH (100) times
+    //                             two, plus their ancestors
+    //
+    // None of these is attacker-controlled without spending real work, so the skip
+    // count is bounded by node configuration and ingress rather than by anything a
+    // peer can inflate for free. That is the claim; the clause-(c) term is stated
+    // rather than quietly assumed to be zero.
     bool evicted_any = false;
-    std::set<const CBlockIndex*> skipped;
+
+    // TEMPORARY EXCLUSION, NOT A SKIP-LIST (round-5 seats, gpt6 MEDIUM).
+    //
+    // The previous version kept pinned leaves IN m_evictableLeaves and restarted
+    // iteration at begin() after every eviction, re-visiting and re-testing each
+    // of them every pass. With k pinned leaves ordered before v victims that is
+    // >= v*k pin tests inside ONE cs_main hold — and the bench only ever measured
+    // the single-victim case, so the quadratic term was invisible to it. A comment
+    // claimed the exclusion; the code did not implement it.
+    //
+    // Now a pinned leaf is REMOVED from the set for the duration of this call and
+    // reinstated at the end, so each is tested at most once per call: the loop is
+    // O((v + k) log n) rather than O(v*k). Removal is safe because pinnedness is
+    // evaluated against a snapshot taken once at the top — nothing inside this
+    // call can change it — and the entries are put back before returning, so the
+    // set is unchanged as seen by anyone else. cs_main is held throughout, so no
+    // other thread can observe the intermediate state.
+    std::vector<CBlockIndex*> excluded;
+    excluded.reserve(16);
 
     for (;;) {
         if (target_max > 0 && mapBlockIndex.size() <= target_max) break;
 
         CBlockIndex* victim = nullptr;
-        for (CBlockIndex* cand : m_evictableLeaves) {
-            if (skipped.count(cand) > 0) continue;
+        while (!m_evictableLeaves.empty()) {
+            CBlockIndex* cand = *m_evictableLeaves.begin();
             if (IsLeafPinnedDirect(cand, pending_snapshot)) {
-                skipped.insert(cand);
+                m_evictableLeaves.erase(m_evictableLeaves.begin());
+                excluded.push_back(cand);   // reinstated below, before returning
                 continue;
             }
             victim = cand;   // lowest-work unpinned leaf: the set is ordered
@@ -722,11 +834,22 @@ bool CChainState::EvictLowestWorkLeafNotPinned(size_t target_max) {
         m_setBlockIndexCandidates.erase(victim);
 
         // Side-index maintenance MUST run before the erase destroys the object:
-        // it reads victim->pprev. This is the second and last maintenance site.
+        // it reads victim->pprev. This is the ERASE site -- one of four, not the
+        // "second and last" this used to claim.
         LeafIndexOnErase(victim);
 
         mapBlockIndex.erase(victim_key);   // unique_ptr frees CBlockIndex
         evicted_any = true;
+    }
+
+    // REINSTATE the temporarily-excluded pinned leaves. They were removed only to
+    // stop the loop re-testing them; they are still leaves and still belong in the
+    // index. Missing this would silently shrink the evictable set for the rest of
+    // the process -- a slow leak of evictability that no test asserting a single
+    // call would ever see, which is why LeafIndexMatchesBruteForce is checked
+    // after eviction in the invariant suite.
+    for (CBlockIndex* p : excluded) {
+        m_evictableLeaves.insert(p);
     }
 
     if (evicted_any) {

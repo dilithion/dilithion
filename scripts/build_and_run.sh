@@ -86,8 +86,27 @@ for t in "${TARGETS[@]}"; do
     #
     # --preserve-status is deliberate: without it `timeout` reports 124 and a hang
     # is indistinguishable from a failure. See lesson_timeout_exit_codes_143.
-    timeout --preserve-status "${SUITE_TIMEOUT:-600}" ./"$t" > "/tmp/${t}.out" 2>&1
+    # -k IS LOAD-BEARING (round-5 seats, LOW). Without --kill-after, `timeout`
+    # sends SIGTERM and then WAITS FOREVER for a process that ignores it — so the
+    # timeout that exists to stop a hang can itself hang. -k follows with SIGKILL,
+    # which cannot be ignored.
+    #
+    # And a suite that CATCHES SIGTERM and exits 0 would be reported PASS by a
+    # plain exit-code check: the deadline expiring is a FAILURE regardless of what
+    # the process chose to return. --preserve-status gives us the signal-derived
+    # status (143 = SIGTERM, 137 = SIGKILL; NOT 124 — see
+    # lesson_timeout_exit_codes_143), so those are treated as failures explicitly
+    # rather than trusted to be non-zero.
+    timeout -k 30 --preserve-status "${SUITE_TIMEOUT:-600}" ./"$t" > "/tmp/${t}.out" 2>&1
     rc=$?
+    if [ "$rc" -eq 143 ] || [ "$rc" -eq 137 ] || [ "$rc" -eq 124 ]; then
+        printf '   FAIL  %-52s DEADLINE EXPIRED after %ss (rc=%s)
+'                "$t" "${SUITE_TIMEOUT:-600}" "$rc"
+        echo "         a suite that exceeds its deadline is a FAILURE even if it"
+        echo "         then exits 0 — the run did not complete on its own terms."
+        fail=$((fail + 1))
+        continue
+    fi
     if [ "$rc" -eq 0 ]; then
         printf '   PASS  %-52s\n' "$t"
     else
