@@ -42,6 +42,21 @@ jobs:
     # 30 -> 45: the gcc/Release leg now also links and RUNS the standalone test
     # suites (make tests-fast). Measured locally: ~8s to link 45 suite binaries
     # on top of an already-built tree, ~55s to run the 31 live fast-tier suites.
+    # LOW-1: the ceiling appears here and as JOB_CEILING_MIN's default in
+    # scripts/ci_hang_budget.sh, and the two MUST agree -- if they drift, the
+    # watchdog arms against a ceiling that no longer exists, which is the exact
+    # failure it was written to avoid.
+    #
+    # An `env`-expression tried to make this a single source and DOES NOT WORK:
+    # `timeout-minutes` at job level accepts only the github / needs / strategy
+    # / matrix / vars / inputs contexts, so `${{ env.JOB_CEILING_MIN }}` is a
+    # WORKFLOW PARSE ERROR -- "Unrecognized named-value: 'env'" -- and GitHub
+    # then runs ZERO JOBS. A YAML parser cannot see this: the document is
+    # structurally valid and only GitHub's context rules reject it, which is
+    # why it survived a parse-based check and was caught by an actual run.
+    #
+    # So the literal stays, and the agreement is ENFORCED instead of assumed:
+    # test_run_with_hang_capture.sh greps both and fails if they differ.
     timeout-minutes: 45
 
     strategy:
@@ -219,80 +234,45 @@ jobs:
         # would never once have run. Deriving the budget from JOB_START_EPOCH
         # makes it correct now and self-correcting as the build gets slower.
         set -uo pipefail
-        mkdir -p test-hang-artifacts
-
-        CEILING_SEC=$(( 45 * 60 ))
-        CAPTURE_MARGIN=240        # gdb attach + dump + artifact upload
-        MIN_BUDGET=300            # never watchdog a run into uselessness
-        # Cap against the MEASURED healthy step, not against the ceiling. On a
-        # green main run (34082001939) this step takes 44s / 47s / 57s / 61s
-        # across the four legs; the hung leg ran 1516s. 600s is ~10x the healthy
-        # maximum and ~2.5x below the hang, so it catches the hang ten minutes
-        # in instead of twenty-five, and leaves the rest of the ceiling as
-        # margin. (An earlier comment here cited "~21 min" for this step -- that
-        # was the JOB's wall time misread as the step's. The step is ~1 minute.)
-        MAX_BUDGET=600
-        elapsed=$(( $(date +%s) - JOB_START_EPOCH ))
-        BUDGET=$(( CEILING_SEC - elapsed - CAPTURE_MARGIN ))
-        [ "$BUDGET" -gt "$MAX_BUDGET" ] && BUDGET="$MAX_BUDGET"
-        # If the build has already eaten the budget there is nothing left to
-        # watchdog WITH, and the clamp below would arm a timer that fires after
-        # the ceiling -- inert, exactly like the version this replaces. Say so
-        # out loud: otherwise a missing artifact reads as "no hang happened"
-        # when it actually means "the instrument never armed".
-        if [ "$BUDGET" -lt "$MIN_BUDGET" ]; then
-          echo "::warning::hang watchdog NOT ARMED: ${elapsed}s of the ${CEILING_SEC}s job budget already spent, leaving less than ${MIN_BUDGET}s. A missing hang artifact from this run means nothing."
-          BUDGET="$MIN_BUDGET"
-        fi
-        echo "hang watchdog: ${elapsed}s of the job already spent; budget ${BUDGET}s"
-
-        # NOTE the union with the BUG-77 removal above: this runs with NO
-        # --run_test filter now, so the HD suites are inside the watchdog too.
-        ./test_dilithion --log_level=test_suite --report_level=short &
-        TD_PID=$!
-
-        (
-          sleep "$BUDGET"
-          # PID-reuse guard (L-4). kill -0 alone would happily match a
-          # recycled PID on a busy runner and we would capture a stack of some
-          # unrelated process under an ::error:: saying test_dilithion hung.
-          # One comm check removes the ambiguity entirely.
-          if kill -0 "$TD_PID" 2>/dev/null              && [ "$(cat /proc/$TD_PID/comm 2>/dev/null)" = "test_dilithion" ]; then
-            echo "::error::test_dilithion still alive after ${BUDGET}s - capturing stack before kill (intermittent hang)"
-            {
-              echo "=== test_dilithion hang, captured $(date -u +%FT%TZ) ==="
-              echo "=== /proc/$TD_PID/status ==="; cat "/proc/$TD_PID/status" 2>&1
-              echo "=== per-thread wchan (kernel wait channel) ==="
-              for t in /proc/"$TD_PID"/task/*; do
-                echo "--- tid ${t##*/} comm=$(cat "$t/comm" 2>/dev/null) wchan=$(cat "$t/wchan" 2>/dev/null)"
-              done
-              # gdb gets its own timeout: if IT stalls on attach we ride to the
-              # ceiling and learn nothing, which is the failure this exists to end.
-              echo "=== gdb: thread map + all backtraces ==="
-              timeout -k 10 180 gdb -p "$TD_PID" -batch -ex 'info threads' -ex 'thread apply all bt 25' 2>&1
-              echo "(gdb exit: $?)"
-            } > test-hang-artifacts/test_dilithion_hang_stack.txt
-            kill -9 "$TD_PID" 2>/dev/null || true
-          fi
-        ) &
-        WATCHDOG=$!
-
-        # `wait` under bash -e (GitHub's default shell) ABORTS the step on a
-        # non-zero status, so `wait "$TD_PID"; rc=$?` would make every line
-        # below dead on exactly the failure path we care about.
-        rc=0
-        wait "$TD_PID" || rc=$?
-
-        # Kill the watchdog AND its sleep child. Killing only the subshell
-        # leaves the sleep orphaned holding this step's stdout open.
-        kill "$WATCHDOG" 2>/dev/null || true
-        pkill -P "$WATCHDOG" 2>/dev/null || true
-        wait "$WATCHDOG" 2>/dev/null || true
-
-        if [ "$rc" -ne 0 ]; then
-          echo "Boost unit tests exited $rc"
-          exit "$rc"
-        fi
+        # The watchdog now lives in scripts/run_with_hang_capture.sh so it can be
+        # TESTED. As inline YAML nothing had ever executed it except a real CI
+        # hang -- an event that fires about 8% of the time -- and extracting it
+        # immediately surfaced two defects that reading had not:
+        #
+        #   1. the PID-reuse guard compared basename "$1" against
+        #      /proc/<pid>/comm. comm is the EXECUTABLE name (so "bash" for
+        #      anything behind a shebang) and is TRUNCATED TO 15 CHARACTERS.
+        #      "test_dilithion" is 14 -- the guard worked by one character, and a
+        #      longer binary name would have disabled the watchdog silently.
+        #   2. cleanup killed the watchdog subshell and THEN ran `pkill -P`
+        #      against it; the children are already reparented to init by then,
+        #      so the sleep survived holding this step's stdout open. The comment
+        #      above that code named the failure it did not prevent.
+        #
+        # Both are fixed and pinned by scripts/test_run_with_hang_capture.sh,
+        # including "a hang MUST fail the step" and "an incomplete gdb capture
+        # must say so". (That comment used to state an arm count. It drifted
+        # within two days of being written, so the number is gone: the arm list
+        # lives in the self-test header, which cannot go stale relative to
+        # itself.)
+        #
+        # INVOKED VIA `bash`, NOT `./`, AND THAT IS LOAD-BEARING. Committed as
+        # `./scripts/run_with_hang_capture.sh`, this line failed on all four
+        # Build and Test legs with "Permission denied", exit 126: the script is
+        # tracked 100644 because the repo is developed on Windows, where the
+        # executable bit does not survive a checkout. Nearly every tracked
+        # script here is 100644 for that reason, so `bash <script>` is the
+        # convention -- the line directly above already used it. (This comment
+        # used to quote a ratio. Two readers produced two different numbers
+        # within an hour, because one counted every file under scripts/ and the
+        # other counted only *.sh. A figure nobody re-measures is not evidence;
+        # the self-test arm is, and it enforces the property directly.)
+        # The mode bit is ALSO set
+        # in the index now, and an arm in the self-test asserts both, but `bash`
+        # is the half that does not depend on a bit Windows keeps dropping.
+        BUDGET_SEC=$(bash scripts/ci_hang_budget.sh)
+        bash scripts/run_with_hang_capture.sh "$BUDGET_SEC" test-hang-artifacts \
+          ./test_dilithion --log_level=test_suite --report_level=short
         echo "Boost unit tests completed (HD wallet suites INCLUDED and gating)"
 
     # Only produces a file when the hang actually fired; otherwise no-op.
