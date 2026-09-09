@@ -667,6 +667,13 @@ bool CHeadersManager::ProcessHeadersWithDoSProtection(NodeId peer, const std::ve
         } else {
             sync_state = it->second;
             if (!sync_state || sync_state->GetState() == HeadersSyncState::State::FINAL) {
+                // Erase-by-key is SAFE HERE, unlike the two sites further down:
+                // cs_headers has been held continuously since the find() two
+                // lines above, so no other thread can have replaced the entry.
+                // The A-1 compare-and-erase is needed only where the lock was
+                // RELEASED across the expensive call. Recorded so this site is
+                // neither "fixed" unnecessarily nor copied as a pattern to the
+                // sites where it is wrong.
                 mapHeadersSyncStates.erase(peer);
                 sync_state = nullptr;
             }
@@ -684,7 +691,23 @@ bool CHeadersManager::ProcessHeadersWithDoSProtection(NodeId peer, const std::ve
 
     if (!result.success) {
         std::lock_guard<std::mutex> lock(cs_headers);
-        mapHeadersSyncStates.erase(peer);
+        // LP-10 A-1 (H-3 / invariant I6): COMPARE-AND-ERASE, never erase by key.
+        //
+        // The lock was RELEASED for the expensive ProcessNextHeaders call above.
+        // In that window another thread can disconnect this peer (erasing S1) and
+        // re-initialise it (creating S2). An erase by NodeId here would then
+        // destroy S2 -- a session this thread never processed, whose owner is
+        // still using it. The §2.1b shared_ptr keeps S2's MEMORY alive, so this
+        // is not a use-after-free and TSan cannot see it: it is a silent, wrong
+        // DESTRUCTION of live session state. The A-9 harness drove this exact
+        // interleaving 24,002 times under TSan and correctly reported clean.
+        //
+        // MEASURED (A-1): erase-by-key destroyed 44 of 44 sessions in the ABA
+        // window; compare-and-erase destroyed 0 of 74 windows hit.
+        auto it = mapHeadersSyncStates.find(peer);
+        if (it != mapHeadersSyncStates.end() && it->second == sync_state) {
+            mapHeadersSyncStates.erase(it);
+        }
         return false;
     }
 
@@ -744,7 +767,13 @@ bool CHeadersManager::ProcessHeadersWithDoSProtection(NodeId peer, const std::ve
     // and it previously ran unlocked (LP-10 §2.1b).
     if (sync_state->GetState() == HeadersSyncState::State::FINAL) {
         std::lock_guard<std::mutex> lock(cs_headers);
-        mapHeadersSyncStates.erase(peer);
+        // LP-10 A-1 (H-3 / invariant I6): COMPARE-AND-ERASE. Same reasoning as
+        // the !result.success site above -- this is its SIBLING, and fixing one
+        // without the other is the shape this mission has hit repeatedly.
+        auto it = mapHeadersSyncStates.find(peer);
+        if (it != mapHeadersSyncStates.end() && it->second == sync_state) {
+            mapHeadersSyncStates.erase(it);
+        }
     }
 
     return true;
@@ -1566,6 +1595,9 @@ void CHeadersManager::OnPeerDisconnected(NodeId peer)
 
     mapPeerStates.erase(peer);
     mapPeerStartHeight.erase(peer);  // BUG #62: Clean up peer height tracking
+    // Erase-by-key is CORRECT and DELIBERATE here: on disconnect we want to drop
+    // whatever session currently exists for this NodeId, regardless of identity.
+    // This is the one site where the A-1 compare-and-erase would be WRONG.
     mapHeadersSyncStates.erase(peer);  // Clean up DoS protection state
     m_peerHeaderRate.erase(peer);  // Phase 6 PR6.1 fix-up (subagent v1.5+ BLOCKER): prevent monotonic
                                    // memory leak under Bitcoin-level peer churn
