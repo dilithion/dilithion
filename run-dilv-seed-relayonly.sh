@@ -21,7 +21,10 @@ ulimit -n 65536
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 BINARY="$SCRIPT_DIR/dilv-node"
-LOG="/root/dilv-node.log"
+# Overridable ONLY so scripts/seed_wrapper_exit_code_check.sh can drive this
+# loop with a fake binary. Production never sets either variable.
+LOG="${DILITHION_NODE_LOG:-/root/dilv-node.log}"
+RESTART_DELAY="${DILITHION_WRAPPER_RESTART_DELAY:-5}"
 
 # Auto-detect external IP. Required for seed_id resolution (the node matches
 # --externalip to its chainparams seed slot). As of v4.5.0 a missing/mismatched
@@ -45,12 +48,35 @@ while true; do
 
     echo "$(date): Node exited with code $EXIT_CODE"
 
+    # PR #127 (startup integrity, fresh-pass MEDIUM-3 2026-09-07): the node
+    # exits 1 WITHOUT writing the auto_rebuild marker when its startup
+    # integrity check hits a persistent storage fault that is NOT corruption
+    # (failing disk, fsync lag, a file lock). That exit means STOP FOR AN
+    # OPERATOR. Restarting cannot fix it and used to re-run a 60-second retry
+    # loop against the suspect disk every cycle, forever, with no signal but
+    # this log. Exit 1 is also every other fatal init error (bad flag, port in
+    # use, unreadable datadir), none of which a 5-second restart repairs.
+    # So exit 1 STOPS this loop, loudly. Exit 2 (marker written; the node
+    # wipes and resyncs itself on its next start) and every other code keep
+    # the existing restart behaviour. Verified by
+    # scripts/seed_wrapper_exit_code_check.sh, including the inverted-branch
+    # mutant.
+    if [ "$EXIT_CODE" -eq 1 ]; then
+        echo "=========================================================="
+        echo "$(date): RECOVERY REQUIRED — node exited 1 (fatal startup or integrity error, NOT corruption)."
+        echo "  NOT restarting: a restart cannot fix this and would loop forever."
+        echo "  auto_rebuild marker path (absent by design on this exit): $HOME/.dilv/auto_rebuild"
+        echo "  Read the tail of $LOG, fix the cause (disk / lock / config), then start this wrapper again."
+        echo "=========================================================="
+        exit 1
+    fi
+
     # If auto_rebuild marker exists, the node shut down for recovery
     if [ -f "$HOME/.dilv/auto_rebuild" ]; then
         echo "$(date): Auto-rebuild marker detected — node will clean up on restart"
     fi
 
     # Brief pause before restart
-    echo "$(date): Restarting in 5 seconds..."
-    sleep 5
+    echo "$(date): Restarting in ${RESTART_DELAY} seconds..."
+    sleep "$RESTART_DELAY"
 done
