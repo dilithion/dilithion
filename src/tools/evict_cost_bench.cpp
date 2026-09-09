@@ -17,7 +17,7 @@
 // NOT A ROSTER SUITE, deliberately: it allocates ~500K CBlockIndex objects and
 // takes seconds to minutes. It is a tool you run when you change the evictor.
 //
-//   make evict_cost_bench && ./evict_cost_bench [entries] [pinned_percent]
+//   make evict_cost_bench && ./evict_cost_bench [entries] [pinned_pct] [batch_div]
 //
 // WHAT IS AND IS NOT MEASURED. Wall time and the cs_main hold are the same span
 // here — the evictor takes cs_main for its whole body, so timing the call IS
@@ -174,12 +174,15 @@ int main(int argc, char** argv)
 
     // THE MEASUREMENT: exactly what a caller does on one over-cap insert.
     //
-    // The callers drain a BATCH (cap/64) rather than one entry, so that the
-    // rebuild cost is paid once per batch instead of once per header. Mirror that
-    // here — measuring `entries - 1` would report the cost of the routine, not
-    // the cost a node actually pays per header, and those differ by the batch
-    // factor. Pass batch_div=0 on the command line to measure the old
-    // one-at-a-time behaviour for comparison.
+    // batch_div=0 is THE SHIPPED BEHAVIOUR: one entry per over-cap insert. Larger
+    // batches are selectable only to reproduce the measurement that got batching
+    // rejected — the eviction loop rescans the whole map per victim, so a batch of
+    // B costs O(B x n) and turns many short cs_main stalls into one very long one
+    // (n=100,000: B=1 94.7 ms, B=10 263.6, B=20 539.1, B=40 846.3).
+    //
+    // (This comment previously described the cap/64 batch as if it shipped. It was
+    // reverted in the same change that measured it, and the comment did not follow
+    // — the stale-twin shape this PR has produced repeatedly.)
     const size_t batch_div = (argc > 3) ? std::stoul(argv[3]) : 64;
     const size_t batch = (batch_div == 0)
                              ? 1
