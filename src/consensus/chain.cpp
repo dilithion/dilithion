@@ -62,6 +62,31 @@ void CChainState::Cleanup() {
     // would dereference dangling pointers via the comparator.
     m_setBlockIndexCandidates.clear();
 
+    // ⚠️ THE LEAF SIDE INDEX IS THE SAME HAZARD, AND IT WAS MISSED (round-5
+    // reader, HIGH-1). Both structures hold NON-OWNING raw CBlockIndex*, exactly
+    // like the candidate set above — whose comment explains this hazard in as
+    // many words, three lines up from where the omission was written.
+    //
+    // Cleanup() is a THIRD membership mutator. PR #129 documented "maintenance is
+    // exactly TWO sites" (AddBlockIndex and the evictor's erase) and that was
+    // FALSE: `mapBlockIndex.clear()` below frees every node, and without these two
+    // lines m_inDegree and m_evictableLeaves keep the freed pointers. The very
+    // next AddBlockIndex then calls m_evictableLeaves.insert(), whose comparator
+    // reads nChainWork and GetBlockHash() off FREED memory — a use-after-free on
+    // the first insert, and a permanently desynced index thereafter.
+    //
+    // NOT hypothetical: Cleanup() is reused in PRODUCTION, not only in teardown.
+    // dilithion-node.cpp:2970 and dilv-node.cpp:2836 do
+    //     Cleanup(); SetTip(nullptr); goto load_genesis_block;
+    // as the corrupted-DB auto-recovery path, and fixtures re-use it ~19 times.
+    //
+    // WHY THE ORIGINAL GREP MISSED IT: #129 searched for the SHAPE of insert and
+    // erase. `clear()` is neither, and the name-based search never saw it. A
+    // census of mapBlockIndex MUTATIONS finds it; a census of the two operations
+    // someone had in mind does not.
+    m_inDegree.clear();
+    m_evictableLeaves.clear();
+
     // Perf fix 2026-07-12: mapBlockIndex is about to be cleared below —
     // the cached tip set is now stale.
     m_chainTipsCacheDirty = true;
@@ -674,10 +699,23 @@ bool CChainState::EvictLowestWorkLeafNotPinned(size_t target_max) {
             break;
         }
 
-        // Erase by the map's own key (MEDIUM-3), not by victim->GetBlockHash():
-        // the two can disagree if phashBlock was ever set inconsistently, and the
-        // map key is what actually owns the unique_ptr.
-        const uint256 victim_key = victim->GetBlockHash();
+        // ⚠️ THE COMMENT HERE SAID ONE THING AND THE CODE DID THE OTHER (round-5
+        // reader, MEDIUM-1). It read "erase by the map's own key, NOT by
+        // victim->GetBlockHash()" — directly above a line that did exactly
+        // `victim_key = victim->GetBlockHash()`. A comment that contradicts the
+        // line beneath it is worse than none: it tells the next reader the hazard
+        // is handled.
+        //
+        // Now it genuinely erases by the MAP'S key. The two can only disagree if
+        // an entry's phashBlock diverges from the key it is stored under — which
+        // AddBlockIndex's Invariant currently makes unreachable, so this is
+        // defence in depth rather than a live fix. It is worth having anyway
+        // because the bench printed the null-phashBlock diagnostic twice during a
+        // run, which is the shape that would make them disagree.
+        auto victim_it = mapBlockIndex.find(victim->GetBlockHash());
+        ConsensusInvariant(victim_it != mapBlockIndex.end() &&
+                           victim_it->second.get() == victim);
+        const uint256 victim_key = victim_it->first;
 
         // Drop it from the candidate set BEFORE the unique_ptr frees it, or the
         // set keeps a dangling pointer.

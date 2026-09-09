@@ -245,6 +245,67 @@ int main()
             cs.LeafIndexMatchesBruteForce());
     }
 
+    // ---- Cleanup() IS A THIRD MEMBERSHIP MUTATOR (round-5 reader, HIGH-1) ----
+    //
+    // #129 documented "maintenance is exactly TWO sites". That was FALSE:
+    // CChainState::Cleanup() calls mapBlockIndex.clear(), freeing every node,
+    // and the leaf index kept the freed pointers. The next AddBlockIndex then
+    // ran m_evictableLeaves.insert(), whose comparator reads nChainWork and
+    // GetBlockHash() off FREED memory.
+    //
+    // Not a teardown-only path: dilithion-node.cpp:2970 and dilv-node.cpp:2836
+    // use Cleanup() as the corrupted-DB auto-recovery (`Cleanup(); SetTip(nullptr);
+    // goto load_genesis_block;`), so this ran in production on any node that hit
+    // a corrupt database.
+    //
+    // RED-ARM: remove the m_inDegree/m_evictableLeaves clears from Cleanup() and
+    // this goes red (and, under ASan, traps).
+    {
+        CChainState cs;
+        ::dilithion::consensus::port::ChainSelectorAdapter ad(cs);
+
+        auto g1 = MakeHeader(zero, 1700200000, 0x30);
+        if (!ad.ProcessNewHeader(g1)) { std::cerr << "setup: g1 rejected" << std::endl; return 2; }
+        uint256 prev = g1.GetHash();
+        for (int i = 1; i <= 6; ++i) {
+            auto h = MakeHeader(prev, static_cast<uint32_t>(1700200000 + i),
+                                static_cast<uint8_t>(0x40 + i));
+            if (!ad.ProcessNewHeader(h)) { std::cerr << "setup: chain rejected" << std::endl; return 2; }
+            prev = h.GetHash();
+        }
+        CBlockIndex* tip = cs.GetBlockIndex(prev);
+        if (tip) cs.SetTip(tip);
+        chk("pre-Cleanup: index consistent", cs.LeafIndexMatchesBruteForce());
+
+        // THE OPERATION THAT WAS UNMAINTAINED.
+        cs.Cleanup();
+        chk("after Cleanup: index consistent (empty map, empty structures)",
+            cs.LeafIndexMatchesBruteForce());
+        chk("after Cleanup: map is empty", cs.GetBlockIndexSize() == 0);
+
+        // Re-add after Cleanup. WITHOUT the fix this inserts into a set whose
+        // comparator dereferences freed nodes.
+        auto g2 = MakeHeader(zero, 1700300000, 0x50);
+        chk("re-add after Cleanup succeeds", ad.ProcessNewHeader(g2));
+        chk("after re-add: index consistent", cs.LeafIndexMatchesBruteForce());
+
+        uint256 p2 = g2.GetHash();
+        for (int i = 1; i <= 4; ++i) {
+            auto h = MakeHeader(p2, static_cast<uint32_t>(1700300000 + i),
+                                static_cast<uint8_t>(0x60 + i));
+            if (!ad.ProcessNewHeader(h)) break;
+            p2 = h.GetHash();
+        }
+        CBlockIndex* t2 = cs.GetBlockIndex(p2);
+        if (t2) cs.SetTip(t2);
+
+        // And eviction must still work on the rebuilt index.
+        const size_t sz2 = cs.GetBlockIndexSize();
+        if (sz2 > 2) cs.EvictLowestWorkLeafNotPinned(sz2 - 1);
+        chk("after eviction on the rebuilt index: consistent",
+            cs.LeafIndexMatchesBruteForce());
+    }
+
     Dilithion::g_chainParams = saved;
 
     std::cout << "\n  ===== leaf index invariant: "

@@ -78,7 +78,15 @@ echo
 echo "== running =="
 fail=0
 for t in "${TARGETS[@]}"; do
-    ./"$t" > "/tmp/${t}.out" 2>&1
+    # PER-SUITE TIMEOUT (round-5 reader, LOW). Without one, a suite that hangs
+    # hangs this script forever — the reader's arm 2 did exactly that. The roster
+    # runner has had a per-suite timeout since #180; this convenience wrapper did
+    # not, which is the same "the guard exists on the sanctioned path only" shape
+    # that put this script here in the first place.
+    #
+    # --preserve-status is deliberate: without it `timeout` reports 124 and a hang
+    # is indistinguishable from a failure. See lesson_timeout_exit_codes_143.
+    timeout --preserve-status "${SUITE_TIMEOUT:-600}" ./"$t" > "/tmp/${t}.out" 2>&1
     rc=$?
     if [ "$rc" -eq 0 ]; then
         printf '   PASS  %-52s\n' "$t"
