@@ -330,6 +330,43 @@ int main()
     // plausible future change (relaxing the parentless-implies-genesis rule for
     // orphan handling), and if that change lands, THIS is where the test goes.
 
+    // ---- THE ADOPT ARM'S REGRESSION, AS A PRECONDITION GUARD ---------------
+    //
+    // The review's rule is right: unreachable-today code carrying maintenance must
+    // keep a regression, or the maintenance rots exactly like the arm that produced
+    // this defect. But the arm cannot be driven through AddBlockIndex any more --
+    // reaching it needs a parentless entry at height > 0, and AddBlockIndex's
+    // else-branch asserts a parentless entry is height 0. An attempt aborts the
+    // process, and asserting an abort needs death-test machinery this suite lacks.
+    //
+    // So the guard is on the PRECONDITION. The arm becomes reachable if and only if
+    // "parentless implies genesis" is relaxed -- precisely the orphan-handling
+    // change the maintenance exists to serve. This asserts that precondition over
+    // REAL data: every parentless entry in a populated chainstate is height 0.
+    //
+    // ⚠️ THE FIRST VERSION OF THIS GUARD WAS VACUOUS -- it asserted the shape of an
+    // object the test had just constructed, plus a literal `true`. A test that
+    // cannot fail, written in a suite whose entire purpose is catching tests that
+    // cannot fail. Replaced with a property over the built chain, which a
+    // relaxation that actually produced such entries would break.
+    {
+        size_t parentless = 0, parentless_nonzero_height = 0;
+        for (const uint256& h : all) {
+            CBlockIndex* p = chainstate.GetBlockIndex(h);
+            if (!p || p->pprev != nullptr) continue;
+            ++parentless;
+            if (p->nHeight != 0) ++parentless_nonzero_height;
+        }
+        chk("adopt-arm precondition: at least one parentless entry exists to check",
+            parentless > 0);
+        chk("adopt-arm precondition: EVERY parentless entry is height 0, so an "
+            "adoptable entry would need a parent at height -1 -- the arm is "
+            "unreachable. If this fails, the arm is LIVE: restore its maintenance "
+            "regression (insert P at height 0, X parentless at height 1, merge X "
+            "with pprev=P, assert P is not evicted while X names it).",
+            parentless_nonzero_height == 0);
+    }
+
     // ---- IsLeafPinnedDirect, PER CLAUSE (round-5 seats, item 4) --------------
     //
     // The randomized arm above brute-walks clause (a) only and never CALLS
