@@ -178,15 +178,48 @@ def main():
                     use_ln, use_kind, use_txt = j + 1, "escape", rawlines[j].strip()[:80]
                     break
 
-            if use_ln is None:
+            # ── DOES THE POINTER OUTLIVE THE CALL? ───────────────────────────
+            # This decides whether deferred reclamation (draining a graveyard at
+            # an iteration boundary) is sound. If a resolved pointer is stored
+            # into a member, a global, a container or a struct field, it can be
+            # read on a LATER iteration and a per-iteration grace period does not
+            # cover it. Locals cannot outlive the call.
+            #
+            # Same bias as everything else here: anything ambiguous is reported,
+            # not cleared. This finds STORES, so a false positive costs a human
+            # read and a false negative costs a use-after-free.
+            escapes = []
+            depth2 = 0
+            for j in range(idx + 1, min(idx + 260, len(lines))):
+                depth2 += lines[j - 1].count('{') - lines[j - 1].count('}')
+                if depth2 < 0:
+                    break
+                l = lines[j]
+                v = re.escape(var)
+                if re.search(rf'\bm_\w+\s*=\s*{v}\s*;', l) or \
+                   re.search(rf'\bg_\w+\s*=\s*{v}\s*;', l):
+                    escapes.append(f"member/global@{j+1}")
+                elif re.search(rf'\.\w+\s*=\s*{v}\s*;', l) or \
+                     re.search(rf'->\w+\s*=\s*{v}\s*;', l):
+                    escapes.append(f"field@{j+1}")
+                elif re.search(rf'(push_back|emplace_back|insert|emplace|push)\s*\(\s*{v}\s*[,)]', l):
+                    escapes.append(f"container@{j+1}")
+                elif re.search(rf'\breturn\s+{v}\s*;', l):
+                    escapes.append(f"return@{j+1}")
+            stored = ";".join(escapes[:2])
+
+            if use_ln is None and not escapes:
                 cls = "NO-WINDOW"
+            elif escapes:
+                # outlives the call -> a per-iteration grace period does NOT cover it
+                cls = "OUTLIVES-CALL"
             else:
                 g_at_use, _ = lock_in_scope(lines, fn_start, use_ln - 1)
                 cls = "GUARDED" if (guarded and g_at_use) else "UNGUARDED"
             rows.append((path, lineno, fn_name, var, cls, guarded,
                          f"{use_kind}@{use_ln}" if use_ln else "", use_txt))
 
-    order = {"UNGUARDED": 0, "UNKNOWN": 1, "GUARDED": 2, "NO-WINDOW": 3}
+    order = {"OUTLIVES-CALL": 0, "UNGUARDED": 1, "UNKNOWN": 2, "GUARDED": 3, "NO-WINDOW": 4}
     rows.sort(key=lambda r: (order[r[4]], r[0], r[1]))
 
     counts = {}
@@ -200,11 +233,15 @@ def main():
               f"{use or '—'} | {'yes' if guarded else 'no'} |")
     print()
     print("TOTAL call sites: %d" % len(rows))
-    for k in ("UNGUARDED", "UNKNOWN", "GUARDED", "NO-WINDOW"):
+    for k in ("OUTLIVES-CALL", "UNGUARDED", "UNKNOWN", "GUARDED", "NO-WINDOW"):
         print("  %-10s %d" % (k, counts.get(k, 0)))
     print()
     print("UNGUARDED and UNKNOWN both require a human decision. UNKNOWN is NOT a")
     print("clearance -- it is the scanner saying it could not follow the pointer.")
+    print()
+    print("OUTLIVES-CALL is the one that decides deferred reclamation: a pointer")
+    print("stored into a member/global/field/container can be read on a LATER")
+    print("iteration, so a per-iteration grace period would NOT cover it.")
 
     # ------------------------------------------------------------------
     # SELF-CHECK: every reported path:line must actually contain the call.

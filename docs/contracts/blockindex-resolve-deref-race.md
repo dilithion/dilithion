@@ -175,35 +175,35 @@ wrongly cleared is a use-after-free nobody looks at again.
 
 | # | class | file:line | function | var | first use | cs_main in scope |
 |---|---|---|---|---|---|---|
-| 1 | **UNGUARDED** | `src/node/block_processing.cpp:350` | `BlockProcessResult ProcessNewBlock(` | `pParent` | escape@351 | no |
-| 2 | **UNGUARDED** | `src/node/block_processing.cpp:462` | `BlockProcessResult ProcessNewBlock(` | `pParent` | escape@463 | no |
-| 3 | **UNGUARDED** | `src/node/block_processing.cpp:586` | `BlockProcessResult ProcessNewBlock(` | `pParent` | escape@587 | no |
-| 4 | **UNGUARDED** | `src/node/block_processing.cpp:696` | `BlockProcessResult ProcessNewBlock(` | `pindex` | escape@697 | no |
-| 5 | **UNGUARDED** | `src/node/block_processing.cpp:762` | `BlockProcessResult ProcessNewBlock(` | `pParentTS` | deref@763 | no |
-| 6 | **UNGUARDED** | `src/node/block_processing.cpp:795` | `BlockProcessResult ProcessNewBlock(` | `pParent` | escape@796 | no |
-| 7 | **UNGUARDED** | `src/node/block_processing.cpp:894` | `BlockProcessResult ProcessNewBlock(` | `pindex` | deref@895 | no |
-| 8 | **UNGUARDED** | `src/node/block_processing.cpp:1094` | `BlockProcessResult ProcessNewBlock(` | `pprev` | deref@1274 | no |
-| 9 | **UNGUARDED** | `src/node/block_processing.cpp:1293` | `BlockProcessResult ProcessNewBlock(` | `pblockIndexPtr` | deref@1316 | no |
-| 10 | **UNGUARDED** | `src/node/block_processing.cpp:1362` | `BlockProcessResult ProcessNewBlock(` | `forkIndex` | deref@1366 | no |
-| 11 | **UNGUARDED** | `src/node/block_validation_queue.cpp:89` | `bool CBlockValidationQueue::QueueBlock(int peer_id, const CBlock& bloc` | `pParent` | deref@90 | no |
-| 12 | **UNGUARDED** | `src/node/block_validation_queue.cpp:151` | `bool CBlockValidationQueue::QueueBlock(int peer_id, const CBlock& bloc` | `existing` | deref@152 | no |
-| 13 | **UNGUARDED** | `src/node/block_validation_queue.cpp:362` | `bool CBlockValidationQueue::ProcessBlock(const QueuedBlock& queued_blo` | `pprev` | deref@370 | no |
-| 14 | **UNGUARDED** | `src/node/block_validation_queue.cpp:444` | `bool CBlockValidationQueue::ProcessBlock(const QueuedBlock& queued_blo` | `pOrphanParent` | deref@453 | no |
-| 15 | **UNGUARDED** | `src/node/block_validation_queue.cpp:496` | `bool CBlockValidationQueue::ProcessBlock(const QueuedBlock& queued_blo` | `pOrphanIndexRaw` | deref*@506 | no |
-| 16 | **UNGUARDED** | `src/node/dilithion-node.cpp:2758` | `int main(int argc, char* argv[]) {` | `pgenesisIndexPtr` | escape@2766 | no |
-| 17 | **UNGUARDED** | `src/node/dilithion-node.cpp:2852` | `int main(int argc, char* argv[]) {` | `pgenesisIndexPtr` | escape@2858 | no |
-| 18 | **UNGUARDED** | `src/node/dilithion-node.cpp:2909` | `int main(int argc, char* argv[]) {` | `pprev` | deref@2914 | no |
-| 19 | **UNGUARDED** | `src/node/dilithion-node.cpp:3008` | `int main(int argc, char* argv[]) {` | `pblockIndexPtr` | deref@3010 | no |
-| 20 | **UNGUARDED** | `src/node/dilithion-node.cpp:3016` | `int main(int argc, char* argv[]) {` | `pindexTip` | escape@3023 | no |
-| 21 | **UNGUARDED** | `src/node/dilithion-node.cpp:6398` | `int main(int argc, char* argv[]) {` | `pprev` | deref@6407 | no |
-| 22 | **UNGUARDED** | `src/node/dilithion-node.cpp:6427` | `int main(int argc, char* argv[]) {` | `pblockIndexPtr` | escape@6435 | no |
-| 23 | **UNGUARDED** | `src/node/dilithion-node.cpp:6625` | `int main(int argc, char* argv[]) {` | `pprev` | deref@6630 | no |
-| 24 | **UNGUARDED** | `src/node/dilithion-node.cpp:6643` | `int main(int argc, char* argv[]) {` | `pblockIndexPtr` | escape@6647 | no |
-| 25 | **UNGUARDED** | `src/node/dilithion-node.cpp:8722` | `int main(int argc, char* argv[]) {` | `pidx` | deref@8723 | no |
-| 26 | **UNGUARDED** | `src/node/dilv-node.cpp:2615` | `int main(int argc, char* argv[]) {` | `pgenesisIndexPtr` | escape@2623 | no |
-| 27 | **UNGUARDED** | `src/node/dilv-node.cpp:2709` | `int main(int argc, char* argv[]) {` | `pgenesisIndexPtr` | escape@2715 | no |
-| 28 | **UNGUARDED** | `src/node/dilv-node.cpp:2775` | `int main(int argc, char* argv[]) {` | `pprev` | deref@2780 | no |
-| 29 | **UNGUARDED** | `src/node/dilv-node.cpp:2874` | `int main(int argc, char* argv[]) {` | `pblockIndexPtr` | deref@2876 | no |
+| 1 | **OUTLIVES-CALL** | `src/node/block_validation_queue.cpp:444` | `bool CBlockValidationQueue::ProcessBlock(const QueuedBlock& queued_blo` | `pOrphanParent` | deref@453 | no |
+| 2 | **OUTLIVES-CALL** | `src/node/dilithion-node.cpp:3008` | `int main(int argc, char* argv[]) {` | `pblockIndexPtr` | deref@3010 | no |
+| 3 | **OUTLIVES-CALL** | `src/node/dilv-node.cpp:2874` | `int main(int argc, char* argv[]) {` | `pblockIndexPtr` | deref@2876 | no |
+| 4 | **UNGUARDED** | `src/node/block_processing.cpp:350` | `BlockProcessResult ProcessNewBlock(` | `pParent` | escape@351 | no |
+| 5 | **UNGUARDED** | `src/node/block_processing.cpp:462` | `BlockProcessResult ProcessNewBlock(` | `pParent` | escape@463 | no |
+| 6 | **UNGUARDED** | `src/node/block_processing.cpp:586` | `BlockProcessResult ProcessNewBlock(` | `pParent` | escape@587 | no |
+| 7 | **UNGUARDED** | `src/node/block_processing.cpp:696` | `BlockProcessResult ProcessNewBlock(` | `pindex` | escape@697 | no |
+| 8 | **UNGUARDED** | `src/node/block_processing.cpp:762` | `BlockProcessResult ProcessNewBlock(` | `pParentTS` | deref@763 | no |
+| 9 | **UNGUARDED** | `src/node/block_processing.cpp:795` | `BlockProcessResult ProcessNewBlock(` | `pParent` | escape@796 | no |
+| 10 | **UNGUARDED** | `src/node/block_processing.cpp:894` | `BlockProcessResult ProcessNewBlock(` | `pindex` | deref@895 | no |
+| 11 | **UNGUARDED** | `src/node/block_processing.cpp:1094` | `BlockProcessResult ProcessNewBlock(` | `pprev` | deref@1274 | no |
+| 12 | **UNGUARDED** | `src/node/block_processing.cpp:1293` | `BlockProcessResult ProcessNewBlock(` | `pblockIndexPtr` | deref@1316 | no |
+| 13 | **UNGUARDED** | `src/node/block_processing.cpp:1362` | `BlockProcessResult ProcessNewBlock(` | `forkIndex` | deref@1366 | no |
+| 14 | **UNGUARDED** | `src/node/block_validation_queue.cpp:89` | `bool CBlockValidationQueue::QueueBlock(int peer_id, const CBlock& bloc` | `pParent` | deref@90 | no |
+| 15 | **UNGUARDED** | `src/node/block_validation_queue.cpp:151` | `bool CBlockValidationQueue::QueueBlock(int peer_id, const CBlock& bloc` | `existing` | deref@152 | no |
+| 16 | **UNGUARDED** | `src/node/block_validation_queue.cpp:362` | `bool CBlockValidationQueue::ProcessBlock(const QueuedBlock& queued_blo` | `pprev` | deref@370 | no |
+| 17 | **UNGUARDED** | `src/node/block_validation_queue.cpp:496` | `bool CBlockValidationQueue::ProcessBlock(const QueuedBlock& queued_blo` | `pOrphanIndexRaw` | deref*@506 | no |
+| 18 | **UNGUARDED** | `src/node/dilithion-node.cpp:2758` | `int main(int argc, char* argv[]) {` | `pgenesisIndexPtr` | escape@2766 | no |
+| 19 | **UNGUARDED** | `src/node/dilithion-node.cpp:2852` | `int main(int argc, char* argv[]) {` | `pgenesisIndexPtr` | escape@2858 | no |
+| 20 | **UNGUARDED** | `src/node/dilithion-node.cpp:2909` | `int main(int argc, char* argv[]) {` | `pprev` | deref@2914 | no |
+| 21 | **UNGUARDED** | `src/node/dilithion-node.cpp:3016` | `int main(int argc, char* argv[]) {` | `pindexTip` | escape@3023 | no |
+| 22 | **UNGUARDED** | `src/node/dilithion-node.cpp:6398` | `int main(int argc, char* argv[]) {` | `pprev` | deref@6407 | no |
+| 23 | **UNGUARDED** | `src/node/dilithion-node.cpp:6427` | `int main(int argc, char* argv[]) {` | `pblockIndexPtr` | escape@6435 | no |
+| 24 | **UNGUARDED** | `src/node/dilithion-node.cpp:6625` | `int main(int argc, char* argv[]) {` | `pprev` | deref@6630 | no |
+| 25 | **UNGUARDED** | `src/node/dilithion-node.cpp:6643` | `int main(int argc, char* argv[]) {` | `pblockIndexPtr` | escape@6647 | no |
+| 26 | **UNGUARDED** | `src/node/dilithion-node.cpp:8722` | `int main(int argc, char* argv[]) {` | `pidx` | deref@8723 | no |
+| 27 | **UNGUARDED** | `src/node/dilv-node.cpp:2615` | `int main(int argc, char* argv[]) {` | `pgenesisIndexPtr` | escape@2623 | no |
+| 28 | **UNGUARDED** | `src/node/dilv-node.cpp:2709` | `int main(int argc, char* argv[]) {` | `pgenesisIndexPtr` | escape@2715 | no |
+| 29 | **UNGUARDED** | `src/node/dilv-node.cpp:2775` | `int main(int argc, char* argv[]) {` | `pprev` | deref@2780 | no |
 | 30 | **UNGUARDED** | `src/node/dilv-node.cpp:2882` | `int main(int argc, char* argv[]) {` | `pindexTip` | escape@2889 | no |
 | 31 | **UNGUARDED** | `src/node/dilv-node.cpp:6424` | `int main(int argc, char* argv[]) {` | `pprev` | deref@6429 | no |
 | 32 | **UNGUARDED** | `src/node/dilv-node.cpp:6442` | `int main(int argc, char* argv[]) {` | `pblockIndexPtr` | escape@6446 | no |
@@ -229,7 +229,8 @@ wrongly cleared is a use-after-free nobody looks at again.
 | 52 | **NO-WINDOW** | `src/node/ibd_coordinator.cpp:806` | `void CIbdCoordinator::DownloadBlocks(int header_height, int chain_heig` | `pParent` | — | no |
 
 TOTAL call sites: 52
-  UNGUARDED  41
+  OUTLIVES-CALL 3
+  UNGUARDED  38
   UNKNOWN    0
   GUARDED    0
   NO-WINDOW  11
@@ -237,7 +238,13 @@ TOTAL call sites: 52
 UNGUARDED and UNKNOWN both require a human decision. UNKNOWN is NOT a
 clearance -- it is the scanner saying it could not follow the pointer.
 
-**41 UNGUARDED is the scope of this PR's fix work**, superseding the five
+OUTLIVES-CALL is the one that decides deferred reclamation: a pointer
+stored into a member/global/field/container can be read on a LATER
+iteration, so a per-iteration grace period would NOT cover it.
+
+self-check: all 52 reported locations verified to contain GetBlockIndex(
+
+**38 UNGUARDED + 3 OUTLIVES-CALL = 41 sites needing a decision** — that is the scope of this PR's fix work, superseding the five
 hand-named sites above — which remain accurate but were never the whole set. The
 four guards this contract was written around are a subset; the deadlock argument
 must cover the population, not the sample.
