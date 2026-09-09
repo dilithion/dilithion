@@ -12,6 +12,7 @@
 #include <set>                  // Phase 5: m_setBlockIndexCandidates
 #include <vector>
 #include <memory>
+#include <string>
 #include <mutex>
 #include <atomic>
 #include <chrono>
@@ -290,6 +291,17 @@ public:
      * Safe to call from anywhere; takes cs_main. Returns the number freed.
      */
     size_t DrainGraveyard();
+
+    /** How many threads have checkpointed at least once (i.e. are participants). */
+    size_t RegisteredEpochThreads() const;
+
+    /**
+     * Have at least `expected` threads registered? A thread that never
+     * checkpoints pins the graveyard for the process lifetime -- safe, but an
+     * unbounded and SILENT leak, which is why this is asserted at startup rather
+     * than assumed. `why` carries the diagnostic on failure.
+     */
+    bool EpochRegistrationComplete(size_t expected, std::string& why) const;
 
     /** Test/diagnostic: how many entries are unlinked but not yet freed. */
     size_t GraveyardSize() const {

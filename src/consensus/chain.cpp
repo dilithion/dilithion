@@ -2,6 +2,8 @@
 // Distributed under the MIT software license
 
 #include <consensus/chain.h>
+
+#include <string>
 #include <consensus/params.h>    // Consensus::MAX_REORG_DEPTH (single source of truth)
 #include <consensus/pow.h>
 #include <consensus/reorg_wal.h>  // P1-4: WAL for atomic reorgs
@@ -401,6 +403,41 @@ void CChainState::EpochCheckpoint()
     // must also observe everything this thread did before the checkpoint.
     const uint64_t now = m_globalEpoch.load(std::memory_order_acquire);
     MyEpochSlot()->store(now, std::memory_order_release);
+}
+
+size_t CChainState::RegisteredEpochThreads() const
+{
+    std::lock_guard<std::mutex> lk(Registry().mu);
+    return Registry().slots.size();
+}
+
+bool CChainState::EpochRegistrationComplete(size_t expected, std::string& why) const
+{
+    // A THREAD THAT NEVER REGISTERS PINS THE GRAVEYARD FOREVER. That is the safe
+    // direction -- nothing is freed on the account of a thread that made no
+    // promise -- but it is a LEAK, and a silent one: the node runs correctly and
+    // memory grows without bound, which is the worst shape a defect can take.
+    //
+    // So it is asserted rather than trusted. The count is checked against the
+    // thread table in docs/contracts/deferred-reclamation-quiescence-proof.md; a
+    // NINTH thread added later that resolves block indices and does not
+    // checkpoint makes this fail loudly at startup instead of quietly holding the
+    // graveyard for the process lifetime.
+    //
+    // Deliberately a >= test with a diagnostic, not an equality: threads start
+    // asynchronously, so at any given instant fewer may have reached their first
+    // checkpoint. The caller supplies the deadline; what is forbidden is running
+    // indefinitely with a participant missing.
+    const size_t have = RegisteredEpochThreads();
+    if (have >= expected) return true;
+    why = "deferred reclamation: only " + std::to_string(have) + " of " +
+          std::to_string(expected) + " expected threads have checkpointed. A "
+          "thread that never checkpoints PINS THE GRAVEYARD FOR THE PROCESS "
+          "LIFETIME -- memory grows without bound while the node behaves "
+          "correctly. Add EpochCheckpoint() at that thread's no-pointer-held "
+          "boundary, or add it to the exclusion list in the quiescence proof if "
+          "it provably never resolves a CBlockIndex*.";
+    return false;
 }
 
 size_t CChainState::DrainGraveyard()

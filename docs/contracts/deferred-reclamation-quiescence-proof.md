@@ -142,3 +142,55 @@ memory-safe but must never be read as reachability. Nothing may walk *from* the 
 * the ASan RED arm: resolve a pointer, evict on another thread, dereference — must trap
   on `main`, be clean here, **and trap again with the drain forced immediate**, which is
   what proves the harness actually reaches the free rather than passing vacuously.
+
+## WIRING CENSUS — where EpochCheckpoint() actually is
+
+| thread | checkpoint site | pin bound |
+|---|---|---|
+| Validation worker | `block_validation_queue.cpp` `ValidationWorker`, loop top **before** `m_queue_cv.wait` | one `ProcessBlock` |
+| Header validation | `headers_manager.cpp` `ValidationWorkerThread`, **before** `m_validation_cv.wait` | one validation unit |
+| Header processor | `headers_manager.cpp` `HeaderProcessorThread`, loop top | one header batch |
+| TxIndex sync | `tx_index.cpp` `SyncLoop`, loop top before the walk | one walk pass |
+| CoinStatsIndex sync | `coinstatsindex.cpp` `SyncLoop`, loop top | one walk pass |
+| RPC server | `rpc/server.cpp` `ServerThread`, **immediately before `accept()`** | one request |
+| Hash worker pool | — none, and deliberately | never resolves an index pointer |
+| P2P handler / main loop / IBD coordinator | run **on** the node main loop | one loop iteration |
+
+### The blocking-thread question, settled
+
+**A thread that registers and then blocks for a long time pins nothing, because
+the checkpoint goes BEFORE the block, not after the work.**
+
+This is the whole reason for that placement. At the point just before
+`cv.wait()` or `accept()`, the thread has finished its previous unit and started
+no new one — it provably holds no `CBlockIndex*`. Publishing the epoch there means:
+
+* an **idle** node's workers sleep for minutes on an empty queue having already
+  published — they pin nothing while asleep;
+* an **RPC server** sitting hours in `accept()` pins nothing;
+* a sync loop waiting on I/O between passes pins nothing.
+
+Checkpointing *after* the work instead would be exactly backwards: it would make a
+thread hold the graveyard for precisely the period it is doing nothing, which is
+when it is most obviously safe.
+
+**So the bound per thread is ONE UNIT OF WORK, never the duration of a wait.**
+The worst case is the longest single unit: a `ProcessBlock` containing a LevelDB
+write, or one index walk pass. Those are the numbers to measure — not idle time,
+which contributes nothing.
+
+**The exception that would break this**: a thread that blocks on I/O *while
+holding* a resolved pointer. None of the eight does today (the census found no
+site retaining a pointer across an iteration boundary), and if one is ever added
+it must checkpoint before blocking or drop the pointer first. That is the rule to
+apply when the ninth thread arrives.
+
+### A non-participant is a silent leak, so it is asserted
+
+A thread that never checkpoints reads epoch 0 and pins the **entire graveyard for
+the process lifetime**. That is the safe direction — nothing is freed on the
+account of a thread that made no promise — but it is an unbounded leak in which
+the node behaves perfectly and memory grows. `EpochRegistrationComplete()` checks
+the participant count against this table so a ninth thread that resolves block
+indices and forgets to checkpoint fails loudly at startup rather than quietly
+holding the graveyard. Its diagnostic names the leak, not just a count.

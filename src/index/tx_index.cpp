@@ -683,6 +683,13 @@ void CTxIndex::SyncLoop(int initial_snapshotted_tip) {
     int current_target = initial_snapshotted_tip;
 
     while (!m_interrupt.load()) {
+        // DEFERRED-RECLAMATION CHECKPOINT — loop top, before the walk. This
+        // thread holds no CBlockIndex* between iterations: each resolve/deref in
+        // WalkBlockRange spans two or three lines and nothing is retained across
+        // an iteration (tx_index.cpp documents the same discipline for m_mutex).
+        // Pin duration is therefore ONE WALK PASS, not the life of the sync.
+        g_chainstate.EpochCheckpoint();
+
         // PR-7G R1: each iteration walks `[m_last_height+1, current_target]`,
         // then re-reads the live tip. If the tip advanced during the walk,
         // bump current_target and walk again. Only when the tip is stable

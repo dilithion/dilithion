@@ -3383,6 +3383,13 @@ void CHeadersManager::ValidationWorkerThread()
 
         PendingValidation pending;
 
+        // DEFERRED-RECLAMATION CHECKPOINT — before the wait, not after the work.
+        // At the loop top this thread has finished the previous unit and started
+        // no new one, so it holds no CBlockIndex*. Publishing here means a thread
+        // that then sleeps (idle node, empty queue) pins NOTHING while it sleeps;
+        // the pin is one unit of work, never the duration of a wait.
+        g_chainstate.EpochCheckpoint();
+
         // Wait for work
         {
             std::unique_lock<std::mutex> lock(m_validation_mutex);
@@ -3482,6 +3489,13 @@ void CHeadersManager::HeaderProcessorThread()
         std::cout << "[HeadersManager] Header processor thread started" << std::endl;
 
     while (m_processor_running.load()) {
+        // DEFERRED-RECLAMATION CHECKPOINT — before the wait, not after the work.
+        // At the loop top this thread has finished the previous unit and started
+        // no new one, so it holds no CBlockIndex*. Publishing here means a thread
+        // that then sleeps (idle node, empty queue) pins NOTHING while it sleeps;
+        // the pin is one unit of work, never the duration of a wait.
+        g_chainstate.EpochCheckpoint();
+
         // Check if paused for fork recovery - wait until unpaused
         if (m_processing_paused.load()) {
             std::this_thread::sleep_for(std::chrono::milliseconds(10));

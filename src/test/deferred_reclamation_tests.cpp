@@ -141,6 +141,31 @@ int main()
     chk("the tip survived", cs.GetBlockIndex(prev) != nullptr);
     chk("genesis survived", cs.GetBlockIndex(gh) != nullptr);
 
+    // ---- REGISTRATION CENSUS: a thread that never checkpoints is a LEAK ------
+    //
+    // A non-participating thread pins the graveyard for the process lifetime.
+    // That is the SAFE direction — nothing is freed on the account of a thread
+    // that made no promise — but it is a silent unbounded leak: the node behaves
+    // correctly and memory grows. Worst possible shape for a defect, so the
+    // registration is asserted rather than assumed.
+    {
+        std::string why;
+        // This test process has exactly one participating thread (main), which
+        // has checkpointed above.
+        chk("registration: at least one thread has registered",
+            cs.RegisteredEpochThreads() >= 1);
+        chk("registration: the census passes when the expectation is met",
+            cs.EpochRegistrationComplete(1, why));
+
+        // And it must FAIL loudly, with a diagnostic, when a participant is
+        // missing — the ninth-thread-added-later case.
+        why.clear();
+        const bool ok = cs.EpochRegistrationComplete(99, why);
+        chk("registration: a missing participant FAILS the census", !ok);
+        chk("registration: and the failure explains the leak, not just a count",
+            !why.empty() && why.find("PINS THE GRAVEYARD") != std::string::npos);
+    }
+
     Dilithion::g_chainParams = saved;
 
     std::cout << "\n  ===== deferred reclamation: "

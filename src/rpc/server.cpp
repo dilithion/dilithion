@@ -774,6 +774,18 @@ void CRPCServer::ServerThread() {
         // release-store of INVALID_SOCKET. Loading inside the accept() call
         // argument list would be a second, independent read.
         const int listenSock = m_serverSocket.load(std::memory_order_acquire);
+
+        // DEFERRED-RECLAMATION CHECKPOINT — immediately BEFORE accept(), which is
+        // the long block COORD asked about. RPC has no "iteration": it is
+        // request/response, and accept() can wait indefinitely for a connection.
+        // At this instant the previous request is finished and the next has not
+        // arrived, so the thread holds no CBlockIndex*. Checkpointing HERE means
+        // an idle RPC server pins NOTHING for the hours it may sit in accept();
+        // checkpointing after the request instead would be equivalent here, but
+        // stating it at the blocking call makes the reason explicit — a thread
+        // waiting on I/O is holding nothing, so it should say so before it waits.
+        if (m_chainstate) m_chainstate->EpochCheckpoint();
+
         int clientSocket = accept(listenSock, (struct sockaddr*)&clientAddr, &clientLen);
 
         if (clientSocket == INVALID_SOCKET) {

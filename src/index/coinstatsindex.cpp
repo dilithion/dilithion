@@ -723,6 +723,13 @@ void CCoinStatsIndex::SyncLoop(int initial_snapshotted_tip) {
     int current_target = initial_snapshotted_tip;
 
     while (!m_interrupt.load()) {
+        // DEFERRED-RECLAMATION CHECKPOINT — loop top, before the walk. This
+        // thread holds no CBlockIndex* between iterations: each resolve/deref in
+        // WalkBlockRange spans two or three lines and nothing is retained across
+        // an iteration (tx_index.cpp documents the same discipline for m_mutex).
+        // Pin duration is therefore ONE WALK PASS, not the life of the sync.
+        g_chainstate.EpochCheckpoint();
+
         const int walk_start = m_last_height.load() + 1;
         if (walk_start > current_target) {
             // Already at-or-past the target; fall through to tip re-read.
