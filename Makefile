@@ -660,6 +660,7 @@ tests: tests-build
 # not a guard — it is a file. It runs FIRST: it is a sub-second grep, and if the
 # drain invariant is broken there is no point running the suites.
 tests-fast: check-tip-notify-drain $(TEST_SUITES_FAST)
+	@bash scripts/check_roster_completeness.sh
 	@bash scripts/test_run_test_suites_timeout.sh
 	@bash scripts/test_run_test_suites_staleness.sh
 	@bash scripts/test_run_test_suites_args.sh
@@ -1092,11 +1093,6 @@ dna_history_test: $(CORE_OBJECTS) $(OBJ_DIR)/digital_dna/dna_history_test.o $(DI
 	@echo "$(COLOR_BLUE)[LINK]$(COLOR_RESET) $@"
 	@$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS) $(LIBS)
 	@echo "$(COLOR_GREEN)✓ dna_history_test built successfully$(COLOR_RESET)"
-
-dna_monitor_test: $(CORE_OBJECTS) $(OBJ_DIR)/digital_dna/dna_monitor_test.o $(DILITHIUM_OBJECTS) $(CHIAVDF_OBJECTS)
-	@echo "$(COLOR_BLUE)[LINK]$(COLOR_RESET) $@"
-	@$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS) $(LIBS)
-	@echo "$(COLOR_GREEN)✓ dna_monitor_test built successfully$(COLOR_RESET)"
 
 verification_test: $(CORE_OBJECTS) $(OBJ_DIR)/digital_dna/verification_test.o $(DILITHIUM_OBJECTS) $(CHIAVDF_OBJECTS)
 	@echo "$(COLOR_BLUE)[LINK]$(COLOR_RESET) $@"

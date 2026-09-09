@@ -187,8 +187,24 @@ set -u
 # runs nightly does not gate the PR that breaks it. Measured cost: miner_tests
 # 19s (it mines for real), wallet_tests under 1s.
 #
-# ORPHAN REGISTRATION 2026-09-08. Eighteen Makefile test targets were named by
-# no roster row -- built by nothing, run by nothing, invoked by no workflow.
+# ORPHAN REGISTRATION 2026-09-08/09. Twenty-seven Makefile test targets were
+# named by no roster row -- built by nothing, run by nothing, invoked by no
+# workflow.
+#
+# THE COUNT MOVED THREE TIMES AND THAT IS THE REAL FINDING. An audit said 24,
+# my census said 18, a second reader found 9 more. Nobody was careless: each
+# method drew a different boundary (one compared against `--list all`, which
+# drops NOBUILD rows and so MANUFACTURES orphans; one matched only targets
+# linking $(OBJ_DIR)/test/, missing the ones under digital_dna/, vdf/ and
+# miner/). A fourth hand count would have produced a fourth number, so the
+# census is now a MACHINE CHECK -- scripts/check_roster_completeness.sh, wired
+# into the roster self-tests, fails on any unrostered test target. The roster
+# cannot silently drift again and nobody has to be careful.
+#
+# NAME TRAP worth one line: wallet_load_guard_test (script-driven, run by CI)
+# and wallet_load_guard_tests (compiled suite, rostered) are DIFFERENT tests
+# one character apart. Seeing the plural in the roster and ticking off the
+# singular is a mistake that has already cost a reviewer a step.
 # Every verdict below was MEASURED by executing the binary once on Linux/WSL
 # (the platform every runs-on: in ci.yml uses) against binaries newer than HEAD
 # (staleness checked: 16 built, 0 stale), with hangs classified by CPU TIME
@@ -202,7 +218,7 @@ set -u
 #
 # TWO TARGETS ARE DELIBERATELY NOT ROSTERED, and both would be wrong to add:
 #
-#   batch_verifier_race_control -- the Makefile (:1220-1224) says it
+#   batch_verifier_race_control -- the Makefile's `batch_verifier_race_control:` recipe says it
 #     "deterministically HANGS -- proving the harness is a real discriminator".
 #     Its hang is the point. Rostering it would file a working control as a
 #     defect, and the verdict would look genuine. It also served as the positive
@@ -277,6 +293,13 @@ fast|regtest_chainparams_smoke|60||
 fast|v4_2_time_decay_cooldown_tests|60||
 fast|hd_wallet_standalone_tests|120|FIXED IN PR #187, quarantined only until it merges. DIAGNOSED, not unknown: all its HD expectations predate the BUG #115 pre-generation, so external_idx is off by exactly HD_GAP_LIMIT - 1 = 19 (measured by probe: expected 1, actual 20). 10 tests run, 9 pass, 1 fails -- no assert() here, so that count is a real total and not a floor. NOTE the ci.yml exclusion reason for this suite ("GetNewHDAddress() hangs in CI (BUG-77) ... Likely blocking on /dev/random") is a MISDIAGNOSIS: there is no /dev/random path in src/ or depends/dilithium/, and it fails in 2s with 2.29s of CPU rather than hanging. Lift this row when #187 merges.|
 fast|difficulty_determinism_test|60|NOBUILD: does not LINK. undefined reference to GetDataDir(Dilithion::Network) and GetDataDir(bool) from chainparams.o -- a missing object in its Makefile link line, not a code defect. Needs a Makefile fix before it can be rostered; the source is fine.|
+fast|dna_p2p_test|120||
+fast|verification_test|120||
+fast|vdf_test|120||
+fast|vdf_miner_test|120||
+fast|asert_test|60||
+fast|eda_test|60||
+fast|dna_history_test|120|SUSPECTED REAL, measured on this branch: 2 of ~19 checks fail -- "Update 1 succeeds" and "Update 2 succeeds" (UpdateDNA returns false). The ODD part, and why this needs a DNA owner rather than an expectation bump: every assertion ABOUT the effect of those updates passes -- history has 1 then 2 entries, archived IPS values are right, ordering and persistence across a DB reopen are right. So the write happens and the return value says it did not. Either the return is wrong or the test asserts the wrong contract; both are real. No assert() here, so 2-of-19 is a true count, not a floor.|
 full|integration_tests|600||
 full|connman_tests|600|SUSPECTED REAL: high-load throughput test loses messages (pop_count != NUM_MESSAGES, connman_tests.cpp:552). Message loss under load in CConnman is not a stale expectation.|
 full|tx_relay_tests|600|WINDOWS-ONLY teardown hang (re-scoped 2026-08-15): all 6 tests PASS, then the process never exits on Windows/MSYS2 (exit 124 at 600s; teardown-path, post-J1/F6). LINUX CONFIRMATION DONE: under TSan on Linux (WSL, gcc, -fsanitize=thread) the binary runs all tests AND EXITS CLEANLY, zero data-race warnings -- so the hang is a Windows-specific teardown path (likely winsock/thread-join semantics), not a portable logic bug. Do NOT lift the quarantine on Windows by raising the timeout; needs a Windows-teardown owner. Linux CI can run this suite ungated.|
@@ -286,7 +309,8 @@ full|net_tests|600|NOBUILD: source no longer compiles. References a removed glob
 full|randomx_mode_test|1800||
 full|large_pages_optin_test|2100||
 full|wallet_encryption_at_rest_tests|300||
-full|batch_verifier_race_tests|300|TSAN-ONLY, and this is a vacuity quarantine rather than a failure. It PASSES without TSan (exit 0, 3.69s CPU) -- which is the problem: the race it exists to catch is only observable under -fsanitize=thread, so a plain PASS here would report coverage it does not have. Run it as Makefile:1212 documents: make TSAN=1 batch_verifier_race_tests. Its paired control batch_verifier_race_control is deliberately NOT rostered -- see the comment above the roster.|
+full|batch_verifier_race_tests|300|TSAN-ONLY, and this is a vacuity quarantine rather than a failure. It PASSES without TSan (exit 0, 3.69s CPU) -- which is the problem: the race it exists to catch is only observable under -fsanitize=thread, so a plain PASS here would report coverage it does not have. Run it as the `batch_verifier_race_tests:` recipe documents: make TSAN=1 batch_verifier_race_tests. Its paired control batch_verifier_race_control is deliberately NOT rostered -- see the comment above the roster.|
+full|four_node_test|900|NOT A UNIT TEST: the target runs scripts/four_node_local.sh, which stands up a live 4-node regtest mesh (smoke 10 180). It needs ports, datadirs and ~3 minutes, and a failure means "the environment could not host a mesh" as often as "the code is wrong". Rostering it live would make every PR depend on local networking. It is registered here so it is COUNTED rather than invisible; run it deliberately with `make four_node_test`.|
 '
 
 # ---------------------------------------------------------------------------
