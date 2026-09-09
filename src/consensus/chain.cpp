@@ -251,12 +251,52 @@ bool CChainState::EvictLowestWorkLeafNotPinned(size_t target_max) {
     for (CBlockIndex* p = pindexTip; p != nullptr; p = p->pprev) {
         if (!pinned.insert(p).second) break;  // cycle guard (shouldn't happen)
     }
-    // (b) every reorg candidate AND all of its pprev ancestors. This is the
-    //     chain selector's reachable set; it transitively pins the
-    //     best-header tip whenever that tip has a block-index entry (such a
-    //     tip is, by construction, a candidate). pindexBestHeader does not
-    //     exist on CChainState — best-header state lives in CHeadersManager —
-    //     so the candidate set is the in-scope handle on it.
+    // (b) every reorg candidate AND all of its pprev ancestors.
+    //
+    //     ⚠️ WHAT BOUNDS THIS SET — the question the external panel put first, and
+    //     the one this file previously did not answer. Since the cap is advisory,
+    //     the pinned set IS the floor on memory: whatever cannot be evicted is
+    //     what the node must hold. So "can an attacker grow the candidate set?"
+    //     decides whether a remote party can drive that floor up.
+    //
+    //     THEY CANNOT, and the bound is a validity level, not a policy. Both
+    //     insert sites — chain.cpp:761 and :3109, a complete census of
+    //     `m_setBlockIndexCandidates.insert` — are gated by
+    //     IsBlockACandidateForActivation(), which requires
+    //     `(nStatus & BLOCK_VALID_MASK) >= BLOCK_VALID_TRANSACTIONS` and says so
+    //     explicitly: "Pre-validation BLOCK_VALID_HEADER entries are NOT
+    //     candidates — they live in mapBlockIndex for fork visibility, not for
+    //     activation."
+    //
+    //     Header spam therefore produces BLOCK_VALID_HEADER entries that can never
+    //     enter the candidate set and so can never be pinned by this clause. They
+    //     stay evictable leaves, which is exactly what the evictor is for. To grow
+    //     the pinned set an attacker must supply FULLY VALIDATED BLOCKS — real
+    //     work at the real difficulty — at which point the cost is the chain's own
+    //     security parameter and not a memory bug.
+    //
+    //     KEEP THIS TRUE. If a future change ever admits header-only entries to
+    //     the candidate set, the advisory cap becomes remotely exhaustible and
+    //     this whole argument has to be redone.
+    //
+    //     This is the chain selector's activation-reachable set. pindexBestHeader
+    //     does not exist on CChainState — best-header state lives in
+    //     CHeadersManager — so the candidate set is the in-scope handle on it.
+    //
+    //     ⚠️ CORRECTED (external panel, item 7). This used to add: "it transitively
+    //     pins the best-header tip whenever that tip has a block-index entry (such
+    //     a tip is, by construction, a candidate)." The parenthesis is FALSE, and
+    //     the paragraph directly above is why: a candidate needs
+    //     BLOCK_VALID_TRANSACTIONS, whereas a best-HEADER tip is by definition
+    //     header-only until its block arrives and validates. So a best-header tip
+    //     is precisely the case that is NOT pinned here.
+    //
+    //     That is correct behaviour, not a hole — an un-downloaded header tip is
+    //     re-obtainable (mapHeaders is a separate, unbounded store in
+    //     CHeadersManager) and holding it is exactly the memory the cap exists to
+    //     reclaim. But the old wording claimed a pin that does not exist, which is
+    //     the more dangerous half: it would let a reader assume header-tip
+    //     protection that nothing provides.
     for (CBlockIndex* cand : m_setBlockIndexCandidates) {
         for (CBlockIndex* p = cand; p != nullptr; p = p->pprev) {
             if (!pinned.insert(p).second) break;  // ancestor already pinned

@@ -1353,6 +1353,26 @@ $(OBJ_DIR)/test \
 $(OBJ_DIR)/test/fuzz:
 	@mkdir -p $@
 
+# ASSERTS MUST SURVIVE IN TEST OBJECTS, WHATEVER CXXFLAGS ARRIVES.
+#
+# Raised by the external panel (kimi): "confirm no CI leg defines NDEBUG for the
+# assert-based suites." Confirmed — NDEBUG appears nowhere in this Makefile or in
+# .github/workflows/, and ci.yml states that matrix.build_type sets no compiler
+# flags. So the answer today is "none".
+#
+# It is true by luck, though, and that is the part worth fixing. CXXFLAGS is
+# assigned with `?=`, so a CI job, a distro packager, or `make CXXFLAGS=...` can
+# replace it wholesale — and 23 of the standalone suites are hand-written mains
+# whose ONLY checks are assert(). Under -DNDEBUG every one of them compiles to a
+# no-op, runs in milliseconds, and EXITS 0. The roster would report them green.
+# That is a silent, total loss of coverage with a passing result, which is the
+# exact failure shape this branch keeps turning up.
+#
+# `-UNDEBUG` last on the command line makes the property hold by construction
+# instead of by inspection. Scoped to test objects only: whether production
+# builds keep asserts is a separate policy decision and is not changed here.
+$(OBJ_DIR)/test/%.o: CXXFLAGS += -UNDEBUG
+
 # Compile C++ source files
 $(OBJ_DIR)/%.o: src/%.cpp | $(OBJ_DIR)/attestation $(OBJ_DIR)/consensus $(OBJ_DIR)/consensus/port $(OBJ_DIR)/core $(OBJ_DIR)/crypto $(OBJ_DIR)/db $(OBJ_DIR)/dfmp $(OBJ_DIR)/index $(OBJ_DIR)/kernel $(OBJ_DIR)/miner $(OBJ_DIR)/net $(OBJ_DIR)/net/port $(OBJ_DIR)/node $(OBJ_DIR)/primitives $(OBJ_DIR)/rpc $(OBJ_DIR)/wallet $(OBJ_DIR)/util $(OBJ_DIR)/api $(OBJ_DIR)/vdf $(OBJ_DIR)/digital_dna $(OBJ_DIR)/script $(OBJ_DIR)/policy $(OBJ_DIR)/tools $(OBJ_DIR)/x402 $(OBJ_DIR)/zmq $(OBJ_DIR)/test
 	@echo "$(COLOR_BLUE)[CXX]$(COLOR_RESET)  $<"

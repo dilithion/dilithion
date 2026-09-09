@@ -703,6 +703,31 @@ public:
      * a leaf, and is ineligible for eviction. Before that instant it is naked.
      * Holding cs_main across those two calls is the whole fix.
      *
+     * ⚠️ THIS GUARD IS APPLIED AT TWO SITES. THE CLASS IS LIVE AT FOUR MORE, AND
+     * THEY ARE NAMED HERE SO NOBODY HAS TO REDISCOVER THEM (external panel /
+     * non-author reader, H-1). Everything above describes what the guard does
+     * where it is used; it is not a statement that the resolve→deref race is
+     * closed in the node. It is not:
+     *
+     *   src/node/block_processing.cpp:1094 → :1274 → :1281 → :1287
+     *       resolve pprev, deref pprev->nHeight, LevelDB WriteBlockIndex, add.
+     *       This file contains ZERO occurrences of cs_main or MainLockGuard, and
+     *       the disk write sits INSIDE the window, so it is the widest of the six.
+     *   src/node/dilithion-node.cpp:6413 → :6432
+     *   src/node/dilithion-node.cpp:6622 → :6650
+     *   src/node/dilv-node.cpp:6431 → :6459
+     *
+     * Those four are PRE-EXISTING and are fixed in the sibling PR, not here —
+     * four widenings of the hottest lock in the node need their own deadlock
+     * argument against the queue mutex and ActivateBestChain, plus a TSan run
+     * with a positive control and a test that goes RED by freeing the parent in
+     * the window. That work does not belong inside a fold.
+     *
+     * The cap reduction rides with them for the same reason: eviction is
+     * attacker-triggerable by header spam at any cap, so the cap does not create
+     * or remove this race — it only prices the trigger. Lowering it while the
+     * four sites are open would make a live class ~10x cheaper to reach.
+     *
      * WHY A GUARD RATHER THAN A NEW ATOMIC METHOD. The two call sites build
      * materially different CBlockIndex objects (a header-only entry with
      * BLOCK_VALID_HEADER and a sequence id, vs. a received block with
@@ -830,12 +855,31 @@ public:
 
     /**
      * Phase 6 PR6.1: number of entries in mapBlockIndex.
-     * Used by ChainSelectorAdapter::ProcessNewHeader for cap eviction
-     * (chainparams.nMapBlockIndexCap). Read is racy without cs_main but
-     * the cap is sized for sustained-attack-rate so race-window overshoot
-     * is irrelevant.
+     * Used by the cap-eviction checks in ChainSelectorAdapter::ProcessNewHeader
+     * and CBlockValidationQueue::ProcessBlock.
+     *
+     * TAKES cs_main (external panel, gpt6 HIGH). This used to read
+     * `mapBlockIndex.size()` unlocked, excused by the comment "Read is racy
+     * without cs_main but the cap is sized for sustained-attack-rate so
+     * race-window overshoot is irrelevant."
+     *
+     * THAT EXCUSE ANSWERED THE WRONG OBJECTION. It defends a stale VALUE, and a
+     * stale value genuinely would be harmless here — the cap is advisory. But
+     * `std::map::size()` executing concurrently with `erase()` or `operator[]`
+     * on another thread is a DATA RACE and therefore undefined behaviour,
+     * whatever the number is used for afterwards. Three threads reach these
+     * paths (the P2P message handler and the header-validation worker via
+     * ProcessNewHeader, plus the queue worker), and eviction erases from this
+     * very map, so the race is reachable rather than theoretical.
+     *
+     * cs_main is a RECURSIVE mutex and is `mutable`, so this is safe to call
+     * from a const context and from callers that already hold it — which the
+     * queue path does.
      */
-    size_t GetBlockIndexSize() const { return mapBlockIndex.size(); }
+    size_t GetBlockIndexSize() const {
+        std::lock_guard<std::recursive_mutex> lock(cs_main);
+        return mapBlockIndex.size();
+    }
 
     /**
      * Phase 6 PR6.1 (v1.5 §3.2 + Cursor v1.5+ A1): evict the lowest-work
@@ -853,15 +897,36 @@ public:
      * an entry with in-degree 0 in the pprev graph (no surviving entry names
      * it as pprev) that is also not in the pinned set.
      *
-     * PINNED SET (never evicted, even if it is a leaf):
-     *   - every ancestor of pindexTip (the active chain);
-     *   - every entry in m_setBlockIndexCandidates AND all their pprev
-     *     ancestors (the chain selector's reorg-candidate reachable set —
-     *     this also covers the best-header tip whenever it has a block-index
-     *     entry, since such a tip is a candidate). Note: pindexBestHeader does
-     *     NOT exist on CChainState; best-header tracking lives in the separate
-     *     CHeadersManager, so it is pinned transitively via the candidate set
-     *     rather than by direct reference.
+     * PINNED SET (never evicted, even if it is a leaf) — ALL FOUR CLAUSES. This
+     * list used to stop after the first two, which understated what the evictor
+     * refuses to touch and therefore understated the memory floor:
+     *   (a) every ancestor of pindexTip (the active chain);
+     *   (b) every entry in m_setBlockIndexCandidates AND all their pprev
+     *       ancestors (the chain selector's activation-reachable set). Note:
+     *       pindexBestHeader does NOT exist on CChainState; best-header tracking
+     *       lives in the separate CHeadersManager.
+     *   (c) every entry with BLOCK_HAVE_DATA but validity below
+     *       BLOCK_VALID_TRANSACTIONS — defense-in-depth for a future split
+     *       ingress path; no current path produces that state.
+     *   (d) every hash the block-validation queue reports as pending (queued +
+     *       the single in-flight block) AND their pprev ancestors — a LIVENESS
+     *       pin, so a cascade cannot free a queued block's parent.
+     *
+     * ⚠️ CORRECTED (external panel, item 7): clause (b) previously claimed it
+     * "also covers the best-header tip whenever it has a block-index entry, since
+     * such a tip is a candidate". FALSE. IsBlockACandidateForActivation() requires
+     * BLOCK_VALID_TRANSACTIONS and explicitly excludes BLOCK_VALID_HEADER entries,
+     * so a header-only best-header tip is exactly what clause (b) does NOT pin.
+     * That is correct behaviour — an un-downloaded header tip is re-obtainable
+     * from CHeadersManager's separate unbounded mapHeaders — but the old wording
+     * promised protection that nothing provides.
+     *
+     * WHAT BOUNDS THE PINNED SET, since an advisory cap makes it the real memory
+     * floor: both m_setBlockIndexCandidates.insert sites (chain.cpp:761 and
+     * :3109, a complete census) are gated by IsBlockACandidateForActivation, so
+     * header spam CANNOT grow it — pinning an entry costs a fully validated block
+     * at the real difficulty. If that gate ever admits header-only entries, the
+     * advisory cap becomes remotely exhaustible.
      *
      * ALGORITHM: build an in-degree map over mapBlockIndex (how many entries
      * name each node as pprev), build the pinned set, then evict eligible
@@ -893,10 +958,32 @@ public:
      *        the destructive "drain all" path can only be reached by explicitly
      *        writing 0 (self-documenting). Production code always passes cap-1.
      *
-     * Returns true if at least one entry was evicted; false if no eligible
-     * unpinned leaf exists while still over target (caller falls back to
-     * fail-closed reject). The false case is unreachable at production cap
-     * sizes.
+     * @return true if AT LEAST ONE entry was evicted; false if nothing eligible
+     *         was found.
+     *
+     * ⚠️ TRUE DOES NOT MEAN "REACHED target_max", AND CALLERS MUST NOT READ IT
+     * THAT WAY. The value is `evicted_any`. A run that frees three leaves and is
+     * still over the cap returns TRUE. A caller that wants to know whether the
+     * cap was actually met must re-read GetBlockIndexSize() — not test this
+     * return. That distinction is not academic: the over-cap log in
+     * ChainSelectorAdapter::ProcessNewHeader was written as `if (!Evict(...))`
+     * and was therefore SILENT in precisely the state it existed to report
+     * (freed some, still over cap), which is the defect the external panel
+     * caught. Its sibling in block_validation_queue.cpp had it right.
+     *
+     * ⚠️ TWO CLAIMS THAT USED TO STAND HERE WERE FALSE and are removed rather
+     * than softened:
+     *   - "caller falls back to fail-closed reject" — NO CALLER DOES ANY LONGER.
+     *     Both production callers treat the cap as ADVISORY and proceed: refusing
+     *     to extend the chain is strictly worse than exceeding a soft memory
+     *     target. A doc promising fail-closed on a path that deliberately falls
+     *     through is worse than no doc.
+     *   - "The false case is unreachable at production cap sizes" — it is
+     *     reachable, and reproducibly so. Once active height approaches the cap
+     *     every entry is a pinned active-chain ancestor, so there is nothing to
+     *     evict; regtest (cap 1000) reaches it by ordinary block generation and
+     *     src/test/regtest_cap_rejection_tests.cpp demonstrates it. The advisory
+     *     semantics exist BECAUSE this case is reachable.
      */
     bool EvictLowestWorkLeafNotPinned(size_t target_max);
 

@@ -407,13 +407,43 @@ bool CBlockValidationQueue::ProcessBlock(const QueuedBlock& queued_block) {
     //     their pprev ancestors, via the GetPendingBlockHashes() provider. That
     //     pin is a LIVENESS guarantee (it stops a cascade from freeing this
     //     block's parent and stalling adoption); it is NOT a correctness license.
-    // Either way, this re-resolve stays MANDATORY and authoritative: pinning
-    // guards against EVICTION, but the AddBlockIndex flag-merge can still destroy
-    // a specific unique_ptr and re-home the canonical pointer for this hash even
-    // while the hash is pinned. So do NOT re-introduce a cached-pointer fast-path:
-    // the cached raw QueuedBlock::pindex MUST NOT be re-read across a cs_main
-    // release. If the block was evicted while queued, GetBlockIndex returns null
-    // below and the create-or-fail-closed path handles it.
+    // Either way, this re-resolve stays MANDATORY and authoritative, and do NOT
+    // re-introduce a cached-pointer fast-path: the cached raw QueuedBlock::pindex
+    // MUST NOT be re-read across a cs_main release. If the block has no index
+    // entry, GetBlockIndex returns null below and the create path handles it.
+    //
+    // ⚠️ ONE SENTENCE THAT USED TO STAND HERE WAS FALSE, and it was the stated
+    // reason for the rule above: "pinning guards against EVICTION, but the
+    // AddBlockIndex flag-merge can still destroy a specific unique_ptr and re-home
+    // the canonical pointer for this hash even while the hash is pinned."
+    // AddBlockIndex does no such thing. Its merge branch (chain.cpp, the
+    // `existing_it != mapBlockIndex.end()` arm) MUTATES THE EXISTING OBJECT IN
+    // PLACE — `existing->nStatus |= pindex->nStatus`, `existing->pprev = ...` —
+    // and discards the INCOMING pindex. The mapped unique_ptr is never reset or
+    // replaced, so the address of an existing entry is stable across a merge.
+    // A rule kept for a mechanism that does not exist is one nobody can maintain.
+    //
+    // WHY THE EXISTING-ENTRY POINTER IS ACTUALLY SAFE (external panel, gpt6
+    // BLOCKER: "show address stability under AddBlockIndex destroy-and-replace, or
+    // protect resolve+consume"). Three links, each checkable, and ALL THREE are
+    // required — if any one is broken by a later change, this argument dies and
+    // the resolve+consume region must be brought under one MainLockGuard instead:
+    //
+    //   1. THE HASH IS PINNED FOR THE WHOLE OF ProcessBlock. GetPendingBlockHashes
+    //      returns the union of m_queued_hashes and the in-flight hash, and the
+    //      worker moves a block from queued to in-flight ATOMICALLY under one
+    //      m_queue_mutex scope (ValidationWorker, the pop). There is no instant at
+    //      which the block is neither queued nor in-flight, so eviction clause (d)
+    //      never stops covering it mid-flight.
+    //   2. A PINNED ENTRY IS NEVER FREED. EvictLowestWorkLeafNotPinned only erases
+    //      entries absent from the pinned set.
+    //   3. A MERGE DOES NOT MOVE IT, per the in-place mutation above.
+    //
+    // 1 and 2 exclude free-by-eviction; 3 excludes free-by-replacement; together
+    // they are the address stability the panel asked for. The re-resolve remains
+    // because it is what makes (1) meaningful — it reads the pointer that the pin
+    // protects, rather than one captured before the pin was established — and
+    // because it costs one map lookup on a path that also does a LevelDB write.
     //
     // LOW-a (PR #129 re-red-team): the cached QueuedBlock::pindex field is left in
     // the struct for callers that still SET it (block_processing.cpp,

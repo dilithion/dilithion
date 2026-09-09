@@ -445,9 +445,43 @@ void test_evict_never_frees_referenced_parent()
 }
 
 // ============================================================================
-// Test 7 — BLOCKER-1 REGRESSION (PR #129 re-red-team HIGH-1): the queue's
-// by-hash RE-RESOLVE is the SOLE mechanism that closes the BLOCKER-1 UAF for a
-// queued block. This test drives the leg that ACTUALLY holds.
+// Test 7 — NOT A BLOCKER-1 REGRESSION TEST. Read this before citing it as one.
+//
+// ⚠️ RETITLED after the external panel (gpt6, grok) both found that this test
+// CANNOT EXHIBIT THE DEFECT ITS OLD NAME CLAIMED. It was called
+// "BLOCKER-1 REGRESSION ... drives the leg that ACTUALLY holds". It does not
+// drive that leg: this file never constructs a CBlockValidationQueue, never
+// calls ProcessBlock (all three textual mentions in this file are comments), and
+// never dereferences a cached QueuedBlock::pindex. If someone re-armed a
+// cached-pointer fast path in the real ProcessBlock tomorrow, THIS TEST WOULD
+// STAY GREEN.
+//
+// WHAT IT ACTUALLY PROVES, which is real and worth keeping: that the eviction
+// PRIMITIVE behaves as the queue path assumes — an in-flight-shaped leaf
+// (HAVE_DATA + VALID_TRANSACTIONS, no provider registered) IS evictable, and a
+// by-hash lookup for an evicted entry returns a clean null rather than a
+// dangling pointer. That is a property of CChainState, not of the queue.
+//
+// WHAT REMAINS UNCOVERED, stated so nobody has to rediscover it: the production
+// queue path — QueueBlock → ValidationWorker → ProcessBlock → the by-hash
+// re-resolve → ActivateBestChain — has NO executable regression test, and
+// neither does the create-path guard that contains the LevelDB write. Closing
+// that needs a real CBlockValidationQueue over an opened CBlockchainDB, driven
+// through the public Start/QueueBlock/WaitForBlock surface, with a deliberately
+// WRONG cached pindex passed to QueueBlock so that any code reading it produces
+// an observably wrong answer — i.e. guard-removal → RED, which is the property
+// the panel asked for and the one this test cannot supply.
+//
+// That harness is a deliverable of the SIBLING PR, not of this fold: it is the
+// same infrastructure that PR needs for its RED test at
+// block_processing.cpp:1094→1287, and a queue/DB/ActivateBestChain harness
+// written mid-fold is the kind of work that produces a second review round
+// rather than a closed one. Tracked, named, and not silently dropped.
+//
+// The safety argument for the queue path in the meantime is a CONSTRUCTION, not
+// a test, and it is written out in full at block_validation_queue.cpp (the
+// three-link pinned/never-freed/in-place-merge argument). A construction is
+// weaker than an executable check; that is exactly why the gap is named here.
 //
 // LOW-d (PR #129 re-red-team): RENAMED from test_evict_never_frees_inflight_block.
 // The old name was the OPPOSITE of what this test proves — with no

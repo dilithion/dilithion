@@ -286,19 +286,41 @@ bool ChainSelectorAdapter::ProcessNewHeader(const CBlockHeader& header)
         if (cap > 0 && m_chainstate.GetBlockIndexSize() >= static_cast<size_t>(cap)) {
             // Make room for exactly one new header: evict down to cap-1.
             const size_t target_max = static_cast<size_t>(cap) - 1;
-            if (!m_chainstate.EvictLowestWorkLeafNotPinned(target_max)) {
+            // TEST THE OUTCOME, NOT THE RETURN VALUE (external panel, kimi).
+            //
+            // This used to be `if (!EvictLowestWorkLeafNotPinned(target_max))`.
+            // That function returns `evicted_any` — TRUE if it freed at least one
+            // entry — NOT "reached target_max". So the case this message exists to
+            // report, "we evicted something and are STILL over the cap", returned
+            // true and logged NOTHING. The arm was silent in exactly the state it
+            // was written to announce, and loud only in the narrower case where
+            // nothing at all could be freed.
+            //
+            // The sibling check in block_validation_queue.cpp already did this
+            // correctly by re-reading the size. Two sites, one predicate, and only
+            // one of them right — so this is the same "a fix aimed at a site leaves
+            // siblings" shape, with the sibling being the one left wrong.
+            m_chainstate.EvictLowestWorkLeafNotPinned(target_max);
+            if (m_chainstate.GetBlockIndexSize() >= static_cast<size_t>(cap)) {
                 // Rate-limited: at or over cap this fires on every insert, and the
                 // steady state past the height ceiling is "every insert".
                 static std::atomic<uint64_t> s_overCapLogged{0};
                 const uint64_t n = s_overCapLogged.fetch_add(1, std::memory_order_relaxed);
                 if (n == 0 || (n % 10000) == 0) {
-                    std::cerr << "[ChainSelector] NOTE: mapBlockIndex is at the "
-                              << cap << "-entry cap and no evictable unpinned leaf "
-                              << "remains (the map is active-chain ancestors, which are "
-                              << "never evicted). Continuing WITHOUT enforcing the cap — "
-                              << "the cap is advisory and must never gate chain progress. "
-                              << "Memory use will exceed the target. Occurrence " << (n + 1)
-                              << "." << std::endl;
+                    // The wording tracks the PREDICATE. It used to say "no
+                    // evictable unpinned leaf remains", which was true of the old
+                    // `!evicted_any` condition and is NOT true of this one: we may
+                    // have freed several leaves and still be at or over the cap.
+                    // Fixing a condition and leaving the message describing the old
+                    // one just moves the wrong claim from the code into the log.
+                    std::cerr << "[ChainSelector] NOTE: mapBlockIndex is still at or over "
+                              << "the " << cap << "-entry cap after eviction (size "
+                              << m_chainstate.GetBlockIndexSize() << "); the remaining "
+                              << "entries are pinned — active-chain ancestors and reorg "
+                              << "candidates are never evicted. Continuing WITHOUT "
+                              << "enforcing the cap — it is advisory and must never gate "
+                              << "chain progress. Memory use exceeds the target. "
+                              << "Occurrence " << (n + 1) << "." << std::endl;
                 }
                 // Deliberately fall through and accept the header.
             }
