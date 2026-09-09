@@ -178,7 +178,36 @@ would NOT cover. Result over the same 52 sites:
 | `dilithion-node.cpp:3008` | `pblockIndexPtr->pprev->pnext = pblockIndexPtr;` | active-chain `pnext` linkage |
 | `dilv-node.cpp:2874` | same as above | active-chain `pnext` linkage |
 
-**Zero sites store a resolved `CBlockIndex*` into a member, a global, or a container.**
+> ## ⚠️ RETRACTED — THE SENTENCE BELOW IS FALSE
+>
+> It read: *"Zero sites store a resolved `CBlockIndex*` into a member, a global, or a
+> container."* That was the headline claim this recommendation leaned on, and LP10's
+> read (BLOCKER 1) refuted it.
+>
+> **The counter-example is one the scanner cannot see by construction.**
+> `block_validation_queue.cpp:151` resolves `existing`; `:166` stores it into a **local
+> struct**; `:172` copies that local into `m_queue`; `:349` reads it back in
+> `ProcessBlock` on the worker thread, arbitrarily later, bounded only by queue depth.
+> My tool binds the resolved variable and inspects its first *use* — the escape is six
+> lines away through a struct copy, and the variable's name is gone by then. A
+> first-use scanner cannot answer a lifetime question, and I presented its silence as
+> a finding.
+>
+> **Until the tool classifies local→container escapes and is re-run tree-wide, treat
+> the escape analysis in this note as UNMEASURED.** The count below (3 OUTLIVES-CALL)
+> is a floor, not a census — the same error I flagged in #129's "four more sites", made
+> by me, one document later.
+>
+> **What survives the retraction**, and it is why the conclusion still holds: on #129's
+> base the queue path is covered by **pinning**, not by grace. A queued block and its
+> parent are reported by `GetPendingBlockHashes` and pinned by eviction clause (d), so
+> eviction cannot free them while they are queued, and `ProcessBlock` no longer reads
+> the cached pointer at all — it re-resolves by hash. That is precisely why this work
+> is based on #129 and not on `main`, where neither protection exists.
+
+The original sentence, kept visible rather than deleted:
+
+~~**Zero sites store a resolved `CBlockIndex*` into a member, a global, or a container.**~~
 Every retained pointer is stored *inside the block-index graph*, which the graveyard
 design already reasons about explicitly: `pnext` is null on anything evictable, and a
 `pprev` written into a new child makes the parent non-leaf and therefore non-evictable

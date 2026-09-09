@@ -46,15 +46,31 @@ import os
 import re
 import sys
 
-FILES = [
-    "src/node/block_processing.cpp",
-    "src/node/block_validation_queue.cpp",
-    "src/node/dilithion-node.cpp",
-    "src/node/dilv-node.cpp",
-    "src/node/ibd_coordinator.cpp",
-    "src/net/headers_manager.cpp",
-    "src/net/orphan_manager.cpp",
-]
+# ⚠️ DISCOVERED, NOT HARDCODED — the previous version listed five files by hand and
+# reported "52 call sites" as if that were the population. The real tree-wide figure
+# is 81 across 14 files: rpc/server.cpp, index/tx_index.cpp, index/coinstatsindex.cpp,
+# consensus/port/chain_selector_impl.cpp, chain_verifier.cpp and fork_manager.cpp were
+# all outside the list. That is the same "a hand-listed set read as a census" defect
+# this tool exists to prevent, committed by the tool itself.
+#
+# The set is now whatever the tree contains. A new file with a GetBlockIndex( call is
+# included automatically and cannot be missed by anyone forgetting to edit a list.
+def discover_files():
+    out = []
+    for dirpath, dirnames, filenames in os.walk("src"):
+        if os.sep + "test" in dirpath + os.sep:
+            continue
+        for fn in filenames:
+            if not fn.endswith((".cpp", ".h")):
+                continue
+            fp = os.path.join(dirpath, fn).replace("\\", "/")
+            try:
+                if "GetBlockIndex(" in open(fp, encoding="utf-8", errors="replace").read():
+                    out.append(fp)
+            except OSError:
+                pass
+    return sorted(out)
+
 
 CALL = re.compile(r'GetBlockIndex\s*\(')
 # `CBlockIndex* foo = ...GetBlockIndex(` / `auto* foo =` / `foo = ...GetBlockIndex(`
@@ -135,10 +151,7 @@ def main():
         sys.exit(2)
     os.chdir(root)
     rows = []
-    for path in FILES:
-        if not os.path.exists(path):
-            print(f"WARN: {path} missing", file=sys.stderr)
-            continue
+    for path in discover_files():
         raw = open(path, encoding='utf-8', errors='replace').read()
         code = strip_comments(raw)
         lines = code.split('\n')
@@ -188,6 +201,7 @@ def main():
             # Same bias as everything else here: anything ambiguous is reported,
             # not cleared. This finds STORES, so a false positive costs a human
             # read and a false negative costs a use-after-free.
+            aliases = set()
             escapes = []
             depth2 = 0
             for j in range(idx + 1, min(idx + 260, len(lines))):
@@ -206,6 +220,33 @@ def main():
                     escapes.append(f"container@{j+1}")
                 elif re.search(rf'\breturn\s+{v}\s*;', l):
                     escapes.append(f"return@{j+1}")
+
+                # LP10 BLOCKER 1 — THE INDIRECT ESCAPE THIS TOOL COULD NOT SEE.
+                # A resolved pointer can be assigned into a LOCAL aggregate, which
+                # is then pushed into a member/container; by then the pointer
+                # travels under the aggregate's name and tracking `var` alone
+                # loses it. Real instance: block_validation_queue.cpp resolves at
+                # :151, stores into a local struct at :166, copies that local into
+                # m_queue at :172, and reads it back on the worker thread at :349.
+                # The first version of this tool reported "zero container escapes"
+                # on that file — a false all-clear that reached a design note.
+                # The variable must be matched ANYWHERE in the right-hand side, not
+                # as the whole of it. The first version required `local.f = var;`
+                # exactly — and the real instance LP10 cited is
+                #     queued_block.pindex = pindex ? pindex : existing;
+                # a TERNARY, which that pattern missed. So the extension written to
+                # catch this case did not catch this case: the same "a guard that
+                # does not cover its own named vector" shape as the Makefile
+                # `override` and the exec-bit assertion earlier in this PR.
+                am = re.search(rf'\b([A-Za-z_]\w*)\s*\.\w+\s*=\s*[^;]*\b{v}\b[^;]*;', l)
+                if am:
+                    aliases.add(am.group(1))
+                for al in list(aliases):
+                    a = re.escape(al)
+                    if re.search(rf'(push_back|emplace_back|insert|emplace|push)\s*\(\s*{a}\s*[,)]', l) or \
+                       re.search(rf'\bm_\w+\s*=\s*{a}\s*;', l) or \
+                       re.search(rf'\bg_\w+\s*=\s*{a}\s*;', l):
+                        escapes.append(f"via-local:{al}@{j+1}")
             stored = ";".join(escapes[:2])
 
             if use_ln is None and not escapes:
@@ -215,11 +256,20 @@ def main():
                 cls = "OUTLIVES-CALL"
             else:
                 g_at_use, _ = lock_in_scope(lines, fn_start, use_ln - 1)
-                cls = "GUARDED" if (guarded and g_at_use) else "UNGUARDED"
+                if guarded and g_at_use:
+                    # LP10 BLOCKER 2: separate "held under one cs_main for the whole
+                    # body" from "a window that happens to be covered". An RPC
+                    # handler that locks once and never releases is guarded BY
+                    # CONSTRUCTION and is not a site needing a fix; counting it as
+                    # UNGUARDED inflates the fix list and buries the real ones.
+                    cls = "HELD-UNDER-CS_MAIN"
+                else:
+                    cls = "UNGUARDED"
             rows.append((path, lineno, fn_name, var, cls, guarded,
                          f"{use_kind}@{use_ln}" if use_ln else "", use_txt))
 
-    order = {"OUTLIVES-CALL": 0, "UNGUARDED": 1, "UNKNOWN": 2, "GUARDED": 3, "NO-WINDOW": 4}
+    order = {"OUTLIVES-CALL": 0, "UNGUARDED": 1, "UNKNOWN": 2,
+             "HELD-UNDER-CS_MAIN": 3, "GUARDED": 4, "NO-WINDOW": 5}
     rows.sort(key=lambda r: (order[r[4]], r[0], r[1]))
 
     counts = {}
@@ -233,7 +283,8 @@ def main():
               f"{use or '—'} | {'yes' if guarded else 'no'} |")
     print()
     print("TOTAL call sites: %d" % len(rows))
-    for k in ("OUTLIVES-CALL", "UNGUARDED", "UNKNOWN", "GUARDED", "NO-WINDOW"):
+    for k in ("OUTLIVES-CALL", "UNGUARDED", "UNKNOWN", "HELD-UNDER-CS_MAIN",
+              "GUARDED", "NO-WINDOW"):
         print("  %-10s %d" % (k, counts.get(k, 0)))
     print()
     print("UNGUARDED and UNKNOWN both require a human decision. UNKNOWN is NOT a")
