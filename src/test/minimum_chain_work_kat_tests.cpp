@@ -24,7 +24,11 @@
 // start.) A reject/accept test written today could only call HeadersSyncState
 // directly -- which is exactly the "correct check that nothing reaches" defect
 // LP-10 exists to close. That test belongs with the wiring, and must assert the
-// WIRING.
+// WIRING. (Qualification, round 2: headerssync_gate_arming_tests DOES drive the
+// manager's public entry points rather than the state directly -- so "could only
+// construct HeadersSyncState directly" was too strong. What it still cannot do is
+// prove the LIVE header path reaches the gate, because no production caller
+// exists.)
 //
 // ⚠️ SEEDING IS FIXED IN THIS COMMIT (LP-10 §2.0), and this comment used to say
 // otherwise. These thresholds are ABSOLUTE sums from genesis; HeadersSyncState
@@ -170,7 +174,12 @@ void test_dil_constant_is_re_derived_from_the_committed_census()
     uint256 sum;
     for (size_t i = 0; i < DIL_NBITS_CENSUS_LEN; ++i) {
         const uint32_t nbits = DIL_NBITS_CENSUS[i].nBits;
-        REQUIRE(nbits != 0);  // a zero mantissa saturates work to MAX, invisibly
+        // The MANTISSA, not the whole word -- the same hole the generator had, one
+        // layer down, found by two round-2 seats. 0x1e000000 is non-zero, sits
+        // inside the consensus window and has mantissa 0, which saturates
+        // ComputeChainWork to MAX. Sign-bit-set mantissas (0x1ef0c7e6, 1,667
+        // blocks) are LEGITIMATE here and this mask does not touch them.
+        REQUIRE((nbits & 0xFFFFFF) != 0);
         for (uint32_t n = 0; n < DIL_NBITS_CENSUS[i].count; ++n)
             sum = AddChainWork(sum, ComputeChainWork(nbits));
         counted += DIL_NBITS_CENSUS[i].count;

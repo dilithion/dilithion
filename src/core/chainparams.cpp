@@ -136,9 +136,13 @@ ChainParams ChainParams::Mainnet() {
     // the same nBits -- a Core constant would be wrong by a factor of ~10^12.
     // Ordering and ratios are unaffected, so consensus comparisons are fine.
     //
-    // ⚠️ INERT UNTIL THE GATE IS WIRED. As of this commit nothing reads this
-    // value at runtime: CHeadersManager::nMinimumChainWork (headers_manager.cpp
-    // :91) is assigned and never read, and the only path that would carry it
+    // ⚠️ INERT UNTIL THE GATE IS WIRED. Nothing reads this value at runtime IN
+    // PRODUCTION -- qualified in round 2, because this commit adds
+    // GetMinimumChainWork() and test binaries that call the DoS functions, so an
+    // unqualified "never read" / "zero call sites" is false in-tree even though
+    // the substantive claim (inert on a running node) holds.
+    // CHeadersManager::nMinimumChainWork (headers_manager.cpp:91) is assigned
+    // and read only by tests, and the only PRODUCTION path that would carry it
     // into HeadersSyncState -- InitializeDoSProtectedSync /
     // ProcessHeadersWithDoSProtection -- has zero call sites, so
     // mapHeadersSyncStates is never populated and the chain-work comparisons at
@@ -154,8 +158,11 @@ ChainParams ChainParams::Mainnet() {
     // SEEDING: FIXED IN THIS COMMIT (LP-10 §2.0). The threshold above is an
     // ABSOLUTE sum from genesis. HeadersSyncState formerly zeroed its work
     // accumulator while starting from the LOCAL TIP, which would have demanded a
-    // peer supply a whole checkpoint's worth of NEW work beyond our tip -- never
-    // true, so header sync would have stalled on any non-fresh node.
+    // peer supply a whole checkpoint's worth of NEW work beyond our tip.
+    // (Round-2 qualification: "stalls on ANY non-fresh node" was too strong --
+    // a node just past genesis can still receive enough new work to pass. The
+    // defect is demanding a FULL threshold of ADDITIONAL work, which stalls an
+    // otherwise-sufficient chain.)
     //
     // That is no longer the case here: the constructor now takes a REQUIRED
     // chain_start_work (no default -- a defaulted zero is exactly the bug) and
