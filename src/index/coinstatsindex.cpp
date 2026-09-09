@@ -439,7 +439,10 @@ bool CCoinStatsIndex::ComputeBlockStats(const CBlock& block,
 }
 
 bool CCoinStatsIndex::WriteBlock(const CBlock& block, int height, const uint256& block_hash) {
-    std::lock_guard<std::mutex> lock(m_mutex);
+    // P2P-17: unique_lock, not lock_guard, because the main-chain pre-check below
+    // calls into the chainstate (which takes cs_main) and m_mutex MUST NOT be held
+    // across that call. See the comment at the unlock site.
+    std::unique_lock<std::mutex> lock(m_mutex);
 
     if (!m_db) return false;
 
@@ -479,6 +482,40 @@ bool CCoinStatsIndex::WriteBlock(const CBlock& block, int height, const uint256&
     // record. Detect by comparing the just-supplied block's hashPrevBlock
     // against the canonical main-chain hash at height-1.
     if (height > 0) {
+        // ⛔ P2P-17 FIX — LIVE AB-BA DEADLOCK, both edges measured at source.
+        //
+        // This block calls into the chainstate, and both GetBlocksAtHeight
+        // (chain.cpp) and GetBlockIndex take cs_main. Holding m_mutex across
+        // them created the second half of a cycle:
+        //
+        //   edge 1  cs_main -> m_mutex :  ActivateBestChain holds cs_main at
+        //           function scope, DisconnectTip fires the block-disconnect
+        //           callbacks with it STILL held (cs_main is recursive, so an
+        //           inner scope ending does not release it), and the registered
+        //           callback calls EraseBlock, which takes m_mutex.
+        //   edge 2  m_mutex -> cs_main :  m_sync_thread -> SyncLoop ->
+        //           WalkBlockRange -> WriteBlock, holding m_mutex here, and
+        //           WalkBlockRange holds no cs_main at all.
+        //
+        // Two threads, opposite orders, both reachable. So release m_mutex for
+        // exactly the chainstate query and retake it afterwards.
+        //
+        // THE DISCIPLINE ALREADY EXISTED ONE FUNCTION AWAY: Init() in this file
+        // uses unique_lock and unlock()s before every chainstate call, and
+        // tx_index.cpp:520 spells out the same rule ("GetTip() acquires cs_main
+        // internally (R1). We do NOT hold m_mutex"). WriteBlock is the sibling
+        // that missed it — which is why the fix is to match them, not invent.
+        //
+        // WHY THE UNLOCK WINDOW IS SAFE, and this is the part worth checking if
+        // you change either caller: WriteBlock has exactly two callers and they
+        // are MUTUALLY EXCLUSIVE. The live connect-callback path is gated on
+        // IsSynced(), and m_synced is stored true exactly once, at SyncLoop's
+        // final `return`. So the sync thread has exited before the callback can
+        // ever call in. No second WriteBlock can observe the window and fold
+        // onto a stale m_running. If a third caller is ever added, or the
+        // IsSynced() gate is removed, re-examine this: m_running is read AFTER
+        // the window.
+        lock.unlock();
         const std::vector<uint256> prev_hashes =
             g_chainstate.GetBlocksAtHeight(height - 1);
         uint256 expected_prev;
@@ -499,8 +536,10 @@ bool CCoinStatsIndex::WriteBlock(const CBlock& block, int height, const uint256&
                       << "... (likely reorg during reindex) -- setting "
                       << "corrupt flag and refusing write" << std::endl;
             m_corrupted.store(true);
-            return false;
+            return false;  // returning with m_mutex released is fine: m_corrupted
+                           // is atomic and unique_lock's destructor is a no-op.
         }
+        lock.lock();  // retake for the m_running / m_db work below
     }
 
     CoinStats parent = m_running;
