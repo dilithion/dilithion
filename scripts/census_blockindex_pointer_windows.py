@@ -40,6 +40,30 @@ CLASSES
   NO-WINDOW   result is only null-tested, or immediately returned, or never
               dereferenced at all — nothing to dangle.
   UNKNOWN     the scanner could not follow it. NOT a clearance.
+  HELD-UNDER-CS_MAIN
+              resolve and first use both inside one cs_main holder's scope --
+              guarded BY CONSTRUCTION rather than a window that happens to be
+              covered. Reported separately so it is not counted as needing a fix.
+
+⚠️ HELD-UNDER-CS_MAIN IS EMPTY, AND THAT IS A FINDING, NOT A BROKEN DETECTOR.
+It was added because an RPC handler that locks once for its whole body would be
+safe by construction. Checked: there is no such handler. `rpc/server.cpp` mentions
+`cs_main` EXACTLY ONCE and it is inside a COMMENT --
+"GetTip() is O(1), cs_main-protected, so cheap to call on every request" -- above
+code that does the unguarded thing:
+
+    CBlockIndex* pTipNow = m_chainstate ? m_chainstate->GetTip() : nullptr;
+    ...
+    uint256 currentTipHash = haveTip ? pTipNow->GetBlockHash() : uint256();
+
+`GetTip()` takes cs_main, releases it, and returns a raw pointer; the dereference
+on the next lines runs unlocked. The comment describes the CALL as cs_main-
+protected and a reader carries that over to the POINTER, which is the whole
+released-pointer confusion in one line.
+
+So: **no production handler holds cs_main for the duration of a call.** The class
+stays in the classifier for future code, and its zero is reported as a fact about
+the tree rather than a gap in the tool.
 """
 
 import os
