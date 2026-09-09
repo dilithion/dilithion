@@ -21,6 +21,20 @@ on:
     branches: [ main, master ]
   workflow_dispatch:
 
+# Supersede in-flight runs of the same ref. Without this, every push queues a
+# FULL run behind its own predecessor: on 2026-09-07 the Actions queue hit 6
+# in-progress / 12 queued, two of them superseded pushes of a single branch that
+# nothing ever cancelled. Cost and throughput, not a gate: what runs is
+# unchanged, only how many stale copies of it.
+#
+# main is deliberately NEVER cancelled -- a cancelled main run destroys the
+# record for that commit, which is exactly how the test_dilithion hang stayed
+# undiagnosed (a `cancelled` conclusion reads as a failure and its evidence is
+# gone).
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
 jobs:
   build-and-test:
     name: Build and Test (${{ matrix.compiler }}, ${{ matrix.build_type }})
@@ -37,8 +51,24 @@ jobs:
         build_type: [Debug, Release]
 
     steps:
+    # FIRST STEP, DELIBERATELY, AND BEFORE CHECKOUT.
+    #
+    # `timeout-minutes` is measured from JOB start, but a watchdog inside a
+    # step can only see STEP time -- so the watchdog derives its budget from
+    # how much of the job the build already spent. That subtraction is only as
+    # good as this clock.
+    #
+    # It used to be stamped inside "Set up compiler", 42-68s into the job
+    # (checkout with recursive submodules, then apt). Those seconds were
+    # silently credited back to the watchdog, eroding the 240s capture margin
+    # at exactly the point where the derived budget binds -- a build that has
+    # eaten the ceiling is the case this instrument exists for. Stamping here
+    # costs nothing and removes the error.
+    - name: Stamp job-start clock (hang watchdog budget)
+      run: echo "JOB_START_EPOCH=$(date +%s)" >> $GITHUB_ENV
+
     - name: Checkout code
-      uses: actions/checkout@v6
+      uses: actions/checkout@v7
       with:
         submodules: recursive
 
@@ -66,6 +96,15 @@ jobs:
           echo "CC=gcc" >> $GITHUB_ENV
           echo "CXX=g++" >> $GITHUB_ENV
         fi
+
+    # gdb is needed only on the hang path, but installing it THERE would spend
+    # minutes of a budget that is already exhausted, and would fail silently.
+    - name: Install hang-capture tooling
+      run: |
+        sudo apt-get install -y -q gdb
+        # gdb must be able to attach to a non-descendant; the runner default
+        # blocks that and a failed attach would waste the one occurrence we get.
+        sudo sysctl -w kernel.yama.ptrace_scope=0
 
     - name: Build RandomX
       run: |
@@ -120,12 +159,154 @@ jobs:
 
     - name: Run Boost Unit Tests
       run: |
-        # Skip HD wallet tests temporarily - GetNewHDAddress() hangs in CI (BUG-77)
-        # Likely blocking on /dev/random or deadlock issue
-        # Affected: wallet_hd_tests, rpc_hd_wallet_tests, hd_wallet_standalone_tests
-        ./test_dilithion --log_level=test_suite --report_level=short \
-          --run_test='!wallet_hd_tests:!rpc_hd_wallet_tests:!hd_wallet_standalone_tests'
-        echo "✅ Boost unit tests completed (HD wallet tests skipped - BUG-77)"
+        # BUG-77 EXCLUSION REMOVED HERE (2026-09-09). The suites were excluded
+        # for "GetNewHDAddress() hangs in CI (BUG-77) / Likely blocking on
+        # /dev/random or deadlock issue". Both halves of that were wrong:
+        #
+        #   * there is NO /dev/random path in src/ or depends/dilithium/ --
+        #     entropy is getrandom()/urandom throughout (independently
+        #     re-derived by a second reader);
+        #   * the suites do not hang. They FAILED, on stale expectations: every
+        #     HD index expectation predates the BUG #115 pre-generation, so it
+        #     was off by exactly HD_GAP_LIMIT - 1 = 19 (measured by probe:
+        #     expected 1, actual 20). Fixed in this PR.
+        #
+        # The misdiagnosis kept anyone from looking for ~1054 commits, and the
+        # real cost was not the bug -- it was ZERO ENFORCED COVERAGE on
+        # user-facing HD key derivation for that whole time.
+        #
+        # This job has no `|| true`, so it GATES. That is the point of removing
+        # the exclusion here first: the four sanitizer/coverage jobs still
+        # swallow their exit status, so re-enabling there would restore the
+        # APPEARANCE of coverage and enforce nothing. Those four are a separate
+        # PR (they are also owned by another lane at :381/:517).
+        #
+        # hd_wallet_standalone_tests is deliberately NOT named below and never
+        # should have been: it is a standalone main(), not a Boost suite (zero
+        # BOOST_AUTO_TEST macros), so its name in a --run_test filter was always
+        # a NO-OP. It reads as an exclusion and excludes nothing.
+        #
+        # Where it DOES run: nowhere yet. It is a standalone binary that no
+        # roster names on this branch or on main. #188 rosters it -- quarantined
+        # until this PR lands, then live. An earlier draft of this comment said
+        # "it runs via the roster instead", which was not true of any tree that
+        # exists; a comment asserting coverage that does not exist is the same
+        # defect class this PR is fixing.
+        #
+        # The same dead name is still in the four swallowed filters and should
+        # go with them.
+        #
+        # HANG INSTRUMENT. test_dilithion intermittently hangs (~8% of Release
+        # runs: this job on run 33929931137, and gcc/Release on main run
+        # 33887089440, both ending "Terminate orphan process: (test_dilithion)").
+        # When the job ceiling fires the runner kills the orphan and the process
+        # state is GONE - which is why the hang has never been diagnosed. 44
+        # local runs (20 full-width + 24 pinned to 4 cores) reproduced it ZERO
+        # times, so the evidence has to be captured where it happens: here.
+        #
+        # THE BUDGET IS COMPUTED, NOT A LITERAL, AND THAT IS THE WHOLE POINT.
+        # `timeout-minutes: 45` is measured from JOB start; a watchdog inside
+        # this step can only measure STEP time. Measured on the hung job
+        # (run 33929931137, steps API):
+        #     job start                 00:43:37
+        #     "Run Boost Unit Tests"    01:03:33   <- 19m56s of the job already
+        #                                             spent (16m19s of it in the
+        #                                             wallet-guard step alone)
+        #     45-min ceiling            01:28:37
+        # So this step had ~25 minutes of real budget, not 45. A fixed 38-minute
+        # watchdog - which is what the first version of this used - would have
+        # fired at 01:41, THIRTEEN MINUTES AFTER the ceiling: the instrument
+        # would never once have run. Deriving the budget from JOB_START_EPOCH
+        # makes it correct now and self-correcting as the build gets slower.
+        set -uo pipefail
+        mkdir -p test-hang-artifacts
+
+        CEILING_SEC=$(( 45 * 60 ))
+        CAPTURE_MARGIN=240        # gdb attach + dump + artifact upload
+        MIN_BUDGET=300            # never watchdog a run into uselessness
+        # Cap against the MEASURED healthy step, not against the ceiling. On a
+        # green main run (34082001939) this step takes 44s / 47s / 57s / 61s
+        # across the four legs; the hung leg ran 1516s. 600s is ~10x the healthy
+        # maximum and ~2.5x below the hang, so it catches the hang ten minutes
+        # in instead of twenty-five, and leaves the rest of the ceiling as
+        # margin. (An earlier comment here cited "~21 min" for this step -- that
+        # was the JOB's wall time misread as the step's. The step is ~1 minute.)
+        MAX_BUDGET=600
+        elapsed=$(( $(date +%s) - JOB_START_EPOCH ))
+        BUDGET=$(( CEILING_SEC - elapsed - CAPTURE_MARGIN ))
+        [ "$BUDGET" -gt "$MAX_BUDGET" ] && BUDGET="$MAX_BUDGET"
+        # If the build has already eaten the budget there is nothing left to
+        # watchdog WITH, and the clamp below would arm a timer that fires after
+        # the ceiling -- inert, exactly like the version this replaces. Say so
+        # out loud: otherwise a missing artifact reads as "no hang happened"
+        # when it actually means "the instrument never armed".
+        if [ "$BUDGET" -lt "$MIN_BUDGET" ]; then
+          echo "::warning::hang watchdog NOT ARMED: ${elapsed}s of the ${CEILING_SEC}s job budget already spent, leaving less than ${MIN_BUDGET}s. A missing hang artifact from this run means nothing."
+          BUDGET="$MIN_BUDGET"
+        fi
+        echo "hang watchdog: ${elapsed}s of the job already spent; budget ${BUDGET}s"
+
+        # NOTE the union with the BUG-77 removal above: this runs with NO
+        # --run_test filter now, so the HD suites are inside the watchdog too.
+        ./test_dilithion --log_level=test_suite --report_level=short &
+        TD_PID=$!
+
+        (
+          sleep "$BUDGET"
+          # PID-reuse guard (L-4). kill -0 alone would happily match a
+          # recycled PID on a busy runner and we would capture a stack of some
+          # unrelated process under an ::error:: saying test_dilithion hung.
+          # One comm check removes the ambiguity entirely.
+          if kill -0 "$TD_PID" 2>/dev/null              && [ "$(cat /proc/$TD_PID/comm 2>/dev/null)" = "test_dilithion" ]; then
+            echo "::error::test_dilithion still alive after ${BUDGET}s - capturing stack before kill (intermittent hang)"
+            {
+              echo "=== test_dilithion hang, captured $(date -u +%FT%TZ) ==="
+              echo "=== /proc/$TD_PID/status ==="; cat "/proc/$TD_PID/status" 2>&1
+              echo "=== per-thread wchan (kernel wait channel) ==="
+              for t in /proc/"$TD_PID"/task/*; do
+                echo "--- tid ${t##*/} comm=$(cat "$t/comm" 2>/dev/null) wchan=$(cat "$t/wchan" 2>/dev/null)"
+              done
+              # gdb gets its own timeout: if IT stalls on attach we ride to the
+              # ceiling and learn nothing, which is the failure this exists to end.
+              echo "=== gdb: thread map + all backtraces ==="
+              timeout -k 10 180 gdb -p "$TD_PID" -batch -ex 'info threads' -ex 'thread apply all bt 25' 2>&1
+              echo "(gdb exit: $?)"
+            } > test-hang-artifacts/test_dilithion_hang_stack.txt
+            kill -9 "$TD_PID" 2>/dev/null || true
+          fi
+        ) &
+        WATCHDOG=$!
+
+        # `wait` under bash -e (GitHub's default shell) ABORTS the step on a
+        # non-zero status, so `wait "$TD_PID"; rc=$?` would make every line
+        # below dead on exactly the failure path we care about.
+        rc=0
+        wait "$TD_PID" || rc=$?
+
+        # Kill the watchdog AND its sleep child. Killing only the subshell
+        # leaves the sleep orphaned holding this step's stdout open.
+        kill "$WATCHDOG" 2>/dev/null || true
+        pkill -P "$WATCHDOG" 2>/dev/null || true
+        wait "$WATCHDOG" 2>/dev/null || true
+
+        if [ "$rc" -ne 0 ]; then
+          echo "Boost unit tests exited $rc"
+          exit "$rc"
+        fi
+        echo "Boost unit tests completed (HD wallet suites INCLUDED and gating)"
+
+    # Only produces a file when the hang actually fired; otherwise no-op.
+    - name: Upload hang stack (only if the hang fired)
+      # NOT gated to one compiler: the hang has been observed on clang/Release
+      # (run 33929931137) AND gcc/Release (main run 33887089440). if-no-files-found
+      # makes this a no-op on every healthy leg.
+      if: always()
+      uses: actions/upload-artifact@v7
+      with:
+        name: test-dilithion-hang-stack-${{ matrix.compiler }}-${{ matrix.build_type }}
+        path: test-hang-artifacts/
+        retention-days: 30
+        if-no-files-found: ignore
 
     # ------------------------------------------------------------------
     # MERGE 2026-09-05 — this PR's own "Run block-index eviction / UAF
@@ -186,7 +367,7 @@ jobs:
 
     steps:
     - name: Checkout code
-      uses: actions/checkout@v6
+      uses: actions/checkout@v7
       with:
         submodules: recursive
 
@@ -276,7 +457,7 @@ jobs:
 
     steps:
     - name: Checkout code
-      uses: actions/checkout@v6
+      uses: actions/checkout@v7
       with:
         submodules: recursive
 
@@ -350,7 +531,7 @@ jobs:
 
     steps:
     - name: Checkout code
-      uses: actions/checkout@v6
+      uses: actions/checkout@v7
       with:
         submodules: recursive
 
@@ -424,7 +605,7 @@ jobs:
 
     steps:
     - name: Checkout code
-      uses: actions/checkout@v6
+      uses: actions/checkout@v7
 
     - name: Install analysis tools
       run: |
@@ -456,7 +637,7 @@ jobs:
 
     steps:
     - name: Checkout code
-      uses: actions/checkout@v6
+      uses: actions/checkout@v7
 
     - name: Install codespell
       run: |
@@ -482,7 +663,7 @@ jobs:
 
     steps:
     - name: Checkout code
-      uses: actions/checkout@v6
+      uses: actions/checkout@v7
       with:
         submodules: recursive
 
@@ -504,7 +685,15 @@ jobs:
         cd depends/randomx
         mkdir -p build
         cd build
-        cmake .. -DCMAKE_CXX_FLAGS="--coverage" -DCMAKE_C_FLAGS="--coverage"
+        # -fprofile-update=atomic HERE TOO. The main build below already carries
+        # it, with a comment explaining why -- but RandomX was left on plain
+        # --coverage, and RandomX is the most heavily threaded code in the tree.
+        # That is exactly where the torn counters land:
+        #   geninfo: ERROR: Unexpected negative count '-3184421' for branch 1
+        #   of depends/randomx/src/superscalar_program.hpp:47
+        # which fails the whole coverage leg. The lesson had been learned once
+        # and applied to one of the three builds.
+        cmake .. -DCMAKE_CXX_FLAGS="--coverage -fprofile-update=atomic" -DCMAKE_C_FLAGS="--coverage -fprofile-update=atomic"
         make -j$(nproc)
 
     - name: Build Dilithium library
@@ -526,7 +715,7 @@ jobs:
         fi
         cd depends/dilithium/ref
         make clean || true
-        CFLAGS="--coverage -O0 -g -DDILITHIUM_MODE=3" make -j$(nproc)
+        CFLAGS="--coverage -fprofile-update=atomic -O0 -g -DDILITHIUM_MODE=3" make -j$(nproc)
 
     - name: Build with coverage
       run: |
@@ -594,7 +783,7 @@ jobs:
         retention-days: 30
 
     - name: Upload coverage to Codecov
-      uses: codecov/codecov-action@v6
+      uses: codecov/codecov-action@v7
       with:
         files: ./coverage-filtered.info
         flags: unittests
@@ -611,12 +800,12 @@ jobs:
 
     steps:
     - name: Checkout code
-      uses: actions/checkout@v6
+      uses: actions/checkout@v7
       with:
         submodules: recursive
 
     - name: Install Python
-      uses: actions/setup-python@v6
+      uses: actions/setup-python@v7
       with:
         python-version: '3.10'
 
@@ -679,7 +868,7 @@ jobs:
 
     steps:
     - name: Checkout code
-      uses: actions/checkout@v6
+      uses: actions/checkout@v7
       with:
         submodules: recursive
 
@@ -733,7 +922,7 @@ jobs:
 
     steps:
     - name: Checkout code
-      uses: actions/checkout@v6
+      uses: actions/checkout@v7
       with:
         submodules: recursive
 
@@ -771,7 +960,7 @@ jobs:
 
     steps:
     - name: Checkout code
-      uses: actions/checkout@v6
+      uses: actions/checkout@v7
 
     - name: Check documentation completeness
       run: |
@@ -799,7 +988,7 @@ jobs:
 
     steps:
     - name: Checkout code
-      uses: actions/checkout@v6
+      uses: actions/checkout@v7
       with:
         submodules: recursive
 
