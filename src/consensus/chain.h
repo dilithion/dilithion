@@ -703,11 +703,24 @@ public:
      * a leaf, and is ineligible for eviction. Before that instant it is naked.
      * Holding cs_main across those two calls is the whole fix.
      *
-     * ⚠️ THIS GUARD IS APPLIED AT TWO SITES. THE CLASS IS LIVE AT FOUR MORE, AND
-     * THEY ARE NAMED HERE SO NOBODY HAS TO REDISCOVER THEM (external panel /
-     * non-author reader, H-1). Everything above describes what the guard does
-     * where it is used; it is not a statement that the resolve→deref race is
-     * closed in the node. It is not:
+     * ⚠️ THIS GUARD IS APPLIED AT TWO SITES. THE CLASS IS LIVE AT **AT LEAST FIVE**
+     * MORE, AND THE LIST BELOW IS A FLOOR, NOT A CENSUS (external panel /
+     * non-author reader). Everything above describes what the guard does where it
+     * is used; it is not a statement that the resolve→deref race is closed in the
+     * node. It is not.
+     *
+     * ⚠️ "FOUR MORE" WAS ITSELF AN OVERCLAIM and is corrected here. The reader
+     * found a FIFTH in this PR's own file — block_validation_queue.cpp QueueBlock,
+     * `GetBlockIndex(block.hashPrevBlock)` then `pParent->nStatus`, resolved and
+     * dereferenced across a cs_main release — and there are ~61 `GetBlockIndex(`
+     * call sites across block_processing / block_validation_queue /
+     * dilithion-node / dilv-node / ibd_coordinator / headers_manager /
+     * orphan_manager that have never been swept for this shape. A hand-listed set
+     * of sites read as a complete enumeration is exactly the defect
+     * "a-fix-aimed-at-a-site-leaves-siblings" describes; the ENUMERATION itself is
+     * a #193 deliverable, mechanical and grep-driven, not another hand count.
+     *
+     * The named ones so far:
      *
      *   src/node/block_processing.cpp:1094 → :1274 → :1281 → :1287
      *       resolve pprev, deref pprev->nHeight, LevelDB WriteBlockIndex, add.
@@ -716,6 +729,9 @@ public:
      *   src/node/dilithion-node.cpp:6413 → :6432
      *   src/node/dilithion-node.cpp:6622 → :6650
      *   src/node/dilv-node.cpp:6431 → :6459
+     *   src/node/block_validation_queue.cpp — QueueBlock: GetBlockIndex(
+     *       block.hashPrevBlock) then pParent->nStatus, across a cs_main release.
+     *       In THIS PR's own file, pre-existing, unpinned.
      *
      * Those four are PRE-EXISTING and are fixed in the sibling PR, not here —
      * four widenings of the hottest lock in the node need their own deadlock
@@ -917,9 +933,16 @@ public:
      * such a tip is a candidate". FALSE. IsBlockACandidateForActivation() requires
      * BLOCK_VALID_TRANSACTIONS and explicitly excludes BLOCK_VALID_HEADER entries,
      * so a header-only best-header tip is exactly what clause (b) does NOT pin.
-     * That is correct behaviour — an un-downloaded header tip is re-obtainable
-     * from CHeadersManager's separate unbounded mapHeaders — but the old wording
-     * promised protection that nothing provides.
+     * That is correct behaviour — an un-downloaded header tip is re-obtainable by
+     * PEER RE-ANNOUNCEMENT if that fork ever becomes the most-work chain — but the
+     * old wording promised protection that nothing provides.
+     *
+     * (An earlier version of this paragraph said "re-obtainable from
+     * CHeadersManager's separate unbounded mapHeaders". WRONG, and wrong against
+     * an explicit warning ~20 lines below in this same file: mapHeaders is itself
+     * capped and PruneOrphanedHeaders erases non-best-chain headers behind the
+     * tip. Recovery-safety rests on peer re-announcement, never on a second
+     * unbounded store. Caught by the non-author reader.)
      *
      * WHAT BOUNDS THE PINNED SET, since an advisory cap makes it the real memory
      * floor: both m_setBlockIndexCandidates.insert sites (chain.cpp:761 and

@@ -259,21 +259,39 @@ bool CChainState::EvictLowestWorkLeafNotPinned(size_t target_max) {
     //     what the node must hold. So "can an attacker grow the candidate set?"
     //     decides whether a remote party can drive that floor up.
     //
-    //     THEY CANNOT, and the bound is a validity level, not a policy. Both
-    //     insert sites — chain.cpp:761 and :3109, a complete census of
-    //     `m_setBlockIndexCandidates.insert` — are gated by
-    //     IsBlockACandidateForActivation(), which requires
-    //     `(nStatus & BLOCK_VALID_MASK) >= BLOCK_VALID_TRANSACTIONS` and says so
-    //     explicitly: "Pre-validation BLOCK_VALID_HEADER entries are NOT
-    //     candidates — they live in mapBlockIndex for fork visibility, not for
+    //     HEADERS ALONE CANNOT, and the bound is a validity level, not a policy.
+    //     Every `m_setBlockIndexCandidates.insert` in this file — grep it; there
+    //     are exactly two, one in the useNewPath arm of the connect path and one
+    //     in RecomputeCandidates() — is gated by IsBlockACandidateForActivation(),
+    //     which requires `(nStatus & BLOCK_VALID_MASK) >= BLOCK_VALID_TRANSACTIONS`
+    //     and says so explicitly: "Pre-validation BLOCK_VALID_HEADER entries are
+    //     NOT candidates — they live in mapBlockIndex for fork visibility, not for
     //     activation."
+    //
+    //     (Cited by SYMBOL, not by line. An earlier version of this paragraph gave
+    //     line numbers; they drifted twice inside this one PR as the file was
+    //     edited, and a stale cite in a security argument is how a reader ends up
+    //     reading the wrong function.)
     //
     //     Header spam therefore produces BLOCK_VALID_HEADER entries that can never
     //     enter the candidate set and so can never be pinned by this clause. They
-    //     stay evictable leaves, which is exactly what the evictor is for. To grow
-    //     the pinned set an attacker must supply FULLY VALIDATED BLOCKS — real
-    //     work at the real difficulty — at which point the cost is the chain's own
-    //     security parameter and not a memory bug.
+    //     stay evictable leaves, which is exactly what the evictor is for.
+    //
+    //     ⚠️ WHAT IT ACTUALLY COSTS TO PIN ONE, stated precisely, because an
+    //     earlier version of this said "FULLY VALIDATED BLOCKS — real work at the
+    //     real difficulty" and that OVERSTATES the barrier (non-author reader,
+    //     LOW-2). The gate flag is stamped by MarkBlockReceived() (block_index.h),
+    //     which sets BLOCK_HAVE_DATA and raises validity to
+    //     BLOCK_VALID_TRANSACTIONS in ONE op ON RECEIPT — not after full
+    //     validation — and the connect-path insert runs before ConnectTip has
+    //     ruled on the block. So the true cost is supplying PoW-valid BLOCK DATA
+    //     at the fork point's difficulty, and such an entry is pinned only
+    //     TRANSIENTLY, until activation resolves it.
+    //
+    //     That is still a real cost — it is block data at difficulty, not free
+    //     headers — and it is still the difference between "remotely exhaustible"
+    //     and "not". But it is a weaker barrier than full validation, and anyone
+    //     sizing the pinned set should use the weaker number.
     //
     //     KEEP THIS TRUE. If a future change ever admits header-only entries to
     //     the candidate set, the advisory cap becomes remotely exhaustible and
@@ -292,11 +310,19 @@ bool CChainState::EvictLowestWorkLeafNotPinned(size_t target_max) {
     //     is precisely the case that is NOT pinned here.
     //
     //     That is correct behaviour, not a hole — an un-downloaded header tip is
-    //     re-obtainable (mapHeaders is a separate, unbounded store in
-    //     CHeadersManager) and holding it is exactly the memory the cap exists to
-    //     reclaim. But the old wording claimed a pin that does not exist, which is
-    //     the more dangerous half: it would let a reader assume header-tip
-    //     protection that nothing provides.
+    //     re-obtainable by PEER RE-ANNOUNCEMENT if that fork ever becomes the
+    //     most-work chain, and holding it meanwhile is exactly the memory the cap
+    //     exists to reclaim. The old wording claimed a pin that does not exist,
+    //     which is the more dangerous half: it would let a reader assume
+    //     header-tip protection that nothing provides.
+    //
+    //     (An earlier version of this correction justified it with "mapHeaders is
+    //     a separate, unbounded store". That is FALSE — mapHeaders is capped and
+    //     PruneOrphanedHeaders erases non-best-chain headers behind the tip — and
+    //     chain.h's EvictLowestWorkLeafNotPinned doc already warned in as many
+    //     words not to rest the argument on it. Fixing one wrong claim by
+    //     introducing another, against a warning in the file being edited, is the
+    //     failure this PR keeps finding; recorded rather than quietly patched.)
     for (CBlockIndex* cand : m_setBlockIndexCandidates) {
         for (CBlockIndex* p = cand; p != nullptr; p = p->pprev) {
             if (!pinned.insert(p).second) break;  // ancestor already pinned

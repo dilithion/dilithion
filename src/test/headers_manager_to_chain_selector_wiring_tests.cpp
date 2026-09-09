@@ -943,20 +943,30 @@ void test_medium2_provider_unrelated_hash_does_not_overpin()
 }
 
 // ============================================================================
-// Test 11 — MEDIUM-1 (PR #129 re-red-team): the cap is a HARD CEILING reachable
-// via the queue create-path, not only via ProcessNewHeader. The queue path now
-// runs the SAME ceiling logic ProcessNewHeader uses: at/over cap, call
-// EvictLowestWorkLeafNotPinned(cap-1); if that cannot get under cap, fail closed.
+// Test 11 — the cap is reached via the queue create-path, not only via
+// ProcessNewHeader, and on BOTH paths it is ADVISORY.
 //
-// HONEST SCOPE NOTE: CBlockValidationQueue::ProcessBlock is private and requires
-// a fully-wired CBlockchainDB + ActivateBestChain to drive end-to-end, which is
-// disproportionate test infra for a branch that mirrors an already-tested
-// primitive. This test drives the DECISION PRIMITIVE the queue path relies on at
-// the same granularity Test 5 covers ProcessNewHeader: (a) when an evictable leaf
-// exists, EvictLowestWorkLeafNotPinned(cap-1) makes room so a subsequent add
-// stays AT the cap (ceiling holds); (b) when every entry is pinned, eviction
-// cannot get under cap and size stays >= cap — exactly the condition on which the
-// queue create-path fails closed.
+// ⚠️ HEADER CORRECTED (non-author reader, MEDIUM-2). It read "the cap is a HARD
+// CEILING ... if that cannot get under cap, fail closed" — describing behaviour
+// this branch deliberately REMOVED, directly above a body that asserts the
+// opposite. The fold that made the cap advisory rewrote the code and the
+// chain.h/chainparams prose and missed this header: the same
+// a-fix-aimed-at-a-site shape, in the test file that documents the fix.
+//
+// What the queue path actually does now: at/over cap, call
+// EvictLowestWorkLeafNotPinned(cap-1); if that cannot get under cap, log a
+// rate-limited NOTE and CONNECT THE BLOCK ANYWAY. Failing closed here would halt
+// block connection permanently once active height approaches the cap, because
+// every entry is then a pinned active-chain ancestor.
+//
+// HONEST SCOPE NOTE: CBlockValidationQueue::ProcessBlock is private and needs a
+// wired CBlockchainDB + ActivateBestChain to drive end-to-end. This test drives
+// the DECISION PRIMITIVE the queue path relies on, at the same granularity Test 5
+// covers ProcessNewHeader: (a) when an evictable leaf exists,
+// EvictLowestWorkLeafNotPinned(cap-1) makes room so a subsequent add stays AT the
+// cap; (b) when every entry is pinned, eviction cannot get under cap and size
+// stays >= cap — the condition on which the create path now proceeds ADVISORILY
+// rather than failing closed. The end-to-end harness is a #193 deliverable.
 // ============================================================================
 void test_blocker1_queue_path_cap_is_advisory()
 {
