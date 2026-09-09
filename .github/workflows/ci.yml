@@ -120,12 +120,44 @@ jobs:
 
     - name: Run Boost Unit Tests
       run: |
-        # Skip HD wallet tests temporarily - GetNewHDAddress() hangs in CI (BUG-77)
-        # Likely blocking on /dev/random or deadlock issue
-        # Affected: wallet_hd_tests, rpc_hd_wallet_tests, hd_wallet_standalone_tests
-        ./test_dilithion --log_level=test_suite --report_level=short \
-          --run_test='!wallet_hd_tests:!rpc_hd_wallet_tests:!hd_wallet_standalone_tests'
-        echo "✅ Boost unit tests completed (HD wallet tests skipped - BUG-77)"
+        # BUG-77 EXCLUSION REMOVED HERE (2026-09-09). The suites were excluded
+        # for "GetNewHDAddress() hangs in CI (BUG-77) / Likely blocking on
+        # /dev/random or deadlock issue". Both halves of that were wrong:
+        #
+        #   * there is NO /dev/random path in src/ or depends/dilithium/ --
+        #     entropy is getrandom()/urandom throughout (independently
+        #     re-derived by a second reader);
+        #   * the suites do not hang. They FAILED, on stale expectations: every
+        #     HD index expectation predates the BUG #115 pre-generation, so it
+        #     was off by exactly HD_GAP_LIMIT - 1 = 19 (measured by probe:
+        #     expected 1, actual 20). Fixed in this PR.
+        #
+        # The misdiagnosis kept anyone from looking for ~1054 commits, and the
+        # real cost was not the bug -- it was ZERO ENFORCED COVERAGE on
+        # user-facing HD key derivation for that whole time.
+        #
+        # This job has no `|| true`, so it GATES. That is the point of removing
+        # the exclusion here first: the four sanitizer/coverage jobs still
+        # swallow their exit status, so re-enabling there would restore the
+        # APPEARANCE of coverage and enforce nothing. Those four are a separate
+        # PR (they are also owned by another lane at :381/:517).
+        #
+        # hd_wallet_standalone_tests is deliberately NOT named below and never
+        # should have been: it is a standalone main(), not a Boost suite (zero
+        # BOOST_AUTO_TEST macros), so its name in a --run_test filter was always
+        # a NO-OP. It reads as an exclusion and excludes nothing.
+        #
+        # Where it DOES run: nowhere yet. It is a standalone binary that no
+        # roster names on this branch or on main. #188 rosters it -- quarantined
+        # until this PR lands, then live. An earlier draft of this comment said
+        # "it runs via the roster instead", which was not true of any tree that
+        # exists; a comment asserting coverage that does not exist is the same
+        # defect class this PR is fixing.
+        #
+        # The same dead name is still in the four swallowed filters and should
+        # go with them.
+        ./test_dilithion --log_level=test_suite --report_level=short
+        echo "Boost unit tests completed (HD wallet suites now INCLUDED and gating)"
 
     # ------------------------------------------------------------------
     # F4: the standalone (non-Boost) test suites.
