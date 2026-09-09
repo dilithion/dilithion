@@ -34,6 +34,26 @@ chk(){ if [ "$2" = "$3" ]; then echo "   PASS  $1"; P=$((P+1)); else echo "   FA
 HAVE_PROC=0
 if [ -r "/proc/$$/comm" ]; then HAVE_PROC=1; fi
 
+# AMBIENT-ENVIRONMENT BANNER. Not a gate -- a legend for reading two logs side
+# by side.
+#
+# Four separate defects on 2026-09-09 were of one shape: green locally, red only
+# on the runner. The last was an arm that constructed its "missing job clock"
+# case by not setting JOB_START_EPOCH, which is absent on a developer machine and
+# PRESENT on the runner (ci.yml stamps it into $GITHUB_ENV at job level, so every
+# later step inherits it). The arm was asserting about the environment rather
+# than the code, and nothing in the output said the two runs differed.
+#
+# Printing what is ambient makes that difference legible the first time somebody
+# compares the logs, instead of after a CI round-trip. Arms that care about one
+# of these must construct the state they need (`env -u VAR ...`) rather than
+# inherit it.
+printf '   env:'
+for v in GITHUB_ACTIONS CI JOB_START_EPOCH JOB_CEILING_MIN CC CXX; do
+    if [ -n "${!v:-}" ]; then printf ' %s=set' "$v"; else printf ' %s=unset' "$v"; fi
+done
+printf '  (/proc: %s)\n\n' "$([ "$HAVE_PROC" -eq 1 ] && echo present || echo absent)"
+
 mk() {   # mk <name> <body>
     local d="$1" name="$2" body="$3"
     printf '%s' "$body" > "$d/$name"
@@ -179,6 +199,16 @@ if [ -f "$B" ]; then
   case "$err" in
     *"JOB_START_EPOCH not set"*) chk "a missing job clock is called out, not assumed" yes yes ;;
     *) echo "   FAIL  a missing JOB_START_EPOCH was silently tolerated"; F=$((F+1)) ;;
+  esac
+  # THE INVERSE CONTROL. Without it, the arm above is satisfied by a script that
+  # prints "JOB_START_EPOCH not set" unconditionally -- warning on every run,
+  # including the healthy ones, which is how a real warning becomes noise nobody
+  # reads. A one-sided assertion cannot tell a working detector from a stuck one.
+  err=$(JOB_CEILING_MIN=45 JOB_START_EPOCH=$(date +%s) bash "$B" 2>&1 >/dev/null)
+  case "$err" in
+    *"JOB_START_EPOCH not set"*)
+      echo "   FAIL  the missing-clock warning fires even when the clock IS set"; F=$((F+1)) ;;
+    *) chk "and it stays QUIET when the clock is present" yes yes ;;
   esac
 else
   echo "   SKIP  ci_hang_budget.sh not present"
