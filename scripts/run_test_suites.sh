@@ -245,7 +245,7 @@ fast|peer_scorer_tests|180||
 fast|peer_scorer_banman_integration_tests|180||
 fast|header_proof_checker_tests|180||
 fast|chain_selector_tests|180||
-fast|regtest_cap_rejection_tests|180|REPRODUCTION OF A LIVE DEFECT, red by design until the fix lands -- it is quarantined because it FAILS, not because it is unreliable. It asserts that a linear regtest chain longer than nMapBlockIndexCap is accepted in full. Measured 2026-09-09 on this branch: exit 1, the header at height 1000 REJECTED, index size 1000, cap 1000, no spam and no attacker. Cause: the eviction trigger (chain_selector_impl.cpp:262-268) is purely count-based, and the victim search (chain.cpp:220-275) skips every entry on the active chain -- so at cap with an all-active-chain index there is no victim, EvictLowestWorkNotOnBestChain returns false and ProcessNewHeader fails closed. DO NOT lift this by raising the regtest cap without reading chainparams.cpp:754-757 first: 1000 is DELIBERATE so cap-saturation tests can exercise eviction without flooding 500K headers, and raising it removes the only place eviction is exercised. Lift when the cap is made a bound on non-active-chain entries rather than on total index size.|
+fast|regtest_cap_rejection_tests|180||
 fast|getchaintips_equivalence_tests|180||
 fast|chain_work_smoke_tests|180||
 fast|competing_sibling_below_checkpoint_tests|180||

@@ -726,26 +726,53 @@ public:
      * a watchdog lock. Taking m_queue_mutex first and then cs_main WOULD invert the
      * order — do NOT use this guard anywhere that already holds the queue mutex.
      *
-     * vs. cs_headers: NOT CLEAN, and this guard sits on the wrong side of it.
+     * vs. cs_headers: ONE-DIRECTIONAL AS OF #183. Re-verified on the merge of
+     * origin/main into this branch, because the paragraph that used to stand here
+     * had gone stale and would have justified live code with a dead fact.
      *
      * An earlier version of this comment claimed both call sites "hold no other
      * lock when they enter". That is FALSE and was corrected after a fresh-context
      * review caught it. CHeadersManager::ProcessHeaders takes cs_headers at
-     * headers_manager.cpp:218 and calls ProcessNewHeader at :365 INSIDE that scope
-     * (likewise :542 and :685 from their own cs_headers holders). So on those paths
-     * the order is cs_headers -> cs_main.
+     * headers_manager.cpp:222 and calls ProcessNewHeader at :369 INSIDE that scope
+     * (likewise the :546 and :689 holders). So on those paths the order is
+     * cs_headers -> cs_main. THAT FORWARD EDGE IS STILL LIVE and is re-confirmed
+     * above against the merged head, not carried over.
      *
-     * The opposing edge is live and documented in-repo at headers_manager.cpp:1082-1085:
-     * "OnBlockActivated holds cs_main and wants cs_headers". That is cs_main ->
-     * cs_headers. Both directions exist: a textbook ABBA.
+     * WHAT CHANGED, AND WHY THE PREVIOUS TEXT HERE IS NOW WRONG. It read: "The
+     * opposing edge is live and documented in-repo at headers_manager.cpp:1082-1085:
+     * 'OnBlockActivated holds cs_main and wants cs_headers' ... Both directions
+     * exist: a textbook ABBA." That citation now points at text saying the
+     * OPPOSITE. #183 (P2P-14/15) removed the reverse edge:
      *
-     * THIS GUARD DOES NOT CREATE THAT INVERSION — before it, ProcessNewHeader
+     *   - the tip callback passes VALUES, not a CBlockIndex*, so the fire no
+     *     longer has to happen under cs_main (chain.h, TipUpdateCallback);
+     *   - DrainTipNotifications copies the queue AND the callback vector under
+     *     cs_main, closes that scope, and fires with cs_main NOT held
+     *     (chain.cpp:2802-2839, its own comment: "cs_main is released. Consumers
+     *     may now take their own locks (cs_headers) without inverting against it");
+     *   - headers_manager.cpp:1103-1106 retracts the old rationale in as many words.
+     *
+     * The reverse edge was the ONLY one. The P2P-14/15 harness census
+     * (src/test/p2p14_lock_inversion_tsan_tests.cpp:11-21) enumerates exactly one:
+     * ActivateBestChain -> NotifyTipUpdate -> m_tipCallbacks -> OnBlockActivated ->
+     * cs_headers. Independently: chain.cpp, which owns cs_main, contains ZERO calls
+     * into CHeadersManager (3 textual mentions, all comments).
+     *
+     * A single direction is not a cycle. So this guard WIDENS A FORWARD-ONLY EDGE.
+     *
+     * THIS GUARD STILL DOES NOT CREATE AN INVERSION — before it, ProcessNewHeader
      * already called GetBlockIndex and AddBlockIndex, each taking cs_main
      * internally, so cs_headers -> cs_main was already on this path. What the guard
-     * does is WIDEN the hold, which enlarges the window in which the ABBA can be
-     * hit. That is a real increase in deadlock exposure traded for closing a real
-     * UAF, and it must not be described as "lock order preserved". The underlying
-     * ABBA is pre-existing and is tracked separately; it is not fixed here.
+     * does is WIDEN the hold. The cost of that is now CONTENTION, not deadlock
+     * exposure: there is no opposing edge left for the widened window to meet.
+     * Do not restate the old "real increase in deadlock exposure" claim without
+     * re-running the harness — and do not read this as "lock order preserved"
+     * either, which was the error the old text was written to prevent.
+     *
+     * IF ANYONE REINTRODUCES A cs_main -> cs_headers EDGE, this analysis dies with
+     * it and the ABBA is back, wider than before. The regression guard is the
+     * registered arm of p2p14_lock_inversion_tsan_tests, which HANGS when the cycle
+     * exists and exits 0 when it does not.
      *
      * SCOPE IT TIGHTLY. Widening a cs_main hold is a real cost: it is the lock
      * block processing, ActivateBestChain and the RPC tip-cache all contend on.
