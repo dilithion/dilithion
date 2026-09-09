@@ -363,4 +363,81 @@ BOOST_AUTO_TEST_CASE(cleanup_invalidates_cache)
     BOOST_CHECK(before != after);
 }
 
+
+// ============================================================================
+// P2P-16: CChainState::GetAncestorHashes equivalence.
+//
+// The locator path used to do pTip->GetAncestor(height)->GetBlockHash() on a
+// pointer from GetTip(), which releases cs_main before returning — so the walk
+// ran while the header thread could evict that CBlockIndex. The repair resolves
+// the same question under cs_main and returns VALUES.
+//
+// That repair is only correct if the values are the SAME values. Nothing else in
+// the P2P-16 diff pins that: an off-by-one or a reordered result would hand peers
+// a wrong locator and still pass the build, the structural guard, and every
+// existing suite. So assert the new API against the walk it replaced, on the same
+// chainstate, plus the edges.
+//
+// A chain deeper than the fork fixture is built here so "order is preserved" and
+// "out of range" are distinguishable rather than degenerate.
+// ============================================================================
+BOOST_AUTO_TEST_CASE(p2p16_get_ancestor_hashes_matches_the_walk_it_replaced)
+{
+    CChainState chainstate;
+
+    // A linear chain 0..5, each block more work than the last.
+    std::vector<uint256> hashes;
+    CBlockIndex* prev = nullptr;
+    for (int h = 0; h <= 5; ++h) {
+        auto p = MakeIndex(static_cast<uint8_t>(0x10 + h), prev, h,
+                           CBlockIndex::BLOCK_VALID_TRANSACTIONS, 10 * (h + 1));
+        const uint256 hash = p->GetBlockHash();
+        BOOST_REQUIRE(chainstate.AddBlockIndex(hash, std::move(p)));
+        prev = chainstate.GetBlockIndex(hash);
+        BOOST_REQUIRE(prev != nullptr);
+        hashes.push_back(hash);
+    }
+    chainstate.SetTip(prev);
+
+    // --- EQUIVALENCE: the new API vs the old pointer walk, same heights. ---
+    const std::vector<int> heights{5, 4, 3, 2, 1, 0};
+    const std::vector<uint256> got = chainstate.GetAncestorHashes(heights);
+    BOOST_REQUIRE_EQUAL(got.size(), heights.size());
+
+    CBlockIndex* tip = chainstate.GetTip();
+    BOOST_REQUIRE(tip != nullptr);
+    for (size_t i = 0; i < heights.size(); ++i) {
+        CBlockIndex* viaWalk = tip->GetAncestor(heights[i]);
+        BOOST_REQUIRE_MESSAGE(viaWalk != nullptr, "fixture: no ancestor at height " << heights[i]);
+        BOOST_CHECK_MESSAGE(got[i] == viaWalk->GetBlockHash(),
+            "GetAncestorHashes disagrees with GetAncestor()->GetBlockHash() at height "
+            << heights[i] << " (index " << i << ") — a wrong locator would ship silently");
+    }
+
+    // --- ORDER IS PRESERVED, not merely "the right set". A locator is ordered;
+    // returning the same hashes in a different order would pass a set comparison
+    // and still be wrong on the wire. Ascending input must come back ascending.
+    const std::vector<int> ascending{0, 1, 2, 3, 4, 5};
+    const std::vector<uint256> asc = chainstate.GetAncestorHashes(ascending);
+    BOOST_REQUIRE_EQUAL(asc.size(), ascending.size());
+    for (size_t i = 0; i < ascending.size(); ++i) {
+        BOOST_CHECK_MESSAGE(asc[i] == hashes[ascending[i]],
+            "order not preserved at index " << i);
+    }
+
+    // --- EDGES. Each must behave exactly as GetAncestor() returning nullptr did:
+    // a null hash, never a throw and never a neighbouring height's hash.
+    const std::vector<int> edges{6, 99, -1, 0};
+    const std::vector<uint256> e = chainstate.GetAncestorHashes(edges);
+    BOOST_REQUIRE_EQUAL(e.size(), edges.size());
+    BOOST_CHECK_MESSAGE(e[0].IsNull(), "height above the tip must be null, not clamped to the tip");
+    BOOST_CHECK_MESSAGE(e[1].IsNull(), "far above the tip must be null");
+    BOOST_CHECK_MESSAGE(e[2].IsNull(), "negative height must be null, not genesis");
+    BOOST_CHECK_MESSAGE(e[3] == hashes[0], "genesis must still resolve alongside invalid entries");
+
+    // --- EMPTY INPUT: empty out, no crash. The locator helper can legitimately
+    // produce an empty height list (startHeight <= 0).
+    BOOST_CHECK(chainstate.GetAncestorHashes({}).empty());
+}
+
 BOOST_AUTO_TEST_SUITE_END()

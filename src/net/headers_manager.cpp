@@ -1252,7 +1252,19 @@ std::map<int, uint256> CHeadersManager::ResolveChainstateHashes(int startHeight,
     // order. If that ever stopped holding, silently zipping mismatched vectors
     // would map hashes to the WRONG heights and hand peers a corrupt locator —
     // far worse than an empty one. Refuse instead.
-    if (hashes.size() != wanted.size()) return resolved;
+    if (hashes.size() != wanted.size()) {
+        // LOW (review fold): returning an empty map degrades the WHOLE locator,
+        // which is the right direction — a mis-zipped locator hands peers hashes
+        // attributed to the wrong heights, and an empty locator only costs a
+        // sync round. But degrading silently would make a broken contract look
+        // like a quiet node, so name it.
+        std::cerr << "[HeadersManager] WARN: GetAncestorHashes returned "
+                  << hashes.size() << " entries for " << wanted.size()
+                  << " requested heights — contract violated, locator degraded to"
+                  << " empty rather than risk mis-attributing hashes to heights"
+                  << " (P2P-16)" << std::endl;
+        return resolved;
+    }
 
     for (size_t i = 0; i < wanted.size(); ++i) {
         if (!hashes[i].IsNull()) resolved[wanted[i]] = hashes[i];

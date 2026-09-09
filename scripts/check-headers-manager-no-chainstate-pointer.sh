@@ -27,6 +27,15 @@
 # is never CALLED here, no such pointer can exist here — no matter what future
 # code does. That is a stronger claim than "no dereference looks unsafe".
 #
+# ON THE TWO ARMS, stated precisely because the weaker phrasing overclaims
+# (review fold, LOW): the HIT arm of the resolved-value lookup is EXECUTED by the
+# equivalence test in chain_tips_cache_invalidation_tests. The MISS arm — a
+# pattern height at or below the chainstate tip that is absent from the resolved
+# map — needs a gap in the pprev chain below the tip, which the eviction rules
+# make unconstructible in production. So the miss arm is provably EQUIVALENT to
+# the old "GetAncestor() returned nullptr" behaviour, not EXECUTED. Claiming
+# "both arms verified" would be the stronger-sounding and weaker claim.
+#
 # Exit 0 = invariant holds. Exit 1 = it does not.
 
 set -u
