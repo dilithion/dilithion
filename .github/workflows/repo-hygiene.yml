@@ -22,6 +22,20 @@ on:
 permissions:
   contents: read
 
+# Supersede in-flight runs of the same ref. Without this, every push queues a
+# FULL run behind its own predecessor: on 2026-09-07 the Actions queue hit 6
+# in-progress / 12 queued, two of them superseded pushes of a single branch that
+# nothing ever cancelled. Cost and throughput, not a gate: what runs is
+# unchanged, only how many stale copies of it.
+#
+# main is deliberately NEVER cancelled -- a cancelled main run destroys the
+# record for that commit, which is exactly how the test_dilithion hang stayed
+# undiagnosed (a `cancelled` conclusion reads as a failure and its evidence is
+# gone).
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
 jobs:
   hygiene:
     name: Check repo hygiene
