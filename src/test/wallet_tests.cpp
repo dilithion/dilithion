@@ -7,6 +7,9 @@
 
 #include <iostream>
 #include <iomanip>
+#include <sstream>
+#include <random>
+#include <filesystem>
 
 using namespace std;
 
@@ -259,6 +262,52 @@ bool TestHashConsistency() {
 #include <primitives/transaction.h>
 #include <consensus/tx_validation.h>
 
+// ---------------------------------------------------------------------------
+// A real, unique, self-cleaning directory for each CUTXOSet in this file.
+//
+// WHY. Every call site used to read `utxo_set.Open(":memory:")` with the comment
+// "In-memory database for testing". LevelDB has no such convention -- that is
+// SQLite's -- and CUTXOSet::Open passes the string straight through as a PATH.
+// So this suite never had an in-memory database on ANY platform:
+//
+//   * on Linux it silently created a real on-disk directory literally named
+//     ":memory:" in the working directory and passed. Measured: after a run,
+//     `ls ':memory:'` shows 000015.log and friends. It was also left behind
+//     between runs, so a stale LOCK is a latent flake and every run shared one
+//     database.
+//   * on Windows ':' is not legal in a filename, so it fails outright:
+//     "CUTXOSet::Open: IO error: :memory:/LOCK: The filename, directory name,
+//     or volume label syntax is incorrect" (measured by a second reader on
+//     Windows/MSYS2). Since wallet_tests moved into the FAST tier, every
+//     Windows developer gets a red that CI never sees.
+//
+// The comment was the most dangerous part: it asserted isolation the code did
+// not provide, so nobody looked. A unique temp directory per fixture gives the
+// isolation the comment always claimed.
+// ---------------------------------------------------------------------------
+namespace {
+class ScopedUtxoDir {
+public:
+    ScopedUtxoDir() {
+        std::random_device rd;
+        std::ostringstream oss;
+        oss << "dilithion-wallet-tests-" << rd() << "-" << rd();
+        m_path = std::filesystem::temp_directory_path() / oss.str();
+        std::error_code ec;
+        std::filesystem::create_directories(m_path, ec);
+    }
+    ~ScopedUtxoDir() {
+        std::error_code ec;
+        std::filesystem::remove_all(m_path, ec);
+    }
+    ScopedUtxoDir(const ScopedUtxoDir&) = delete;
+    ScopedUtxoDir& operator=(const ScopedUtxoDir&) = delete;
+    std::string str() const { return m_path.string(); }
+private:
+    std::filesystem::path m_path;
+};
+} // namespace
+
 bool TestScriptCreation() {
     cout << "\nTesting script creation (Phase 5.2)..." << endl;
 
@@ -350,7 +399,11 @@ bool TestCoinSelection() {
 
     // Create mock UTXO set
     CUTXOSet utxo_set;
-    utxo_set.Open(":memory:");  // In-memory database for testing
+    ScopedUtxoDir utxo_dir;  // real, unique, removed on scope exit
+    if (!utxo_set.Open(utxo_dir.str())) {
+        cout << "  ✗ Could not open the UTXO test database at " << utxo_dir.str() << endl;
+        return false;
+    }
 
     // Add multiple UTXOs to wallet with different values
     std::vector<CAmount> values = {50000000, 30000000, 20000000, 10000000};
@@ -416,7 +469,11 @@ bool TestTransactionCreation() {
 
     // Create UTXO set
     CUTXOSet utxo_set;
-    utxo_set.Open(":memory:");
+    ScopedUtxoDir utxo_dir;  // real, unique, removed on scope exit
+    if (!utxo_set.Open(utxo_dir.str())) {
+        cout << "  ✗ Could not open the UTXO test database at " << utxo_dir.str() << endl;
+        return false;
+    }
 
     // Give sender some coins
     uint256 funding_txid;
@@ -522,7 +579,11 @@ bool TestTransactionSending() {
 
     // Create UTXO set
     CUTXOSet utxo_set;
-    utxo_set.Open(":memory:");
+    ScopedUtxoDir utxo_dir;  // real, unique, removed on scope exit
+    if (!utxo_set.Open(utxo_dir.str())) {
+        cout << "  ✗ Could not open the UTXO test database at " << utxo_dir.str() << endl;
+        return false;
+    }
 
     // Fund wallet
     uint256 funding_txid;
@@ -588,7 +649,11 @@ bool TestBalanceCalculation() {
     CDilithiumAddress addr = wallet.GetNewAddress();
 
     CUTXOSet utxo_set;
-    utxo_set.Open(":memory:");
+    ScopedUtxoDir utxo_dir;  // real, unique, removed on scope exit
+    if (!utxo_set.Open(utxo_dir.str())) {
+        cout << "  ✗ Could not open the UTXO test database at " << utxo_dir.str() << endl;
+        return false;
+    }
 
     std::vector<uint8_t> pubkey_hash = wallet.GetPubKeyHash();
     std::vector<uint8_t> scriptPubKey = WalletCrypto::CreateScriptPubKey(pubkey_hash);
@@ -649,7 +714,11 @@ bool TestEdgeCases() {
     CDilithiumAddress addr = wallet.GetNewAddress();
 
     CUTXOSet utxo_set;
-    utxo_set.Open(":memory:");
+    ScopedUtxoDir utxo_dir;  // real, unique, removed on scope exit
+    if (!utxo_set.Open(utxo_dir.str())) {
+        cout << "  ✗ Could not open the UTXO test database at " << utxo_dir.str() << endl;
+        return false;
+    }
 
     // Test: Create transaction with zero amount (should fail)
     CTransactionRef tx;
