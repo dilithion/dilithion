@@ -244,6 +244,7 @@ fast|addrman_v2_tests|180||
 fast|peer_scorer_tests|180||
 fast|peer_scorer_banman_integration_tests|180||
 fast|header_proof_checker_tests|180||
+fast|nbits_work_saturation_tests|120||
 fast|chain_selector_tests|180||
 fast|leaf_index_invariant_tests|180||
 fast|queue_parent_pin_publication_tests|180||

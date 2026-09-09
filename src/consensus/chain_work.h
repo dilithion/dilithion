@@ -24,6 +24,39 @@
 
 namespace dilithion::consensus {
 
+// Is this nBits usable for CHAIN-WORK ACCOUNTING?
+//
+// ⛔ CALL THIS BEFORE FEEDING PEER-SUPPLIED nBits TO ComputeChainWork.
+//
+// ComputeChainWork SATURATES to 0xFF..FF when the mantissa is zero (see its
+// own edge-case list below). That is deliberate for the arithmetic, and it is a
+// LIVE DEFECT MAGNIFIER on any path that accepts nBits from a peer without
+// validating it against a target:
+//
+//   * a zero MANTISSA is NOT a zero WORD. 0x1e000000 has a non-zero nBits and a
+//     zero mantissa, so the widespread `nBits == 0` guard does NOT catch it.
+//   * a header whose proof is never checked against its claimed target -- any
+//     VDF header, which skips CheckProofOfWork entirely -- can therefore claim
+//     MAXIMUM chain work for free.
+//
+// MEASURED (2026-09-10, probe P4 on CHeadersManager::ProcessHeaders): a
+// zero-mantissa VDF sibling OVERTOOK an honest sibling as best header with
+// newWork = 0xffff..., on the PRODUCTION header path. Block-level consensus
+// still refuses to connect it, so the impact is best-header DoS rather than a
+// consensus split -- but it was peer-triggerable on a live node.
+//
+// The predicate lives HERE, beside the saturation it guards, rather than being
+// re-implemented at each caller: the previous round of this fix guarded three
+// sites in the dormant header-sync path and MISSED BOTH LIVE SITES, because the
+// sibling census was scoped to the wrong files. A guard at the producer cannot
+// be scoped to the wrong files.
+inline bool NBitsUsableForWork(uint32_t nBits)
+{
+    // The mantissa test subsumes `nBits == 0`; both are stated because every
+    // site this replaces tested only the latter.
+    return (nBits & 0x00FFFFFFu) != 0;
+}
+
 // Compute per-block chain-work contribution from compact-form difficulty
 // bits. Returns work value in little-endian (bytes 0..31 = LSB..MSB) so
 // arithmetic addition matches existing AddChainWork semantics.

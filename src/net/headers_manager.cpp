@@ -915,8 +915,15 @@ bool CHeadersManager::ValidateHeader(const CBlockHeader& header, const CBlockHea
     }
 
     // 3. Check difficulty transition (simplified - full implementation would check retarget logic)
-    // For now, just check bits are within reasonable range
-    if (header.nBits == 0) {
+    //
+    // ⛔ nBits must be usable for WORK ACCOUNTING, not merely non-zero. The old
+    // `nBits == 0` test missed a zero MANTISSA (0x1e000000: non-zero word, zero
+    // mantissa), and CalculateChainWork below feeds this straight into
+    // ComputeChainWork, which SATURATES to max work on exactly that input.
+    // VDF headers skip CheckProofOfWork (:905), so nothing else constrains nBits
+    // on that path. MEASURED (probe P4): a zero-mantissa VDF sibling overtook an
+    // honest sibling as best header with newWork = 0xffff... Peer-triggerable.
+    if (!::dilithion::consensus::NBitsUsableForWork(header.nBits)) {
         return false;
     }
 
@@ -2585,9 +2592,13 @@ bool CHeadersManager::QuickValidateHeader(const CBlockHeader& header, const CBlo
         return false;
     }
 
-    // 2. Check bits are set (non-zero difficulty)
-    if (header.nBits == 0) {
-        std::cerr << "[HeadersManager] Quick validate FAILED: nBits == 0" << std::endl;
+    // 2. Check bits are usable for WORK ACCOUNTING, not merely non-zero.
+    // SIBLING of the ValidateHeader check — same defect, same fix, and the pair
+    // is why the predicate lives in chain_work.h rather than being written twice.
+    if (!::dilithion::consensus::NBitsUsableForWork(header.nBits)) {
+        std::cerr << "[HeadersManager] Quick validate FAILED: nBits unusable for "
+                     "work accounting (zero mantissa saturates ComputeChainWork)"
+                  << std::endl;
         return false;
     }
 
