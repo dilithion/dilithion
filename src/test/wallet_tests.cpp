@@ -398,8 +398,16 @@ bool TestCoinSelection() {
     CDilithiumAddress addr = wallet.GetNewAddress();
 
     // Create mock UTXO set
+    // DECLARATION ORDER IS LOAD-BEARING: destructors run in reverse, so the
+    // directory must be declared FIRST to be destroyed LAST -- after
+    // ~CUTXOSet has run Close() and released the LevelDB LOCK. Declared the
+    // other way round, remove_all() runs while the DB is still open: POSIX
+    // tolerates unlinking open files so Linux looked clean, but on Windows
+    // the delete fails and every run leaves a dilithion-wallet-tests-* tree
+    // behind in TEMP (measured by a second reader: five of them, each with
+    // LOCK/MANIFEST/log).
+    ScopedUtxoDir utxo_dir;  // declared first => destroyed last
     CUTXOSet utxo_set;
-    ScopedUtxoDir utxo_dir;  // real, unique, removed on scope exit
     if (!utxo_set.Open(utxo_dir.str())) {
         cout << "  ✗ Could not open the UTXO test database at " << utxo_dir.str() << endl;
         return false;
@@ -468,8 +476,16 @@ bool TestTransactionCreation() {
     CDilithiumAddress recipient_addr = recipient_wallet.GetNewAddress();
 
     // Create UTXO set
+    // DECLARATION ORDER IS LOAD-BEARING: destructors run in reverse, so the
+    // directory must be declared FIRST to be destroyed LAST -- after
+    // ~CUTXOSet has run Close() and released the LevelDB LOCK. Declared the
+    // other way round, remove_all() runs while the DB is still open: POSIX
+    // tolerates unlinking open files so Linux looked clean, but on Windows
+    // the delete fails and every run leaves a dilithion-wallet-tests-* tree
+    // behind in TEMP (measured by a second reader: five of them, each with
+    // LOCK/MANIFEST/log).
+    ScopedUtxoDir utxo_dir;  // declared first => destroyed last
     CUTXOSet utxo_set;
-    ScopedUtxoDir utxo_dir;  // real, unique, removed on scope exit
     if (!utxo_set.Open(utxo_dir.str())) {
         cout << "  ✗ Could not open the UTXO test database at " << utxo_dir.str() << endl;
         return false;
@@ -578,8 +594,16 @@ bool TestTransactionSending() {
     CDilithiumAddress addr = wallet.GetNewAddress();
 
     // Create UTXO set
+    // DECLARATION ORDER IS LOAD-BEARING: destructors run in reverse, so the
+    // directory must be declared FIRST to be destroyed LAST -- after
+    // ~CUTXOSet has run Close() and released the LevelDB LOCK. Declared the
+    // other way round, remove_all() runs while the DB is still open: POSIX
+    // tolerates unlinking open files so Linux looked clean, but on Windows
+    // the delete fails and every run leaves a dilithion-wallet-tests-* tree
+    // behind in TEMP (measured by a second reader: five of them, each with
+    // LOCK/MANIFEST/log).
+    ScopedUtxoDir utxo_dir;  // declared first => destroyed last
     CUTXOSet utxo_set;
-    ScopedUtxoDir utxo_dir;  // real, unique, removed on scope exit
     if (!utxo_set.Open(utxo_dir.str())) {
         cout << "  ✗ Could not open the UTXO test database at " << utxo_dir.str() << endl;
         return false;
@@ -648,8 +672,16 @@ bool TestBalanceCalculation() {
     wallet.GenerateNewKey();
     CDilithiumAddress addr = wallet.GetNewAddress();
 
+    // DECLARATION ORDER IS LOAD-BEARING: destructors run in reverse, so the
+    // directory must be declared FIRST to be destroyed LAST -- after
+    // ~CUTXOSet has run Close() and released the LevelDB LOCK. Declared the
+    // other way round, remove_all() runs while the DB is still open: POSIX
+    // tolerates unlinking open files so Linux looked clean, but on Windows
+    // the delete fails and every run leaves a dilithion-wallet-tests-* tree
+    // behind in TEMP (measured by a second reader: five of them, each with
+    // LOCK/MANIFEST/log).
+    ScopedUtxoDir utxo_dir;  // declared first => destroyed last
     CUTXOSet utxo_set;
-    ScopedUtxoDir utxo_dir;  // real, unique, removed on scope exit
     if (!utxo_set.Open(utxo_dir.str())) {
         cout << "  ✗ Could not open the UTXO test database at " << utxo_dir.str() << endl;
         return false;
@@ -713,8 +745,16 @@ bool TestEdgeCases() {
     wallet.GenerateNewKey();
     CDilithiumAddress addr = wallet.GetNewAddress();
 
+    // DECLARATION ORDER IS LOAD-BEARING: destructors run in reverse, so the
+    // directory must be declared FIRST to be destroyed LAST -- after
+    // ~CUTXOSet has run Close() and released the LevelDB LOCK. Declared the
+    // other way round, remove_all() runs while the DB is still open: POSIX
+    // tolerates unlinking open files so Linux looked clean, but on Windows
+    // the delete fails and every run leaves a dilithion-wallet-tests-* tree
+    // behind in TEMP (measured by a second reader: five of them, each with
+    // LOCK/MANIFEST/log).
+    ScopedUtxoDir utxo_dir;  // declared first => destroyed last
     CUTXOSet utxo_set;
-    ScopedUtxoDir utxo_dir;  // real, unique, removed on scope exit
     if (!utxo_set.Open(utxo_dir.str())) {
         cout << "  ✗ Could not open the UTXO test database at " << utxo_dir.str() << endl;
         return false;
