@@ -311,6 +311,25 @@ void NodeContext::Reset() {
     peer_manager.reset();
     connman.reset();  // Phase 2: Reset CConnman
     message_processor = nullptr;
+
+    // PR #129 round-3 (non-author reader, LOW-1): STOP THE QUEUE BEFORE THE
+    // SUBSYSTEMS ITS WORKER USES.
+    //
+    // The Stop() below was already hoisted above the provider deregistration in
+    // round 2; it was still BELOW headers_manager / orphan_manager /
+    // block_fetcher / block_tracker, and ProcessBlock reads
+    // g_node_context.orphan_manager (among others) while running. So a live
+    // Reset() could free a subsystem out from under the worker mid-block — a
+    // second instance of the same shape, one line further up, found only because
+    // someone re-read the whole function instead of the changed line.
+    //
+    // Shutdown() stops the queue before touching the IBD managers. Reset() now
+    // matches it. Test-only caller today, so this is latent rather than live,
+    // which is exactly why it is worth fixing now: nothing would have caught it.
+    if (validation_queue) {
+        validation_queue->Stop();
+    }
+
     headers_manager.reset();
     orphan_manager.reset();
     block_fetcher.reset();
@@ -332,7 +351,7 @@ void NodeContext::Reset() {
     // Stop() joins the worker thread, so once it returns nothing is in flight and
     // removing the provider cannot strand anybody.
     if (validation_queue) {
-        validation_queue->Stop();
+        validation_queue->Stop();  // idempotent; already stopped above in round-3 order
     }
     g_chainstate.RegisterPendingBlockHashProvider(nullptr);
     validation_queue.reset();  // Phase 2: Reset validation queue

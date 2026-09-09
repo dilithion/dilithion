@@ -285,13 +285,20 @@ bool CChainState::EvictLowestWorkLeafNotPinned(size_t target_max) {
     //     BLOCK_VALID_TRANSACTIONS in ONE op ON RECEIPT — not after full
     //     validation — and the connect-path insert runs before ConnectTip has
     //     ruled on the block. So the true cost is supplying PoW-valid BLOCK DATA
-    //     at the fork point's difficulty, and such an entry is pinned only
-    //     TRANSIENTLY, until activation resolves it.
+    //     at the fork point's difficulty.
     //
-    //     That is still a real cost — it is block data at difficulty, not free
-    //     headers — and it is still the difference between "remotely exhaustible"
-    //     and "not". But it is a weaker barrier than full validation, and anyone
-    //     sizing the pinned set should use the weaker number.
+    //     TWO CLAIMS REMOVED HERE, not softened (external panel round 3): "pinned
+    //     only TRANSIENTLY until activation resolves it" and "the difference
+    //     between remotely exhaustible and not". Neither follows from these gates.
+    //     The prune in RecomputeCandidates removes strictly-lower-work candidates
+    //     only, so equal-work alternatives persist until work advances and can be
+    //     repopulated — residency is not bounded by activation. And "not remotely
+    //     exhaustible" is a claim about an attacker's whole budget that the gates
+    //     do not establish.
+    //
+    //     WHAT IS PROVEN, and the only thing to carry forward: header-only entries
+    //     can never pin, and pinning requires PoW-bearing block data at fork-point
+    //     difficulty. Size the pinned set from that and no more.
     //
     //     KEEP THIS TRUE. If a future change ever admits header-only entries to
     //     the candidate set, the advisory cap becomes remotely exhaustible and

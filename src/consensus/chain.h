@@ -698,6 +698,31 @@ public:
      * in the landmine ledger. It does not cover STACK-LOCAL holders across a lock
      * release, and cannot: they are invisible to it.
      *
+     * WHAT THIS GUARD IS FOR — STATED AS PROPERTIES, NOT AS A SPAN. Two things
+     * have to hold, and any arrangement of locking that delivers both is correct:
+     *
+     *   (a) NO DEREFERENCE OF A RESOLVED CBlockIndex* AFTER cs_main IS RELEASED.
+     *       GetBlockIndex takes cs_main, looks up, and releases it before
+     *       returning, so the returned pointer is only meaningful while a lock is
+     *       still held. "Dereference" includes a WALK: GetNextWorkRequired follows
+     *       pprev, so passing it a resolved pointer is a chain of unlocked derefs,
+     *       not one — which is how the second instance in
+     *       CBlockValidationQueue::QueueBlock survived the fix for the first.
+     *   (b) PIN PUBLICATION UNDER cs_main. The evictor snapshots the pending-hash
+     *       set under cs_main and deletes under the same cs_main, so a producer
+     *       that publishes under m_queue_mutex alone loses a snapshot→publish→
+     *       delete race that has nothing to do with the queue mutex. Publishing
+     *       under cs_main makes admission atomic against an eviction in flight.
+     *
+     * WHY THAT PHRASING MATTERS. A review of PR #129 asked for ONE guard spanning
+     * resolve → nStatus → publication in QueueBlock. That span holds cs_main
+     * across CheckProofOfWorkDFMP on the block-admission path — cs_main is what
+     * block processing, ActivateBestChain and the RPC tip cache contend on — so it
+     * would have bought the two properties AND a contention regression. Three
+     * narrow guards buy the properties alone. The properties are the requirement;
+     * the span is an implementation choice, and a future edit should be checked
+     * against (a) and (b), not against how many guards there are.
+     *
      * THE CRITICAL SECTION IS EXACTLY [resolve pprev, insert the child]. Once the
      * child is in the map pointing at pprev, pprev has in-degree >= 1, is no longer
      * a leaf, and is ineligible for eviction. Before that instant it is naked.
@@ -733,8 +758,8 @@ public:
      *       block.hashPrevBlock) then pParent->nStatus, across a cs_main release.
      *       In THIS PR's own file, pre-existing, unpinned.
      *
-     * Those four are PRE-EXISTING and are fixed in the sibling PR, not here —
-     * four widenings of the hottest lock in the node need their own deadlock
+     * The FOREIGN-FILE ones are PRE-EXISTING and are fixed in the sibling PR, not
+     * here — widenings of the hottest lock in the node need their own deadlock
      * argument against the queue mutex and ActivateBestChain, plus a TSan run
      * with a positive control and a test that goes RED by freeing the parent in
      * the window. That work does not belong inside a fold.
@@ -951,14 +976,26 @@ public:
      * >= BLOCK_VALID_TRANSACTIONS. Header spam CANNOT grow the pinned set.
      *
      * WHAT IT DOES COST, stated at the weaker true value: PoW-valid BLOCK DATA at
-     * the fork point's difficulty, pinned only TRANSIENTLY until activation
-     * resolves the entry. NOT "a fully validated block at the real difficulty",
+     * the fork point's difficulty. NOT "a fully validated block at the real
+     * difficulty",
      * which is what this paragraph used to claim and which overstates the barrier
      * — MarkBlockReceived() (block_index.h) sets BLOCK_HAVE_DATA and raises
      * validity to BLOCK_VALID_TRANSACTIONS in ONE op ON RECEIPT, and the
      * connect-path insert runs before ConnectTip has ruled on the block. The
-     * "not remotely exhaustible" conclusion survives; the margin is smaller than
-     * the old wording implied, so size the pinned set with the weaker number.
+     * Two further claims that stood here are REMOVED rather than softened
+     * (external panel round 3, gpt6 MEDIUM), because neither is proven by the
+     * gates above and a security argument must not carry more than it shows:
+     *   - "pinned only TRANSIENTLY until activation resolves the entry" — the
+     *     prune in RecomputeCandidates drops strictly-LOWER-work candidates only,
+     *     so equal-work alternatives persist until work advances, and
+     *     RecomputeCandidates can repopulate them. Residency is not bounded by
+     *     activation.
+     *   - "not remotely exhaustible" — that is a conclusion about an attacker's
+     *     whole budget, and the gates do not establish it.
+     * WHAT THE GATES DO PROVE, and all this paragraph should be read as claiming:
+     * header-only entries can NEVER pin, and pinning requires PoW-bearing block
+     * data at the fork point's difficulty. Size the pinned set from that, and do
+     * not inherit a stronger conclusion from this comment.
      *
      * If that gate ever admits header-only entries, the advisory cap becomes
      * remotely exhaustible and this argument has to be redone.

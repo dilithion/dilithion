@@ -121,8 +121,41 @@ bool CBlockValidationQueue::QueueBlock(int peer_id, const CBlock& block, int exp
     // BUG #250 FIX: Only run DFMP/Coinbase when parent is on ACTIVE chain.
     // Height-dependent validation (DFMP identity lookup, coinbase rules) can only be
     // authoritative when parent is on active chain. Otherwise, defer to ActivateBestChain.
-    CBlockIndex* pParent = m_chainstate.GetBlockIndex(block.hashPrevBlock);
-    bool parentOnActiveChain = (pParent != nullptr) && (pParent->nStatus & CBlockIndex::BLOCK_VALID_CHAIN);
+    //
+    // ⚠️ UAF FIX (external panel round 3, gpt6 HIGH). This used to be:
+    //     CBlockIndex* pParent = m_chainstate.GetBlockIndex(block.hashPrevBlock);
+    //     bool parentOnActiveChain = pParent && (pParent->nStatus & BLOCK_VALID_CHAIN);
+    // GetBlockIndex takes cs_main, looks up, and RELEASES it before returning, so
+    // the nStatus read on the next line ran with no lock held. An indexed but
+    // unpinned header leaf — which a fork parent normally is — can be evicted in
+    // that gap, and the read is then a use-after-free. Same class the MainLockGuard
+    // closes twice elsewhere in this file, on the queue ADMISSION path.
+    //
+    // The guard covers exactly [resolve, read] and NOTHING ELSE. `pParent` must not
+    // outlive it as a dereferenceable pointer; only the two extracted VALUES do.
+    //
+    // ⚠️ SCOPED NARROWER THAN THE REVIEW ASKED, deliberately, and this is the one
+    // place I did not follow the instruction as written. The request was one guard
+    // spanning resolve → nStatus → the multiset publication. Those are ~95 lines
+    // apart with GetNextWorkRequired and CheckProofOfWorkDFMP in between, so a
+    // single guard would hold cs_main across full DFMP validation on the block
+    // admission path — cs_main is the lock block processing, ActivateBestChain and
+    // the RPC tip cache all contend on, and this PR is already being reviewed for
+    // widening it. Two narrow guards deliver both properties without that: this one
+    // closes the UAF, and the publication below takes cs_main around the
+    // m_queue_mutex scope to close the snapshot/publish/delete race. Lock order
+    // cs_main → m_queue_mutex is preserved in both.
+    bool parentOnActiveChain = false;
+    bool parentExists = false;
+    {
+        CChainState::MainLockGuard main_lock(m_chainstate);
+        CBlockIndex* pParent = m_chainstate.GetBlockIndex(block.hashPrevBlock);
+        parentExists = (pParent != nullptr);
+        parentOnActiveChain = parentExists &&
+                              (pParent->nStatus & CBlockIndex::BLOCK_VALID_CHAIN) != 0;
+        // pParent deliberately does not escape this scope.
+    }
+    (void)parentExists;
 
     if (!skipPoWCheck) {
         // Get block height for DFMP (use expected_height if valid, else estimate)
@@ -145,7 +178,31 @@ bool CBlockValidationQueue::QueueBlock(int peer_id, const CBlock& block, int exp
 
             // CRITICAL FIX: Validate nBits matches expected difficulty
             // Without this check, miners can use ANY difficulty forever.
-            uint32_t expectedNBits = GetNextWorkRequired(pParent, static_cast<int64_t>(block.nTime));
+            //
+            // ⚠️ ALSO GUARDED, and it was the SAME defect one branch further in.
+            // This read `GetNextWorkRequired(pParent, ...)` using the pointer
+            // resolved far above with cs_main already released — and
+            // GetNextWorkRequired WALKS the index via pprev, so it is not one
+            // dereference but a chain of them, all unlocked. Re-resolve by hash
+            // under a guard and do the whole computation inside it.
+            //
+            // A fresh resolve, not the earlier pointer: that is the by-hash
+            // discipline this file already applies in ProcessBlock, and it makes
+            // an evicted parent show up as a clean null instead of a stale
+            // pointer. If it IS gone, the parent is no longer on the active chain
+            // and the difficulty check cannot be authoritative anyway, so treat
+            // it as the non-active case rather than inventing a verdict.
+            uint32_t expectedNBits = 0;
+            {
+                CChainState::MainLockGuard main_lock(m_chainstate);
+                CBlockIndex* pParentNow = m_chainstate.GetBlockIndex(block.hashPrevBlock);
+                if (!pParentNow) {
+                    std::cerr << "[ValidationQueue] Parent vanished between admission "
+                              << "checks (evicted); deferring to ActivateBestChain" << std::endl;
+                    return false;
+                }
+                expectedNBits = GetNextWorkRequired(pParentNow, static_cast<int64_t>(block.nTime));
+            }
             if (block.nBits != expectedNBits) {
                 std::cerr << "[ValidationQueue] Block from peer " << peer_id << " has wrong difficulty" << std::endl;
                 std::cerr << "  Block nBits:    0x" << std::hex << block.nBits << std::endl;
@@ -202,7 +259,19 @@ bool CBlockValidationQueue::QueueBlock(int peer_id, const CBlock& block, int exp
 
     // SSOT FIX #3: Add to queue and update stats
     // Use GetQueueDepth() after adding to get accurate count
+    // PUBLISH THE PIN ATOMICALLY AGAINST A RUNNING EVICTION (external panel
+    // round 3, gpt6 MEDIUM). The evictor SNAPSHOTS pending hashes under cs_main
+    // (calling the provider, which takes m_queue_mutex) and then DELETES under the
+    // same cs_main. Publishing under m_queue_mutex alone therefore loses a race
+    // that has nothing to do with the queue mutex: eviction snapshots (this block
+    // absent), we publish, eviction deletes the parent we just pinned.
+    //
+    // Taking cs_main around the publication makes admission atomic with respect to
+    // any eviction in flight — an eviction either sees this block's hashes in its
+    // snapshot or has not started. Lock order is cs_main → m_queue_mutex, the same
+    // documented edge the provider already establishes, so this adds no new edge.
     {
+        CChainState::MainLockGuard main_lock(m_chainstate);
         std::lock_guard<std::mutex> lock(m_queue_mutex);
         m_queue.push(queued_block);
         m_queued_heights.insert(expected_height);  // O(1) lookup for IsHeightQueued
