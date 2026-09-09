@@ -18,14 +18,17 @@
 //     "does this peer's chain exceed the absolute minimum?"
 //
 // Against an absolute, from-genesis nMinimumChainWork the first question is
-// never true on a node with any history: PRESYNC never reaches REDOWNLOAD,
+// never true on a node whose tip already carries a threshold's worth of work
+// (not "any node with history" -- see chainparams.cpp): PRESYNC never reaches
+// REDOWNLOAD,
 // pow_validated_headers stays empty, and header sync stalls. Found by red-team,
 // not by me, and it would have shipped as "we set two constants".
 //
 // ⚠️ WHAT THIS SUITE IS NOT. It is NOT evidence that the presync gate is wired.
 // It constructs HeadersSyncState directly, and on this tree nothing in
 // production constructs it at all -- InitializeDoSProtectedSync and
-// ProcessHeadersWithDoSProtection still have zero call sites. The contract's
+// ProcessHeadersWithDoSProtection still have zero PRODUCTION call sites (they
+// are called from these suites). The contract's
 // reject/accept arms must assert the WIRING and are blocked on deliverable 0b
 // (a test-only arming mechanism). What this suite proves is narrower and real:
 // the constructor now seeds the accumulator, so that WHEN the gate is wired it

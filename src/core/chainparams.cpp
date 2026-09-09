@@ -136,15 +136,18 @@ ChainParams ChainParams::Mainnet() {
     // the same nBits -- a Core constant would be wrong by a factor of ~10^12.
     // Ordering and ratios are unaffected, so consensus comparisons are fine.
     //
-    // ⚠️ INERT UNTIL THE GATE IS WIRED. Nothing reads this value at runtime IN
-    // PRODUCTION -- qualified in round 2, because this commit adds
-    // GetMinimumChainWork() and test binaries that call the DoS functions, so an
-    // unqualified "never read" / "zero call sites" is false in-tree even though
-    // the substantive claim (inert on a running node) holds.
-    // CHeadersManager::nMinimumChainWork (headers_manager.cpp:91) is assigned
-    // and read only by tests, and the only PRODUCTION path that would carry it
+    // ⚠️ INERT UNTIL THE GATE IS WIRED. Precisely (round 3, all three external
+    // seats): CHeadersManager's DEFAULT constructor DOES read this value in
+    // production and store it in a member -- so "nothing reads it" is false.
+    // What is true is that NO NODE DECISION is made from it: not RPC, not IBD,
+    // not chain selection, not logging. Earlier revisions of this comment said
+    // "assigned and never read" and then "never read IN PRODUCTION"; both were
+    // wrong in the same direction, which is why the distinction is now spelled
+    // out rather than compressed.
+    // The only PRODUCTION path that would carry it
     // into HeadersSyncState -- InitializeDoSProtectedSync /
-    // ProcessHeadersWithDoSProtection -- has zero call sites, so
+    // ProcessHeadersWithDoSProtection -- has zero PRODUCTION call sites (the
+    // LP-10 suites call both), so
     // mapHeadersSyncStates is never populated and the chain-work comparisons at
     // headerssync.cpp:85/:115 are unreachable.
     //
@@ -600,8 +603,11 @@ ChainParams ChainParams::DilV() {
     // ⚠️ UNITS: see the Mainnet() note -- our work unit is 2^40 times Bitcoin
     // Core's for the same nBits. Never copy a Core constant into this field.
     //
-    // ⚠️ INERT UNTIL THE GATE IS WIRED -- see the Mainnet() note; nothing reads
-    // this value at runtime as of this commit.
+    // ⚠️ INERT UNTIL THE GATE IS WIRED -- see the Mainnet() note for the precise
+    // statement: the value IS read into a member in production and is never used
+    // for any node decision. ("Nothing reads this value" was wrong here too --
+    // the Mainnet note was corrected in round 3 and this sibling was not, which
+    // is the fix-one-site-leave-the-siblings shape this mission keeps hitting.)
     params.nMinimumChainWork = uint256S(
         "00000000000000000000000000000000000000000105ba05ba05ba05b9000000");
 

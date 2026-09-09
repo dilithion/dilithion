@@ -13,27 +13,30 @@
 // ⚠️ WHAT THIS SUITE DOES *NOT* PROVE.
 // It does not prove the gate works, because as of this commit the gate is not
 // wired: CHeadersManager::nMinimumChainWork (headers_manager.cpp:91) is
-// assigned and never read, and InitializeDoSProtectedSync /
-// ProcessHeadersWithDoSProtection have zero call sites, so HeadersSyncState is
-// never constructed in production. The LIVE header path is the node's
+// read into a member in production and never used for any node decision, and
+// InitializeDoSProtectedSync / ProcessHeadersWithDoSProtection have zero
+// PRODUCTION call sites (these suites call them), so HeadersSyncState is never
+// constructed in production. The LIVE header path is the node's
 // SetHeadersHandler lambda -> QueueRawHeadersForProcessing (:3317) ->
 // HeaderProcessorThread (:3350) -> QueueHeadersForValidation (:2514), and it
 // applies no chain-work threshold either. (An earlier revision of this comment
 // named ProcessHeaders as the live path. That was wrong: ProcessHeaders is
 // itself near-dead, reachable only when the async validation thread fails to
-// start.) A reject/accept test written today could only call HeadersSyncState
-// directly -- which is exactly the "correct check that nothing reaches" defect
-// LP-10 exists to close. That test belongs with the wiring, and must assert the
-// WIRING. (Qualification, round 2: headerssync_gate_arming_tests DOES drive the
-// manager's public entry points rather than the state directly -- so "could only
-// construct HeadersSyncState directly" was too strong. What it still cannot do is
-// prove the LIVE header path reaches the gate, because no production caller
-// exists.)
+// start.) A reject/accept test written today CANNOT prove the LIVE header path
+// reaches the gate, because no production caller exists -- which is exactly the
+// "correct check that nothing reaches" defect LP-10 exists to close. That test
+// belongs with the wiring, and must assert the WIRING.
+//
+// (headerssync_gate_arming_tests DOES drive the manager's public entry points
+// rather than constructing the state directly, so it is not the weakest possible
+// shape -- it still cannot reach the live path.)
 //
 // ⚠️ SEEDING IS FIXED IN THIS COMMIT (LP-10 §2.0), and this comment used to say
 // otherwise. These thresholds are ABSOLUTE sums from genesis; HeadersSyncState
 // formerly zeroed its accumulator while starting from the LOCAL TIP, which would
-// have stalled header sync on any non-fresh node. It now takes a REQUIRED
+// have stalled header sync on any node whose tip already carried a threshold's
+// worth of work -- not on "any non-fresh node", which was an overclaim. It now
+// takes a REQUIRED
 // chain_start_work and seeds from it. Flagged by all three external seats as
 // same-commit comment rot -- the defect this mission polices.
 //

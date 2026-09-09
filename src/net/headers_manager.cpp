@@ -85,7 +85,9 @@ static bool CheckpointCheckHeader(int height, const uint256& headerHash) {
 // LP-10 deliverable 0b: explicit-threshold construction. Delegates to the
 // production constructor so there is exactly ONE initialisation path (a second
 // copy would drift, and the genesis/mapHeaders seeding below is load-bearing),
-// then overrides the one value. nMinimumChainWork is write-once at construction
+// then overrides the one value -- so on THIS path the member is written twice,
+// not once ("write-once" was inaccurate for the delegating constructor).
+// It is not written after construction
 // and read-only afterwards, so no lock is involved here or in the accessor.
 CHeadersManager::CHeadersManager(const uint256& minimum_chain_work)
     : CHeadersManager()

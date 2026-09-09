@@ -19,7 +19,7 @@
 //   (InitializeDoSProtectedSync -> ProcessHeadersWithDoSProtection), producing
 //   OPPOSITE outcomes either side of the threshold.
 //   DOES NOT: that the header MESSAGE path reaches those entry points. It does
-//   not -- both still have zero call sites in production, and the live route is
+//   not -- both still have zero PRODUCTION call sites, and the live route is
 //   SetHeadersHandler -> QueueRawHeadersForProcessing -> HeaderProcessorThread
 //   -> QueueHeadersForValidation. Closing that is §2.1/§3, and its arms build
 //   on this one.

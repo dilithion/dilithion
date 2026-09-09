@@ -49,7 +49,10 @@ HeadersSyncState::HeadersSyncState(
     // ask "has this peer supplied a whole threshold's worth of NEW work beyond
     // our tip?" rather than "does this chain exceed the absolute minimum?".
     // Against an absolute, from-genesis nMinimumChainWork that is never true on
-    // a node with any history: PRESYNC never reaches REDOWNLOAD,
+    // a node whose local tip already carries a threshold's worth of work
+    // (NOT "any node with history" -- a node just past genesis can still receive
+    // enough new work to pass; the defect is demanding a FULL threshold of
+    // ADDITIONAL work): PRESYNC never reaches REDOWNLOAD,
     // pow_validated_headers stays empty, and header sync stalls.
     //
     // Upstream Core seeds from chain_start->nChainWork. Both accumulators are
