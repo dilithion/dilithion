@@ -82,6 +82,29 @@ static bool CheckpointCheckHeader(int height, const uint256& headerHash) {
     return true;  // no checkpoint at this height
 }
 
+// LP-10 deliverable 0b: explicit-threshold construction. Delegates to the
+// production constructor so there is exactly ONE initialisation path (a second
+// copy would drift, and the genesis/mapHeaders seeding below is load-bearing),
+// then overrides the one value -- so on THIS path the member is written twice,
+// not once ("write-once" was inaccurate for the delegating constructor).
+// It is not written after construction
+// and read-only afterwards, so no lock is involved here or in the accessor.
+CHeadersManager::CHeadersManager(const uint256& minimum_chain_work)
+    : CHeadersManager()
+{
+    nMinimumChainWork = minimum_chain_work;
+}
+
+uint256 CHeadersManager::GetMinimumChainWork() const
+{
+    // Deliberately NOT taking cs_headers: the field is written ONLY DURING
+    // construction and is immutable afterwards (on the delegating path it is
+    // written twice -- see the constructor above; "write-once" was wrong there
+    // and was wrong here, eight lines apart, in the same edit), and a lock here would be a deadlock hazard for any caller
+    // that already holds it (cs_headers is a non-recursive std::mutex).
+    return nMinimumChainWork;
+}
+
 CHeadersManager::CHeadersManager()
     : nBestHeight(-1)
 {
@@ -619,23 +642,48 @@ bool CHeadersManager::ProcessHeadersWithDoSProtection(NodeId peer, const std::ve
         }
     }
 
-    // Check if peer has active HeadersSyncState
-    auto it = mapHeadersSyncStates.find(peer);
-    if (it == mapHeadersSyncStates.end()) {
+    // LP-10 §2.1b — LOCK DISCIPLINE. Everything below used to touch
+    // mapHeadersSyncStates with NO lock held (the guard above is scoped and
+    // released), while OnPeerDisconnected erases from the same map under
+    // cs_headers on the net thread. A disconnect concurrent with the
+    // ProcessNextHeaders call below destroyed the state mid-dereference: a
+    // use-after-free, not merely a race. Fixed before wiring, not after,
+    // because wiring this into the live header path is what would have made it
+    // reachable.
+    //
+    // The shape: take a SHARED reference under the lock, drop the lock, then do
+    // the expensive call. A concurrent erase now only drops the map's
+    // reference; the local one keeps the object alive for the duration.
+    std::shared_ptr<HeadersSyncState> sync_state;
+    {
+        std::lock_guard<std::mutex> lock(cs_headers);
+        auto it = mapHeadersSyncStates.find(peer);
+        if (it == mapHeadersSyncStates.end()) {
+            // No DoS-protected session for this peer.
+            // NOTE: ProcessHeaders takes cs_headers itself and cs_headers is a
+            // NON-RECURSIVE std::mutex, so it must be called AFTER this scope
+            // closes -- never from inside it.
+            sync_state = nullptr;
+        } else {
+            sync_state = it->second;
+            if (!sync_state || sync_state->GetState() == HeadersSyncState::State::FINAL) {
+                mapHeadersSyncStates.erase(peer);
+                sync_state = nullptr;
+            }
+        }
+    }
+    if (!sync_state) {
         return ProcessHeaders(peer, headers);
     }
 
-    HeadersSyncState* sync_state = it->second.get();
-    if (!sync_state || sync_state->GetState() == HeadersSyncState::State::FINAL) {
-        mapHeadersSyncStates.erase(peer);
-        return ProcessHeaders(peer, headers);
-    }
-
-
-    // Process through HeadersSyncState
+    // Process through HeadersSyncState. Deliberately OUTSIDE cs_headers: this
+    // validates headers and is expensive, and holding the global header lock
+    // across it would serialise the header path. Safe now only because
+    // sync_state is a shared_ptr taken above.
     auto result = sync_state->ProcessNextHeaders(headers, true);
 
     if (!result.success) {
+        std::lock_guard<std::mutex> lock(cs_headers);
         mapHeadersSyncStates.erase(peer);
         return false;
     }
@@ -692,8 +740,10 @@ bool CHeadersManager::ProcessHeadersWithDoSProtection(NodeId peer, const std::ve
 
     }
 
-    // Check if sync is complete
+    // Check if sync is complete. Erase under the lock: this is a map mutation,
+    // and it previously ran unlocked (LP-10 §2.1b).
     if (sync_state->GetState() == HeadersSyncState::State::FINAL) {
+        std::lock_guard<std::mutex> lock(cs_headers);
         mapHeadersSyncStates.erase(peer);
     }
 
@@ -758,12 +808,57 @@ bool CHeadersManager::InitializeDoSProtectedSync(NodeId peer, const uint256& min
         chainStartHeight = 0;
     }
 
+    // LP-10 §2.0: the CUMULATIVE work at the chain start must be handed to
+    // HeadersSyncState, or its accumulator starts at zero while its start point
+    // is our local tip -- see the constructor comment. Read it from mapHeaders,
+    // which stores "accumulated PoW from genesis" per header.
+    //
+    // NOTE ON LOCKING: we already hold cs_headers (taken at the top of this
+    // function) and it is a NON-RECURSIVE std::mutex, so this must NOT call
+    // GetBestHeaderChainWork() -- that takes cs_headers itself and would
+    // self-deadlock. Read the map directly. (LP-10 red-team BLOCKER-3 names the
+    // wider lock discipline problem on this path; this is one instance of it.)
+    uint256 chainStartWork;
+    auto itWork = mapHeaders.find(chainStartHash);
+    if (itWork != mapHeaders.end()) {
+        chainStartWork = itWork->second.chainWork;
+    } else if (chainStartHeight == 0) {
+        // Genesis is not necessarily in mapHeaders (it is not received over the
+        // wire). Its cumulative work is its own block work.
+        // NOT `g_chainParams ? genesisNBits : 0`. A zero nBits has a zero
+        // mantissa, and ComputeChainWork SATURATES to MAX work on that -- so the
+        // IsNull() fail-closed check below would PASS and PRESYNC would start
+        // already above any threshold. That is fail-OPEN wearing a fail-closed
+        // comment, in the one function whose whole point is refusing to seed
+        // wrong. Found by two external seats. Leave chainStartWork null instead
+        // and let the refusal below fire.
+        if (Dilithion::g_chainParams != nullptr) {
+            chainStartWork = ::dilithion::consensus::ComputeChainWork(
+                Dilithion::g_chainParams->genesisNBits);
+        }
+    }
+
+    // FAIL CLOSED. Passing zero for an unknown start would silently reinstate
+    // the exact defect §2.0 exists to remove, and it would present as a stalled
+    // sync rather than an error. Refusing to start DoS-protected sync leaves the
+    // peer on the ordinary path instead of on a gate that cannot pass.
+    if (chainStartWork.IsNull()) {
+        LogPrintf(NET, WARN,
+            "[HeadersManager] DoS-protected sync NOT started for peer=%d: no chain work "
+            "known for start hash %s at height %lld. Refusing to seed the PRESYNC "
+            "accumulator with zero.\n",
+            static_cast<int>(peer), chainStartHash.GetHex().c_str(),
+            static_cast<long long>(chainStartHeight));
+        return false;
+    }
+
     // Create the state — Phase 3: pass the chain-agnostic proof checker.
-    auto state = std::make_unique<HeadersSyncState>(
+    auto state = std::make_shared<HeadersSyncState>(  // LP-10 §2.1b: shared, see the map decl
         peer,
         params,
         chainStartHash,
         chainStartHeight,
+        chainStartWork,     // LP-10 §2.0: was implicitly zero
         minimum_work,
         m_proof_checker.get()
     );
@@ -998,11 +1093,25 @@ void CHeadersManager::OnBlockActivated(const CBlockHeader& header, const uint256
         } else {
             // Parent not in mapHeaders (compact block arrived without header pipeline).
             // Look up actual height from chainstate block index.
-            // Safe: cs_main is already held (called from ConnectTip→NotifyTipUpdate),
-            // and cs_main is a recursive_mutex.
-            CBlockIndex* pindex = g_chainstate.GetBlockIndex(hash);
-            if (pindex) {
-                height = pindex->nHeight;
+            //
+            // P2P-14/15 §0.3-POST: this USED to read
+            //     CBlockIndex* pindex = g_chainstate.GetBlockIndex(hash);
+            //     if (pindex) { height = pindex->nHeight; }
+            // with the comment "Safe: cs_main is already held (called from
+            // ConnectTip→NotifyTipUpdate), and cs_main is a recursive_mutex."
+            //
+            // That guarantee is GONE. The tip callback now fires AFTER cs_main
+            // is released — that is the whole point of the fix — so this ran
+            // with a raw pointer from a function that takes and releases the
+            // lock, dereferenced outside it. That is exactly the race LP10
+            // measured under TSan at 6353bc33.
+            //
+            // Snapshotting the callback's own parameters did not cover this:
+            // it is a SECOND, internal pointer. Read the value under the lock
+            // instead, so nothing escapes the lock scope.
+            int lookedUpHeight = 0;
+            if (g_chainstate.GetBlockHeightByHash(hash, lookedUpHeight)) {
+                height = lookedUpHeight;
             }
         }
     }
@@ -1085,8 +1194,28 @@ std::vector<uint256> CHeadersManager::GetLocator(const uint256& hashTip)
 {
     // DEADLOCK FIX: Get chainstate tip BEFORE acquiring cs_headers
     // to avoid cs_headers/cs_main lock order inversion.
-    // (OnBlockActivated holds cs_main and wants cs_headers;
-    //  GetLocatorImpl would hold cs_headers and want cs_main via GetTip)
+    //
+    // ⚠️ RATIONALE CORRECTED BY P2P-14/15. This used to read "(OnBlockActivated
+    // holds cs_main and wants cs_headers; GetLocatorImpl would hold cs_headers
+    // and want cs_main via GetTip)". The first half is NO LONGER TRUE —
+    // OnBlockActivated now runs with cs_main released, which is the entire point
+    // of that change. Left uncorrected it would be a stale safety rationale
+    // justifying live code: exactly the shape this mission excavated 100 lines
+    // above (the "cs_main is already held" comment at the GetBlockIndex deref).
+    //
+    // The pre-fetch is still CORRECT and still wanted, for the surviving half:
+    // GetLocatorImpl holds cs_headers, and calling GetTip() under it would take
+    // cs_main beneath cs_headers. Hoisting it keeps that edge out.
+    //
+    // ⚠️ RESIDUAL, NOT FIXED HERE (red-team H-2 / port-review L9): pTip is a raw
+    // CBlockIndex* obtained from a take-and-release accessor, and the walk below
+    // (GetAncestor, pprev/pskip) dereferences it with cs_main NOT held — the same
+    // released-pointer class this contract fixes at one call site and scopes OUT
+    // for the other ~205 (dilithion-strategy 794e27b,
+    // missions/lp10-chainstate-pointer-api/CENSUS_both_producers.tsv). It is
+    // LP10's class and its root cause is upstream of the call sites: runtime
+    // eviction exists only because nMinimumChainWork was zeroed. Recorded here
+    // so the next reader does not mistake this line for audited-safe.
     CBlockIndex* pTip = g_chainstate.GetTip();
     int chainstateHeight = (pTip && pTip->nHeight > 0) ? pTip->nHeight : 0;
 

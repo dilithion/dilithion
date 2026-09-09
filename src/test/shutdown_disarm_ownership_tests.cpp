@@ -31,6 +31,8 @@
  *      the final Disarm really are last.
  */
 
+#include <test/test_only_selector.h>
+
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -46,9 +48,18 @@ static int g_failed = 0;
 #define ASSERT(cond, msg) \
     do { if (!(cond)) throw std::runtime_error(msg); } while (0)
 
+// The --only= selector, held at file scope so RUN stays a one-liner. main owns
+// the object; this only points at it.
+static test_only::Selector* g_only_p = nullptr;
+
 #define TEST(name) void test_##name()
+// RUN consults the selector. With no --only argument ShouldRun returns true for
+// everything, so this is a NO-OP for every existing caller -- the property that
+// makes the selector safe to adopt across the roster, and one that is asserted
+// rather than assumed (test_only_selector_selftest.cpp, "no --only" arm).
 #define RUN(name) \
     do { \
+        if (!g_only_p->ShouldRun(#name)) break; \
         std::cout << "[TEST] " << #name << std::endl; \
         try { test_##name(); std::cout << "  PASSED" << std::endl; g_passed++; } \
         catch (const std::exception& e) { std::cout << "  FAILED: " << e.what() << std::endl; g_failed++; } \
@@ -144,12 +155,20 @@ TEST(guard_declared_first_in_both_mains) {
     }
 }
 
-int main() {
+int main(int argc, char** argv) {
+    test_only::Selector only(argc, argv);
+    g_only_p = &only;
     std::cout << "=== shutdown final-Disarm ownership (structural) ===" << std::endl;
     RUN(guard_owns_exactly_one_disarm);
     RUN(mains_never_disarm);
     RUN(repo_wide_no_other_disarm);
     RUN(guard_declared_first_in_both_mains);
     std::cout << "Passed: " << g_passed << "  Failed: " << g_failed << std::endl;
+    // A selector error (unknown --only name, unrecognised argument) beats a
+    // clean scenario tally: the run covered less than was asked for, and
+    // "Passed: 0  Failed: 0" plus exit 0 is exactly the vacuous green this
+    // machinery exists to prevent.
+    const int sel = only.Finish();
+    if (sel != 0) return sel;
     return g_failed == 0 ? 0 : 1;
 }

@@ -21,6 +21,20 @@ on:
     branches: [ main, master ]
   workflow_dispatch:
 
+# Supersede in-flight runs of the same ref. Without this, every push queues a
+# FULL run behind its own predecessor: on 2026-09-07 the Actions queue hit 6
+# in-progress / 12 queued, two of them superseded pushes of a single branch that
+# nothing ever cancelled. Cost and throughput, not a gate: what runs is
+# unchanged, only how many stale copies of it.
+#
+# main is deliberately NEVER cancelled -- a cancelled main run destroys the
+# record for that commit, which is exactly how the test_dilithion hang stayed
+# undiagnosed (a `cancelled` conclusion reads as a failure and its evidence is
+# gone).
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
 jobs:
   build-and-test:
     name: Build and Test (${{ matrix.compiler }}, ${{ matrix.build_type }})
@@ -28,6 +42,21 @@ jobs:
     # 30 -> 45: the gcc/Release leg now also links and RUNS the standalone test
     # suites (make tests-fast). Measured locally: ~8s to link 45 suite binaries
     # on top of an already-built tree, ~55s to run the 31 live fast-tier suites.
+    # LOW-1: the ceiling appears here and as JOB_CEILING_MIN's default in
+    # scripts/ci_hang_budget.sh, and the two MUST agree -- if they drift, the
+    # watchdog arms against a ceiling that no longer exists, which is the exact
+    # failure it was written to avoid.
+    #
+    # An `env`-expression tried to make this a single source and DOES NOT WORK:
+    # `timeout-minutes` at job level accepts only the github / needs / strategy
+    # / matrix / vars / inputs contexts, so `${{ env.JOB_CEILING_MIN }}` is a
+    # WORKFLOW PARSE ERROR -- "Unrecognized named-value: 'env'" -- and GitHub
+    # then runs ZERO JOBS. A YAML parser cannot see this: the document is
+    # structurally valid and only GitHub's context rules reject it, which is
+    # why it survived a parse-based check and was caught by an actual run.
+    #
+    # So the literal stays, and the agreement is ENFORCED instead of assumed:
+    # test_run_with_hang_capture.sh greps both and fails if they differ.
     timeout-minutes: 45
 
     strategy:
@@ -37,6 +66,22 @@ jobs:
         build_type: [Debug, Release]
 
     steps:
+    # FIRST STEP, DELIBERATELY, AND BEFORE CHECKOUT.
+    #
+    # `timeout-minutes` is measured from JOB start, but a watchdog inside a
+    # step can only see STEP time -- so the watchdog derives its budget from
+    # how much of the job the build already spent. That subtraction is only as
+    # good as this clock.
+    #
+    # It used to be stamped inside "Set up compiler", 42-68s into the job
+    # (checkout with recursive submodules, then apt). Those seconds were
+    # silently credited back to the watchdog, eroding the 240s capture margin
+    # at exactly the point where the derived budget binds -- a build that has
+    # eaten the ceiling is the case this instrument exists for. Stamping here
+    # costs nothing and removes the error.
+    - name: Stamp job-start clock (hang watchdog budget)
+      run: echo "JOB_START_EPOCH=$(date +%s)" >> $GITHUB_ENV
+
     - name: Checkout code
       uses: actions/checkout@v7
       with:
@@ -66,6 +111,15 @@ jobs:
           echo "CC=gcc" >> $GITHUB_ENV
           echo "CXX=g++" >> $GITHUB_ENV
         fi
+
+    # gdb is needed only on the hang path, but installing it THERE would spend
+    # minutes of a budget that is already exhausted, and would fail silently.
+    - name: Install hang-capture tooling
+      run: |
+        sudo apt-get install -y -q gdb
+        # gdb must be able to attach to a non-descendant; the runner default
+        # blocks that and a failed attach would waste the one occurrence we get.
+        sudo sysctl -w kernel.yama.ptrace_scope=0
 
     - name: Build RandomX
       run: |
@@ -120,12 +174,119 @@ jobs:
 
     - name: Run Boost Unit Tests
       run: |
-        # Skip HD wallet tests temporarily - GetNewHDAddress() hangs in CI (BUG-77)
-        # Likely blocking on /dev/random or deadlock issue
-        # Affected: wallet_hd_tests, rpc_hd_wallet_tests, hd_wallet_standalone_tests
-        ./test_dilithion --log_level=test_suite --report_level=short \
-          --run_test='!wallet_hd_tests:!rpc_hd_wallet_tests:!hd_wallet_standalone_tests'
-        echo "✅ Boost unit tests completed (HD wallet tests skipped - BUG-77)"
+        # BUG-77 EXCLUSION REMOVED HERE (2026-09-09). The suites were excluded
+        # for "GetNewHDAddress() hangs in CI (BUG-77) / Likely blocking on
+        # /dev/random or deadlock issue". Both halves of that were wrong:
+        #
+        #   * there is NO /dev/random path in src/ or depends/dilithium/ --
+        #     entropy is getrandom()/urandom throughout (independently
+        #     re-derived by a second reader);
+        #   * the suites do not hang. They FAILED, on stale expectations: every
+        #     HD index expectation predates the BUG #115 pre-generation, so it
+        #     was off by exactly HD_GAP_LIMIT - 1 = 19 (measured by probe:
+        #     expected 1, actual 20). Fixed in this PR.
+        #
+        # The misdiagnosis kept anyone from looking for ~1054 commits, and the
+        # real cost was not the bug -- it was ZERO ENFORCED COVERAGE on
+        # user-facing HD key derivation for that whole time.
+        #
+        # This job has no `|| true`, so it GATES. That is the point of removing
+        # the exclusion here first: the four sanitizer/coverage jobs still
+        # swallow their exit status, so re-enabling there would restore the
+        # APPEARANCE of coverage and enforce nothing. Those four are a separate
+        # PR (they are also owned by another lane at :381/:517).
+        #
+        # hd_wallet_standalone_tests is deliberately NOT named below and never
+        # should have been: it is a standalone main(), not a Boost suite (zero
+        # BOOST_AUTO_TEST macros), so its name in a --run_test filter was always
+        # a NO-OP. It reads as an exclusion and excludes nothing.
+        #
+        # Where it DOES run: nowhere yet. It is a standalone binary that no
+        # roster names on this branch or on main. #188 rosters it -- quarantined
+        # until this PR lands, then live. An earlier draft of this comment said
+        # "it runs via the roster instead", which was not true of any tree that
+        # exists; a comment asserting coverage that does not exist is the same
+        # defect class this PR is fixing.
+        #
+        # The same dead name is still in the four swallowed filters and should
+        # go with them.
+        #
+        # HANG INSTRUMENT. test_dilithion intermittently hangs (~8% of Release
+        # runs: this job on run 33929931137, and gcc/Release on main run
+        # 33887089440, both ending "Terminate orphan process: (test_dilithion)").
+        # When the job ceiling fires the runner kills the orphan and the process
+        # state is GONE - which is why the hang has never been diagnosed. 44
+        # local runs (20 full-width + 24 pinned to 4 cores) reproduced it ZERO
+        # times, so the evidence has to be captured where it happens: here.
+        #
+        # THE BUDGET IS COMPUTED, NOT A LITERAL, AND THAT IS THE WHOLE POINT.
+        # `timeout-minutes: 45` is measured from JOB start; a watchdog inside
+        # this step can only measure STEP time. Measured on the hung job
+        # (run 33929931137, steps API):
+        #     job start                 00:43:37
+        #     "Run Boost Unit Tests"    01:03:33   <- 19m56s of the job already
+        #                                             spent (16m19s of it in the
+        #                                             wallet-guard step alone)
+        #     45-min ceiling            01:28:37
+        # So this step had ~25 minutes of real budget, not 45. A fixed 38-minute
+        # watchdog - which is what the first version of this used - would have
+        # fired at 01:41, THIRTEEN MINUTES AFTER the ceiling: the instrument
+        # would never once have run. Deriving the budget from JOB_START_EPOCH
+        # makes it correct now and self-correcting as the build gets slower.
+        set -uo pipefail
+        # The watchdog now lives in scripts/run_with_hang_capture.sh so it can be
+        # TESTED. As inline YAML nothing had ever executed it except a real CI
+        # hang -- an event that fires about 8% of the time -- and extracting it
+        # immediately surfaced two defects that reading had not:
+        #
+        #   1. the PID-reuse guard compared basename "$1" against
+        #      /proc/<pid>/comm. comm is the EXECUTABLE name (so "bash" for
+        #      anything behind a shebang) and is TRUNCATED TO 15 CHARACTERS.
+        #      "test_dilithion" is 14 -- the guard worked by one character, and a
+        #      longer binary name would have disabled the watchdog silently.
+        #   2. cleanup killed the watchdog subshell and THEN ran `pkill -P`
+        #      against it; the children are already reparented to init by then,
+        #      so the sleep survived holding this step's stdout open. The comment
+        #      above that code named the failure it did not prevent.
+        #
+        # Both are fixed and pinned by scripts/test_run_with_hang_capture.sh,
+        # including "a hang MUST fail the step" and "an incomplete gdb capture
+        # must say so". (That comment used to state an arm count. It drifted
+        # within two days of being written, so the number is gone: the arm list
+        # lives in the self-test header, which cannot go stale relative to
+        # itself.)
+        #
+        # INVOKED VIA `bash`, NOT `./`, AND THAT IS LOAD-BEARING. Committed as
+        # `./scripts/run_with_hang_capture.sh`, this line failed on all four
+        # Build and Test legs with "Permission denied", exit 126: the script is
+        # tracked 100644 because the repo is developed on Windows, where the
+        # executable bit does not survive a checkout. Nearly every tracked
+        # script here is 100644 for that reason, so `bash <script>` is the
+        # convention -- the line directly above already used it. (This comment
+        # used to quote a ratio. Two readers produced two different numbers
+        # within an hour, because one counted every file under scripts/ and the
+        # other counted only *.sh. A figure nobody re-measures is not evidence;
+        # the self-test arm is, and it enforces the property directly.)
+        # The mode bit is ALSO set
+        # in the index now, and an arm in the self-test asserts both, but `bash`
+        # is the half that does not depend on a bit Windows keeps dropping.
+        BUDGET_SEC=$(bash scripts/ci_hang_budget.sh)
+        bash scripts/run_with_hang_capture.sh "$BUDGET_SEC" test-hang-artifacts \
+          ./test_dilithion --log_level=test_suite --report_level=short
+        echo "Boost unit tests completed (HD wallet suites INCLUDED and gating)"
+
+    # Only produces a file when the hang actually fired; otherwise no-op.
+    - name: Upload hang stack (only if the hang fired)
+      # NOT gated to one compiler: the hang has been observed on clang/Release
+      # (run 33929931137) AND gcc/Release (main run 33887089440). if-no-files-found
+      # makes this a no-op on every healthy leg.
+      if: always()
+      uses: actions/upload-artifact@v7
+      with:
+        name: test-dilithion-hang-stack-${{ matrix.compiler }}-${{ matrix.build_type }}
+        path: test-hang-artifacts/
+        retention-days: 30
+        if-no-files-found: ignore
 
     # ------------------------------------------------------------------
     # F4: the standalone (non-Boost) test suites.
@@ -468,7 +629,15 @@ jobs:
         cd depends/randomx
         mkdir -p build
         cd build
-        cmake .. -DCMAKE_CXX_FLAGS="--coverage" -DCMAKE_C_FLAGS="--coverage"
+        # -fprofile-update=atomic HERE TOO. The main build below already carries
+        # it, with a comment explaining why -- but RandomX was left on plain
+        # --coverage, and RandomX is the most heavily threaded code in the tree.
+        # That is exactly where the torn counters land:
+        #   geninfo: ERROR: Unexpected negative count '-3184421' for branch 1
+        #   of depends/randomx/src/superscalar_program.hpp:47
+        # which fails the whole coverage leg. The lesson had been learned once
+        # and applied to one of the three builds.
+        cmake .. -DCMAKE_CXX_FLAGS="--coverage -fprofile-update=atomic" -DCMAKE_C_FLAGS="--coverage -fprofile-update=atomic"
         make -j$(nproc)
 
     - name: Build Dilithium library
@@ -490,7 +659,7 @@ jobs:
         fi
         cd depends/dilithium/ref
         make clean || true
-        CFLAGS="--coverage -O0 -g -DDILITHIUM_MODE=3" make -j$(nproc)
+        CFLAGS="--coverage -fprofile-update=atomic -O0 -g -DDILITHIUM_MODE=3" make -j$(nproc)
 
     - name: Build with coverage
       run: |

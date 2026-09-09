@@ -2,10 +2,14 @@
 // Distributed under the MIT software license
 
 #include <wallet/wallet.h>
+#include <core/chainparams.h>
 #include <crypto/sha3.h>
 
 #include <iostream>
 #include <iomanip>
+#include <sstream>
+#include <random>
+#include <filesystem>
 
 using namespace std;
 
@@ -258,6 +262,52 @@ bool TestHashConsistency() {
 #include <primitives/transaction.h>
 #include <consensus/tx_validation.h>
 
+// ---------------------------------------------------------------------------
+// A real, unique, self-cleaning directory for each CUTXOSet in this file.
+//
+// WHY. Every call site used to read `utxo_set.Open(":memory:")` with the comment
+// "In-memory database for testing". LevelDB has no such convention -- that is
+// SQLite's -- and CUTXOSet::Open passes the string straight through as a PATH.
+// So this suite never had an in-memory database on ANY platform:
+//
+//   * on Linux it silently created a real on-disk directory literally named
+//     ":memory:" in the working directory and passed. Measured: after a run,
+//     `ls ':memory:'` shows 000015.log and friends. It was also left behind
+//     between runs, so a stale LOCK is a latent flake and every run shared one
+//     database.
+//   * on Windows ':' is not legal in a filename, so it fails outright:
+//     "CUTXOSet::Open: IO error: :memory:/LOCK: The filename, directory name,
+//     or volume label syntax is incorrect" (measured by a second reader on
+//     Windows/MSYS2). Since wallet_tests moved into the FAST tier, every
+//     Windows developer gets a red that CI never sees.
+//
+// The comment was the most dangerous part: it asserted isolation the code did
+// not provide, so nobody looked. A unique temp directory per fixture gives the
+// isolation the comment always claimed.
+// ---------------------------------------------------------------------------
+namespace {
+class ScopedUtxoDir {
+public:
+    ScopedUtxoDir() {
+        std::random_device rd;
+        std::ostringstream oss;
+        oss << "dilithion-wallet-tests-" << rd() << "-" << rd();
+        m_path = std::filesystem::temp_directory_path() / oss.str();
+        std::error_code ec;
+        std::filesystem::create_directories(m_path, ec);
+    }
+    ~ScopedUtxoDir() {
+        std::error_code ec;
+        std::filesystem::remove_all(m_path, ec);
+    }
+    ScopedUtxoDir(const ScopedUtxoDir&) = delete;
+    ScopedUtxoDir& operator=(const ScopedUtxoDir&) = delete;
+    std::string str() const { return m_path.string(); }
+private:
+    std::filesystem::path m_path;
+};
+} // namespace
+
 bool TestScriptCreation() {
     cout << "\nTesting script creation (Phase 5.2)..." << endl;
 
@@ -348,8 +398,20 @@ bool TestCoinSelection() {
     CDilithiumAddress addr = wallet.GetNewAddress();
 
     // Create mock UTXO set
+    // DECLARATION ORDER IS LOAD-BEARING: destructors run in reverse, so the
+    // directory must be declared FIRST to be destroyed LAST -- after
+    // ~CUTXOSet has run Close() and released the LevelDB LOCK. Declared the
+    // other way round, remove_all() runs while the DB is still open: POSIX
+    // tolerates unlinking open files so Linux looked clean, but on Windows
+    // the delete fails and every run leaves a dilithion-wallet-tests-* tree
+    // behind in TEMP (measured by a second reader: five of them, each with
+    // LOCK/MANIFEST/log).
+    ScopedUtxoDir utxo_dir;  // declared first => destroyed last
     CUTXOSet utxo_set;
-    utxo_set.Open(":memory:");  // In-memory database for testing
+    if (!utxo_set.Open(utxo_dir.str())) {
+        cout << "  ✗ Could not open the UTXO test database at " << utxo_dir.str() << endl;
+        return false;
+    }
 
     // Add multiple UTXOs to wallet with different values
     std::vector<CAmount> values = {50000000, 30000000, 20000000, 10000000};
@@ -414,8 +476,20 @@ bool TestTransactionCreation() {
     CDilithiumAddress recipient_addr = recipient_wallet.GetNewAddress();
 
     // Create UTXO set
+    // DECLARATION ORDER IS LOAD-BEARING: destructors run in reverse, so the
+    // directory must be declared FIRST to be destroyed LAST -- after
+    // ~CUTXOSet has run Close() and released the LevelDB LOCK. Declared the
+    // other way round, remove_all() runs while the DB is still open: POSIX
+    // tolerates unlinking open files so Linux looked clean, but on Windows
+    // the delete fails and every run leaves a dilithion-wallet-tests-* tree
+    // behind in TEMP (measured by a second reader: five of them, each with
+    // LOCK/MANIFEST/log).
+    ScopedUtxoDir utxo_dir;  // declared first => destroyed last
     CUTXOSet utxo_set;
-    utxo_set.Open(":memory:");
+    if (!utxo_set.Open(utxo_dir.str())) {
+        cout << "  ✗ Could not open the UTXO test database at " << utxo_dir.str() << endl;
+        return false;
+    }
 
     // Give sender some coins
     uint256 funding_txid;
@@ -434,7 +508,19 @@ bool TestTransactionCreation() {
 
     // Create transaction
     CAmount amount_to_send = 50000000;  // 0.5 DLT
-    CAmount fee = 1000;
+    // STALE EXPECTATION, fixed with the cite that actually FIRES. 1000 ions =
+    // 0.00001000 DIL, an order of magnitude below MIN_RELAY_FEE = 10000
+    // (amount.h:26), so CreateTransaction refused at wallet.cpp:4677 with
+    // "Fee below minimum relay fee". The expectation predates the fee policy.
+    //
+    // Note there are TWO similarly-named constants with the same value:
+    // MIN_RELAY_FEE (amount.h:26) and MIN_RELAY_TX_FEE (consensus/fees.h:20).
+    // Only the first one gates this path -- cite the one that fires, or the
+    // next person changes the other and wonders why nothing moves.
+    // Use the wallet's own estimator rather than a fresh hardcoded number --
+    // a literal here would go stale again the next time policy moves, and the
+    // sibling test at :538 in this same file was ALREADY migrated to it.
+    CAmount fee = CWallet::EstimateFee();
     CTransactionRef tx;
     std::string error;
     unsigned int current_height = 200;
@@ -508,8 +594,20 @@ bool TestTransactionSending() {
     CDilithiumAddress addr = wallet.GetNewAddress();
 
     // Create UTXO set
+    // DECLARATION ORDER IS LOAD-BEARING: destructors run in reverse, so the
+    // directory must be declared FIRST to be destroyed LAST -- after
+    // ~CUTXOSet has run Close() and released the LevelDB LOCK. Declared the
+    // other way round, remove_all() runs while the DB is still open: POSIX
+    // tolerates unlinking open files so Linux looked clean, but on Windows
+    // the delete fails and every run leaves a dilithion-wallet-tests-* tree
+    // behind in TEMP (measured by a second reader: five of them, each with
+    // LOCK/MANIFEST/log).
+    ScopedUtxoDir utxo_dir;  // declared first => destroyed last
     CUTXOSet utxo_set;
-    utxo_set.Open(":memory:");
+    if (!utxo_set.Open(utxo_dir.str())) {
+        cout << "  ✗ Could not open the UTXO test database at " << utxo_dir.str() << endl;
+        return false;
+    }
 
     // Fund wallet
     uint256 funding_txid;
@@ -574,8 +672,20 @@ bool TestBalanceCalculation() {
     wallet.GenerateNewKey();
     CDilithiumAddress addr = wallet.GetNewAddress();
 
+    // DECLARATION ORDER IS LOAD-BEARING: destructors run in reverse, so the
+    // directory must be declared FIRST to be destroyed LAST -- after
+    // ~CUTXOSet has run Close() and released the LevelDB LOCK. Declared the
+    // other way round, remove_all() runs while the DB is still open: POSIX
+    // tolerates unlinking open files so Linux looked clean, but on Windows
+    // the delete fails and every run leaves a dilithion-wallet-tests-* tree
+    // behind in TEMP (measured by a second reader: five of them, each with
+    // LOCK/MANIFEST/log).
+    ScopedUtxoDir utxo_dir;  // declared first => destroyed last
     CUTXOSet utxo_set;
-    utxo_set.Open(":memory:");
+    if (!utxo_set.Open(utxo_dir.str())) {
+        cout << "  ✗ Could not open the UTXO test database at " << utxo_dir.str() << endl;
+        return false;
+    }
 
     std::vector<uint8_t> pubkey_hash = wallet.GetPubKeyHash();
     std::vector<uint8_t> scriptPubKey = WalletCrypto::CreateScriptPubKey(pubkey_hash);
@@ -635,8 +745,20 @@ bool TestEdgeCases() {
     wallet.GenerateNewKey();
     CDilithiumAddress addr = wallet.GetNewAddress();
 
+    // DECLARATION ORDER IS LOAD-BEARING: destructors run in reverse, so the
+    // directory must be declared FIRST to be destroyed LAST -- after
+    // ~CUTXOSet has run Close() and released the LevelDB LOCK. Declared the
+    // other way round, remove_all() runs while the DB is still open: POSIX
+    // tolerates unlinking open files so Linux looked clean, but on Windows
+    // the delete fails and every run leaves a dilithion-wallet-tests-* tree
+    // behind in TEMP (measured by a second reader: five of them, each with
+    // LOCK/MANIFEST/log).
+    ScopedUtxoDir utxo_dir;  // declared first => destroyed last
     CUTXOSet utxo_set;
-    utxo_set.Open(":memory:");
+    if (!utxo_set.Open(utxo_dir.str())) {
+        cout << "  ✗ Could not open the UTXO test database at " << utxo_dir.str() << endl;
+        return false;
+    }
 
     // Test: Create transaction with zero amount (should fail)
     CTransactionRef tx;
@@ -684,6 +806,19 @@ int main() {
     cout << "Post-Quantum Transaction System" << endl;
     cout << "======================================" << endl;
     cout << endl;
+
+    // THE OTHER QUARANTINE CAUSE. Without this the suite fails with its own
+    // message -- "Transaction creation failed: Chain parameters not
+    // initialized" -- because CreateTransaction reaches consensus code that
+    // needs g_chainParams. Production initialises it at startup
+    // (dilithion-node.cpp:2249-2255); this harness never did. Same shape as
+    // rpc_tests (auth+permissions) and miner_tests (RandomX): the code
+    // correctly refuses to run uninitialised and the SUITE was quarantined for
+    // it. Regtest is the lightest of the three parameter sets.
+    if (Dilithion::g_chainParams == nullptr) {
+        Dilithion::g_chainParams =
+            new Dilithion::ChainParams(Dilithion::ChainParams::Regtest());
+    }
 
     bool allPassed = true;
 
