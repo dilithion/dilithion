@@ -55,6 +55,8 @@ exempt_reason() {
             echo "Target lands ahead of its source: both are in flight in PR #116. Dead on THIS branch, alive when that merges -- exempt rather than deleted, and this line should be removed when #116 lands." ;;
         p2p14_lock_inversion_tsan_tests)
             echo "TSan-only by construction: it exists to make a lock-order inversion observable and is run via scripts/run_p2p14_lock_inversion_tsan.sh, not the roster. A non-TSan build of it proves nothing." ;;
+        headerssync_disconnect_race_tsan)
+            echo "TSan-only by construction, same class as p2p14_lock_inversion_tsan_tests: it drives ProcessHeadersWithDoSProtection against OnPeerDisconnected to make a use-after-free observable, and the OBSERVABLE IS THE SANITISER REPORT, not the exit code. Built and run by hand: 'make TSAN=1 headerssync_disconnect_race_tsan', then 'setarch \$(uname -m) -R ./headerssync_disconnect_race_tsan' (TSan aborts with a FATAL mapping error unless ASLR is off). A non-TSan build exits 0 while proving nothing, so rostering it would manufacture a green. Its own reachability guard exits 3 if neither edge was driven, so an unrun harness cannot read as a pass. RED/GREEN evidence: dilithion-strategy/missions/lp10-headerssync-wiring/EVIDENCE_A9_tsan_{red,green}.txt." ;;
         *) echo "" ;;
     esac
 }

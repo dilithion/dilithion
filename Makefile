@@ -1070,6 +1070,31 @@ genesis_all_networks_tests: $(CORE_OBJECTS) $(OBJ_DIR)/test/genesis_all_networks
 	@echo "$(COLOR_GREEN)✓ genesis_all_networks_tests built successfully$(COLOR_RESET)"
 
 # Phase 5 Day 5: regtest mode scaffold smoke test.
+# LP-10 A-9 (2026-09-08): TSan harness, concurrent-disconnect UAF. Build with
+# make TSAN=1 headerssync_disconnect_race_tsan  (Linux/WSL only; not MSYS2).
+headerssync_disconnect_race_tsan: $(CORE_OBJECTS) $(OBJ_DIR)/test/headerssync_disconnect_race_tsan.o $(DILITHIUM_OBJECTS) $(CHIAVDF_OBJECTS)
+	@echo "$(COLOR_BLUE)[LINK]$(COLOR_RESET) $@"
+	@$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS) $(LIBS)
+	@echo "$(COLOR_GREEN)✓ headerssync_disconnect_race_tsan built successfully$(COLOR_RESET)"
+
+# LP-10 deliverable 0b (2026-09-08): gate arming + armed-value reaches the gate.
+headerssync_gate_arming_tests: $(CORE_OBJECTS) $(OBJ_DIR)/test/headerssync_gate_arming_tests.o $(DILITHIUM_OBJECTS) $(CHIAVDF_OBJECTS)
+	@echo "$(COLOR_BLUE)[LINK]$(COLOR_RESET) $@"
+	@$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS) $(LIBS)
+	@echo "$(COLOR_GREEN)✓ headerssync_gate_arming_tests built successfully$(COLOR_RESET)"
+
+# LP-10 §2.0 (2026-09-08): PRESYNC accumulator seeding.
+headerssync_accumulator_seeding_tests: $(CORE_OBJECTS) $(OBJ_DIR)/test/headerssync_accumulator_seeding_tests.o $(DILITHIUM_OBJECTS) $(CHIAVDF_OBJECTS)
+	@echo "$(COLOR_BLUE)[LINK]$(COLOR_RESET) $@"
+	@$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS) $(LIBS)
+	@echo "$(COLOR_GREEN)✓ headerssync_accumulator_seeding_tests built successfully$(COLOR_RESET)"
+
+# LP-10 (2026-09-07): KAT pinning nMinimumChainWork + the work UNITS.
+minimum_chain_work_kat_tests: $(CORE_OBJECTS) $(OBJ_DIR)/test/minimum_chain_work_kat_tests.o $(DILITHIUM_OBJECTS) $(CHIAVDF_OBJECTS)
+	@echo "$(COLOR_BLUE)[LINK]$(COLOR_RESET) $@"
+	@$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS) $(LIBS)
+	@echo "$(COLOR_GREEN)✓ minimum_chain_work_kat_tests built successfully$(COLOR_RESET)"
+
 regtest_chainparams_smoke: $(CORE_OBJECTS) $(OBJ_DIR)/test/regtest_chainparams_smoke.o $(DILITHIUM_OBJECTS) $(CHIAVDF_OBJECTS)
 	@echo "$(COLOR_BLUE)[LINK]$(COLOR_RESET) $@"
 	@$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS) $(LIBS)
