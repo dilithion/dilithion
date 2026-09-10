@@ -202,29 +202,49 @@ HeadersSyncState::ProcessingResult HeadersSyncState::ProcessNextHeaders(
     result.success = false;
     result.request_more = false;
 
-    if (headers.empty()) {
-        // Empty headers message - peer has no more headers
-        if (m_download_state == State::PRESYNC) {
-            // Check if we have enough work to proceed
-            if (ChainWorkGreaterOrEqual(m_current_chain_work, m_minimum_required_work)) {
-                std::cout << "[HeadersSyncState] Peer " << m_id
-                          << " PRESYNC complete, transitioning to REDOWNLOAD" << std::endl;
-                EnterRedownloadPhase();   // LP-10 A-2: reseeds all five fields
-                result.success = true;
-                result.request_more = true;  // Request headers again for phase 2
-            } else {
-                std::cout << "[HeadersSyncState] Peer " << m_id
-                          << " insufficient chain work in PRESYNC" << std::endl;
-                Finalize();
-            }
-        } else if (m_download_state == State::REDOWNLOAD) {
-            // Finished redownloading
-            result.pow_validated_headers = PopHeadersReadyForAcceptance();
-            result.success = true;
-            Finalize();
-        }
-        return result;
-    }
+    // ⛔ LP-10 F5 / D-2 — AN EMPTY BATCH IS REFUSED, as upstream refuses it.
+    //
+    // Core v28.0 headerssync.cpp:74-75:
+    //     Assume(!received_headers.empty());
+    //     if (received_headers.empty()) return ret;
+    // An empty HEADERS message is the CALLER's business, not this state
+    // machine's.
+    //
+    // WHAT WAS HERE, AND WHY IT HAD TO GO. This function used to hang BOTH state
+    // transitions off `headers.empty()`: the PRESYNC -> REDOWNLOAD promotion and
+    // the REDOWNLOAD completion. That was invented, not ported. Its consequence
+    // was found TWICE by earlier reviews on this mission and fixed neither time:
+    //
+    //   REVIEW_grill_substitute_r2.md:143 — the below-threshold rejection "is
+    //     reached ONLY when headers.empty()", and the non-empty PRESYNC branch
+    //     "does nothing at all" on failure, so "a test that feeds a
+    //     below-threshold chain and then stops observes NO REJECTION EVER — it
+    //     just keeps being asked for more."
+    //   REVIEW_port_189.md:29 — the gate "fires only on an empty headers batch".
+    //
+    // Both described it as a hazard for whoever writes the tests. It was a port
+    // defect, and the tests had been shaped around it: every arm in this mission
+    // that needed a phase change sent an empty batch.
+    //
+    // NOTHING IS LOST BY REMOVING IT, because D-1 restored the signal that
+    // upstream uses for the same purposes:
+    //   * promotion — the work check inside the PRESYNC branch below already
+    //     calls EnterRedownloadPhase the moment cumulative work crosses the
+    //     threshold, which is Core's behaviour and always was;
+    //   * "the peer has nothing more" — a NON-FULL headers message, which D-1
+    //     made an abort at both phases;
+    //   * REDOWNLOAD completion — `m_header_commitments.empty()` in the
+    //     REDOWNLOAD branch below, which is what actually means "done".
+    // The empty batch was a fourth, redundant, invented signal, and it was the
+    // only one any test used.
+    //
+    // ⚠️ D-5 IS DELIBERATELY NOT PORTED HERE. Core also guards
+    // `m_download_state != State::FINAL` on entry (:54, :77); ours does not, and a
+    // call after Finalize() silently returns success = false, so a caller bug
+    // reads as a peer failure. That is a separate divergence, tracked in
+    // FINDING_F5_state_machine_divergences.md, and it gets its own change rather
+    // than riding along in this one.
+    if (headers.empty()) return result;
 
     if (m_download_state == State::PRESYNC) {
         // Phase 1: Build commitments

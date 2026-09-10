@@ -37,6 +37,7 @@
 // compares absolute work against an absolute threshold.
 
 #include <net/headerssync.h>
+#include <net/iheader_proof_checker.h>
 
 #include <consensus/chain_work.h>
 #include <core/chainparams.h>
@@ -68,28 +69,72 @@ const char* StateName(HeadersSyncState::State s)
     return "?";
 }
 
+// Accepts every proof, so the only variable across arms stays the SEED.
+// Required since LP-10 F5/D-2: this driver used to send an EMPTY batch, which the
+// state machine now refuses (Core v28.0 headerssync.cpp:74), so it must send real
+// headers — and a real header needs a checker.
+class AlwaysValidChecker final : public ::dilithion::net::IHeaderProofChecker {
+public:
+    bool CheckHeaderProof(const CBlockHeader&) const override { return true; }
+    uint256 ChainWorkContribution(const CBlockHeader& h) const override
+    {
+        return dilithion::consensus::ComputeChainWork(h.nBits);
+    }
+    bool ChainWorkGreaterThan(const uint256& a, const uint256& b) const override
+    {
+        for (int i = 31; i >= 0; --i) {
+            if (a.data[i] > b.data[i]) return true;
+            if (a.data[i] < b.data[i]) return false;
+        }
+        return false;
+    }
+};
+
 // Drive one PRESYNC decision with a given seed, and report where it lands.
-// An empty headers message is the branch that evaluates the work comparison
-// and either promotes to REDOWNLOAD or finalises the peer.
+//
+// ⛔ REWRITTEN FOR LP-10 F5/D-2, AND THE OLD SHAPE IS WHY IT NEEDED REWRITING.
+// It used to send an EMPTY batch, because that was the only way this port
+// evaluated the work comparison. Core refuses an empty batch outright
+// (headerssync.cpp:74) — the empty-batch transition was invented here, and every
+// arm in this mission had been built on it. With D-2 the batch is real and the
+// decision rides Core's own signals.
+//
+// ONE VARIABLE STILL, WHICH IS THE POINT OF THE PAIR. Both arms send the same
+// single header with full_headers_available = FALSE, so:
+//   * seed >= threshold -> the work check promotes to REDOWNLOAD, `just_promoted`
+//     keeps request_more true, and no abort fires;
+//   * seed <  threshold -> no promotion, and a NON-full message means the peer's
+//     chain has ended (Core :91), so the sync aborts to FINAL.
+// The seed alone decides, exactly as before.
 HeadersSyncState::State RunPresyncDecision(const uint256& chain_start_work,
                                            const uint256& minimum_work)
 {
     HeadersSyncParams params;
     uint256 start_hash;
-    start_hash.data[0] = 0xA1;  // opaque; this path never dereferences it
+    start_hash.data[0] = 0xA1;
 
+    AlwaysValidChecker checker;
     HeadersSyncState state(/*peer_id=*/1, params, start_hash,
                            /*chain_start_height=*/54000,
-                           chain_start_work, minimum_work,
-                           /*proof_checker=*/nullptr);
+                           chain_start_work, minimum_work, &checker);
 
-    const std::vector<CBlockHeader> no_more_headers;
-    state.ProcessNextHeaders(no_more_headers, true);
+    // A VDF header: linking needs GetHash(), and a RandomX header's GetHash()
+    // throws outside a mining context. The checker accepts either way.
+    CBlockHeader h;
+    h.nVersion = CBlockHeader::VDF_VERSION;
+    h.nBits    = 0x1d00ffff;
+    h.nTime    = 1700000000;
+    h.nNonce   = 0;
+    h.hashPrevBlock = start_hash;
+    for (int i = 0; i < 32; ++i) h.vdfProofHash.data[i] = 0x42;
+    for (int i = 0; i < 32; ++i) h.vdfOutput.data[i]    = 0x37;
+
+    state.ProcessNextHeaders({h}, /*full_headers_available=*/false);
     return state.GetState();
 }
 
-// The discriminating pair. Same threshold, same peer, same empty-headers
-// message -- ONLY the seed differs. If both arms landed in the same state the
+// The discriminating pair. Same threshold, same peer, same single-header
+// non-full message -- ONLY the seed differs. If both arms landed in the same state the
 // test would be certifying nothing, which is the failure mode this whole
 // mission exists to close.
 void test_seeded_accumulator_clears_an_absolute_threshold()

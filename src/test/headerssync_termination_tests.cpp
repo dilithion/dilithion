@@ -337,6 +337,64 @@ void test_the_phase_observable_reports_the_state_machines_own_field()
     std::cout << " OK" << std::endl;
 }
 
+
+// ============================================================================
+// F5 / D-2 — AN EMPTY BATCH IS REFUSED (Core headerssync.cpp:74)
+// ============================================================================
+//
+// ⛔ THIS ARM IS THE ONE THAT PINS D-2, AND WITHOUT IT THE OTHERS DO NOT.
+// The suites that used to drive phase changes with an empty batch were all
+// re-derived onto real headers, so every one of them passes whether or not the
+// empty-batch transition still exists. Restoring that invented transition would
+// have SURVIVED the whole re-derived suite set — measured, not assumed: the
+// mutation run was stopped once that became clear, and this arm written before
+// it was re-run.
+//
+// Core refuses the case outright:
+//     Assume(!received_headers.empty());
+//     if (received_headers.empty()) return ret;
+// An empty HEADERS message is the CALLER's business. Ours used to hang BOTH
+// state transitions off it — invented, not ported.
+void test_an_empty_batch_is_refused_and_changes_nothing()
+{
+    std::cout << "  test_an_empty_batch_is_refused_and_changes_nothing..." << std::flush;
+
+    HeadersSyncParams params;
+    AlwaysValidChecker checker;
+
+    // Seeded AT the threshold, so under the OLD code an empty batch would have
+    // promoted to REDOWNLOAD. That is precisely what must no longer happen.
+    uint256 threshold;
+    for (int i = 0; i < 1000; ++i)
+        threshold = AddChainWork(threshold, ComputeChainWork(0x1d00ffff));
+
+    HeadersSyncState state(/*peer_id=*/1, params, ChainStartHash(),
+                           /*chain_start_height=*/0,
+                           /*chain_start_work=*/threshold, threshold, &checker);
+
+    const auto r = state.ProcessNextHeaders({}, /*full_headers_available=*/true);
+
+    RequireTrue("empty batch reports failure", !r.success);
+    RequireTrue("empty batch does not ask for more", !r.request_more);
+    RequireTrue("empty batch returns no headers", r.pow_validated_headers.empty());
+    // THE LOAD-BEARING ONE: no state transition. Under the old code this same
+    // call promoted to REDOWNLOAD.
+    RequireTrue("empty batch does NOT change phase",
+                state.GetState() == HeadersSyncState::State::PRESYNC);
+
+    // THE DISCRIMINATING HALF. Without it, a state machine that refused
+    // EVERYTHING would pass every assertion above. The same seeded state, given a
+    // real header, must still promote.
+    HeadersSyncState live(/*peer_id=*/2, params, ChainStartHash(),
+                          /*chain_start_height=*/0,
+                          /*chain_start_work=*/threshold, threshold, &checker);
+    live.ProcessNextHeaders(LinkedChain(1), /*full_headers_available=*/true);
+    RequireTrue("a REAL batch still promotes",
+                live.GetState() == HeadersSyncState::State::REDOWNLOAD);
+
+    std::cout << " OK" << std::endl;
+}
+
 int main()
 {
     // CHeadersManager reads chainparams during construction, so the manager-level
@@ -350,6 +408,7 @@ int main()
     test_presync_short_batch_ends_the_sync();
     test_redownload_full_batch_keeps_asking();
     test_redownload_short_batch_gives_up_but_keeps_its_headers();
+    test_an_empty_batch_is_refused_and_changes_nothing();
     test_the_phase_observable_reports_the_state_machines_own_field();
     std::cout << "\nheaderssync_termination_tests: ALL PASS" << std::endl;
     return 0;

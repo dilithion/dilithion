@@ -201,13 +201,18 @@ bool RedownloadAcceptsBatch(const std::vector<CBlockHeader>& phase2)
                            /*chain_start_height=*/0,
                            /*chain_start_work=*/Threshold(), Threshold(), &checker);
 
-    // Promote with an EMPTY batch, the branch that evaluates the work comparison.
-    // chain_start_work is seeded AT the threshold, so PRESYNC is satisfied
-    // immediately. Feeding phase-1 headers BEFORE this call was measured to leave
-    // the state somewhere other than REDOWNLOAD by the time the empty batch
-    // returned — the arm below caught it. Which state it lands in was not
-    // measured and is not claimed here; one call is enough for this arm.
-    state.ProcessNextHeaders({}, /*full_headers_available=*/true);
+    // ⛔ REWRITTEN FOR LP-10 F5/D-2. This used to promote by sending an EMPTY
+    // batch — the invented transition Core refuses outright (headerssync.cpp:74).
+    // Now it promotes the way upstream does: a REAL batch whose cumulative work
+    // crosses the threshold. chain_start_work is seeded AT the threshold, so one
+    // honest header is enough, and the work check inside the PRESYNC branch calls
+    // EnterRedownloadPhase before this call returns.
+    //
+    // full_headers_available = true here so the promotion is the ONLY thing under
+    // way; a non-full batch would also abort if the work check had not fired, and
+    // this helper exists to reach REDOWNLOAD, not to test termination.
+    state.ProcessNextHeaders({MakeHeader(0x1d00ffff, ChainStartHash(), /*vdf=*/true)},
+                             /*full_headers_available=*/true);
     REQUIRE(state.GetState() == HeadersSyncState::State::REDOWNLOAD);
 
     return state.ProcessNextHeaders(phase2, /*full_headers_available=*/true).success;
