@@ -292,10 +292,21 @@ ThreadMessageHandler (msghand thread):
 === All Phase 6 Tests Passed! (12 tests) ===
 ```
 
+⚠️ **The transcript above is HISTORICAL and its throughput line is retired.** That
+run pushed 10,000 messages through a queue capped at 1,000, so ~90% of them were
+discarded and the figure measures the discard path, not queue throughput. The
+scenario was rewritten (see the cap entries above) and now reports a rate over a
+batch that fits under the cap. Kept as a record of what Phase 6 reported at the
+time rather than deleted, because the number is quoted elsewhere.
+
 ### Deliverables
-- [x] All unit/integration tests pass (12/12)
+- [x] All unit/integration tests pass (13/13)
 - [x] BUG #134 confirmed fixed (handshake timing)
-- [x] Performance validated (1.5M msg/sec throughput)
+- [x] Both queue caps pinned — process queue keeps the NEWEST, send queue keeps
+      the OLDEST, and each cap's EXISTENCE is asserted separately from its policy
+- [ ] Performance re-validated — the old "1.5M msg/sec" claim is withdrawn (it
+      measured a mostly-discarding run); a like-for-like figure over a batch that
+      fits under the cap has not been recorded here yet
 
 ---
 
