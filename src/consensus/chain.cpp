@@ -2793,11 +2793,30 @@ bool CChainState::DisconnectTip(CBlockIndex* pindex, bool force_skip_utxo) {
     // P2P-14/15 fixed for the TIP callback — a consumer that takes its own
     // lock here creates a cs_main → <consumer lock> edge.
     //
-    // The behaviour is NOT changed here: rerouting the block connect/disconnect
-    // callback families through a deferred drain is a separate contract with
-    // its own consumers (wallet, txindex, coinstatsindex, ZMQ) to audit. Only
-    // the false claim is removed, so nobody builds on it. The wallet's own
-    // cs_wallet does not make the ordering safe — it is what would deadlock.
+    // ⚠️ STATUS UPDATED 2026-09-10 — read this instead of assuming a fix landed.
+    //
+    // P2P-14/15 corrected the false CLAIM above. It did NOT change the routing,
+    // and the routing is NOT going to change: a deferred drain was considered
+    // for these two families and REJECTED. The tip drain works because its
+    // payload is an 80-byte CBlockHeader; these callbacks carry a whole CBlock,
+    // so deferring them would buffer blocks proportional to REORG DEPTH — an
+    // attacker-influenced memory cost, i.e. spending a memory lever to close a
+    // lock-order class. Callbacks therefore keep firing with cs_main HELD, on
+    // purpose, and that is now a documented property rather than an oversight.
+    //
+    // THE CLASS IS CLOSED FROM THE OTHER SIDE. cs_main -> <consumer lock> only
+    // deadlocks if something supplies <consumer lock> -> cs_main. That reverse
+    // edge is what scripts/check-no-private-mutex-across-chainstate.sh now fails
+    // the build on, tree-wide, wired into tests-fast/tests-full (register
+    // P2P-17, which was exactly such a reverse edge and is fixed).
+    //
+    // So the rule for anyone adding a consumer here: your callback runs with
+    // cs_main HELD. Take your own lock if you must, but you may NOT hold it
+    // across a call that takes cs_main. The guard enforces that; review does not.
+    //
+    // Residual, so the guarantee is not over-read: the guard matches direct
+    // g_chainstate. calls. A consumer that reaches cs_main INDIRECTLY, through
+    // another object, is not caught.
     for (size_t i = 0; i < m_blockDisconnectCallbacks.size(); ++i) {
         try {
             m_blockDisconnectCallbacks[i](block, disconnectHeight, disconnectHash);
