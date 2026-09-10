@@ -196,7 +196,7 @@ HeadersSyncState::HeadersSyncState(
 
 HeadersSyncState::ProcessingResult HeadersSyncState::ProcessNextHeaders(
     const std::vector<CBlockHeader>& headers,
-    bool /* full_headers_available */)
+    bool full_headers_available)
 {
     ProcessingResult result;
     result.success = false;
@@ -243,8 +243,34 @@ HeadersSyncState::ProcessingResult HeadersSyncState::ProcessNextHeaders(
             EnterRedownloadPhase();   // LP-10 A-2: reseeds all five fields
         }
 
+        // ⛔ LP-10 F5 / D-1 — THE SYNC-TERMINATION SIGNAL, RESTORED.
+        // This parameter was declared and its NAME commented out, so the abort
+        // below did not exist and a peer answering with SHORT batches was treated
+        // exactly like one answering with full ones: request_more was
+        // unconditionally true and we kept asking.
+        //
+        // Core v28.0 headerssync.cpp:86 — a FULL message means the peer may have
+        // more; so does having just switched to REDOWNLOAD, which needs the chain
+        // re-requested from the beginning. Anything else (:91): "If we're in
+        // PRESYNC and we get a non-full headers message, then the peer's chain has
+        // ended and definitely doesn't have enough work, so we can stop our sync."
+        //
+        // Read AFTER the promotion check above, exactly as Core does — a batch
+        // that both completed the work threshold AND was short must still be
+        // re-requested for phase 2.
+        const bool just_promoted = (m_download_state == State::REDOWNLOAD);
+
         result.success = true;
-        result.request_more = true;
+        result.request_more = full_headers_available || just_promoted;
+
+        if (!result.request_more) {
+            std::cout << "[HeadersSyncState] Peer " << m_id
+                      << " sync aborted: incomplete headers message at height "
+                      << m_current_height
+                      << " (presync) — the chain has ended below the threshold"
+                      << std::endl;
+            Finalize();
+        }
 
     } else if (m_download_state == State::REDOWNLOAD) {
         // Phase 2: Validate against commitments
@@ -282,10 +308,27 @@ HeadersSyncState::ProcessingResult HeadersSyncState::ProcessNextHeaders(
             result.pow_validated_headers = PopHeadersReadyForAcceptance();
         }
 
+        // LP-10 F5 / D-1, the REDOWNLOAD half. Core v28.0 headerssync.cpp:127:
+        // "For some reason our peer gave us a high-work chain, but is now
+        // declining to serve us that full chain again. Give up."
+        //
+        // success stays TRUE in that case, and deliberately — the headers in THIS
+        // batch were validated against their commitments and there is simply
+        // nothing further to do. Core says so in as many words: "there's no more
+        // processing to be done with these headers, so we can still return
+        // success." Turning it into a failure would discard good headers and, once
+        // A-3 wires the reject reasons, would score a peer for stopping early.
         result.success = true;
-        result.request_more = !finished;
+        result.request_more = !finished && full_headers_available;
 
-        if (finished) {
+        if (!result.request_more) {
+            if (!finished) {
+                std::cout << "[HeadersSyncState] Peer " << m_id
+                          << " sync aborted: incomplete headers message at height "
+                          << m_redownload_buffer_last_height
+                          << " (redownload) — peer is declining to re-serve its own"
+                             " chain" << std::endl;
+            }
             Finalize();
         }
     }

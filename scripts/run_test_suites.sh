@@ -281,6 +281,7 @@ fast|chain_case_2_5_equivalence_tests|180|UNTRIAGED: scenario_2 (connect-replace
 fast|headerssync_gate_arming_tests|120||
 fast|headerssync_accumulator_seeding_tests|120||
 fast|headerssync_work_bound_tests|120||
+fast|headerssync_termination_tests|120||
 fast|minimum_chain_work_kat_tests|120||
 fast|vdf_consensus_test|300||
 fast|vdf_lottery_test|300||
