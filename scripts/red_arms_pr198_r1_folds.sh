@@ -69,14 +69,19 @@ arm() {
   fi
   ./deferred_reclamation_tests > /tmp/r1_mut_run.out 2>&1
   local ec=$?
-  if [ $ec -eq 0 ]; then
+  # ⚠️ THE SURVIVAL CHECK IS NOT UNIVERSAL, AND PUTTING IT FIRST BROKE AN ARM. For
+  # an INVERTED arm (kind=nesting) the mutant surviving IS the evidence: the fix's
+  # own signature is a process abort, which a suite cannot assert from the inside.
+  # A verdict rule that assumes every arm has the same shape is the same mistake as
+  # accepting any non-zero exit — one level up.
+  if [ $ec -eq 0 ] && [ "$kind" != "nesting" ]; then
       echo "   FAIL  $label: THE MUTANT SURVIVED — the arm does not guard this fix"
       rc=$((rc+1)); restore; return
   fi
 
   case "$kind" in
     assert)
-      if grep -q "FAIL  $expect" /tmp/r1_mut_run.out; then
+      if grep -qF "FAIL  $expect" /tmp/r1_mut_run.out; then
           echo "   PASS  $label: killed by its named assertion (exit $ec)"
           grep -m2 "FAIL  " /tmp/r1_mut_run.out | sed 's/^/         /'
       else
@@ -92,11 +97,26 @@ arm() {
       # for its own refusals too -- and a positional marker is not enough either:
       # the abort happens wherever the first qualifying drain is, which moves as
       # arms are added. Naming the invariant pins WHICH check fired.
-      if [ $ec -eq 3 ] && grep -q "$expect" /tmp/r1_mut_run.out; then
+      if [ $ec -eq 3 ] && grep -qF "$expect" /tmp/r1_mut_run.out; then
           echo "   PASS  $label: aborted on the reinstated invariant, past \"$expect\" (exit 3)"
           tail -2 /tmp/r1_mut_run.out | sed 's/^/         /'
       else
           echo "   FAIL  $label: expected an abort past \"$expect\", got exit $ec"
+          tail -3 /tmp/r1_mut_run.out | sed 's/^/         /'
+          rc=$((rc+1))
+      fi ;;
+    nesting)
+      # The illegal nest ABORTS on the real tree — a test cannot catch a
+      # ConsensusInvariant and keep running, so the suite's own abort is the fix's
+      # signature and cannot be asserted from inside the suite. With the refusal
+      # REMOVED the nest is silently accepted and the suite passes, which is what
+      # this arm observes. It is therefore an inverted arm: the mutant SURVIVING is
+      # the evidence, and the fix's value is that the same nest aborts without it.
+      if [ $ec -eq 0 ]; then
+          echo "   PASS  $label: refusal removed => the illegal nest is silently accepted"
+          echo "         (on the real tree that same nest aborts; that is the fix)"
+      else
+          echo "   FAIL  $label: expected the mutant to ACCEPT the nest, got exit $ec"
           tail -3 /tmp/r1_mut_run.out | sed 's/^/         /'
           rc=$((rc+1))
       fi ;;
@@ -142,6 +162,27 @@ assert 'MUTANT: erased at unlink' in io.open(p,encoding='utf-8').read()
 print('MUTATED')
 " "CONSENSUS INVARIANT VIOLATION: it_deg != m_inDegree.end()" abort
 
+arm "F13 - reentrancy refusal removed (offline nested in offline)" "
+import io
+p='$CHAIN'; s=io.open(p,encoding='utf-8').read()
+old='    ConsensusInvariant(!t_epoch_offline);'
+assert s.count(old)==1, ('anchor',s.count(old))
+s=s.replace(old,'    // MUTANT: nesting allowed again',1)
+io.open(p,'w',encoding='utf-8',newline='').write(s)
+assert 'MUTANT: nesting allowed' in io.open(p,encoding='utf-8').read()
+print('MUTATED')
+" "F13-NESTING" nesting
+
+arm "F15 - re-record after a quiesce-withdraw removed" "
+import io
+p='$CHAIN'; s=io.open(p,encoding='utf-8').read()
+old='        t_recorded_reset_for_reresolve = true;'
+assert s.count(old)==1, ('anchor',s.count(old))
+s=s.replace(old,'        return;   // MUTANT: re-enter only, accusation never restored',1)
+io.open(p,'w',encoding='utf-8',newline='').write(s)
+assert 'MUTANT: re-enter only' in io.open(p,encoding='utf-8').read()
+print('MUTATED')
+" "F15: a resolve after a quiesce RE-RECORDS the accusation"
 echo
 echo "=== the tree is back where it started ==="
 if same "$CHAIN" "$BAK"; then echo "   PASS  $CHAIN is byte-identical to the saved baseline"; else echo "   FAIL"; rc=$((rc+1)); fi

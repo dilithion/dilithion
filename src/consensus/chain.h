@@ -285,13 +285,21 @@ private:
     //     vector : drain max 19.3 ms, mean 1.0 ms
     //     deque  : drain max 28.0 ms, mean 1.5 ms
     //
-    // The deque is ~45% WORSE at the scale that occurs, because a GraveyardEntry is
-    // 16 bytes and moving a 100,000-entry suffix is a ~1.6 MB contiguous move,
-    // while the deque pays chunked iteration and per-element destruction across
-    // segments. The asymptotics only overtake the constant factor at a G the
-    // MEMORY ceiling reaches first: at the measured 47 MB peak the suffix move is
-    // ~2.5 MB, and long before erase cost matters the node is out of RAM for other
-    // reasons.
+    // The deque is ~45% WORSE at the measured size, because a GraveyardEntry is 16
+    // bytes and moving a ~100,000-entry suffix is a bulk move of contiguous
+    // trivially-relocatable-in-practice data, while the deque pays chunked
+    // iteration and per-element destruction across segments. (The move is a
+    // sequence of unique_ptr moves, NOT a specified memmove -- the compiler is free
+    // to emit one and typically does, but the standard does not promise it.)
+    //
+    // ⚠️ THE TRIGGER IS A BUDGET, NOT A "MEMORY CEILING". An earlier version of
+    // this comment argued the asymptotics never win because the node runs out of
+    // RAM first; that is a hand-wave, not a bound. The supported workload is the
+    // one measured: ~10,400 evictions/s with a slowest participant of ~10 s, giving
+    // G in the 10^5 range. REVISIT THIS CHOICE IF EITHER of these is breached:
+    // a drain hold above ~50 ms under cs_main, or a graveyard above ~10^6 entries.
+    // Both are reported by graveyard_occupancy_bench on every run, so the trigger
+    // is observable rather than remembered.
     //
     // Reverted on the measurement, not on preference, and recorded here so the next
     // reader does not re-derive the same "obviously a deque" conclusion from the
@@ -431,7 +439,14 @@ public:
      */
     void SetEpochHoldTrackingForTest(bool on);
 
-    /** Adjust this thread's declared hold count. Use EpochPointerHold, not this. */
+    /**
+     * Adjust this thread's declared hold count. ⚠️ NOT FOR DIRECT USE — it is
+     * public only because EpochPointerHold is a free class, and a caller passing a
+     * negative delta by hand can drive the count below what it holds and defeat
+     * the boundary assertions. The implementation refuses a negative result; use
+     * EpochPointerHold, whose constructor and destructor are the only balanced
+     * pair.
+     */
     static void NoteEpochPointerHeld(int delta);
 
     /** Test-only: how many in-degree rows exist (live entries plus graveyard). */

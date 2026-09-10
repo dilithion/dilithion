@@ -445,6 +445,13 @@ int CWebSocketServer::SocketRead(WebSocketConnection& connection, void* buffer, 
 }
 
 int CWebSocketServer::SocketWrite(WebSocketConnection& connection, const void* buffer, int size) {
+    // OFFLINE ACROSS THE WRITE, the same rule as the RPC server's socket_write: a
+    // slow client stalls the send and an online thread pins every eviction for the
+    // duration. Every websocket response leaves through here, which is why this one
+    // helper covers the write side. Same CONTRACT as the RPC site and with the same
+    // limit: it rests on no caller holding a resolved CBlockIndex* across the
+    // write, which is a census of today's callers, not an enforced property.
+    EpochOfflineScope offline(&g_chainstate, "websocket-server");
     if (connection.is_ssl && connection.ssl && m_ssl_wrapper) {
         return m_ssl_wrapper->SSLWrite(connection.ssl, buffer, size);
     } else {

@@ -285,6 +285,16 @@ void CHttpServer::WorkerThread() {
             // The scope re-enters before HandleRequest, which is what resolves.
             EpochOfflineScope offline(&g_chainstate, "http-worker");
             got_work = m_work_queue.Dequeue(client_socket);
+            // ⚠️ COVERAGE LIMIT, STATED RATHER THAN IMPLIED: this thread's WRITE
+            // side is NOT offline. The RPC server funnels every response through
+            // one socket_write lambda and the websocket through one SocketWrite, so
+            // both were wired; http_server has no such funnel -- SendResponse plus
+            // a dozen raw send() calls scattered through HandleRequest -- so an
+            // HTTP response to a slow client is written while this thread is
+            // ONLINE and pins for the duration of the send. Bounded by the socket
+            // timeouts set on the client socket, not by anything here. Wiring it
+            // means routing every write through one helper first, which is a
+            // refactor of this file and not this PR's scope.
         }
         if (!got_work) {
             break;  // Shutdown signaled

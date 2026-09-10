@@ -443,6 +443,10 @@ thread_local int t_epoch_holds = 0;
 // OFFLINE = "I am blocked and hold nothing". See CChainState::EpochQuiesce.
 thread_local bool t_epoch_offline = false;
 
+// Set when a resolve-while-offline re-enters, so the accusation the quiesce
+// withdrew is restored on the way back through (see NoteIndexPointerResolved).
+thread_local bool t_recorded_reset_for_reresolve = false;
+
 // Count of resolves that happened while a thread was OFFLINE. That is a design
 // error — a thread must re-enter before it resolves — and it is made SAFE here
 // (the resolve re-enters immediately, under cs_main, before the pointer escapes)
@@ -580,6 +584,37 @@ void NoteIndexPointerResolved(uint64_t current_epoch)
         g_offline_resolves.fetch_add(1, std::memory_order_relaxed);
         t_epoch_offline = false;
         t_epoch_slot->store(current_epoch, std::memory_order_release);
+
+        // ⚠️ RE-RECORD, BECAUSE THE QUIESCE WITHDREW THE ACCUSATION. A thread that
+        // was accused (slot 0, pinning) and then parked had its record withdrawn by
+        // EpochQuiesce — correctly, since parking claims it holds nothing. If it
+        // now resolves anyway, the claim is false and the accusation must come
+        // back: re-entering at `current_epoch` alone pins only what is unlinked
+        // AFTER this moment, and the census would report the thread as clean while
+        // it holds a pointer it took after promising it would not.
+        //
+        // The recording path below does exactly that, so fall through to it rather
+        // than returning here. The slot is already non-null, so it is not
+        // re-created at 0 — the epoch published above is the correct pin for a
+        // pointer resolved at this instant, under cs_main, while the entry is still
+        // linked.
+        t_recorded_reset_for_reresolve = true;
+    }
+
+    // A thread that came back online through the path above re-records below, so
+    // that a quiesce-withdrawn accusation is restored the moment its claim is
+    // falsified.
+    if (t_recorded_reset_for_reresolve) {
+        t_recorded_reset_for_reresolve = false;
+        auto& u2 = Unregistered();
+        UnregisteredRecordScope& me2 = t_unregistered_scope;
+        if (!me2.recorded) {
+            me2.recorded = true;
+            me2.id = std::this_thread::get_id();
+            std::lock_guard<std::mutex> lk2(u2.mu);
+            if (u2.ids.size() < MAX_RECORDED_OFFENDERS) u2.ids.push_back(me2.id);
+            else ++u2.overflow;
+        }
         return;
     }
 
@@ -677,6 +712,23 @@ void CChainState::EpochCheckpoint(const char* name)
 
     // Answer the declaration made at this thread's spawn site. Once only: the
     // name is passed on every loop iteration and this costs a predicted branch.
+    // ⚠️ ONE THREAD, ONE NAME — AND NOTHING CHECKED IT. `t_epoch_name` is set by
+    // the FIRST named checkpoint and never revisited, so a thread that registers as
+    // "rpc-accept" and later checkpoints as "rpc-worker" silently keeps the first
+    // name: the second pool's registration count comes up short and the census
+    // either fails for an invented reason or is satisfied by the wrong thread. The
+    // scopes make this easy to do by accident, because a name is chosen per SITE
+    // while a slot belongs to a THREAD. Refuse it out loud.
+    if (name != nullptr && t_epoch_name != nullptr &&
+        std::strcmp(name, t_epoch_name) != 0) {
+        std::cerr << "[Chain] FATAL: thread registered as '" << t_epoch_name
+                  << "' is now checkpointing as '" << name
+                  << "'. A thread must carry ONE participant name: slots belong to "
+                  << "threads, names to declarations, and the census compares "
+                  << "counts per name." << std::endl;
+        ConsensusInvariant(false);
+    }
+
     if (name != nullptr && t_epoch_name == nullptr) {
         t_epoch_name = name;
         std::lock_guard<std::mutex> lk(Registry().mu);
@@ -703,6 +755,24 @@ void CChainState::EpochQuiesce()
     // quiescent-state calculation entirely, exactly as a thread that has exited
     // does, and re-enters BEFORE it resolves anything. EpochOfflineScope pairs the
     // two so no wake path can forget the second half.
+    // ⚠️ ORDER MATTERS, AND IT WAS WRONG: THE CHECKS COME FIRST. This used to
+    // withdraw the accusation and publish RETIRED and only then assert the hold
+    // count — so a thread quiescing with a pointer in hand had already unpinned
+    // itself and dropped its own accusation before anything objected. On a build
+    // where the invariant does not abort, the damage was done. Check, then act.
+    if (g_epoch_hold_tracking.load(std::memory_order_relaxed)) {
+        ConsensusInvariant(t_epoch_holds == 0);
+    }
+
+    // ⚠️ NOT REENTRANT, AND NESTING SILENTLY CANCELS THE OUTER PARK. t_epoch_offline
+    // is a bool, so an inner scope's destructor re-enters the thread while the outer
+    // scope still believes it is parked — and HandleClient's scope can lexically
+    // enclose socket_write's. A counter would make nesting "work" and hide the
+    // design error; refusing it says what the scopes actually mean. The ONE legal
+    // nest is EpochOnlineWindow inside an EpochOfflineScope, which is the opposite
+    // direction and goes through EpochCheckpoint, not here.
+    ConsensusInvariant(!t_epoch_offline);
+
     // ⚠️ GOING OFFLINE IS A CLAIM, AND THE ACCUSATION IS THE SAME CLAIM INVERTED.
     // A thread recorded as an unregistered resolver holds a slot at 0 and pins
     // everything. If it then parks, the slot goes RETIRED and it stops pinning —
@@ -714,15 +784,6 @@ void CChainState::EpochQuiesce()
     t_epoch_offline = true;
     MyEpochSlot()->store(EPOCH_SLOT_RETIRED, std::memory_order_release);
 
-    // TEST-TIME ENFORCEMENT OF THE CONTRACT THIS SCOPE CANNOT OTHERWISE CHECK.
-    // "Offline" means "I hold no CBlockIndex*", and nothing in the type system
-    // stops a caller from quiescing with one in hand — the seats called it an
-    // honour system, correctly. When hold-tracking is on (tests only), a pointer
-    // declared held via EpochPointerHold makes this fire instead of silently
-    // publishing a false claim.
-    if (g_epoch_hold_tracking.load(std::memory_order_relaxed)) {
-        ConsensusInvariant(t_epoch_holds == 0);
-    }
 }
 
 uint64_t CChainState::OfflineResolveCount()
@@ -860,8 +921,11 @@ void CChainState::SetEpochHoldTrackingForTest(bool on)
 
 void CChainState::NoteEpochPointerHeld(int delta)
 {
+    // Refuse the unbalanced call rather than absorbing it: a stray -1 would drive
+    // the count under the holds a caller really has and quietly disable the
+    // boundary assertions, which is worse than no tracking at all.
+    ConsensusInvariant(t_epoch_holds + delta >= 0);
     t_epoch_holds += delta;
-    ConsensusInvariant(t_epoch_holds >= 0);
 }
 
 void CChainState::SetDeepDrainInvariantsForTest(bool on)
@@ -960,9 +1024,14 @@ size_t CChainState::DrainGraveyard()
     // they strictly increase, and entries are appended in that order. The first
     // entry answers "is anything freeable at all?" in O(1), and a binary search
     // finds the cutoff in O(log G). Only the freed prefix is touched.
-    // The fast path's premise, checked in production at O(1) rather than assumed:
-    // the front stamp must be the smallest. A cheap guard on the one property that
-    // would make the early-out and the binary search silently wrong.
+    // ⚠️ AN ENDPOINT SANITY CHECK, NOT A SORTEDNESS PROOF — and calling it the
+    // latter was wrong. `front < back` passes for [2, 1, 3]: it cannot detect an
+    // out-of-order interior, which is exactly what would break the binary search.
+    // It is here because it is O(1) and catches a gross inversion (a stamp assigned
+    // out of order, a container mutated elsewhere); the REAL guarantee comes from
+    // the append path, where stamps are taken from fetch_add under cs_main and
+    // therefore increase by construction. The full check runs under the deep-drain
+    // switch below.
     ConsensusInvariant(m_graveyard.size() < 2 ||
                        m_graveyard.front().unlinked_epoch <
                            m_graveyard.back().unlinked_epoch);
@@ -1036,8 +1105,11 @@ size_t CChainState::DrainGraveyard()
         ++freed;
     }
 
-    // Only the freed prefix is erased; survivors keep their order and their stamps,
-    // so the next call's O(1) early-out still holds.
+    // The freed prefix is erased and the survivors keep their order and their
+    // stamps, so the next call's O(1) early-out still holds. NOTE the survivors ARE
+    // touched: erase moves them down. An earlier comment here claimed "only the
+    // freed prefix is touched", which is the opposite of what a vector erase does
+    // and would have misled the next reader about the cost.
     //
     // ⚠️ THIS ERASE MOVES THE SURVIVING SUFFIX, AND THAT IS A DELIBERATE,
     // MEASURED CHOICE. An external seat flagged it as O(G) per partial reclamation

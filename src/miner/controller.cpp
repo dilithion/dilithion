@@ -278,15 +278,13 @@ bool CMiningController::StartMining(const CBlockTemplate& blockTemplate) {
     m_workers.reserve(m_nThreads);
     for (uint32_t i = 0; i < m_nThreads; ++i) {
         m_workers.emplace_back(&CMiningController::MiningWorker, this, i);
+        // ⚠️ DECLARED PER SUCCESSFUL SPAWN. Declaring the total after the loop is
+        // skipped ENTIRELY if a std::thread constructor throws partway through --
+        // the exception leaves StartMining before the declaration, so the workers
+        // that DID start run undeclared. One declaration per thread that actually
+        // exists makes the count honest on every path out of this loop.
+        g_chainstate.DeclareEpochParticipant("mining-worker", 1);
     }
-
-    // ⚠️ DECLARED AFTER THE SPAWNS, AND WITH THE COUNT THAT ACTUALLY STARTED. A
-    // declaration made before the loop promises m_nThreads participants; if a
-    // std::thread constructor throws partway through, the promise outlives the
-    // threads and the census refuses a node over workers that do not exist.
-    // m_workers.size() is what started. (Conditional: mining off means never
-    // declared, so a non-mining node's census does not expect them at all.)
-    g_chainstate.DeclareEpochParticipant("mining-worker", m_workers.size());
 
     // Start hash rate monitoring thread
     m_monitoring = true;

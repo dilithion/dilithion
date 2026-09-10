@@ -471,6 +471,90 @@ int main()
             cs.LeafIndexMatchesBruteForce());
     }
 
+    // ---- F12: A RESOLVE AFTER THE WAIT MUST NOT HAPPEN WHILE OFFLINE ---------
+    //
+    // ⚠️ ROUND-3 PANEL, 3/3. My own round-2 wiring declared the offline scope at
+    // FUNCTION scope in the three wait-* RPCs, so it stayed alive through the
+    // `get_tip()` after the wait — every non-shutdown return was a
+    // resolve-while-offline, and therefore a false alarm on the counter I had just
+    // added to find real ones. A detector that cries wolf is worse than none.
+    // The scopes are braced to the blocking call now; this arm pins the property.
+    {
+        const uint64_t before = CChainState::OfflineResolveCount();
+        std::thread t([&] {
+            cs.EpochCheckpoint("f12-thread");
+            {
+                EpochOfflineScope offline(&cs, "f12-thread");
+                // (the "blocking call" — nothing resolves in here)
+            }
+            // Braced correctly, this resolve is ONLINE and must not be counted.
+            CBlockIndex* p = cs.GetBlockIndex(gh);
+            (void)p;
+        });
+        t.join();
+        chk("F12: a resolve AFTER a correctly-braced scope is not counted as offline",
+            CChainState::OfflineResolveCount() == before);
+    }
+
+    // ---- F13: THE OFFLINE SCOPE IS NOT REENTRANT, AND NESTING IS REFUSED -----
+    //
+    // grok, round 3: t_epoch_offline is a bool, so an inner scope's destructor
+    // re-enters the thread while the outer scope still believes it is parked —
+    // and HandleClient's scope can lexically enclose socket_write's. A counter
+    // would make nesting "work" and hide the design error. The only legal nest is
+    // an EpochOnlineWindow INSIDE an offline scope, which is the other direction.
+    {
+        std::thread t([&] {
+            cs.EpochCheckpoint("f13-thread");
+            EpochOfflineScope outer(&cs, "f13-thread");
+            {
+                // The legal nest: online inside offline. Must not fire.
+                EpochOnlineWindow inner(&cs, "f13-thread");
+            }
+        });
+        t.join();
+        chk("F13: EpochOnlineWindow nested inside an offline scope is legal", true);
+        // The ILLEGAL nest (offline inside offline) aborts the process by design,
+        // so it is exercised by the mutation harness rather than here — a test
+        // cannot catch a ConsensusInvariant and keep running.
+    }
+
+    // ---- F15: A RESOLVE AFTER A QUIESCE MUST RE-PIN, NOT JUST RE-ENTER -------
+    //
+    // kimi, round 3. EpochQuiesce withdraws the unregistered-resolver accusation
+    // (correctly — parking claims the thread holds nothing). If the thread then
+    // resolves anyway, the claim is false and BOTH halves must come back: the
+    // epoch re-entry AND the record. Without the record the census reports the
+    // thread as clean while it holds a pointer taken after promising it would not.
+    {
+        std::mutex m; std::condition_variable cv;
+        bool resolved = false, release = false;
+        std::thread t([&] {
+            CBlockIndex* p0 = cs.GetBlockIndex(gh);   // accused: slot 0, pinning
+            (void)p0;
+            cs.EpochQuiesce();                        // withdraws the accusation
+            CBlockIndex* p1 = cs.GetBlockIndex(gh);   // ...and resolves anyway
+            {
+                std::unique_lock<std::mutex> lk(m);
+                resolved = (p1 != nullptr);
+                cv.notify_all();
+                cv.wait(lk, [&] { return release; });
+            }
+        });
+        { std::unique_lock<std::mutex> lk(m); cv.wait(lk, [&] { return resolved; }); }
+
+        std::string detail;
+        chk("F15: a resolve after a quiesce RE-RECORDS the accusation",
+            cs.UnregisteredResolverThreads(detail) == 1);
+
+        { std::lock_guard<std::mutex> lk(m); release = true; }
+        cv.notify_all();
+        t.join();
+        std::string d2;
+        chk("F15: and it is withdrawn again when that thread exits",
+            cs.UnregisteredResolverThreads(d2) == 0);
+    }
+
     // ---- REGISTRATION CENSUS: a thread that never checkpoints is a LEAK ------
     //
     // A non-participating thread pins the graveyard for the process lifetime.

@@ -259,6 +259,13 @@ absence is invisible to a suite that supplies the missing thing itself.
 
 ## MEASURED — the arithmetic is gone
 
+> Regenerate this whole table with **`scripts/graveyard_occupancy_sweep.sh`**, which
+> runs every configuration in one command and fails closed on a stale binary. It was
+> written because five numbers gathered from five hand-typed invocations drift: one
+> gets re-measured after a change and the other four keep their old values, with
+> nothing in the document saying which is which. That had already happened here —
+> see the variance note below.
+
 Both open numbers are now observations. `graveyard_occupancy_bench` (500,000-entry
 index, evictions throttled to a sustained **10,400/s** — the ingress ceiling, not
 the evictor's own, which measures 1.29 M/s and would consume the whole evictable set
@@ -269,6 +276,18 @@ in 19 ms and report its size as a "peak"):
 | **A — as wired**: 1 Hz drain, 1 Hz slowest checkpoint | **21,041 entries = 6.42 MB** | predicted 3.17 MB → **2.03x** |
 | B — 10 s drain, 10 s slowest checkpoint | 113,844 entries = 34.74 MB | predicted 31.72 MB → 1.10x |
 | C — 1 Hz drain, **10 s** slowest checkpoint | 105,666 entries = 32.25 MB | → 1.02x |
+
+⚠️ **AND THEY VARY RUN TO RUN BY ~2x, WHICH A SINGLE QUOTED FIGURE HID.** The
+wired setting measured **6.42, 6.39 and 3.53 MB** on three consecutive runs of the
+same command. Peak occupancy is sampled after each eviction, so it depends on where
+the run ends relative to the 1 Hz drain cycle — a run that stops just before a drain
+reports roughly twice one that stops just after. The honest statement for the wired
+setting is **3.5–6.4 MB**, and the number to quote is the **upper** end.
+
+This only became visible when `scripts/graveyard_occupancy_sweep.sh` ran the whole
+table in one command and config A came back at 3.53 MB against the 6.42 MB this
+document had carried since it was measured once. **A figure measured once is a
+sample, and this document had been treating it as a constant.**
 
 ⚠️ **THESE ARE OBSERVATIONS AT THESE SETTINGS, NOT A BOUND.** 6.42 MB is what a
 1 Hz drain and a 1 Hz slowest checkpoint produced on this machine at this ingress
@@ -456,6 +475,75 @@ So the two instrumented accessors are the complete set of *new* escapes, and the
 detector at those two points sees every thread that acquires one. **What it does not
 see** is a pointer passed from one thread to another after the fact — see the
 no-handoff obligation above.
+
+## ⚠️ THE PER-SITE CONTRACT *IS* THE MECHANISM — SO HERE IS EVERY SITE
+
+The round-3 panel was asked directly whether the no-pointer-across-a-boundary rule
+can be made structural rather than contractual. **All three seats: it cannot, in
+C++17.** There is no borrow checker; a raw pointer copied to the stack, obtained via
+`.get()`, or handed to another thread is invisible to any scope type.
+
+What they proposed instead — and COORD ruled it **out of this PR's scope**, to its
+own contract and PR — is that the two instrumented accessors return a **move-only
+handle** whose constructor and destructor drive the hold counter, with every boundary
+asserting `holds == 0` **in production**. Cost: one thread-local add per resolve and
+~62 call sites touched. Escape from the handle (`.get()`, a copy of the raw pointer)
+stays contractual even then, so it narrows the hole rather than closing it.
+
+**Until that lands, this PR's mechanism is the contract stated at each site.** A
+contract nobody can point at is not a mechanism, so every site is listed here with
+its enclosing function and what the contract asserts there. **Fourteen sites**, not
+the nine an earlier count claimed:
+
+| # | site | enclosing function | what is claimed while offline |
+|---|---|---|---|
+| 1 | `connman.cpp:908` | `CConnman::ThreadMessageHandler` | the batch is routed; nothing resolved is retained across the bottom wait |
+| 2 | `connman.cpp:990` | `CConnman::HeadersWorkerThread` | between messages this thread holds nothing; `ProcessQueuedMessage` has returned |
+| 3 | `connman.cpp:1051` | `CConnman::BlocksWorkerThread` | as above, per block message |
+| 4 | `headers_manager.cpp:3419` | `CHeadersManager::ValidationWorkerThread` | the pool never resolves at all (`FullValidateHeader` is hash-only); the scope is belt-and-braces |
+| 5 | `block_validation_queue.cpp:422` | `CBlockValidationQueue::ValidationWorker` | the previous `ProcessBlock` is complete; the queued entry is pinned by clause (d), not by this thread |
+| 6 | `http_server.cpp:286` | `CHttpServer::WorkerThread` | the previous request is finished. ⚠️ **Write side NOT covered** — see the coverage note below |
+| 7 | `websocket.cpp:170` | `CWebSocketServer::ServerThread` | no client is being served; `HandleClient` has returned |
+| 8 | `websocket.cpp:454` | `CWebSocketServer::SocketWrite` | the response is a built buffer; no index pointer is live in any caller frame |
+| 9 | `server.cpp:810` | `CRPCServer::ServerThread` (accept) | this thread never resolves at all |
+| 10 | `server.cpp:838` | `CRPCServer::ServerThread` (SSL handshake) | as above; the handshake moves bytes |
+| 11 | `server.cpp:920` | `CRPCServer::WorkerThread` | the previous request is complete |
+| 12 | `server.cpp:1045` | `CRPCServer::HandleClient` → `socket_write` lambda | the response is a built `std::string`; the census of handlers says no pointer is live |
+| 13 | `server.cpp:10191/:10240/:10288` | `RPC_WaitForNewBlock` / `WaitForBlock` / `WaitForBlockHeight` | the park holds only `{uint256, int}` copies; the predicate goes **online** to resolve |
+| 14 | `server.cpp:10193/:10242/:10290` | the same three predicates (`EpochOnlineWindow`) | the inverse: briefly online **because** it resolves |
+
+**Row 13 and 14 are one mechanism.** The wait is offline; its predicate is online.
+The braces matter and were wrong once: a function-scoped park kept the thread offline
+through the `get_tip()` *after* the wait, making every ordinary return a
+resolve-while-offline and a false alarm on the observer added to catch real ones.
+
+**⚠️ THE HOLE THE CONTRACT DOES NOT COVER, stated plainly and not softened: a thread
+that RESOLVES A POINTER AND THEN PARKS.** `EpochQuiesce` publishes "I hold nothing"
+and unpins; if the caller is holding, that is a lie and the entry can be freed under
+it. The hold tracking catches it **only when a test declares the hold**; the
+resolve-while-offline counter catches the *other* order (park, then resolve) and
+nothing else. **The detector is not protection against resolve-then-park** — it is
+detection of a different mistake, and any reading of it as protection is wrong.
+
+### Coverage, stated rather than implied
+
+* **The write side is covered for RPC and WebSocket, not HTTP.** Both of those funnel
+  every response through one helper (`socket_write`, `CWebSocketServer::SocketWrite`),
+  so one scope covers each. `http_server.cpp` has no funnel — `SendResponse` plus a
+  dozen raw `send()` calls through `HandleRequest` — so an HTTP response to a slow
+  client is written **online**, pinning for the send. Bounded by that socket's
+  timeouts, not by anything here. Wiring it means routing every write through one
+  helper first: a refactor of that file, not this PR.
+* **Nesting is refused, not counted.** `EpochOfflineScope` inside `EpochOfflineScope`
+  fires a `ConsensusInvariant` — `t_epoch_offline` is a bool, so an inner destructor
+  would silently re-enter a thread whose outer scope still believes it is parked (and
+  `HandleClient`'s scope can lexically enclose `socket_write`'s). A counter would make
+  the nest "work" and hide the design error. `EpochOnlineWindow` inside an offline
+  scope is the one legal nest and goes through `EpochCheckpoint`.
+* **One thread, one name.** A named checkpoint whose name differs from the one this
+  thread already registered under aborts. Names are chosen per *site* while slots
+  belong to *threads*, so a thread opening scopes under two names would silently
+  under-count one pool's registrations.
 
 ## WIRING CENSUS — checkpoints, offline scopes, and declared counts
 
