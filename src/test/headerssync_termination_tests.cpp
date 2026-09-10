@@ -59,8 +59,21 @@
 
 namespace {
 
-// Not assert(): this repo ships -DNDEBUG release builds, under which assert()
-// compiles away and this suite would print ALL PASS while checking nothing.
+// Not assert(), and the REASON matters because the obvious one is WRONG.
+//
+// The obvious reason -- "this repo ships -DNDEBUG release builds, so assert()
+// compiles away" -- does not apply to test objects. The Makefile carries the rule
+// `$(OBJ_DIR)/test/%.o: override CXXFLAGS += -UNDEBUG` (:1443 on this branch,
+// :1429 on main -- grep the rule, not the line), added precisely so an
+// assert-based suite cannot be silently disarmed, and `override` specifically so
+// that `make CXXFLAGS=...` cannot drop it. Anything built through this Makefile
+// keeps its assertions.
+//
+// What REQUIRE() actually buys: the -UNDEBUG rule protects only objects built
+// THROUGH the Makefile. A suite compiled by another path -- an IDE, a hand-written
+// g++ line, a future CMake target -- would strip assert() and print ALL PASS while
+// checking nothing. REQUIRE() holds the property for every build path, not just
+// the one we control.
 void RequireTrue(const char* what, bool ok)
 {
     if (!ok) {
