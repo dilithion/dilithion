@@ -4,6 +4,11 @@
 #129's fold was pushed, so that the deferral is a tracked deliverable with an owner
 rather than a register row nobody carries.
 
+**Base, updated 2026-09-10: #129 IS MERGED — main `4ccf3797`.** Every "depends on
+#129" below now reads "depends on main >= `4ccf3797`": the leaf-only evictor and its
+evictable-leaf side index are in the base, so this PR extends a merged invariant
+rather than a pending one. Scope is otherwise unchanged.
+
 **Why this exists as its own PR.** #129 closes this race at two sites with
 `CChainState::MainLockGuard` and leaves it open at four more. Those four were not
 folded into #129 because four widenings of `cs_main` — the lock that block
