@@ -602,4 +602,153 @@ BOOST_AUTO_TEST_CASE(p2p16_locator_pattern_is_one_walk_not_two)
         "the silent dropped-entry bug (walk start != resolve start)");
 }
 
+
+// ============================================================================
+// PR #194 LOW fold: the RESOLVER arm.
+//
+// The two cases above pin the height schedule and the WALK. Neither one ever
+// enters the resolver, so the half of the fix that actually holds cs_main was
+// unexercised: ResolveLocatorHashes could have been reverted to the
+// probe-then-resolve shape, or had its single descending walk broken, with both
+// existing cases still green.
+//
+// SCOPE, stated rather than implied. This targets CChainState::ResolveLocatorHashes,
+// not CHeadersManager::ResolveChainstateHashes. The wrapper reads the GLOBAL
+// g_chainstate, and every case in this file builds a LOCAL CChainState on
+// purpose; populating the global to reach the wrapper would leak fixture state
+// into every other suite in this binary. So what stays unpinned here is the
+// wrapper's own three behaviours - the F3 tip mapping (-1 to 0), the
+// size-mismatch degradation, and dropping null hashes - and they are unpinned
+// deliberately, not by oversight.
+//
+// The load-bearing property is EQUIVALENCE. Up-to-64 independent GetAncestor()
+// calls were replaced with ONE descending pprev walk, after GetAncestor turned
+// out to be linear here (pskip is inert), so 64 calls under cs_main would have
+// moved real work into the lock. An optimisation is only allowed if it returns
+// identical answers, and nothing else in this diff checks that.
+// ============================================================================
+BOOST_AUTO_TEST_CASE(p2p16_resolver_one_walk_equals_many_getancestor_calls)
+{
+    CChainState chainstate;
+
+    // Deep enough that the schedule leaves the linear phase and starts doubling,
+    // so the descending walk has to skip over heights rather than step one back.
+    const int kTipHeight = 40;
+    std::vector<uint256> hashes;
+    CBlockIndex* prev = nullptr;
+    for (int h = 0; h <= kTipHeight; ++h) {
+        auto p = MakeIndex(static_cast<uint8_t>(0x40 + (h & 0x3f)), prev, h,
+                           CBlockIndex::BLOCK_VALID_TRANSACTIONS, 10 * (h + 1));
+        const uint256 hash = p->GetBlockHash();
+        BOOST_REQUIRE(chainstate.AddBlockIndex(hash, std::move(p)));
+        prev = chainstate.GetBlockIndex(hash);
+        BOOST_REQUIRE(prev != nullptr);
+        hashes.push_back(hash);
+    }
+    chainstate.SetTip(prev);
+
+    std::vector<int> heights;
+    int tipHeight = -99;
+    const std::vector<uint256> got =
+        chainstate.ResolveLocatorHashes(0, &hdrtest::LocatorHeightPatternForTest,
+                                        heights, tipHeight);
+
+    BOOST_CHECK_EQUAL(tipHeight, kTipHeight);
+    BOOST_REQUIRE_EQUAL(got.size(), heights.size());
+    BOOST_REQUIRE_MESSAGE(!heights.empty(), "resolver returned nothing for a 40-block chain");
+
+    // 1. EQUIVALENCE with the walk it replaced: one descending pass must agree
+    //    with an independent GetAncestor() per height, hash for hash.
+    CBlockIndex* tip = chainstate.GetTip();
+    BOOST_REQUIRE(tip != nullptr);
+    for (size_t i = 0; i < heights.size(); ++i) {
+        CBlockIndex* viaWalk = tip->GetAncestor(heights[i]);
+        BOOST_REQUIRE_MESSAGE(viaWalk != nullptr,
+            "fixture: no ancestor at height " << heights[i]);
+        BOOST_CHECK_MESSAGE(got[i] == viaWalk->GetBlockHash(),
+            "single-walk resolver disagrees with GetAncestor() at height "
+            << heights[i] << " (index " << i << ") - the optimisation changed answers");
+    }
+
+    // 2. The walk consumes the SCHEDULE, in order, descending. The single-pass
+    //    implementation only works because the heights are sorted descending
+    //    first; if that sort is lost, the walk passes a height and can never go
+    //    back, so entries silently vanish.
+    for (size_t i = 1; i < heights.size(); ++i) {
+        BOOST_REQUIRE_MESSAGE(heights[i] < heights[i - 1],
+            "resolved heights must strictly descend (index " << i << ")");
+    }
+    BOOST_CHECK_MESSAGE(heights.front() == kTipHeight,
+        "the schedule starts at the tip when headers are not ahead, got " << heights.front());
+
+    // 3. Nothing above the tip is emitted, and nothing below genesis.
+    for (int h : heights) {
+        BOOST_REQUIRE_MESSAGE(h >= 0 && h <= kTipHeight,
+            "resolver emitted out-of-range height " << h);
+    }
+
+    // 4. HEADERS AHEAD OF THE CHAINSTATE - the IBD state this whole path exists
+    //    for. The schedule is taken from the headers height, but only heights at
+    //    or below the chainstate tip may come back. Emitting an above-tip height
+    //    would pair a real hash with the wrong height on the wire.
+    std::vector<int> aheadHeights;
+    int aheadTip = -99;
+    const std::vector<uint256> ahead =
+        chainstate.ResolveLocatorHashes(kTipHeight + 500, &hdrtest::LocatorHeightPatternForTest,
+                                        aheadHeights, aheadTip);
+    BOOST_CHECK_EQUAL(aheadTip, kTipHeight);
+    BOOST_REQUIRE_EQUAL(ahead.size(), aheadHeights.size());
+    for (int h : aheadHeights) {
+        BOOST_REQUIRE_MESSAGE(h <= kTipHeight,
+            "a headers height ahead of the chainstate must not produce above-tip entries, got " << h);
+    }
+    BOOST_CHECK_MESSAGE(!aheadHeights.empty(),
+        "headers ahead of the chainstate must still yield the chainstate side, not nothing");
+
+    // 5. A null pattern must be empty and harmless, not a crash under cs_main.
+    std::vector<int> nullHeights;
+    int nullTip = -99;
+    BOOST_CHECK(chainstate.ResolveLocatorHashes(0, nullptr, nullHeights, nullTip).empty());
+    BOOST_CHECK(nullHeights.empty());
+    BOOST_CHECK_EQUAL(nullTip, kTipHeight);
+}
+
+// F3, the distinction a single "is there a tip" test cannot make: an empty
+// chainstate and a genesis-only chainstate are different states, and collapsing
+// them is how a height-0 node silently emitted an EMPTY locator and could never
+// start syncing.
+BOOST_AUTO_TEST_CASE(p2p16_resolver_distinguishes_no_tip_from_genesis_only)
+{
+    {
+        CChainState empty;
+        std::vector<int> heights;
+        int tipHeight = -99;
+        const std::vector<uint256> got =
+            empty.ResolveLocatorHashes(0, &hdrtest::LocatorHeightPatternForTest,
+                                       heights, tipHeight);
+        BOOST_CHECK_MESSAGE(tipHeight == -1,
+            "no tip must report -1, not 0 - 0 is a real chain at genesis, got " << tipHeight);
+        BOOST_CHECK(got.empty());
+        BOOST_CHECK(heights.empty());
+    }
+    {
+        CChainState genesisOnly;
+        auto p = MakeIndex(0x77, nullptr, 0, CBlockIndex::BLOCK_VALID_TRANSACTIONS, 10);
+        const uint256 hash = p->GetBlockHash();
+        BOOST_REQUIRE(genesisOnly.AddBlockIndex(hash, std::move(p)));
+        genesisOnly.SetTip(genesisOnly.GetBlockIndex(hash));
+
+        std::vector<int> heights;
+        int tipHeight = -99;
+        const std::vector<uint256> got =
+            genesisOnly.ResolveLocatorHashes(0, &hdrtest::LocatorHeightPatternForTest,
+                                             heights, tipHeight);
+        BOOST_CHECK_EQUAL(tipHeight, 0);
+        BOOST_REQUIRE_MESSAGE(got.size() == 1 && heights.size() == 1,
+            "a genesis-only chain must still yield its genesis entry, got " << got.size());
+        BOOST_CHECK_EQUAL(heights[0], 0);
+        BOOST_CHECK_MESSAGE(got[0] == hash, "genesis entry must be the genesis hash");
+    }
+}
+
 BOOST_AUTO_TEST_SUITE_END()

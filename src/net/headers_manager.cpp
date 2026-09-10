@@ -519,6 +519,26 @@ bool CHeadersManager::ProcessHeaders(NodeId peer, const std::vector<CBlockHeader
                     // Track missing parent and request ancestors immediately
                     m_pendingParentRequests.insert(header.hashPrevBlock);
 
+                    // ⚠️ KNOWN COST, NAMED NOT FIXED (external review F5; COORD ruled it
+                    // out of PR #194). This locator is built from startHeightPreFetched,
+                    // which was captured BEFORE this batch was processed. In headers-first
+                    // IBD that means the peer can re-send up to one batch per continuation
+                    // round, and those duplicates count against CheckPeerHeaderRateLimit.
+                    //
+                    // The fix is to defer the send until cs_headers is released and rebuild
+                    // from a fresh GetLocator(). That is NOT a statement move: the
+                    // cs_headers guard at :244 is FUNCTION-scope, this send sits inside the
+                    // batch loop, and eight returns follow it — so it needs the
+                    // collect-then-dispatch shape used by TipNotifyDrain, with every one of
+                    // those returns shown to flush or to not reach the send. A return that
+                    // skips the dispatch silently drops a GETHEADERS, which is the same
+                    // silent-drop class as the F1 bug this PR fixes.
+                    //
+                    // Deferring also removes the cs_headers -> cs_vNodes edge that the
+                    // PushMessage below creates. That edge is the DECLARED order in net.h,
+                    // so it is not an inversion today — but it is worth losing.
+                    // Follow-up PR. Do not attempt it as a one-line change.
+                    //
                     // DEADLOCK FIX: Use GetLocatorImpl directly since we already hold cs_headers.
                     // Calling RequestHeaders() would call GetLocator() which tries to relock cs_headers,
                     // causing a deadlock (std::mutex is not recursive).
@@ -1218,9 +1238,15 @@ void CHeadersManager::BulkLoadHeaders(const std::vector<ActiveChainHeader>& chai
 //
 // The cap is 64, not the locator's 32. The Impl's 32 is a cap on ENTRIES, and a
 // height that resolves to nothing adds no entry while still consuming a step, so
-// the number of heights VISITED can exceed the number of entries. 10 linear
-// steps then doubling reaches genesis from height 10^7 in ~34 steps, so 64 is a
-// comfortable superset for any real chain and keeps this a bounded pre-resolve.
+// the number of heights VISITED can exceed the number of entries.
+//
+// Why 64 is enough, corrected: this used to say "doubling reaches genesis from
+// height 10^7 in ~34 steps". The count is about right, the REASON was wrong -
+// [measured] a start of 10^7 yields 33 heights and stops at 1611384, having
+// never reached genesis. The schedule terminates because the doubling
+// OVERSHOOTS zero, not because it arrives at it. The conclusion survives the
+// correction: ~33 heights worst case against a cap of 64 is a comfortable
+// superset, and this stays a bounded pre-resolve.
 // Forward declaration: ResolveChainstateHashes below calls this, and the
 // definition sits further down next to GetLocator, where the walk it mirrors
 // lives. Declaring rather than reordering keeps the schedule and the walk
@@ -1287,6 +1313,26 @@ static std::vector<int> LocatorHeightPattern(int startHeight)
     // startHeight == 0 is a real chain (genesis only) and must still yield the
     // genesis entry — external review, PR #194. Only a NEGATIVE start is empty.
     if (startHeight < 0) return heights;
+
+    // ⚠️ GENESIS IS EMITTED IF AND ONLY IF startHeight <= 10, and the 64-entry
+    // cap is not what stops it. [measured, this exact loop] the first 10 steps
+    // are linear, so a start of 10 or less walks down to 0 and breaks there;
+    // from 11 up the doubling overshoots, `height` goes negative and the loop
+    // exits on `height >= 0` having never emitted 0. Oldest entry by start:
+    // 11->1, 13->1, 25->1, 100->28, 1000->480, 250000->118920, 10^7->1611384.
+    // The cap is never reached (33 entries at 10^7), so it is not the cause.
+    //
+    // Consequence: a peer whose fork point lies BELOW the oldest entry cannot
+    // find a common ancestor from this locator. Bitcoin Core's locator always
+    // terminates at genesis for exactly that reason.
+    //
+    // NOT introduced by PR #194 and deliberately NOT changed by it: origin/main's
+    // GetLocatorImpl runs a structurally identical loop (same `while (height >= 0)`,
+    // same `if (height == 0) break;`, same doubling), so this is pre-existing
+    // wire behaviour, not a regression from the P2P-16 refactor. Appending
+    // genesis would change what every locator this node emits puts on the wire.
+    // That belongs in its own change with its own review — not folded into a
+    // lock-order fix.
 
     int height = startHeight;
     int step = 1;
@@ -1373,12 +1419,26 @@ std::vector<uint256> CHeadersManager::GetLocatorImpl(const uint256& hashTip,
 {
     // NOTE: Caller MUST hold cs_headers lock
     // This is the implementation of GetLocator without lock acquisition.
+    //
+    // hashTip IS INTENTIONALLY UNUSED, and removing it would be the wrong fix.
+    // BUG #178 (Part 2) made the locator ALWAYS exponential and never rooted at
+    // a caller-supplied hash: rooting it there meant a peer that does not have
+    // that hash falls back to genesis instead of finding the fork point. The
+    // caller-supplied start still takes effect — RequestHeaders PREPENDS it to
+    // the finished locator (see the prepend just after the GetLocator call), so
+    // the peer tries it first and keeps the exponential tail as fallback. The
+    // parameter is kept so that call path reads coherently end to end.
     // Used by internal functions that already hold the lock to avoid deadlock.
     //
     // DEADLOCK FIX: the chainstate data must be obtained BEFORE acquiring
     // cs_headers to avoid lock order inversion with cs_main. P2P-16: it is now
     // obtained as VALUES (height->hash), so there is nothing here whose target
     // can be freed while this runs.
+
+    // Says to the compiler what the comment above says to the reader, and
+    // silences -Wunused-parameter without removing a parameter the caller
+    // path still needs to read coherently.
+    (void)hashTip;
 
     std::vector<uint256> locator;
     locator.reserve(32);  // Pre-allocate for efficiency
@@ -1394,6 +1454,13 @@ std::vector<uint256> CHeadersManager::GetLocatorImpl(const uint256& hashTip,
     // 3. For heights > chainstate: use headers_manager best chain hashes
     //
     // This ensures we don't re-request headers while maintaining fork safety.
+    //
+    // ⚠️ QUALIFIED (external review F5). That "don't re-request" property holds
+    // for the locator GetLocator() builds fresh. It does NOT hold for the
+    // continuation send inside ProcessHeaders, which passes a start captured
+    // before its batch was processed and so CAN re-request up to a batch per
+    // round during headers-first IBD. See the note at that call site; the
+    // deferred-send fix is a follow-up PR, not this one.
     // Note: chainstateHashes and chainstateHeight are resolved BY VALUE before
     // the cs_headers lock (P2P-16) — no chainstate pointer survives into here.
 

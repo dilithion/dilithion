@@ -26,23 +26,45 @@
 #
 # WHAT THIS PROVES, AND WHAT IT DOES NOT — measured, not asserted.
 #
-# The claim here was NARROWED to match a mutant table, because a broad claim
-# resting on a grep is the false-confidence failure this PR has already paid for
-# twice. One mutant per shape, appended to the real files and run against this
-# guard:
+# The claim is NARROWED to match a mutant table, because a broad claim resting
+# on a grep is the false-confidence failure this PR has already paid for twice.
+# One mutant per shape, appended to the real files and run against this guard.
+# The results below are from a run, not from reading the regexes:
 #
 #   S1  g_chainstate.GetTip() call                 CAUGHT
 #   S2  g_chainstate.GetBlockIndex() call          CAUGHT  (added after it MISSED)
-#   S6  alias via `auto p = ...GetTip()`           CAUGHT  (still a call)
+#   S6  alias via auto p = ...GetTip()             CAUGHT  (still a call)
+#   S7  a real GetTip() call in headers_manager.h  CAUGHT
 #   S4  p->GetAncestor(h) walk                     CAUGHT
-#   S7  the same call in headers_manager.h         CAUGHT  (added after it MISSED)
-#   S3  a bare `CBlockIndex* p` declaration        MISSED
-#   S5  a bare `p->nHeight` dereference            MISSED
+#   S13 p->pprev walk                              CAUGHT
+#   S12 p->pskip walk                              CAUGHT
+#   S8  newline between GetTip and its open paren  CAUGHT  (added after it MISSED)
+#   S9  whitespace after the arrow: p ->  pprev    CAUGHT  (added after it MISSED)
+#   S10 a // inside a string literal, on a line    CAUGHT  (added after it MISSED)
+#       that also carries a real GetTip() call
+#   S11 inline block comment before the paren      CAUGHT  (added after it MISSED)
+#   S3  a bare CBlockIndex* p declaration          MISSED
+#   S5  a bare p->nHeight dereference              MISSED
+#
+# Plus a false-FAIL control: the guard must PASS on the clean tree, whose own
+# comments name GetTip and GetAncestor throughout.
+#
+# S7 previously read CAUGHT on the strength of a DEFECTIVE mutant that appended
+# a bare comment rather than a call, so it proved nothing. The row above is from
+# a real call in the header.
+#
+# S8..S11 are the regex gaps an external reader predicted by reading this file
+# rather than running it. Every one was MISSED when measured. S10 is the
+# dangerous direction - a FALSE PASS, the guard reporting the invariant holds
+# while the violating call sits in the file - because the old stripper deleted
+# the rest of any line containing // inside a string literal.
 #
 # So this guard proves exactly two things:
-#   (1) neither GetTip() nor GetBlockIndex() — the two accessors that RELEASE
-#       cs_main and hand back a pointer — is CALLED in headers_manager.{cpp,h};
-#   (2) no CBlockIndex ancestor/parent walk appears in the .cpp.
+#   (1) neither GetTip() nor GetBlockIndex() - the two accessors that RELEASE
+#       cs_main and hand back a pointer - is CALLED in headers_manager.{cpp,h},
+#       however the call is spelled or split across lines;
+#   (2) no CBlockIndex ancestor/parent walk (GetAncestor/pprev/pskip) appears in
+#       the .cpp, with or without whitespace around the arrow.
 #
 # It does NOT prove "no released chainstate pointer can exist here". A pointer
 # arriving by another route — a parameter, a member, another object's accessor —
@@ -69,80 +91,116 @@ cd "$(dirname "${BASH_SOURCE[0]}")/.." || exit 2
 
 HM="src/net/headers_manager.cpp"
 HH="src/net/headers_manager.h"
+CS="src/consensus/chain.cpp"
+STRIP="scripts/strip-cxx-comments.awk"
 fail=0
 
-if [ ! -f "$HM" ] || [ ! -f "$HH" ]; then
-    echo "FAIL: $HM or $HH missing — this guard cannot check what it claims"
-    exit 1
-fi
+for f in "$HM" "$HH" "$CS" "$STRIP"; do
+    if [ ! -f "$f" ]; then
+        echo "FAIL: $f missing - this guard cannot check what it claims"
+        exit 1
+    fi
+done
 
-# Strip comments before looking for CALLS, so the explanatory comments in this
-# file (which necessarily name GetTip and GetAncestor) are not read as code.
-# Removes //-to-end-of-line and whole-line /* */ blocks; good enough for a
-# call-site check and deliberately simple enough to audit by eye.
-code_only() {
-    sed -e 's://.*::' -e '/^[[:space:]]*\/\*/,/\*\//d' "$1"
+# Strip comments and string-literal CONTENTS before looking at anything, so the
+# explanatory comments in these files (which necessarily name GetTip and
+# GetAncestor) are not read as code, and so a // inside a string literal cannot
+# delete a real call from the line before the grep sees it.
+#
+# The previous stripper was sed 's://.*::' and it failed in BOTH directions:
+#   - it deleted everything after the first // on a line, string literals
+#     included, hiding a real call on that line (FALSE PASS, mutant S10);
+#   - it removed only WHOLE-LINE block comments, so an inline one survived (S11).
+# And checks 3 and 4 did not strip at all, so a doc comment could fail a clean
+# tree - which is exactly what happened when a comment gained the words "see the
+# note in GetLocatorImpl". Every check now reads stripped code.
+#
+# The stripper exits 3 rather than guess at a construct it cannot parse; that
+# must fail this guard, never pass it.
+TMPD=$(mktemp -d) || exit 2
+trap 'rm -rf "$TMPD"' EXIT
+strip_to() {
+    if ! awk -f "$STRIP" "$1" > "$2" 2>"$TMPD/strip.err"; then
+        echo "FAIL: the comment stripper refused $1 - this guard cannot report CLEAN."
+        sed -e 's/^/      /' "$TMPD/strip.err"
+        exit 1
+    fi
 }
+strip_to "$HM" "$TMPD/hm"
+strip_to "$HH" "$TMPD/hh"
+strip_to "$CS" "$TMPD/cs"
 
-# 1. GetTip() must not be CALLED in the headers manager. This is the entry
-#    point for the whole released-pointer class; close it and the class cannot
-#    appear in this translation unit at all.
-hits=$(( $(code_only "$HM" | grep -cE '\b(GetTip|GetBlockIndex)[[:space:]]*\(') + $(code_only "$HH" | grep -cE '\b(GetTip|GetBlockIndex)[[:space:]]*\(') ))
+# Flattened views. grep is line-based, so GetTip at end of line with its open
+# paren on the next line reads as no call at all (mutant S8). Match on the
+# joined text; report line numbers from the per-line view as a best effort.
+flat() { tr '\n' ' ' < "$1"; }
+count_re() { grep -oE "$1" | wc -l | tr -d ' '; }
+
+# 1. GetTip() / GetBlockIndex() must not be CALLED in the headers manager. These
+#    are the two accessors that RELEASE cs_main and hand back a pointer, so this
+#    is the entry point for the whole released-pointer class; close it and the
+#    class cannot appear in this translation unit at all.
+CALL_RE='(GetTip|GetBlockIndex)[[:space:]]*\('
+hits=$(( $(flat "$TMPD/hm" | count_re "$CALL_RE") + $(flat "$TMPD/hh" | count_re "$CALL_RE") ))
 if [ "$hits" -ne 0 ]; then
     echo "FAIL: the headers manager CALLS GetTip()/GetBlockIndex() ($hits site(s))."
     echo "      GetTip() releases cs_main before returning, so the CBlockIndex*"
     echo "      it hands back can be freed by eviction at any time. Walking it"
     echo "      without cs_main is P2P-16, a peer-triggerable use-after-free."
-    echo "      Use CChainState::GetAncestorHashes() — it returns VALUES."
-    code_only "$HM" | grep -nE '\b(GetTip|GetBlockIndex)[[:space:]]*\(' | head -5
-    code_only "$HH" | grep -nE '\b(GetTip|GetBlockIndex)[[:space:]]*\(' | head -5
+    echo "      Use CChainState::ResolveLocatorHashes() - it returns VALUES."
+    grep -nE "$CALL_RE" "$TMPD/hm" "$TMPD/hh" | head -5
+    echo "      (nothing listed = the call is split across lines - see the flattened match)"
     fail=1
 fi
 
 # 2. No CBlockIndex ancestor/parent walk in this file. Even reached by some
 #    other route, such a walk belongs under cs_main in chain.cpp, not here.
-walks=$(code_only "$HM" | grep -cE '\->(GetAncestor|pprev|pskip)\b')
+#    Whitespace around the arrow is legal C++, so "p ->  pprev" is the same walk
+#    and must count (mutant S9). The trailing class stands in for a word
+#    boundary: \b was silently written into this file once as a literal control
+#    byte, which disabled the whole check while it still looked correct.
+WALK_RE='(->|\.)[[:space:]]*(GetAncestor|pprev|pskip)([^A-Za-z0-9_]|$)'
+walks=$(flat "$TMPD/hm" | count_re "$WALK_RE")
 if [ "$walks" -ne 0 ]; then
     echo "FAIL: headers_manager.cpp walks a CBlockIndex ($walks site(s))."
     echo "      A chain walk must happen under cs_main, inside chain.cpp, and"
-    echo "      leave as values. See CChainState::GetAncestorHashes()."
-    code_only "$HM" | grep -nE '\->(GetAncestor|pprev|pskip)\b' | head -5
+    echo "      leave as values. See CChainState::ResolveLocatorHashes()."
+    grep -nE "$WALK_RE" "$TMPD/hm" | head -5
     fail=1
 fi
 
 # 3. GetLocatorImpl must keep taking VALUES. Reverting its parameter to a
 #    CBlockIndex* is precisely the regression, and it would compile cleanly.
-#    NOTE: the declaration spans three lines, and grep is line-based — the
-#    first version of this check looked only at single lines and reported the
-#    parameter missing on a tree where it was present. Flatten first.
-flatten() { tr '\n' ' ' < "$1" | tr -s ' '; }
-
-if flatten "$HH" | grep -qE 'GetLocatorImpl[^;]*CBlockIndex[[:space:]]*\*' \
-   || flatten "$HM" | grep -qE 'GetLocatorImpl[^;)]*CBlockIndex[[:space:]]*\*'; then
+#    NOTE: the declaration spans three lines, and grep is line-based - an early
+#    version looked only at single lines and reported the parameter missing on a
+#    tree where it was present. Flatten first.
+if flat "$TMPD/hh" | grep -qE 'GetLocatorImpl[^;]*CBlockIndex[[:space:]]*\*' \
+   || flat "$TMPD/hm" | grep -qE 'GetLocatorImpl[^;)]*CBlockIndex[[:space:]]*\*'; then
     echo "FAIL: GetLocatorImpl takes a CBlockIndex* again."
     echo "      It must take resolved height->hash VALUES; a pointer parameter"
     echo "      re-opens P2P-16 with every test still green."
     fail=1
 fi
-if ! flatten "$HH" | grep -qE 'GetLocatorImpl[^;]*std::map<int,[[:space:]]*uint256>'; then
+if ! flat "$TMPD/hh" | grep -qE 'GetLocatorImpl[^;]*std::map<int,[[:space:]]*uint256>'; then
     echo "FAIL: GetLocatorImpl no longer declares the resolved-values parameter"
-    echo "      in $HH — check this guard against the source before trusting it."
+    echo "      in $HH - check this guard against the source before trusting it."
     fail=1
 fi
 
-# 4. The accessor this fix depends on must still return values, not the
-#    pointer someone might restore "for efficiency".
+# 4. The accessor this fix depends on must still return values, not the pointer
+#    someone might restore "for efficiency".
 # F4 (external review r2): this used to pin GetAncestorHashes, which the headers
-# manager no longer calls — so reverting ResolveLocatorHashes to the probe+resolve
-# shape passed the guard. Pin the accessor that is actually used, and pin its
-# ONE-ACQUISITION property: exactly one lock_guard in its body.
-if ! grep -qE 'std::vector<uint256>[[:space:]]+CChainState::ResolveLocatorHashes' src/consensus/chain.cpp 2>/dev/null; then
+# manager no longer calls - so reverting ResolveLocatorHashes to the
+# probe-then-resolve shape passed the guard. Pin the accessor that is actually
+# used, and pin its ONE-ACQUISITION property: exactly one lock_guard in its body.
+if ! grep -qE 'std::vector<uint256>[[:space:]]+CChainState::ResolveLocatorHashes' "$TMPD/cs"; then
     echo "FAIL: CChainState::ResolveLocatorHashes is missing or no longer returns"
     echo "      std::vector<uint256>. The headers manager depends on it to get"
     echo "      chain data across a lock-free window without a pointer."
     fail=1
 else
-    guards=$(awk '/std::vector<uint256> CChainState::ResolveLocatorHashes/,/^}/' src/consensus/chain.cpp              | grep -cE 'lock_guard<std::recursive_mutex>')
+    guards=$(awk '/std::vector<uint256> CChainState::ResolveLocatorHashes/,/^}/' "$TMPD/cs" \
+             | grep -cE 'lock_guard<std::recursive_mutex>')
     if [ "$guards" -ne 1 ]; then
         echo "FAIL: ResolveLocatorHashes holds cs_main $guards time(s), expected exactly 1."
         echo "      Its whole point is ONE acquisition: a probe-then-resolve shape lets"

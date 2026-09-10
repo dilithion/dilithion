@@ -293,12 +293,23 @@ public:
     /**
      * @brief Generate block locator for sync
      *
-     * Bitcoin Core exponential backoff algorithm:
-     * - Start from tip
-     * - Go back: 1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024...
-     * - Always include genesis
+     * Exponential backoff, in the shape of Bitcoin Core's:
+     * - Start from the tip (or the headers height, whichever is higher)
+     * - Ten single-height steps, then double: 1,1,...,1, 2, 4, 8, 16, ...
+     * - Stop at 32 entries
      *
-     * @param hashTip Starting point (usually best header)
+     * NOT "always include genesis" - that line was here and it is FALSE.
+     * [measured] this schedule emits genesis if and only if the start height is
+     * <= 10; above that the doubling overshoots zero and the loop exits without
+     * ever emitting it (start 1000 stops at 480; start 250000 stops at 118920).
+     * A peer whose fork point lies below the oldest entry cannot find a common
+     * ancestor from this locator. That is PRE-EXISTING behaviour, identical on
+     * origin/main, and changing it changes what goes on the wire - see the note
+     * at LocatorHeightPattern.
+     *
+     * @param hashTip Caller's preferred starting point. NOT used to root the
+     *        walk (BUG #178 Part 2 — see GetLocatorImpl); RequestHeaders
+     *        prepends it to the returned locator.
      * @return Vector of block hashes for locator
      */
     std::vector<uint256> GetLocator(const uint256& hashTip);
@@ -732,7 +743,12 @@ private:
      * DEADLOCK FIX: The chainstate tip must be obtained BEFORE acquiring cs_headers
      * to avoid cs_headers/cs_main deadlock. Pass the pre-fetched tip here.
      *
-     * @param hashTip Starting point for locator (unused, uses best chain)
+     * @param hashTip UNUSED, on purpose. BUG #178 (Part 2): the locator is
+     *        always exponential and never rooted at a caller hash, because a
+     *        peer lacking that hash would fall back to genesis instead of
+     *        finding the fork point. RequestHeaders prepends the caller's start
+     *        to the finished locator instead. Kept so the call path reads
+     *        coherently; see the note in GetLocatorImpl.
      * @param chainstateHashes P2P-16: height->hash for the chainstate side,
      *        resolved BY VALUE under cs_main before cs_headers was taken. This
      *        used to be a raw CBlockIndex* from GetTip(), which releases cs_main
