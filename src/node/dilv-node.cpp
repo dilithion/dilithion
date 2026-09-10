@@ -3420,18 +3420,16 @@ load_genesis_block:  // Bug #29: Label for automatic retry after blockchain wipe
         // This ensures HeadersManager can serve historical headers, not just newly mined ones
         {
             std::cout << "Populating HeadersManager with existing chain..." << std::endl;
-            CBlockIndex* pindexTip = g_chainstate.GetTip();
+            // P2P-16 F2: the chain walk happens INSIDE cs_main and only values
+            // come back. This used to call GetTip() -- which releases cs_main
+            // before returning -- and then walk pprev on the released pointer,
+            // handing raw pointers to BulkLoadHeaders to dereference under
+            // cs_headers. Latent here (startup, P2P not yet running) but it is
+            // the released-pointer shape, in the blast radius the P2P-16 guard
+            // is supposed to describe.
+            const std::vector<ActiveChainHeader> chain = g_chainstate.GetActiveChainHeaders();
 
-            if (pindexTip != nullptr) {
-                // Build chain from tip to genesis, then reverse for genesis-to-tip order
-                std::vector<CBlockIndex*> chain;
-                CBlockIndex* pindex = pindexTip;
-                while (pindex != nullptr) {
-                    chain.push_back(pindex);
-                    pindex = pindex->pprev;
-                }
-                std::reverse(chain.begin(), chain.end());
-
+            if (!chain.empty()) {
                 // Bulk-load all headers at once (skips per-block logging and comparisons)
                 g_node_context.headers_manager->BulkLoadHeaders(chain);
             } else {

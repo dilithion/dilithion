@@ -476,7 +476,7 @@ BOOST_RPC_WEBSOCKET_TEST_SOURCE := src/test/rpc_websocket_tests.cpp
 # Targets
 # ============================================================================
 
-.PHONY: all clean install help tests test depends check-tip-notify-drain
+.PHONY: all clean install help tests test depends check-tip-notify-drain check-headers-manager-pointer
 .DEFAULT_GOAL := all
 
 # P2P-14/15 structural guard. Asserts the tip-notification drain invariant that
@@ -486,6 +486,18 @@ BOOST_RPC_WEBSOCKET_TEST_SOURCE := src/test/rpc_websocket_tests.cpp
 # restores the deadlock with every test still green.
 #
 # Wired here deliberately: a check nobody runs is not a check.
+# P2P-16 structural guard. Asserts that no released chainstate pointer can
+# enter the headers manager: GetTip() releases cs_main before returning, so a
+# CBlockIndex* it hands back can be freed by eviction while the locator walk is
+# still using it — a peer-triggerable use-after-free. The repair cannot be "hold
+# cs_main longer" (that is the inversion P2P-14/15 closed), so the data leaves
+# the lock as values instead, and this check keeps it that way.
+#
+# Wired here for the same reason as its sibling above: a guard nobody runs is a
+# file. It is a sub-second grep.
+check-headers-manager-pointer:
+	@bash scripts/check-headers-manager-no-chainstate-pointer.sh
+
 check-tip-notify-drain:
 	@bash scripts/check-tip-notify-drain.sh
 
@@ -659,7 +671,7 @@ tests: tests-build
 # wired into the target CI actually runs because a guard with zero callers is
 # not a guard — it is a file. It runs FIRST: it is a sub-second grep, and if the
 # drain invariant is broken there is no point running the suites.
-tests-fast: check-tip-notify-drain $(TEST_SUITES_FAST)
+tests-fast: check-tip-notify-drain check-headers-manager-pointer $(TEST_SUITES_FAST)
 	@bash scripts/check_roster_completeness.sh
 	@bash scripts/test_run_with_hang_capture.sh
 	@bash scripts/test_run_test_suites_timeout.sh
@@ -667,7 +679,7 @@ tests-fast: check-tip-notify-drain $(TEST_SUITES_FAST)
 	@bash scripts/test_run_test_suites_args.sh
 	@bash scripts/run_test_suites.sh fast
 
-tests-full: check-tip-notify-drain $(TEST_SUITES_FULL)
+tests-full: check-tip-notify-drain check-headers-manager-pointer $(TEST_SUITES_FULL)
 	@bash scripts/run_test_suites.sh full
 
 phase1_test: $(CORE_OBJECTS) $(OBJ_DIR)/test/phase1_simple_test.o $(DILITHIUM_OBJECTS) $(CHIAVDF_OBJECTS)
@@ -1292,6 +1304,7 @@ BOOST_TEST_OBJECTS := $(OBJ_DIR)/test/test_dilithion.o \
 	$(OBJ_DIR)/test/wf1_host_endian_differential_test.o \
 	$(OBJ_DIR)/test/miner_nonce_write_tests.o \
 	$(OBJ_DIR)/test/chain_tips_cache_invalidation_tests.o \
+	$(OBJ_DIR)/test/block_index_getancestor_skip_tests.o \
 	$(CRYPTO_PROPERTY_OBJECTS)
 
 # Link test objects + full library (CORE_OBJECTS) to avoid hand-picked object drift
