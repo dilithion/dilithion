@@ -823,6 +823,13 @@ void CRPCServer::ServerThread() {
 
         // Phase 3: Perform SSL handshake if SSL is enabled
         if (m_ssl_enabled && m_ssl_wrapper) {
+            // OFFLINE ACROSS THE HANDSHAKE. accept() returning puts this thread back
+            // online, and the handshake that follows is a full round trip with a
+            // remote peer that can stall for as long as the peer likes — pinning
+            // every eviction meanwhile. It holds no CBlockIndex* by construction:
+            // it moves bytes. POINTER-FREE IS NOT THE SAME AS PIN-FREE, which is
+            // the whole of this finding.
+            EpochOfflineScope offline(m_chainstate, "rpc-accept");
             SSL* ssl = m_ssl_wrapper->AcceptSSL(clientSocket);
             if (!ssl) {
                 // SSL handshake failed
@@ -1013,6 +1020,19 @@ void CRPCServer::HandleClient(int clientSocket) {
     
     // Phase 3: Helper lambda for writing (works with both plain and SSL sockets)
     auto socket_write = [this, ssl](int socket_fd, const void* buffer, int size) -> int {
+        // OFFLINE ACROSS THE WRITE. Every RPC response leaves through here, and a
+        // slow client stalls the send for up to SO_SNDTIMEO (10 s per call, set
+        // below) — during which an online worker pins every eviction. The response
+        // is a fully-built buffer by this point and no CBlockIndex* is live on this
+        // stack (see the handler census in the quiescence proof), so there is
+        // nothing to hold across it.
+        //
+        // ⚠️ THE CONTRACT THIS RESTS ON: no caller of socket_write may hold a
+        // resolved CBlockIndex*. That is true today because every handler returns a
+        // std::string and every write happens in a caller frame. A handler that
+        // ever streams a response while walking the chain breaks it, and the
+        // breakage is silent.
+        EpochOfflineScope offline(m_chainstate, "rpc-worker");
         if (ssl && m_ssl_wrapper) {
             return m_ssl_wrapper->SSLWrite(ssl, buffer, size);
         } else {
@@ -10144,7 +10164,16 @@ std::string CRPCServer::RPC_WaitForNewBlock(const std::string& params) {
                     std::chrono::milliseconds(timeout_ms);
 
     std::unique_lock<std::mutex> lock(g_wait_cluster_mtx);
+    // OFFLINE FOR THE PARK, ONLINE FOR THE PREDICATE. This wait blocks for up to
+    // the caller's timeout — 300 s for the wait-* RPCs — and an online worker pins
+    // every eviction for that whole period while holding only copied data. The
+    // predicate is the only part that resolves anything (get_tip() calls GetTip and
+    // immediately copies out {hash, height}), so the predicate is the only part
+    // that goes online. Wrapping the whole wait offline instead would make every
+    // predicate evaluation a resolve-while-offline.
+    EpochOfflineScope offline_park(&g_chainstate, "rpc-worker");
     g_wait_cluster_cv.wait_until(lock, deadline, [&]() {
+        EpochOnlineWindow online(&g_chainstate, "rpc-worker");
         return g_wait_cluster_shutdown.load(std::memory_order_relaxed) ||
                get_tip().first != initial.first;
     });
@@ -10176,7 +10205,16 @@ std::string CRPCServer::RPC_WaitForBlock(const std::string& params) {
                     std::chrono::milliseconds(timeout_ms);
 
     std::unique_lock<std::mutex> lock(g_wait_cluster_mtx);
+    // OFFLINE FOR THE PARK, ONLINE FOR THE PREDICATE. This wait blocks for up to
+    // the caller's timeout — 300 s for the wait-* RPCs — and an online worker pins
+    // every eviction for that whole period while holding only copied data. The
+    // predicate is the only part that resolves anything (get_tip() calls GetTip and
+    // immediately copies out {hash, height}), so the predicate is the only part
+    // that goes online. Wrapping the whole wait offline instead would make every
+    // predicate evaluation a resolve-while-offline.
+    EpochOfflineScope offline_park(&g_chainstate, "rpc-worker");
     g_wait_cluster_cv.wait_until(lock, deadline, [&]() {
+        EpochOnlineWindow online(&g_chainstate, "rpc-worker");
         return g_wait_cluster_shutdown.load(std::memory_order_relaxed) ||
                get_tip().first == wanted;
     });
@@ -10207,7 +10245,16 @@ std::string CRPCServer::RPC_WaitForBlockHeight(const std::string& params) {
                     std::chrono::milliseconds(timeout_ms);
 
     std::unique_lock<std::mutex> lock(g_wait_cluster_mtx);
+    // OFFLINE FOR THE PARK, ONLINE FOR THE PREDICATE. This wait blocks for up to
+    // the caller's timeout — 300 s for the wait-* RPCs — and an online worker pins
+    // every eviction for that whole period while holding only copied data. The
+    // predicate is the only part that resolves anything (get_tip() calls GetTip and
+    // immediately copies out {hash, height}), so the predicate is the only part
+    // that goes online. Wrapping the whole wait offline instead would make every
+    // predicate evaluation a resolve-while-offline.
+    EpochOfflineScope offline_park(&g_chainstate, "rpc-worker");
     g_wait_cluster_cv.wait_until(lock, deadline, [&]() {
+        EpochOnlineWindow online(&g_chainstate, "rpc-worker");
         return g_wait_cluster_shutdown.load(std::memory_order_relaxed) ||
                get_tip().second >= target;
     });

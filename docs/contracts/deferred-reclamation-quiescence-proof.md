@@ -413,6 +413,50 @@ the proof the check is no longer vacuous.
   is why the registry must never be keyed to one** — and why a second *production*
   chainstate would require keying the registry by chainstate.
 
+## ⚠️ A CLAIM OF MINE THE ROUND-2 PANEL RETRACTED
+
+I wrote, in the round-1 fold and in the PR body, that the two defects **compose** —
+that after F1 a stale unregistered-resolver record would also stop the drain, so the
+withdrawal bug "would have stopped reclamation outright rather than printing a wrong
+number". **That is false, and the seats were right to call it.**
+
+`DrainGraveyard` refuses on `safe_epoch == 0`, and `safe_epoch` is the minimum over
+**live slot values**. `UnregisteredResolverThreads()` is read only *inside* that
+branch, to format the message. An **exited** thread's slot is `EPOCH_SLOT_RETIRED`,
+which is the maximum — it cannot lower the minimum, so a stale accusation left behind
+by an exited thread never gated the free rule at all. It failed the **startup gate**
+and the **periodic census**, and nothing else.
+
+**So the fifth fix is load-bearing for the CENSUS, not for reclamation.** Still worth
+having — a census that cries wolf is a census nobody reads, and the gate refuses to
+start a node over it — but one grade less serious than I said, and I said it in a
+message that shaped how someone else read the branch. The composition I described
+would require the accusation to be held by a **live** thread, which is precisely the
+case the record is not needed for: that thread's slot is already 0.
+
+## THE POINTER-ESCAPE CENSUS — every way a raw `CBlockIndex*` leaves `cs_main`
+
+The seats could not verify the claim that `GetBlockIndex` and `GetTip` are the only
+escapes, because the pack did not carry `GetTip`. It is instrumented
+(`chain.cpp:3838-3841`, verified in this tree — COORD cited 3767-3770 from an earlier head). The full census, grep-level:
+
+| route | status |
+|---|---|
+| `CChainState::GetBlockIndex(hash)` | **instrumented** — `NoteIndexPointerResolved(current_epoch)` before the return |
+| `CChainState::GetTip()` | **instrumented** — same call, guarded on a non-null tip |
+| `CChainState::FindMostWorkChainImpl()` (`chain.h:1650`, body `chain.cpp:4448`) | **private**, and it has exactly ONE caller: `ActivateBestChain` at `chain.cpp:1994`, inside the function-scoped `lock_guard(cs_main)` taken at `chain.cpp:1820`. The returned pointer is used and discarded within that scope, which covers the whole function. No escape — verified by grep, not asserted. |
+| `CChainState::FindFork(a, b)` (static) | returns one of **its own arguments** — a pointer the caller already had. Creates no new escape. |
+| `mapBlockIndex` iteration | **private**; every mention outside `chain.cpp` is in a comment (verified tree-wide). No caller can iterate it. |
+| callbacks (`RegisterBlockConnectCallback`, tip-update) | pass **values** — `const CBlock&`, `int`, `uint256`. This was deliberately changed from a `const CBlockIndex*` under P2P-14/15 and the header says not to change it back. |
+| `AddBlockIndex(hash, unique_ptr)` | takes ownership; the caller's raw pointer is one it already held before the call. |
+| `phashBlock` / `GetBlockHash()` | returns a `uint256` **by value**. The `phashBlock` member is a value member of the index entry, not a pointer into the map. |
+| `SetTip` / `SetTipForTest` | take a pointer **in**; they do not hand one out. |
+
+So the two instrumented accessors are the complete set of *new* escapes, and the
+detector at those two points sees every thread that acquires one. **What it does not
+see** is a pointer passed from one thread to another after the fact — see the
+no-handoff obligation above.
+
 ## WIRING CENSUS — checkpoints, offline scopes, and declared counts
 
 Three separate things are wired per thread, and conflating them is what produced two

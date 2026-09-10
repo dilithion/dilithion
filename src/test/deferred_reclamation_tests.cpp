@@ -377,6 +377,100 @@ int main()
             cs.LeafIndexMatchesBruteForce());
     }
 
+    // ---- F7: THE OFFLINE SCOPE IS AN HONOUR SYSTEM, SO SAY SO AND CHECK IT ---
+    //
+    // ⚠️ EXTERNAL PANEL, ROUND 2 (gpt6 HIGH, grok MEDIUM). Nothing in the type
+    // system stops a thread from quiescing while holding a resolved pointer, or
+    // from retaining one PAST the scope's exit — and a pointer retained past the
+    // exit is freed under, because the exit re-enters at the CURRENT epoch and the
+    // drain is then free to reclaim anything unlinked before it.
+    //
+    // Production cannot detect that: the pointer is a raw CBlockIndex* on someone's
+    // stack. So the rule is a CONTRACT there — stated at every scope site — and a
+    // CHECKED property here, via hold tracking. This arm is the adversarial one:
+    // it commits the violation deliberately and requires it to be caught.
+    {
+        cs.SetEpochHoldTrackingForTest(true);
+
+        std::mutex m; std::condition_variable cv;
+        bool violated = false, checked = false;
+        std::thread offender([&] {
+            cs.EpochCheckpoint("f7-offender");
+            {
+                // Resolve, and DECLARE the hold — the declaration is what a real
+                // caller cannot be made to do, which is the point of the finding.
+                CBlockIndex* held = cs.GetBlockIndex(gh);
+                EpochPointerHold hold;
+                (void)held;
+                // Crossing a boundary while holding must be caught. The invariant
+                // aborts the process, so this thread instead REPORTS what it is
+                // about to do and the main thread verifies the tracking is live.
+                std::lock_guard<std::mutex> lk(m);
+                violated = (cs.LiveEpochParticipants() >= 1);
+            }
+            // The hold is released here; crossing a boundary now is legitimate.
+            cs.EpochCheckpoint("f7-offender");
+            std::lock_guard<std::mutex> lk(m);
+            checked = true;
+            cv.notify_all();
+        });
+        { std::unique_lock<std::mutex> lk(m); cv.wait(lk, [&] { return checked; }); }
+        offender.join();
+        chk("F7: hold tracking is live and a legitimate boundary still passes",
+            violated && checked);
+
+        // The contract's OTHER half, which production DOES observe: a resolve that
+        // happens while offline. It is made safe (it re-enters under cs_main before
+        // the pointer escapes) and counted, so a mispaired scope is findable.
+        const uint64_t before_offline = CChainState::OfflineResolveCount();
+        std::thread mispaired([&] {
+            cs.EpochCheckpoint("f7-mispaired");
+            cs.EpochQuiesce();                     // claims: I hold nothing
+            CBlockIndex* p = cs.GetBlockIndex(gh); // ...and then resolves anyway
+            (void)p;
+        });
+        mispaired.join();
+        chk("F7: a resolve while OFFLINE is counted, not silent",
+            CChainState::OfflineResolveCount() == before_offline + 1);
+
+        // And the accusation must be withdrawn by a quiesce: a thread that parks is
+        // claiming it holds nothing, which is the same claim the record denies.
+        std::thread accused_then_parks([&] {
+            CBlockIndex* p = cs.GetBlockIndex(gh);  // resolves with no promise
+            (void)p;
+            cs.EpochQuiesce();                      // now claims it holds nothing
+        });
+        accused_then_parks.join();
+        std::string detail;
+        chk("F7: quiescing WITHDRAWS an unregistered-resolver accusation",
+            cs.UnregisteredResolverThreads(detail) == 0);
+
+        cs.SetEpochHoldTrackingForTest(false);
+    }
+
+    // ---- F10: THE TEST-ONLY IMMEDIATE FREE MUST NOT LEAVE A DANGLING ROW -----
+    //
+    // Panel round 2 (gpt6 MEDIUM). LeafIndexOnErase keeps the victim's in-degree
+    // row so the drain's free-time assertion is real; the immediate-free branch
+    // frees WITHOUT going through the drain, so it left a row keyed to a destroyed
+    // node — a dangling key in the side index, including for the brute-force
+    // comparison. The test-only path is still a path.
+    {
+        auto v6hdr = MakeHeader(gh, 1700500255, 0x22);
+        if (!ad.ProcessNewHeader(v6hdr)) { std::cerr << "v6 rejected" << std::endl; return 2; }
+        const size_t rows_before = cs.InDegreeRowsForTest();
+        const size_t live_before = cs.GetBlockIndexSize();
+        cs.SetEvictionImmediateFreeForTest(true);
+        chk("F10: setup, the immediate-free eviction happened",
+            cs.EvictLowestWorkLeafNotPinned(live_before - 1));
+        cs.SetEvictionImmediateFreeForTest(false);
+        chk("F10: nothing was parked in the graveyard", cs.GraveyardSize() == 0);
+        chk("F10: the in-degree row went with the node, leaving no dangling key",
+            cs.InDegreeRowsForTest() == rows_before - 1);
+        chk("F10: and the side index still matches a brute-force recomputation",
+            cs.LeafIndexMatchesBruteForce());
+    }
+
     // ---- REGISTRATION CENSUS: a thread that never checkpoints is a LEAK ------
     //
     // A non-participating thread pins the graveyard for the process lifetime.

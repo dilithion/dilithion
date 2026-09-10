@@ -272,6 +272,32 @@ private:
         std::unique_ptr<CBlockIndex> node;   // owned, unlinked, not yet freed
         uint64_t unlinked_epoch;             // global epoch at unlink time
     };
+    // ⚠️ A VECTOR, AND THE PANEL'S SUGGESTED deque WAS TRIED AND MEASURED SLOWER.
+    //
+    // The finding is asymptotically right: reclamation frees a PREFIX, and
+    // std::vector::erase(begin, cut) moves the surviving suffix down, so freeing a
+    // few entries under a large pinned suffix is O(G) rather than O(freed).
+    // std::deque erases a prefix in time linear in the erased count. So the change
+    // was made — and then measured, same fixture, same configuration (500,000-entry
+    // index, 10,400/s ingress, a 10 s slow participant so ~5,000 entries clear per
+    // call under a ~100,000-entry survivor set):
+    //
+    //     vector : drain max 19.3 ms, mean 1.0 ms
+    //     deque  : drain max 28.0 ms, mean 1.5 ms
+    //
+    // The deque is ~45% WORSE at the scale that occurs, because a GraveyardEntry is
+    // 16 bytes and moving a 100,000-entry suffix is a ~1.6 MB contiguous move,
+    // while the deque pays chunked iteration and per-element destruction across
+    // segments. The asymptotics only overtake the constant factor at a G the
+    // MEMORY ceiling reaches first: at the measured 47 MB peak the suffix move is
+    // ~2.5 MB, and long before erase cost matters the node is out of RAM for other
+    // reasons.
+    //
+    // Reverted on the measurement, not on preference, and recorded here so the next
+    // reader does not re-derive the same "obviously a deque" conclusion from the
+    // asymptotics alone. IF a future change removes the memory ceiling on G — or if
+    // GraveyardEntry grows — this flips, and the fix is an offset-based head rather
+    // than a deque, which keeps the contiguous layout AND avoids the move.
     std::vector<GraveyardEntry> m_graveyard;
 
     // ⚠️ THIS COMMENT SAID "bumped by each participating thread at its call
@@ -395,6 +421,18 @@ public:
      * turn this on so the cheap check is corroborated by the expensive one.
      */
     void SetDeepDrainInvariantsForTest(bool on);
+
+    /**
+     * TEST-ONLY: turn on hold tracking, which makes EpochCheckpoint() and
+     * EpochQuiesce() ASSERT that the calling thread declares no live
+     * CBlockIndex*. Production cannot check this — the pointer is a raw pointer on
+     * someone's stack — so the no-pointer-across-a-boundary rule is a CONTRACT
+     * there and a checked property here. Declare holds with EpochPointerHold.
+     */
+    void SetEpochHoldTrackingForTest(bool on);
+
+    /** Adjust this thread's declared hold count. Use EpochPointerHold, not this. */
+    static void NoteEpochPointerHeld(int delta);
 
     /** Test-only: how many in-degree rows exist (live entries plus graveyard). */
     size_t InDegreeRowsForTest() const {
@@ -1781,6 +1819,56 @@ private:
  * a wake path that forgot to re-enter would resolve pointers while unpinned, and
  * that is the one hazard the offline state introduces.
  */
+/**
+ * Declares that the calling thread is holding a resolved CBlockIndex* for the
+ * lifetime of this object. Inert unless SetEpochHoldTrackingForTest is on, in which
+ * case crossing an epoch boundary (checkpoint or quiesce) while one is alive fires
+ * the invariant instead of publishing a false claim.
+ *
+ * ⚠️ THIS IS TEST-TIME ENFORCEMENT OF A PRODUCTION CONTRACT, NOT THE CONTRACT
+ * ITSELF. Production has no way to know a raw pointer is still live on a caller's
+ * stack; the rule "hold no CBlockIndex* across a checkpoint, a quiesce, or the exit
+ * of an EpochOfflineScope" is enforced by review and by this, not by the type
+ * system.
+ */
+class EpochPointerHold
+{
+public:
+    EpochPointerHold() { CChainState::NoteEpochPointerHeld(+1); }
+    ~EpochPointerHold() { CChainState::NoteEpochPointerHeld(-1); }
+    EpochPointerHold(const EpochPointerHold&) = delete;
+    EpochPointerHold& operator=(const EpochPointerHold&) = delete;
+};
+
+/**
+ * The inverse of EpochOfflineScope: a brief ONLINE window inside a long offline
+ * wait. Checkpoint on entry, quiesce on exit.
+ *
+ * It exists for one shape — a blocking wait whose PREDICATE resolves. The long-poll
+ * wait-* RPCs park for up to 300 s and re-evaluate a predicate on each notification;
+ * that predicate calls GetTip() and immediately copies out {hash, height}. Going
+ * offline for the whole wait would make every predicate evaluation a
+ * resolve-while-offline; staying online for the whole wait pins every eviction for
+ * up to five minutes. The predicate is the only part that holds anything, so the
+ * predicate is the part that goes online.
+ */
+class EpochOnlineWindow
+{
+public:
+    EpochOnlineWindow(CChainState* cs, const char* name) : m_cs(cs), m_name(name)
+    {
+        if (m_cs) m_cs->EpochCheckpoint(m_name);
+    }
+    ~EpochOnlineWindow() { if (m_cs) m_cs->EpochQuiesce(); }
+
+    EpochOnlineWindow(const EpochOnlineWindow&) = delete;
+    EpochOnlineWindow& operator=(const EpochOnlineWindow&) = delete;
+
+private:
+    CChainState* m_cs;
+    const char* m_name;
+};
+
 class EpochOfflineScope
 {
 public:

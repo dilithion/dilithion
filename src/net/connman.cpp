@@ -257,6 +257,11 @@ bool CConnman::Start(CPeerManager& peer_mgr, CNetMessageProcessor& msg_proc, con
     // after the spawn is safe in the other direction: a thread that checkpoints
     // before its declaration lands is simply already in the registered set, and
     // the census only ever asks for declared-minus-registered.
+    // These two are declared here, AFTER every spawn in this function has
+    // succeeded — the same rule as the pool below. Their threads were created
+    // earlier in Start(), but a declaration is a promise about a RUNNING thread,
+    // and until the last spawn succeeds this function can still return false and
+    // join them all.
     g_chainstate.DeclareEpochParticipant("p2p-msg-handler");
     g_chainstate.DeclareEpochParticipant("p2p-headers-worker");
     // ⚠️ DECLARED WITH A COUNT, BECAUSE THIS IS A POOL. The registry used to

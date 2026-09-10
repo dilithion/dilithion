@@ -16,28 +16,48 @@
 # more alarming of the two failure modes.
 # ============================================================================
 set -uo pipefail
-cd /c/tmp/roster-args || exit 9
+# ⚠️ RELATIVE TO THIS SCRIPT, NOT A HARD-CODED WORKTREE. `cd /c/tmp/roster-args`
+# meant this harness silently tested SOMEONE ELSE'S CHECKOUT when run from any other
+# worktree — it would mutate and restore a tree the caller never asked about, and
+# report the verdict as if it were theirs.
+cd "$(dirname "${BASH_SOURCE[0]:-$0}")/.." || exit 9
+CHAIN_REL=src/consensus/chain.cpp
+[ -f "$CHAIN_REL" ] || { echo "FATAL: not a Dilithion checkout: $PWD"; exit 9; }
 
 command -v python >/dev/null || { echo "FATAL: python not on PATH"; exit 7; }
 same() { python -c "
 import sys,io
 sys.exit(0 if io.open(sys.argv[1],'rb').read()==io.open(sys.argv[2],'rb').read() else 1)" "$1" "$2"; }
 
-CHAIN=src/consensus/chain.cpp
+CHAIN=$CHAIN_REL
 BAK=/tmp/chain.cpp.r1folds.baseline
 cp "$CHAIN" "$BAK" || exit 7
 same "$CHAIN" "$BAK" || { echo "FATAL: baseline copy mismatch"; exit 7; }
 echo "baseline saved ($(wc -c < "$BAK") bytes)"
 rc=0
 
+# ⚠️ AN INTERRUPTED RUN MUST NOT LEAVE A MUTANT IN THE TREE. Without this, Ctrl-C
+# between the mutation and the restore leaves chain.cpp defective and the next
+# person's build silently carries it.
+trap 'echo; echo "INTERRUPTED — restoring"; cp "$BAK" "$CHAIN" 2>/dev/null; exit 130' INT TERM EXIT
+
 restore() {
   cp "$BAK" "$CHAIN"
   if same "$CHAIN" "$BAK"; then echo "   restored (byte-identical)"; else echo "   RESTORE FAILED"; rc=$((rc+1)); fi
 }
 
-# $1 label, $2 python mutation (must print MUTATED), $3 expected-red assertion text
+# $1 label, $2 python mutation (must print MUTATED), $3 expected signature,
+# $4 kind: "assert" (a named assertion must FAIL) or "abort" (the process must abort
+# on a ConsensusInvariant, exit 3).
+#
+# ⚠️ EVERY ARM NAMES THE SIGNATURE IT EXPECTS. This used to accept ANY non-zero exit
+# as a kill — "PASS(other)" — and exit 3 for every arm without checking which
+# invariant fired. A mutant that crashed for an unrelated reason, or one that aborted
+# in a different place than the fix it is meant to guard, was scored as a success.
+# An arm that cannot say WHICH failure it expects is not a guard, it is a coincidence
+# detector.
 arm() {
-  local label=$1 mutation=$2 expect=$3
+  local label=$1 mutation=$2 expect=$3 kind=${4:-assert}
   echo
   echo "=== $label ==="
   if ! python -c "$mutation"; then
@@ -49,25 +69,39 @@ arm() {
   fi
   ./deferred_reclamation_tests > /tmp/r1_mut_run.out 2>&1
   local ec=$?
-  if [ $ec -ne 0 ] && grep -q "FAIL  $expect" /tmp/r1_mut_run.out; then
-      echo "   PASS  $label: the arm KILLED the mutant (exit $ec)"
-      grep -m2 "FAIL  " /tmp/r1_mut_run.out | sed 's/^/         /'
-  elif [ $ec -eq 3 ]; then
-      # exit 3 is the process ABORTING on a ConsensusInvariant. For F4 that is the
-      # intended kill and the sharpest possible one: with the in-degree row erased
-      # at unlink again, the free-time assertion FIRES -- which is only possible
-      # because it is no longer a tautology. It aborts at the FIRST drain, before
-      # the named assertion is reached, so the named assertion is not what killed
-      # it; the reinstated check is.
-      echo "   PASS  $label: the mutant ABORTED on the reinstated invariant (exit 3)"
-      tail -3 /tmp/r1_mut_run.out | sed 's/^/         /'
-  elif [ $ec -ne 0 ]; then
-      echo "   PASS(other)  $label: mutant died, but on a different assertion (exit $ec)"
-      grep -m3 "FAIL  \|Assertion\|abort" /tmp/r1_mut_run.out | sed 's/^/         /'
-  else
+  if [ $ec -eq 0 ]; then
       echo "   FAIL  $label: THE MUTANT SURVIVED — the arm does not guard this fix"
-      rc=$((rc+1))
+      rc=$((rc+1)); restore; return
   fi
+
+  case "$kind" in
+    assert)
+      if grep -q "FAIL  $expect" /tmp/r1_mut_run.out; then
+          echo "   PASS  $label: killed by its named assertion (exit $ec)"
+          grep -m2 "FAIL  " /tmp/r1_mut_run.out | sed 's/^/         /'
+      else
+          echo "   FAIL  $label: the mutant died (exit $ec) but NOT on \"$expect\""
+          echo "         A kill on the wrong signature is not evidence for this fix."
+          grep -m3 "FAIL  " /tmp/r1_mut_run.out | sed 's/^/         /'
+          tail -2 /tmp/r1_mut_run.out | sed 's/^/         /'
+          rc=$((rc+1))
+      fi ;;
+    abort)
+      # The process must abort on a ConsensusInvariant, and the output must carry
+      # the EXACT invariant text. Exit 3 alone is not enough -- the fixture returns 3
+      # for its own refusals too -- and a positional marker is not enough either:
+      # the abort happens wherever the first qualifying drain is, which moves as
+      # arms are added. Naming the invariant pins WHICH check fired.
+      if [ $ec -eq 3 ] && grep -q "$expect" /tmp/r1_mut_run.out; then
+          echo "   PASS  $label: aborted on the reinstated invariant, past \"$expect\" (exit 3)"
+          tail -2 /tmp/r1_mut_run.out | sed 's/^/         /'
+      else
+          echo "   FAIL  $label: expected an abort past \"$expect\", got exit $ec"
+          tail -3 /tmp/r1_mut_run.out | sed 's/^/         /'
+          rc=$((rc+1))
+      fi ;;
+    *) echo "   FAIL  $label: unknown arm kind '$kind'"; rc=$((rc+1)) ;;
+  esac
   restore
 }
 
@@ -106,13 +140,15 @@ s=s.replace(old, old+'\n    m_inDegree.erase(pgone);   // MUTANT: erased at unli
 io.open(p,'w',encoding='utf-8',newline='').write(s)
 assert 'MUTANT: erased at unlink' in io.open(p,encoding='utf-8').read()
 print('MUTATED')
-" "F4: the unlinked entry KEEPS its in-degree row until it is freed"
+" "CONSENSUS INVARIANT VIOLATION: it_deg != m_inDegree.end()" abort
 
 echo
 echo "=== the tree is back where it started ==="
 if same "$CHAIN" "$BAK"; then echo "   PASS  $CHAIN is byte-identical to the saved baseline"; else echo "   FAIL"; rc=$((rc+1)); fi
 make deferred_reclamation_tests -j8 > /dev/null 2>&1 && ./deferred_reclamation_tests > /dev/null 2>&1 \
   && echo "   and the restored tree is green again" || { echo "   FAIL: restored tree not green"; rc=$((rc+1)); }
+
+trap - EXIT   # the tree is restored and verified below; the trap has done its job
 
 echo
 echo "===== R1 FOLD RED ARMS: $([ $rc -eq 0 ] && echo PASS || echo FAIL) ($rc failed) ====="

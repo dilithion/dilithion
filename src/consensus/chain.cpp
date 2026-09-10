@@ -432,6 +432,14 @@ struct EpochSlotRetirer {
 thread_local std::atomic<uint64_t>* t_epoch_slot = nullptr;
 thread_local const char* t_epoch_name = nullptr;
 extern thread_local EpochSlotRetirer t_epoch_retirer;
+// TEST-ONLY hold tracking. Production cannot know when a caller is still holding a
+// resolved pointer -- the pointer is a raw CBlockIndex* on someone's stack -- so the
+// no-pointer-across-a-boundary rule is a CONTRACT, not a checked property. A test
+// declares its holds with EpochPointerHold and turns this on; the boundary then
+// asserts instead of trusting.
+std::atomic<bool> g_epoch_hold_tracking{false};
+thread_local int t_epoch_holds = 0;
+
 // OFFLINE = "I am blocked and hold nothing". See CChainState::EpochQuiesce.
 thread_local bool t_epoch_offline = false;
 
@@ -608,15 +616,19 @@ void NoteIndexPointerResolved(uint64_t current_epoch)
 // now made the promise, so the accusation is withdrawn.
 void ClearUnregisteredRecord()
 {
+    // Called from a LIVE thread (a checkpoint or a quiesce), not from a destructor
+    // -- the destructor has its own copy of this loop, because at teardown it must
+    // not touch t_unregistered_scope through the thread_local accessor at all. The
+    // comment here used to describe the destructor's constraints, which made the
+    // two look interchangeable; they are not.
     UnregisteredRecordScope& me = t_unregistered_scope;
     if (!me.recorded) return;
     me.recorded = false;
     auto& u = Unregistered();
     std::lock_guard<std::mutex> lk(u.mu);
     for (size_t i = 0; i < u.ids.size(); ++i) {
-        // The id is read from the OBJECT, not from std::this_thread::get_id():
-        // this runs from a thread_local destructor, and the object's own storage
-        // is the only thing guaranteed intact there.
+        // The id comes from the OBJECT rather than std::this_thread::get_id() so
+        // that this body stays valid if it is ever reached from a teardown path.
         if (u.ids[i] == me.id) { u.ids.erase(u.ids.begin() + i); return; }
     }
     if (u.overflow > 0) --u.overflow;   // was beyond the cap
@@ -643,6 +655,12 @@ void CChainState::EpochCheckpoint(const char* name)
     // Publish "I am now at the current global epoch, and I hold no CBlockIndex*".
     // acquire on the read / release on the store: a drain that observes this value
     // must also observe everything this thread did before the checkpoint.
+    // A checkpoint claims "I hold no CBlockIndex* at this instant" just as loudly
+    // as a quiesce does; under test-time hold tracking it is checked the same way.
+    if (g_epoch_hold_tracking.load(std::memory_order_relaxed)) {
+        ConsensusInvariant(t_epoch_holds == 0);
+    }
+
     const uint64_t now = m_globalEpoch.load(std::memory_order_acquire);
     MyEpochSlot()->store(now, std::memory_order_release);
     t_epoch_offline = false;   // re-entering the quiescent-state calculation
@@ -685,8 +703,26 @@ void CChainState::EpochQuiesce()
     // quiescent-state calculation entirely, exactly as a thread that has exited
     // does, and re-enters BEFORE it resolves anything. EpochOfflineScope pairs the
     // two so no wake path can forget the second half.
+    // ⚠️ GOING OFFLINE IS A CLAIM, AND THE ACCUSATION IS THE SAME CLAIM INVERTED.
+    // A thread recorded as an unregistered resolver holds a slot at 0 and pins
+    // everything. If it then parks, the slot goes RETIRED and it stops pinning —
+    // but the RECORD stayed, so the census went on reporting a holder that had just
+    // declared it holds nothing. Quiescing withdraws it: the two statements cannot
+    // both be true, and the one made here is the deliberate one.
+    ClearUnregisteredRecord();
+
     t_epoch_offline = true;
     MyEpochSlot()->store(EPOCH_SLOT_RETIRED, std::memory_order_release);
+
+    // TEST-TIME ENFORCEMENT OF THE CONTRACT THIS SCOPE CANNOT OTHERWISE CHECK.
+    // "Offline" means "I hold no CBlockIndex*", and nothing in the type system
+    // stops a caller from quiescing with one in hand — the seats called it an
+    // honour system, correctly. When hold-tracking is on (tests only), a pointer
+    // declared held via EpochPointerHold makes this fire instead of silently
+    // publishing a false claim.
+    if (g_epoch_hold_tracking.load(std::memory_order_relaxed)) {
+        ConsensusInvariant(t_epoch_holds == 0);
+    }
 }
 
 uint64_t CChainState::OfflineResolveCount()
@@ -817,6 +853,17 @@ bool CChainState::EpochRegistrationComplete(std::string& why) const
     return false;
 }
 
+void CChainState::SetEpochHoldTrackingForTest(bool on)
+{
+    g_epoch_hold_tracking.store(on, std::memory_order_relaxed);
+}
+
+void CChainState::NoteEpochPointerHeld(int delta)
+{
+    t_epoch_holds += delta;
+    ConsensusInvariant(t_epoch_holds >= 0);
+}
+
 void CChainState::SetDeepDrainInvariantsForTest(bool on)
 {
     // Turns the exhaustive "no live entry names this as pprev" scan back on. It is
@@ -913,6 +960,13 @@ size_t CChainState::DrainGraveyard()
     // they strictly increase, and entries are appended in that order. The first
     // entry answers "is anything freeable at all?" in O(1), and a binary search
     // finds the cutoff in O(log G). Only the freed prefix is touched.
+    // The fast path's premise, checked in production at O(1) rather than assumed:
+    // the front stamp must be the smallest. A cheap guard on the one property that
+    // would make the early-out and the binary search silently wrong.
+    ConsensusInvariant(m_graveyard.size() < 2 ||
+                       m_graveyard.front().unlinked_epoch <
+                           m_graveyard.back().unlinked_epoch);
+
     if (m_graveyard.front().unlinked_epoch > safe_epoch) return 0;   // O(1) early-out
 
     if (m_deepDrainInvariants.load(std::memory_order_relaxed)) {
@@ -984,6 +1038,15 @@ size_t CChainState::DrainGraveyard()
 
     // Only the freed prefix is erased; survivors keep their order and their stamps,
     // so the next call's O(1) early-out still holds.
+    //
+    // ⚠️ THIS ERASE MOVES THE SURVIVING SUFFIX, AND THAT IS A DELIBERATE,
+    // MEASURED CHOICE. An external seat flagged it as O(G) per partial reclamation
+    // and proposed a deque; the deque was implemented and measured 45% SLOWER at
+    // the scale that actually occurs (drain max 28.0 ms vs 19.3 ms, mean 1.5 vs
+    // 1.0, same fixture and configuration) — 16-byte entries move contiguously
+    // faster than a deque iterates chunks and destroys across segments. See the
+    // container's declaration in chain.h for the numbers and for the threshold at
+    // which the asymptotics would win.
     m_graveyard.erase(m_graveyard.begin(), cut);
 
     // The warn threshold is a high-water mark, not a rate: once the graveyard has
@@ -1576,6 +1639,14 @@ bool CChainState::EvictLowestWorkLeafNotPinned(size_t target_max) {
             auto node = std::move(mapBlockIndex[victim_key]);
             mapBlockIndex.erase(victim_key);
             if (m_immediateFreeForTest.load(std::memory_order_relaxed)) {
+                // ⚠️ THE IN-DEGREE ROW MUST GO WITH IT. LeafIndexOnErase now KEEPS
+                // the victim's row so the drain's free-time assertion is real, and
+                // the drain erases it at the free — but this branch frees WITHOUT
+                // going through the drain, so it left a row keyed to a destroyed
+                // node. Harmless in the ASan arm that uses it, and a dangling key
+                // in the side index for anything else, including
+                // LeafIndexMatchesBruteForce. The test-only path is still a path.
+                m_inDegree.erase(victim);
                 // TEST-ONLY: free in place, which is what this code did before
                 // deferral existed. It is here so the ASan arms can compare the
                 // defect and the fix IN ONE BINARY, on one fixture, with deferral

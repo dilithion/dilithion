@@ -8169,6 +8169,25 @@ load_genesis_block:  // Bug #29: Label for automatic retry after blockchain wipe
                     std::cerr << "[Chain] ⚠️  GRAVEYARD PINNED: " << epoch_why
                               << std::endl;
                 }
+
+                // ⚠️ THE OFFLINE-RESOLVE COUNTER HAD NO PRODUCTION OBSERVER, so a
+                // mispaired quiesce/checkpoint was recorded and never read outside
+                // the bench. A non-zero value means some thread resolved a
+                // CBlockIndex* after publishing "I hold nothing" — made safe at the
+                // resolve, but it says a scope pairing is wrong somewhere, and that
+                // only gets fixed if it is said out loud. Reported on each increase,
+                // not every tick.
+                static uint64_t s_reported_offline_resolves = 0;
+                const uint64_t offline_resolves = CChainState::OfflineResolveCount();
+                if (offline_resolves > s_reported_offline_resolves) {
+                    std::cerr << "[Chain] ⚠️  " << offline_resolves
+                              << " resolve(s) happened while a thread was OFFLINE. "
+                              << "A quiesce/checkpoint pairing is wrong: some thread "
+                              << "takes a CBlockIndex* after publishing that it holds "
+                              << "none. Safe at the resolve, wrong by design."
+                              << std::endl;
+                    s_reported_offline_resolves = offline_resolves;
+                }
             }
 
             std::this_thread::sleep_for(std::chrono::seconds(1));
