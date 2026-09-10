@@ -622,6 +622,24 @@ bool CHeadersManager::ProcessHeaders(NodeId peer, const std::vector<CBlockHeader
 // DoS-Protected Header Sync (Bitcoin Core two-phase)
 // ============================================================================
 
+// Test/diagnostic observable: which PHASE a peer's DoS-protected session is in,
+// or nullopt when it has none.
+//
+// It reports the STATE MACHINE'S OWN FIELD, not a proxy inferred from a return
+// value. ProcessHeadersWithDoSProtection returns `true` both when a sync is
+// progressing and when it has just been terminated by a non-full headers message
+// — the termination sets success = true deliberately, because the headers in that
+// batch were valid. A test reading only the return value therefore cannot see the
+// abort at all, which is how the hardcoded `true` above survived unnoticed.
+std::optional<HeadersSyncState::State>
+CHeadersManager::GetHeadersSyncPhase(NodeId peer) const
+{
+    std::lock_guard<std::mutex> lock(cs_headers);
+    auto it = mapHeadersSyncStates.find(peer);
+    if (it == mapHeadersSyncStates.end() || !it->second) return std::nullopt;
+    return it->second->GetState();
+}
+
 bool CHeadersManager::ProcessHeadersWithDoSProtection(NodeId peer, const std::vector<CBlockHeader>& headers)
 {
     // Phase 6 PR6.1: per-peer rate limit. Same policy as ProcessHeaders.
@@ -687,7 +705,26 @@ bool CHeadersManager::ProcessHeadersWithDoSProtection(NodeId peer, const std::ve
     // validates headers and is expensive, and holding the global header lock
     // across it would serialise the header path. Safe now only because
     // sync_state is a shared_ptr taken above.
-    auto result = sync_state->ProcessNextHeaders(headers, true);
+    // ⛔ LP-10 F5 / D-1, THE CALLER'S HALF — this argument was hardcoded `true`.
+    //
+    // `full_headers_available` is the SYNC-TERMINATION SIGNAL: a NON-full headers
+    // message means the peer has nothing more to give (PRESYNC) or is declining to
+    // re-serve the chain it claimed (REDOWNLOAD), and HeadersSyncState aborts the
+    // sync on it. Passing a constant `true` told it every message was full, so
+    // BOTH aborts were unreachable from the only caller that exists — the signal
+    // was restored inside the state machine and still could not fire.
+    //
+    // Fixing the callee alone would have been the "wired" mistake in its purest
+    // form: a correct check no production path can reach.
+    //
+    // Core v28.0 net_processing.cpp:2787 derives it exactly this way:
+    //     ProcessNextHeaders(headers, headers.size() == MAX_HEADERS_RESULTS)
+    // A peer that fills the message to the protocol maximum has more to send; any
+    // shorter answer is the end of what it has.
+    const bool full_headers_message =
+        (headers.size() == Consensus::MAX_HEADERS_RESULTS);
+
+    auto result = sync_state->ProcessNextHeaders(headers, full_headers_message);
 
     if (!result.success) {
         std::lock_guard<std::mutex> lock(cs_headers);

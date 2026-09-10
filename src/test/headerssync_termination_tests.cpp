@@ -45,10 +45,13 @@
 // Reachability clause: the gate has ZERO production callers. This is a port
 // defect in dormant code, corrected before A-3 wires it.
 
+#include <net/headers_manager.h>
 #include <net/headerssync.h>
 #include <net/iheader_proof_checker.h>
 
 #include <consensus/chain_work.h>
+#include <consensus/params.h>
+#include <core/chainparams.h>
 #include <primitives/block.h>
 
 #include <iostream>
@@ -273,13 +276,81 @@ void test_redownload_short_batch_gives_up_but_keeps_its_headers()
     std::cout << " OK" << std::endl;
 }
 
+
+// ============================================================================
+// THE CALLER'S HALF — Core net_processing.cpp:2787
+// ============================================================================
+//
+// ⛔ EVERY ARM ABOVE WOULD HAVE PASSED WITH THE FIX UNREACHABLE.
+// CHeadersManager::ProcessHeadersWithDoSProtection passed a hardcoded `true` for
+// full_headers_available, so the only production caller told the state machine
+// that EVERY message was full and neither abort could fire. Restoring the signal
+// in HeadersSyncState and stopping there would have been a correct check nothing
+// reaches — this mission's own recurring defect, committed while fixing an
+// instance of it. The caller now derives it as Core does.
+//
+// ⚠️ AND THE BEHAVIOURAL ARM FOR IT IS BLOCKED, WHICH IS SAID HERE RATHER THAN
+// PAPERED OVER. Driving the manager with a short batch and with a
+// MAX_HEADERS_RESULTS batch was MEASURED to give identical outcomes:
+//
+//     n=3     init=1  before=PRESYNC  ret=0  after=NONE(erased)
+//     n=2000  init=1  before=PRESYNC  ret=0  after=NONE(erased)
+//
+// Not because the signal is broken — because the manager selects its proof
+// checker on IsDilV(), so REGTEST gets RandomXHeaderProofChecker, which rejects
+// every synthesisable header long before the signal is consulted. That is why the
+// existing gate-arming suite drives the manager with an EMPTY vector. An arm
+// written against this would have been vacuous, and a weakened one would have
+// passed for the wrong reason.
+//
+// So the caller's invariant is a STRUCTURAL guard instead —
+// scripts/check-headers-termination-signal.sh, wired into `make tests-fast`,
+// mutation-verified (it exits 1 on the exact literal that shipped). It is
+// labelled structural, not counted as behavioural coverage. When the
+// checker-selection fix lands (fix/lp10-vdf-checker-selection routes regtest to
+// the VDF checker), replace it with the real arm: short batch -> phase FINAL,
+// full batch -> phase PRESYNC, via GetHeadersSyncPhase.
+
+void test_the_phase_observable_reports_the_state_machines_own_field()
+{
+    std::cout << "  test_the_phase_observable_reports_the_state_machines_own_field..." << std::flush;
+
+    uint256 unreachable;
+    for (int i = 0; i < 200000; ++i)
+        unreachable = AddChainWork(unreachable, ComputeChainWork(0x1d00ffff));
+
+    CHeadersManager mgr(unreachable);
+    const NodeId peer = 7;
+
+    // A peer with no session reports nothing — not a defaulted PRESYNC, which
+    // would make "session exists" and "session is in phase 1" indistinguishable.
+    RequireTrue("no session -> nullopt", !mgr.GetHeadersSyncPhase(peer).has_value());
+
+    RequireTrue("init", mgr.InitializeDoSProtectedSync(peer, mgr.GetMinimumChainWork()));
+    RequireTrue("session -> PRESYNC",
+                mgr.GetHeadersSyncPhase(peer) == HeadersSyncState::State::PRESYNC);
+
+    // A DIFFERENT peer must still report nothing, so the accessor is keyed on the
+    // peer rather than reporting whatever session happens to exist.
+    RequireTrue("other peer -> nullopt", !mgr.GetHeadersSyncPhase(8).has_value());
+
+    std::cout << " OK" << std::endl;
+}
+
 int main()
 {
+    // CHeadersManager reads chainparams during construction, so the manager-level
+    // arm cannot run without it. Static, not `new`: the storage outlives every
+    // test and a leak here would be noise in any sanitizer run.
+    static Dilithion::ChainParams s_regtest = Dilithion::ChainParams::Regtest();
+    Dilithion::g_chainParams = &s_regtest;
+
     std::cout << "\n=== LP-10 F5 / D-1: headers-sync termination signal ===\n" << std::endl;
     test_presync_full_batch_keeps_asking();
     test_presync_short_batch_ends_the_sync();
     test_redownload_full_batch_keeps_asking();
     test_redownload_short_batch_gives_up_but_keeps_its_headers();
+    test_the_phase_observable_reports_the_state_machines_own_field();
     std::cout << "\nheaderssync_termination_tests: ALL PASS" << std::endl;
     return 0;
 }
