@@ -811,6 +811,35 @@ public:
                                            int* tipHeightOut = nullptr) const;
 
     /**
+     * P2P-16: resolve a locator's chainstate side under ONE cs_main hold.
+     *
+     * Exists because the two-call shape it replaces could not keep its promise:
+     * a caller that reads the tip height and THEN asks for hashes takes cs_main
+     * twice, and the tip can move in between — so the height and the hashes come
+     * from different chain states. The comment there claimed coherence the code
+     * did not provide, which is the same defect class as the dropped-entry bug
+     * this whole row is about.
+     *
+     * The schedule is passed IN, so the chainstate never learns locator
+     * semantics: this reads the tip, applies `pattern` to
+     * max(tip, headersHeight), keeps the heights at or below the tip, resolves
+     * them, and returns everything from inside a single acquisition.
+     *
+     * @param headersHeight  The peeked best-header height (may be stale; that is
+     *                       fine — the returned triple is self-consistent, which
+     *                       is what a locator needs).
+     * @param pattern        The locator height schedule. Passing it in keeps the
+     *                       resolver and the walk on ONE definition.
+     * @param heightsOut     The heights actually resolved, in order.
+     * @param tipHeightOut   The tip height read under the SAME hold.
+     * @return One hash per entry of heightsOut, same order; null where absent.
+     */
+    std::vector<uint256> ResolveLocatorHashes(int headersHeight,
+                                              std::vector<int> (*pattern)(int),
+                                              std::vector<int>& heightsOut,
+                                              int& tipHeightOut) const;
+
+    /**
      * Set chain tip (used during initialization)
      * CRITICAL-1 FIX: Now implemented in .cpp with mutex protection
      */

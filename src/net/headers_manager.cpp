@@ -1235,47 +1235,40 @@ int CHeadersManager::BestHeaderHeightLocked() const
 std::map<int, uint256> CHeadersManager::ResolveChainstateHashes(int headersHeight,
                                                                 int* chainstateHeightOut) const
 {
-    // P2P-16. ONE cs_main acquisition (inside GetAncestorHashes), values out.
+    // P2P-16. ONE cs_main acquisition (inside ResolveLocatorHashes), values out.
     // Only the heights the locator walk can actually reach at or below the
     // chainstate tip are asked for — above that the walk uses headers-manager
     // data, which is safe under cs_headers.
     std::map<int, uint256> resolved;
 
-    // The chainstate height comes back from the SAME cs_main acquisition that
-    // resolves the hashes, so the pair is coherent. Probe with an empty request
-    // first to learn it, then ask for exactly the heights the walk will visit.
+    // ONE cs_main acquisition, and now the comment is true. This used to probe
+    // for the tip height, release, then resolve — TWO acquisitions, with the tip
+    // free to move in between, under a comment claiming they were coherent. That
+    // is the same false-invariant defect as the dropped-entry bug this row fixed,
+    // one level down, and it was caught by the same reviewer for the same reason.
+    //
+    // The schedule is passed IN so the chainstate stays ignorant of locator
+    // semantics while the resolver and the walk keep exactly one definition of
+    // which heights matter.
+    std::vector<int> heights;
     int tipHeight = 0;
-    (void)g_chainstate.GetAncestorHashes({}, &tipHeight);
+    const std::vector<uint256> hashes =
+        g_chainstate.ResolveLocatorHashes(headersHeight, &LocatorHeightPattern, heights, tipHeight);
+
     if (chainstateHeightOut) *chainstateHeightOut = tipHeight;
-    if (tipHeight <= 0) return resolved;
 
-    std::vector<int> wanted;
-    for (int h : LocatorHeightPattern(std::max(tipHeight, headersHeight))) {
-        if (h <= tipHeight) wanted.push_back(h);
-    }
-    if (wanted.empty()) return resolved;
-
-    const std::vector<uint256> hashes = g_chainstate.GetAncestorHashes(wanted);
-    // Defensive: GetAncestorHashes contracts to return one entry per height in
-    // order. If that ever stopped holding, silently zipping mismatched vectors
-    // would map hashes to the WRONG heights and hand peers a corrupt locator —
-    // far worse than an empty one. Refuse instead.
-    if (hashes.size() != wanted.size()) {
-        // LOW (review fold): returning an empty map degrades the WHOLE locator,
-        // which is the right direction — a mis-zipped locator hands peers hashes
-        // attributed to the wrong heights, and an empty locator only costs a
-        // sync round. But degrading silently would make a broken contract look
-        // like a quiet node, so name it.
-        std::cerr << "[HeadersManager] WARN: GetAncestorHashes returned "
-                  << hashes.size() << " entries for " << wanted.size()
-                  << " requested heights — contract violated, locator degraded to"
-                  << " empty rather than risk mis-attributing hashes to heights"
-                  << " (P2P-16)" << std::endl;
+    // Contract check, kept: mismatched vectors would attribute hashes to the
+    // WRONG heights, which is worse than an empty locator.
+    if (hashes.size() != heights.size()) {
+        std::cerr << "[HeadersManager] WARN: ResolveLocatorHashes returned "
+                  << hashes.size() << " hashes for " << heights.size()
+                  << " heights — contract violated, locator degraded to empty"
+                  << " rather than risk mis-attributing hashes (P2P-16)" << std::endl;
         return resolved;
     }
 
-    for (size_t i = 0; i < wanted.size(); ++i) {
-        if (!hashes[i].IsNull()) resolved[wanted[i]] = hashes[i];
+    for (size_t k = 0; k < heights.size(); ++k) {
+        if (!hashes[k].IsNull()) resolved[heights[k]] = hashes[k];
     }
     return resolved;
 }

@@ -3057,6 +3057,44 @@ CBlockIndex* CChainState::GetTip() const {
     return pindexTip;
 }
 
+std::vector<uint256> CChainState::ResolveLocatorHashes(int headersHeight,
+                                                       std::vector<int> (*pattern)(int),
+                                                       std::vector<int>& heightsOut,
+                                                       int& tipHeightOut) const {
+    heightsOut.clear();
+    std::vector<uint256> out;
+
+    // COST, stated because this runs under cs_main and a reviewer asked: the walk
+    // is O(log n) per height, not O(n) — CBlockIndex::GetAncestor uses the pskip
+    // skip-list (block_index.cpp:140, pskip at :161-163) and only falls back to
+    // pprev when a skip would overshoot. The schedule visits at most 64 heights
+    // and in practice ~34 for a 2e7 chain, so cs_main is held for roughly
+    // 34 * O(log n) pointer hops with no allocation beyond the two output
+    // vectors. That is why doing this inside the lock is affordable and why the
+    // two-acquisition shape bought nothing.
+    //
+    // ONE acquisition. Everything the caller needs to build a coherent triple is
+    // read inside it: the tip height, the schedule derived from that tip, and the
+    // hashes at those heights. Do not split this into a probe plus a resolve —
+    // that is exactly the two-acquisition shape this replaced, where the tip
+    // could move between the two and the "coherent" comment was false.
+    std::lock_guard<std::recursive_mutex> lock(cs_main);
+
+    tipHeightOut = pindexTip ? pindexTip->nHeight : 0;
+    if (!pindexTip || tipHeightOut <= 0 || pattern == nullptr) return out;
+
+    for (int h : pattern(std::max(tipHeightOut, headersHeight))) {
+        if (h < 0 || h > tipHeightOut) continue;
+        uint256 hash;
+        if (const CBlockIndex* p = pindexTip->GetAncestor(h)) {
+            hash = p->GetBlockHash();
+        }
+        heightsOut.push_back(h);
+        out.push_back(hash);
+    }
+    return out;
+}
+
 std::vector<uint256> CChainState::GetAncestorHashes(const std::vector<int>& heights,
                                                     int* tipHeightOut) const {
     // P2P-16. The whole point is that the walk happens INSIDE this lock and only
