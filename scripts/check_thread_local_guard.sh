@@ -63,27 +63,67 @@ if ! command -v awk >/dev/null 2>&1; then
     exit 2
 fi
 
-# The floor exists so a guard that suddenly sees FEWER declarations FAILS. Raise it
-# when the tree legitimately gains declarations; lower it only when the tree
-# legitimately loses one, and say which one, here.
+# ⚠️ AN EXPLICIT INVENTORY, NOT A FLOOR (round-7 F37e). The floor was a number
+# with an ENV OVERRIDE, which means the check could be silenced from outside the
+# file by the same command line that runs it -- and "at least N" says nothing
+# about WHICH N. An inventory says exactly which declarations are expected to
+# exist, so both directions are failures a human has to look at:
+#   * a declaration DISAPPEARS  -> something removed it; say so and update this list
+#   * a declaration APPEARS     -> it is new, and must be added here deliberately
+# There is no override. Editing the list is the acknowledgement.
 #
-# ⚠️ 6 -> 5 on 2026-09-11: round-6 F35 replaced connman.cpp's
-# `static thread_local std::random_device*` with one process-wide instance behind a
-# mutex, because the per-thread version's stated bound was wrong (it is per thread
-# that ever reaches the site, and CConnman restarts). That is a real, intended
-# reduction. THE FLOOR CAUGHT IT ON THE NEXT RUN, which is the entire point: a
-# declaration leaving the population is now a FAILURE that has to be acknowledged,
-# not a quieter pass.
-MIN_CHECKED="${DIL_TLGUARD_MIN_CHECKED:-5}"
+# Format: <file>:<type>, one per line, sorted. Regenerate the candidate list with
+#   awk -f scripts/check_thread_local_guard.awk <file> ...
+# and then READ it before pasting -- the point is the deliberate step.
+INVENTORY="$(cat <<'EOF'
+src/consensus/chain.cpp:EpochThreadRecord*
+src/consensus/chain.cpp:std::atomic<uint64_t>*
+src/consensus/chain.cpp:const char*
+src/consensus/chain.cpp:bool
+src/digital_dna/verification_manager.cpp:std::mt19937_64
+EOF
+)"
 
-run_over() {   # $1 = directory to scan; prints the awk verdict lines
-    local dir="$1" f
+# ⚠️ THE SCANNED SET, STATED (round-7 F37d). This scans `src/**/*.cpp` and
+# `src/**/*.h`, EXCLUDING `src/test/`. Production code outside that set would not
+# be checked, so: at the time of writing there is none -- the node binaries, the
+# consensus, net, rpc, api, node, wallet, crypto and digital_dna sources are all
+# under `src/`, and `depends/` is third-party. A new top-level source directory
+# must be added here.
+SCAN_DIRS="src"
+SCAN_EXCLUDE_RE='(^|/)test/'
+
+run_over() {   # prints awk verdict lines; returns non-zero if any tool failed
+    local dir="$1" f rc=0 found=0
+    local list
+    # ⚠️ find's exit status is CHECKED (F37d). A failed find previously produced
+    # an empty stream that read as "no declarations", i.e. a broken instrument
+    # reporting a clean tree.
+    if ! list="$(find "$dir" \( -name '*.cpp' -o -name '*.h' \) -type f 2>/dev/null | sort)"; then
+        echo "PARSE $dir 0 find failed over $dir" 
+        return 2
+    fi
+    if [ -z "$list" ]; then
+        echo "PARSE $dir 0 find matched NO source files under $dir"
+        return 2
+    fi
     while IFS= read -r f; do
-        case "$f" in
-            */test/*) continue ;;   # tests may declare their own; they are not a node
-        esac
-        awk -f "$AWK_PROG" "$f"
-    done < <(find "$dir" \( -name '*.cpp' -o -name '*.h' \) -type f | sort)
+        [ -n "$f" ] || continue
+        if echo "$f" | grep -qE "$SCAN_EXCLUDE_RE"; then continue; fi
+        found=$((found + 1))
+        # ⚠️ awk's exit status is CHECKED too, per file.
+        if ! awk -f "$AWK_PROG" "$f"; then
+            echo "PARSE $f 0 awk exited non-zero while parsing this file"
+            rc=2
+        fi
+    done <<EOF
+$list
+EOF
+    if [ "$found" -eq 0 ]; then
+        echo "PARSE $dir 0 no non-test source files were scanned"
+        return 2
+    fi
+    return $rc
 }
 
 # ---------------------------------------------------------------------------
@@ -95,52 +135,81 @@ if [ "${1:-}" = "--self-test" ]; then
     trap 'rm -rf "$tmp"' EXIT INT TERM
     mkdir -p "$tmp/src"
 
-    # (1) inline specifier — previously not counted at all
+    # ── MUST BE REJECTED ─────────────────────────────────────────────────────
+    # Round 6's five bypasses:
     printf '#include <string>\ninline thread_local std::string a;\n' > "$tmp/src/f1.cpp"
-    # (2) constexpr-adjacent / static inline combination
     printf '#include <string>\nstatic inline thread_local std::string b;\n' > "$tmp/src/f2.cpp"
-    # (3) split across lines
     printf '#include <string>\nthread_local\n    std::string c;\n' > "$tmp/src/f3.cpp"
-    # (4) a COMMENT in the window satisfied the old bare-string grep
     printf '#include <string>\nthread_local std::string d;\n// is_trivially_destructible: honest, promise\n' > "$tmp/src/f4.cpp"
-    # (5) an assert on the WRONG type satisfied the old grep
     printf '#include <string>\n#include <type_traits>\nthread_local std::string e;\nstatic_assert(std::is_trivially_destructible<int>::value, "");\n' > "$tmp/src/f5.cpp"
-    # (P) the POSITIVE fixture: a correct declaration must be accepted, or the
-    #     guard is merely rejecting everything and proving nothing.
+
+    # Round 7 F37a — the window keyed on a bare TOKEN, so none of these was an
+    # assert at all, and one of them asserts the OPPOSITE:
+    printf '#include <string>\n#include <type_traits>\nthread_local std::string g;\nusing Check = std::is_trivially_destructible<std::string>;\n' > "$tmp/src/f6.cpp"
+    printf '#include <string>\n#include <type_traits>\nthread_local std::string h;\nstatic_assert(!std::is_trivially_destructible<std::string>::value, "");\n' > "$tmp/src/f7.cpp"
+    printf '#include <string>\n#include <type_traits>\nvoid f() {\nthread_local std::string i;\nif constexpr (std::is_trivially_destructible<std::string>::value) { }\n}\n' > "$tmp/src/f8.cpp"
+
+    # F37b — multiple declarators: one assert cannot describe two types.
+    printf '#include <string>\n#include <type_traits>\nthread_local std::string *p2 = nullptr, s2;\nstatic_assert(std::is_trivially_destructible<std::string*>::value, "");\n' > "$tmp/src/f9.cpp"
+
+    # F37c — a token the parser cannot account for must be PARSE, never skipped.
+    printf '#include <string>\n#define MY_TLS thread_local std::string\nMY_TLS z;\n' > "$tmp/src/f10.cpp"
+    printf '#include <string>\nconstexpr thread_local int k = 0;\n' > "$tmp/src/f11.cpp"
+
+    # F43 — u8 char literals were misparsed as digit separators, which swallowed
+    # the rest of the file: the declaration below then went UNSEEN entirely.
+    printf "#include <string>\nchar c8 = u8'A';\nthread_local std::string w;\n" > "$tmp/src/f12.cpp"
+
+    # ── MUST BE ACCEPTED ─────────────────────────────────────────────────────
+    # Five rejections are equally satisfied by a guard that rejects everything.
     printf '#include <type_traits>\nthread_local int* p = 0;\nstatic_assert(std::is_trivially_destructible<int*>::value, "");\n' > "$tmp/src/p1.cpp"
+    # raw strings must be PARSED, not refused (src/api/*_html.h contain them)
+    printf '#include <string>\n#include <type_traits>\nconst char* html = R"H(<a href="x">//not a comment</a> it'"'"'s fine)H";\nthread_local int* q = 0;\nstatic_assert(std::is_trivially_destructible<int*>::value, "");\n' > "$tmp/src/p2.cpp"
+    # digit separators must still work after the F43 fix
+    printf '#include <type_traits>\nlong v = 200000;\nlong w2 = 0x1F;\nthread_local int* r = 0;\nstatic_assert(std::is_trivially_destructible<int*>::value, "");\n' > "$tmp/src/p3.cpp"
+    # the trait may be spelled with the _v alias and still be a positive assert
+    printf '#include <type_traits>\nthread_local int* t2 = 0;\nstatic_assert(std::is_trivially_destructible<int*>::value, "ok");\n' > "$tmp/src/p4.cpp"
 
     fails=0
-    for f in f1 f2 f3 f4 f5; do
-        out="$(awk -f "$AWK_PROG" "$tmp/src/$f.cpp")"
+    for f in f1 f2 f3 f4 f5 f6 f7 f8 f9 f10 f11 f12; do
+        out="$(awk -f "$AWK_PROG" "$tmp/src/$f.cpp" 2>&1)"
         if echo "$out" | grep -qE '^(BAD|PARSE)'; then
-            echo "  PASS  self-test $f: rejected as it must be"
+            echo "  PASS  reject $f: $(echo "$out" | head -1 | cut -c1-72)"
         else
-            echo "  FAIL  self-test $f: NOT REJECTED -- the bypass is still open"
-            echo "        awk said: ${out:-<nothing>}"
+            echo "  FAIL  reject $f: NOT REJECTED -- the bypass is still open"
+            echo "        awk said: ${out:-<nothing at all, which is the worst case>}"
             fails=$((fails + 1))
         fi
     done
-    out="$(awk -f "$AWK_PROG" "$tmp/src/p1.cpp")"
-    if echo "$out" | grep -q '^OK'; then
-        echo "  PASS  self-test p1: a correct declaration is accepted"
-    else
-        echo "  FAIL  self-test p1: a CORRECT declaration was rejected -- the guard"
-        echo "        rejects everything, which proves nothing. awk said: ${out:-<nothing>}"
-        fails=$((fails + 1))
-    fi
+    for f in p1 p2 p3 p4; do
+        out="$(awk -f "$AWK_PROG" "$tmp/src/$f.cpp" 2>&1)"
+        if echo "$out" | grep -q '^OK'; then
+            echo "  PASS  accept $f: a correct declaration is accepted"
+        else
+            echo "  FAIL  accept $f: a CORRECT declaration was rejected -- a guard that"
+            echo "        rejects everything proves nothing. awk said: ${out:-<nothing>}"
+            fails=$((fails + 1))
+        fi
+    done
 
     echo
     if [ "$fails" -ne 0 ]; then
         echo "===== thread_local guard SELF-TEST: FAIL ($fails) ====="
         exit 1
     fi
-    echo "===== thread_local guard SELF-TEST: PASS (5 bypasses rejected, 1 correct accepted) ====="
+    echo "===== thread_local guard SELF-TEST: PASS (12 rejected, 4 accepted) ====="
     exit 0
 fi
 
 cd "$ROOT" || exit 2
 
-verdicts="$(run_over src)"
+# ⚠️ THE TOOL'S EXIT STATUS IS CAPTURED, NOT DISCARDED (round-7 F37d). Writing
+# `verdicts="$(run_over src)"` on its own throws away run_over's status, so a
+# failed find or a crashed awk became an empty verdict list -- which the report
+# below would have described as a clean tree. `set -u` does not catch that; only
+# looking at the status does.
+verdicts="$(run_over "$SCAN_DIRS")"
+tool_rc=$?
 
 parse=$(printf '%s\n' "$verdicts" | grep -c '^PARSE ' || true)
 bad=$(printf   '%s\n' "$verdicts" | grep -c '^BAD '   || true)
@@ -151,42 +220,68 @@ printf '%s\n' "$verdicts" | grep '^PARSE ' | while IFS= read -r l; do
     set -- $l
     echo "PARSE-FAIL  $2:$3"
     echo "        ${l#PARSE $2 $3 }"
-    echo "        The guard could not parse this declaration, so it cannot certify"
-    echo "        it. Simplify the declaration or extend the parser -- a guard that"
-    echo "        cannot read its input must never report CLEAN."
+    echo "        The guard could not account for this \`thread_local\` token, so it"
+    echo "        cannot certify it -- and it will NOT skip it. Simplify the"
+    echo "        declaration or extend the parser. A guard that cannot read its"
+    echo "        input must never report CLEAN."
 done
 
 printf '%s\n' "$verdicts" | grep '^BAD ' | while IFS= read -r l; do
     set -- $l
     echo "FAIL  $2:$3"
     echo "        declared type: $4"
-    echo "        No static_assert(std::is_trivially_destructible<$4>::value) in"
-    echo "        CODE within 6 lines. On this toolchain a thread_local destructor"
-    echo "        runs on FREED storage. If this type needs to act at thread exit,"
-    echo "        move its state into a pthread-key record (see EpochThreadRecord in"
-    echo "        src/consensus/chain.cpp). If it does not, add the assert -- naming"
-    echo "        THIS type, in code, not in a comment."
+    echo "        No POSITIVE static_assert(std::is_trivially_destructible<$4>::value)"
+    echo "        in CODE within 6 lines. Note all three words: it must be a real"
+    echo "        static_assert (not a using-alias or an if constexpr), it must not"
+    echo "        be negated, and it must name THIS type. On this toolchain a"
+    echo "        thread_local destructor runs on FREED storage; if this type needs"
+    echo "        to act at thread exit, move its state into a pthread-key record"
+    echo "        (see EpochThreadRecord in src/consensus/chain.cpp)."
 done
 
 echo
-echo "checked $checked thread_local declaration(s) in src (excluding tests): $ok ok, $bad unguarded, $parse unparsable"
+echo "checked $checked \`thread_local\` token(s) under $SCAN_DIRS (excluding tests): $ok ok, $bad unguarded, $parse unaccounted"
 
-# ⚠️ A FLOOR, NOT JUST A ZERO CHECK. "Zero declarations" was already caught; the
-# subtler failure is the parser matching FEWER than it used to after an edit, so
-# a declaration silently drops out of the population. The floor makes that a
-# failure instead of a quieter pass.
-if [ "$checked" -lt "$MIN_CHECKED" ]; then
-    echo "===== thread_local guard: FAIL (found $checked declarations, floor is"
-    echo "      $MIN_CHECKED -- the instrument is under-counting, not the tree"
-    echo "      shrinking; raise DIL_TLGUARD_MIN_CHECKED deliberately if the tree"
-    echo "      really did lose declarations) ====="
-    exit 2
+# ── THE INVENTORY (F37e) ─────────────────────────────────────────────────────
+# Both directions are failures a human must look at. No env override exists.
+actual="$(printf '%s\n' "$verdicts" | grep '^OK ' | awk '{ t = $4; for (i = 5; i <= NF; i++) t = t " " $i; print $2 ":" t }' | sort)"
+expected="$(printf '%s\n' "$INVENTORY" | grep -v '^[[:space:]]*$' | sort)"
+
+missing="$(comm -23 <(printf '%s\n' "$expected") <(printf '%s\n' "$actual") || true)"
+extra="$(  comm -13 <(printf '%s\n' "$expected") <(printf '%s\n' "$actual") || true)"
+
+inv_fail=0
+if [ -n "$missing" ]; then
+    echo
+    echo "INVENTORY: these declarations are EXPECTED but were not found —"
+    printf '%s\n' "$missing" | sed 's/^/        /'
+    echo "        Either something removed them (say so, and LOWER the inventory"
+    echo "        deliberately by deleting these lines), or the parser stopped"
+    echo "        seeing them, which is the instrument failing and is far worse."
+    inv_fail=1
+fi
+if [ -n "$extra" ]; then
+    echo
+    echo "INVENTORY: these declarations were found but are NOT expected —"
+    printf '%s\n' "$extra" | sed 's/^/        /'
+    echo "        A new thread_local. It passed the assert check, but adding it to"
+    echo "        the inventory is a deliberate step: confirm it really must be"
+    echo "        thread-local at all, then add the line."
+    inv_fail=1
 fi
 
+if [ "$tool_rc" -ne 0 ]; then
+    echo "===== thread_local guard: FAIL (a tool in the scan failed; status $tool_rc) ====="
+    exit 2
+fi
 if [ "$parse" -ne 0 ] || [ "$bad" -ne 0 ]; then
-    echo "===== thread_local guard: FAIL ($bad unguarded, $parse unparsable) ====="
+    echo "===== thread_local guard: FAIL ($bad unguarded, $parse unaccounted) ====="
+    exit 1
+fi
+if [ "$inv_fail" -ne 0 ]; then
+    echo "===== thread_local guard: FAIL (inventory mismatch — see above) ====="
     exit 1
 fi
 
-echo "===== thread_local guard: PASS (0 unguarded, 0 unparsable) ====="
+echo "===== thread_local guard: PASS ($ok guarded, inventory matches exactly) ====="
 exit 0

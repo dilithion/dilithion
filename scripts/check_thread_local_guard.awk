@@ -2,46 +2,54 @@
 # check_thread_local_guard.awk — the parsing half of the thread_local guard.
 # ==============================================================================
 #
-# Invoked once per file by scripts/check_thread_local_guard.sh. Prints one line
-# per declaration found:
+# Prints one verdict line per `thread_local` token found:
 #
 #   OK    <file> <line> <type>
 #   BAD   <file> <line> <type> <reason>
 #   PARSE <file> <line> <reason>          (unparsable -> the caller FAILS)
 #
-# ⚠️ WHY awk AND NOT grep. Round 6 of the external panel found the first version
-# of this guard bypassable in five ways, and every one of them came from matching
-# lines with regexes instead of parsing declarations:
+# ⚠️ EVERY `thread_local` TOKEN PRODUCES A LINE. There is no silent skip. A token
+# the parser cannot account for is PARSE, never dropped -- round 7 (F37c) found
+# that the previous version `continue`d on any statement it did not recognise as a
+# declaration, so a `#define` containing the token, or a specifier it had not been
+# taught, vanished from the population rather than failing. A declaration that is
+# never counted is worse than one reported unguarded: it cannot be seen at all.
 #
-#   1. the specifier alternation was `(static|extern)? thread_local`, so
-#      `inline thread_local`, `constexpr thread_local` and `static inline
-#      thread_local` were NEVER COUNTED -- not flagged, not even seen;
-#   2. a declaration split across lines (`thread_local` on one, the type on the
-#      next) was likewise invisible;
-#   3. the six-line window grepped the BARE STRING `is_trivially_destructible`,
-#      so a COMMENT mentioning it satisfied the guard;
-#   4. and so did a `static_assert` on a COMPLETELY DIFFERENT TYPE;
-#   5. a macro-wrapped declaration was invisible for the same reason as 1.
+# ⚠️ THE HISTORY, because this file has failed open twice and the pattern is the
+# lesson. Round 6 found five bypasses (`inline`/`constexpr`/`static inline`,
+# line-split declarations, a COMMENT in the window, an assert on a DIFFERENT type)
+# -- all of them consequences of matching LINES with regexes. Round 7 found the
+# rewrite still failing open in five more ways (F37): the window keyed on a bare
+# TOKEN so `using Check = std::is_trivially_destructible<T>;` and
+# `static_assert(!std::is_trivially_destructible<T>::value)` both satisfied it;
+# multiple declarators were unhandled; unrecognised statements were skipped; awk
+# and find failures did not reach the exit code; and the floor could be overridden
+# by an env var. A guard that can be satisfied by a NEGATED assert is not a guard.
 #
-# A guard that can be satisfied by a comment is not a guard. So: strip comments
-# and string literals with a character scanner, join the declaration to its
-# terminating `;`, extract the declared TYPE, and require the assert to name
-# THAT type. See lessons_learned.md, "A COMMENT EDIT CAN BREAK A STRUCTURAL
-# GUARD", which is the same defect class from the other direction.
+# So the rules here are deliberately narrow and the default is refusal:
+#   * the assert must be a real `static_assert(` call,
+#   * its first argument must be POSITIVE (no leading `!`),
+#   * and must name EXACTLY the declared type,
+#   * one declarator per declaration,
+#   * anything else is PARSE.
 #
-# ⚠️ AND IT FAILS CLOSED. Anything this cannot parse is reported as PARSE and the
-# caller treats it as a failure. A stripper that cannot parse its input must
-# never report CLEAN -- that is the direction that ships a false PASS.
+# ⚠️ IT IS ALSO CORRECT WHEN GIVEN SEVERAL FILES AT ONCE. The previous version
+# accumulated into one buffer and reported everything under the LAST filename in
+# the END block; it was correct only because the driver happened to call it once
+# per file. Found by running it on two files by hand. State resets per file.
 
-BEGIN { src = ""; nlines = 0 }
+function reset() { src = ""; nl = 0 }
 
-{ raw[NR] = $0; src = src $0 "\n"; nlines = NR }
+FNR == 1 && NR > 1 { finish() }
+FNR == 1 { reset(); fname = FILENAME }
+{ src = src $0 "\n"; nl = FNR }
+END { finish() }
 
 # ---------------------------------------------------------------------------
 # Strip comments and the CONTENTS of string/char literals, preserving newlines
 # and therefore line numbers. Returns "" on an unterminated construct.
 # ---------------------------------------------------------------------------
-function strip(s,   out, i, n, c, c2, state, prev, delim, endtok, at, k) {
+function strip(s,   out, i, n, c, c2, state, prev, delim, endtok, at, at2, k, run, runstart) {
     out = ""; n = length(s); state = "code"
     for (i = 1; i <= n; i++) {
         c  = substr(s, i, 1)
@@ -50,12 +58,8 @@ function strip(s,   out, i, n, c, c2, state, prev, delim, endtok, at, k) {
             if (c2 == "//") { state = "line"; i++; continue }
             if (c2 == "/*") { state = "block"; out = out "  "; i++; continue }
 
-            # ⚠️ RAW STRING LITERALS. R"DELIM( ... )DELIM" — the embedded HTML in
-            # src/api/*_html.h is full of quotes, apostrophes and `//` inside the
-            # payload, so treating it as ordinary text made the whole file
-            # unparsable. Found by running the guard, not by reading it: four
-            # files came back PARSE-FAIL on the first run of the hardened parser,
-            # which is the fail-closed behaviour working exactly as intended.
+            # RAW STRING LITERALS: R"DELIM( ... )DELIM". src/api/*_html.h embed
+            # whole HTML documents this way, full of quotes and `//`.
             if (c == "R" && substr(s, i + 1, 1) == "\"") {
                 prev = (i > 1) ? substr(s, i - 1, 1) : " "
                 if (prev !~ /[A-Za-z0-9_]/ || prev ~ /[LuU8]/) {
@@ -65,8 +69,7 @@ function strip(s,   out, i, n, c, c2, state, prev, delim, endtok, at, k) {
                     }
                     endtok = ")" delim "\""
                     k = index(substr(s, at), endtok)
-                    if (k == 0) return ""          # unterminated raw string
-                    # keep the newlines so line numbers survive
+                    if (k == 0) return ""
                     for (at2 = i; at2 < at + k + length(endtok) - 1; at2++) {
                         out = out ((substr(s, at2, 1) == "\n") ? "\n" : " ")
                     }
@@ -77,13 +80,25 @@ function strip(s,   out, i, n, c, c2, state, prev, delim, endtok, at, k) {
 
             if (c == "\"")  { state = "str";  out = out "\""; continue }
             if (c == "'") {
-                # ⚠️ A DIGIT SEPARATOR IS NOT A CHARACTER LITERAL. `200'000`
-                # (mempool_persist.h:90) sent the scanner into char-literal state
-                # for the rest of the file. Same discovery route as the raw
-                # strings above.
-                prev = (i > 1) ? substr(s, i - 1, 1) : " "
-                if (prev ~ /[0-9A-Fa-f]/ && substr(s, i + 1, 1) ~ /[0-9A-Fa-f]/) {
-                    out = out "0"; continue
+                # ⚠️ A DIGIT SEPARATOR IS NOT A CHARACTER LITERAL -- AND A CHARACTER
+                # LITERAL WITH AN ENCODING PREFIX IS NOT A DIGIT SEPARATOR (F43).
+                # The first version tested only "hex digit on both sides", which
+                # makes `u8'A'` look like a separator: `8` and `A` are both hex
+                # digits, so the opening quote was swallowed and the CLOSING quote
+                # then opened a literal that ran to the end of the file. a8's
+                # scanner had the identical bug tonight, independently -- one more
+                # argument for the ruled consolidation onto a single lexer.
+                #
+                # A separator only occurs INSIDE a numeric literal. Walk back over
+                # the numeric run; it must start with a DIGIT, and the character
+                # before it must not be an identifier character. `u8'A'` fails that
+                # (the run is "8", preceded by `u`); `200'000` and `0x1F'FF` pass.
+                if (substr(s, i + 1, 1) ~ /[0-9A-Fa-f]/) {
+                    runstart = i - 1
+                    while (runstart >= 1 && substr(s, runstart, 1) ~ /[0-9A-Fa-f.xXbB']/) runstart--
+                    run = substr(s, runstart + 1, i - runstart - 1)
+                    prev = (runstart >= 1) ? substr(s, runstart, 1) : " "
+                    if (run ~ /^[0-9]/ && prev !~ /[A-Za-z_]/) { out = out "0"; continue }
                 }
                 state = "chr"; out = out "'"; continue
             }
@@ -107,8 +122,6 @@ function strip(s,   out, i, n, c, c2, state, prev, delim, endtok, at, k) {
 
 function squash(s) { gsub(/[ \t\n]+/, " ", s); gsub(/^ | $/, "", s); return s }
 
-# The type text a `static_assert(std::is_trivially_destructible<X>::value, ...)`
-# names, normalised the same way as a declared type so the two can be compared.
 function normtype(s) {
     s = squash(s)
     gsub(/ \*/, "*", s); gsub(/\* /, "*", s)
@@ -117,33 +130,95 @@ function normtype(s) {
     gsub(/ >/, ">", s);  gsub(/> /, ">", s)
     gsub(/ ,/, ",", s);  gsub(/, /, ",", s)
     gsub(/ ::/, "::", s); gsub(/:: /, "::", s)
-    sub(/^std::/, "", s)          # std::string and string are the same type here
+    sub(/^std::/, "", s)
     gsub(/<std::/, "<", s)
     gsub(/,std::/, ",", s)
     return s
 }
 
-END {
+# Extract the balanced argument list of a call whose '(' is at position `at` in s.
+function balanced(s, at,   d, k, ch, o) {
+    d = 0; o = ""
+    for (k = at; k <= length(s); k++) {
+        ch = substr(s, k, 1)
+        if (ch == "(") { d++; if (d == 1) continue }
+        else if (ch == ")") { d--; if (d == 0) return o }
+        o = o ch
+    }
+    return ""      # unbalanced
+}
+
+# ⚠️ THE ASSERT CHECK, AND IT IS DELIBERATELY STRICT (F37a). It must be a real
+# `static_assert(` whose FIRST argument is a POSITIVE trait check on exactly the
+# declared type. Rejected on purpose, each with a fixture:
+#     using Check = std::is_trivially_destructible<T>;   (not an assert)
+#     static_assert(!std::is_trivially_destructible<T>::value, "");   (negated)
+#     if constexpr (std::is_trivially_destructible<T>::value) {...}   (not an assert)
+function has_assert(win, want,   pos, rest, args, first, d, k, ch, arg) {
+    rest = win
+    while ((pos = index(rest, "static_assert")) > 0) {
+        rest = substr(rest, pos + length("static_assert"))
+        # the '(' must follow, modulo whitespace
+        k = 1
+        while (k <= length(rest) && substr(rest, k, 1) ~ /[ \t\n]/) k++
+        if (substr(rest, k, 1) != "(") continue
+        args = balanced(rest, k)
+        if (args == "") continue
+        # first argument = up to the first top-level comma
+        first = ""; d = 0
+        for (k = 1; k <= length(args); k++) {
+            ch = substr(args, k, 1)
+            if (ch == "(" || ch == "<" || ch == "[") d++
+            else if (ch == ")" || ch == ">" || ch == "]") d--
+            else if (ch == "," && d <= 0) break
+            first = first ch
+        }
+        first = squash(first)
+        if (first ~ /^!/) continue                       # NEGATED: not a guarantee
+        if (first !~ /is_trivially_destructible/) continue
+        # the trait's template argument must be the declared type
+        k = index(first, "<")
+        if (k == 0) continue
+        arg = ""; d = 0
+        for (; k <= length(first); k++) {
+            ch = substr(first, k, 1)
+            if (ch == "<") { d++; if (d == 1) continue }
+            else if (ch == ">") { d--; if (d == 0) break }
+            arg = arg ch
+        }
+        if (normtype(arg) == want) return 1
+    }
+    return 0
+}
+
+function finish(   code, ncl, cl, ln, line, stmt, j, depth, k, done, ch,
+                   head, hcopy, body, cut, d1, d2, nt, tok, name, ptr, type,
+                   want, win, i, ndecl) {
+    if (src == "") return
     code = strip(src)
     if (code == "") {
-        print "PARSE " FILENAME " 0 unterminated comment or string literal"
-        exit 0
+        print "PARSE " fname " 0 unterminated comment, string or raw-string literal"
+        reset(); return
     }
-
-    # Rebuild a line index over the stripped text so a match position maps back
-    # to a line number in the ORIGINAL file.
     ncl = split(code, cl, "\n")
 
     for (ln = 1; ln <= ncl; ln++) {
         line = cl[ln]
         if (line !~ /(^|[^A-Za-z0-9_])thread_local([^A-Za-z0-9_]|$)/) continue
 
-        # Join forward to the terminating ';' at bracket depth 0 (a declaration
-        # may be split across lines, which the regex version could not see).
-        stmt = line; j = ln; depth = 0; done = 0
+        # (F37c) A preprocessor line carrying the token is not a declaration and
+        # must not be silently skipped -- it is exactly the "macro-wrapped
+        # declaration" bypass, still unfixed and unfixtured before this change.
+        if (line ~ /^[ \t]*#/) {
+            print "PARSE " fname " " ln " `thread_local` inside a preprocessor directive: the guard cannot certify a macro-defined declaration"
+            continue
+        }
+
+        # Join forward to the terminating ';' at bracket depth 0.
+        stmt = line; j = ln; done = 0
         while (j <= ncl) {
             if (j > ln) stmt = stmt " " cl[j]
-            depth = 0; k = 0
+            depth = 0
             for (k = 1; k <= length(stmt); k++) {
                 ch = substr(stmt, k, 1)
                 if (ch == "(" || ch == "[" || ch == "{") depth++
@@ -152,57 +227,65 @@ END {
             }
             if (done) { stmt = substr(stmt, 1, k); break }
             j++
-            if (j > ln + 8) break        # a declaration spanning >8 lines: give up loudly
+            if (j > ln + 8) break
         }
         if (!done) {
-            print "PARSE " FILENAME " " ln " could not find the end of this thread_local declaration"
+            print "PARSE " fname " " ln " could not find the end of this thread_local statement"
             continue
         }
 
-        # Only a DECLARATION, not a mention. After stripping, `thread_local` must
-        # be a declaration specifier: nothing but other specifiers before it.
+        # Everything before `thread_local` must be storage specifiers only.
         head = stmt
         sub(/thread_local.*$/, "", head)
         head = squash(head)
         if (head != "") {
             hcopy = head
-            gsub(/\<(static|extern|inline|constexpr|mutable|const|volatile)\>/, "", hcopy)
-            if (squash(hcopy) != "") continue     # e.g. a using-decl or a comment-free mention
+            gsub(/(^|[^A-Za-z0-9_])(static|extern|inline|mutable|const|volatile)([^A-Za-z0-9_]|$)/, " ", hcopy)
+            gsub(/(^|[^A-Za-z0-9_])(static|extern|inline|mutable|const|volatile)([^A-Za-z0-9_]|$)/, " ", hcopy)
+            if (squash(hcopy) != "") {
+                print "PARSE " fname " " ln " unrecognised tokens before `thread_local` (" head "): refusing rather than skipping"
+                continue
+            }
         }
 
         body = stmt
         sub(/^.*thread_local/, "", body)
-        gsub(/\<(static|extern|inline|constexpr|mutable)\>/, " ", body)
+        gsub(/(^|[^A-Za-z0-9_])(static|extern|inline|mutable)([^A-Za-z0-9_]|$)/, " ", body)
 
-        # Cut at the first top-level '=', '(', '{' or ';' — whichever ends the
-        # declarator — tracking (), [] and <> so a template argument list or a
-        # constructor-argument list does not terminate it early.
         cut = ""; d1 = 0; d2 = 0
         for (k = 1; k <= length(body); k++) {
             ch = substr(body, k, 1)
             if (ch == "<") d2++
             else if (ch == ">") { if (d2 > 0) d2-- }
-            else if (ch == "(" || ch == "[") d1++
+            else if (ch == "(" || ch == "[") { if (d1 <= 0 && d2 <= 0 && ch == "(") break; d1++ }
             else if (ch == ")" || ch == "]") d1--
             else if (d1 <= 0 && d2 <= 0 && (ch == "=" || ch == ";" || ch == "{")) break
-            else if (d1 <= 0 && d2 <= 0 && ch == "(") break
             cut = cut ch
         }
         cut = squash(cut)
         if (cut == "") {
-            print "PARSE " FILENAME " " ln " empty declarator after thread_local"
+            print "PARSE " fname " " ln " empty declarator after `thread_local`"
             continue
         }
 
-        # The last token is the declarator name; everything before it is the
-        # type. A leading '*' or '&' belongs to the type, not the name.
+        # (F37b) MULTIPLE DECLARATORS. `thread_local std::string *p = nullptr, s;`
+        # declares a POINTER and a STRING; one assert cannot describe both, and
+        # silently certifying the first would be the failing-open direction.
+        # Refused, with the fix in the message.
+        if (index(cut, ",") > 0 || index(body, ",") > 0) {
+            ndecl = index(body, ",")
+            if (ndecl > 0 && d2 == 0) {
+                print "PARSE " fname " " ln " multiple declarators in one thread_local declaration: split them, so each carries its own static_assert"
+                continue
+            }
+        }
+
         nt = split(cut, tok, " ")
         if (nt < 2) {
-            print "PARSE " FILENAME " " ln " cannot separate type from name in: " cut
+            print "PARSE " fname " " ln " cannot separate type from name in: " cut
             continue
         }
-        name = tok[nt]
-        ptr = ""
+        name = tok[nt]; ptr = ""
         while (substr(name, 1, 1) == "*" || substr(name, 1, 1) == "&") {
             ptr = ptr substr(name, 1, 1); name = substr(name, 2)
         }
@@ -210,33 +293,16 @@ END {
         for (k = 1; k < nt; k++) type = type " " tok[k]
         type = squash(type) ptr
         if (type == "") {
-            print "PARSE " FILENAME " " ln " no type before the declarator in: " cut
+            print "PARSE " fname " " ln " no type before the declarator in: " cut
             continue
         }
         want = normtype(type)
 
-        # The assert must be within 6 lines of the declaration, in CODE (the
-        # window comes from the stripped text, so a comment cannot satisfy it),
-        # and must name THIS type.
-        found = 0
         win = ""
         for (k = ln; k <= ln + 6 && k <= ncl; k++) win = win " " cl[k]
-        w = win
-        while (match(w, /is_trivially_destructible[ \t]*</)) {
-            rest = substr(w, RSTART + RLENGTH)
-            # take up to the matching '>' at depth 0
-            d = 0; arg = ""
-            for (k = 1; k <= length(rest); k++) {
-                ch = substr(rest, k, 1)
-                if (ch == "<") d++
-                else if (ch == ">") { if (d == 0) break; d-- }
-                arg = arg ch
-            }
-            if (normtype(arg) == want) { found = 1; break }
-            w = substr(rest, k + 1)
-        }
 
-        if (found) print "OK " FILENAME " " ln " " type
-        else       print "BAD " FILENAME " " ln " " type " no static_assert(is_trivially_destructible<" type ">) in code within 6 lines"
+        if (has_assert(win, want)) print "OK " fname " " ln " " type
+        else print "BAD " fname " " ln " " type " no positive static_assert(std::is_trivially_destructible<" type ">::value) in code within 6 lines"
     }
+    reset()
 }
