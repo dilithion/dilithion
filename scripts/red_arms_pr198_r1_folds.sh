@@ -195,6 +195,16 @@ assert 'MUTANT: nesting allowed' in io.open(p,encoding='utf-8').read()
 print('MUTATED')
 " "F13-NESTING" nesting
 
+# ⚠️ NAMING, BECAUSE TWO DIFFERENT THINGS WERE BOTH CALLED "F15" (round-6 F36).
+# This arm is the BLOCKER mutant: it removes the fail-closed refusal so an UNNAMED
+# thread may quiesce. It happens to be KILLED BY an assertion whose text begins
+# "F15:", because that assertion is where the consequence becomes visible. That is
+# NOT the same thing as the retired F15 mutant described further down, which was a
+# different mutation removed because round 4 made its target unreachable.
+#   * this arm            = BLOCKER mutant, ALIVE, killed by the F15-named assertion
+#   * the F15 mutant      = RETIRED, see the note below the F25 arm
+# A kill table that lists "F15/BLOCKER" without that distinction reads as though the
+# retired mutant is still being run.
 arm "BLOCKER - fail-closed removed (an unnamed thread may quiesce)" "
 import io
 p='$CHAIN'; s=io.open(p,encoding='utf-8').read()
@@ -221,6 +231,24 @@ io.open(p,'w',encoding='utf-8',newline='').write(s)
 assert 'MUTANT: nameless checkpoints' in io.open(p,encoding='utf-8').read()
 print('MUTATED')
 " "F25: BOTH SCOPE TYPES ARE INERT ON AN UNNAMED THREAD — it still pins"
+arm "F33 - the re-record does not COUNT (a clamp hides the under-count)" "
+import io
+p='$CHAIN'; s=io.open(p,encoding='utf-8').read()
+old='            ++u2.live;                                 // authoritative -- see above'
+assert s.count(old)==1, ('anchor',s.count(old))
+s=s.replace(old,'            /* MUTANT F33: the re-record does not count */',1)
+io.open(p,'w',encoding='utf-8',newline='').write(s)
+assert 'MUTANT F33' in io.open(p,encoding='utf-8').read()
+print('MUTATED')
+" "F33: an offline resolve RE-RECORDS the accusation, and COUNTS it (0 -> +1)"
+# ⚠️ WHY THIS ARM EXISTS AT ALL: A CLAMP WAS HIDING THE DEFECT. Both withdrawal
+# paths are `if (u.live > 0) --u.live;`. That guard is right -- it stops an
+# underflow to SIZE_MAX -- but it also means a MISSING increment produces no
+# visible symptom in a suite whose counts return to zero anyway. Round 6 flagged
+# the ++live fix as READ-VERIFIED ONLY, which is the correct objection: a fix
+# nobody can observe failing is a fix nobody can prove. Measured before this arm
+# existed: removing ++u2.live left the whole suite GREEN.
+
 # ⚠️ THE F15 MUTANT WAS REMOVED, AND WHY MATTERS MORE THAN THE ARM DID.
 # Round 3 added a re-record on resolve-after-quiesce. Round 4's fail-closed rule
 # (EpochQuiesce refuses on a thread with no registered name) made that path

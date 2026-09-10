@@ -490,6 +490,27 @@ public:
         std::lock_guard<std::recursive_mutex> lock(cs_main);
         return m_graveyard.size();
     }
+
+    /**
+     * Test/diagnostic: is THIS entry still awaiting reclamation?
+     *
+     * ⚠️ IDENTITY, BECAUSE A COUNT IS NOT AN IDENTITY (round-6 F32). Arms used to
+     * assert "the drain freed at least one entry", which an OLDER, UNRELATED entry
+     * left by an earlier arm can satisfy while the entry actually under test stays
+     * pinned. The aggregate is only sufficient if the graveyard is known to hold
+     * exactly one entry, and in a suite whose arms all evict, it is not.
+     *
+     * Compares by hash rather than by pointer on purpose: a freed entry's pointer
+     * is not a legal thing to compare, and re-using it as a key would be reading a
+     * dangling value to decide whether it dangles.
+     */
+    bool GraveyardContains(const uint256& hash) const {
+        std::lock_guard<std::recursive_mutex> lock(cs_main);
+        for (const auto& e : m_graveyard) {
+            if (e.node && e.node->GetBlockHash() == hash) return true;
+        }
+        return false;
+    }
 private:
 
     // Maintain the two structures above. Called only from AddBlockIndex and the

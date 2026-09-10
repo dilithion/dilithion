@@ -93,8 +93,16 @@ int g_failed = 0;
 // Neither could produce a false PASS. They are recorded here because a suite whose
 // failures point at the wrong mechanism is the specific way this defect class has
 // cost time before.
+// ⚠️ AND IT TAKES THE IDENTITY OF THE ENTRY UNDER TEST, BECAUSE A COUNT IS NOT AN
+// IDENTITY (round-6 F32). This observed only CUMULATIVE frees: "the drain freed at
+// least one entry" is satisfied by an OLDER, UNRELATED entry that an earlier arm
+// left behind, while the entry this arm actually evicted stays pinned. The arm
+// would report PASS for the wrong reason -- the one failure mode a green run cannot
+// be argued out of. `intended` is polled by hash until it is gone; the aggregate
+// `expected` is kept as a secondary sanity number, not as the verdict.
 bool DrainUntil(CChainState& cs, size_t expected, const char* name,
-                size_t live_expected, int timeout_ms = 3000)
+                size_t live_expected, const uint256& intended,
+                int timeout_ms = 3000)
 {
     // ⚠️ ANY slot-0 THREAD PINS THE WHOLE GRAVEYARD, SO A STRAGGLER FROM ANOTHER ARM
     // BLOCKS THIS ONE. That is the mechanism working exactly as designed -- one
@@ -135,7 +143,8 @@ bool DrainUntil(CChainState& cs, size_t expected, const char* name,
     for (;;) {
         cs.EpochCheckpoint(name);          // this thread holds nothing here
         freed += cs.DrainGraveyard();
-        if (freed >= expected) {
+        // THE VERDICT: is the entry this arm evicted gone?
+        if (!cs.GraveyardContains(intended)) {
             if (freed > expected) {
                 // (b): visible, not fatal -- see the note above.
                 std::cerr << "    DrainUntil: NOTE freed " << freed << ", expected "
@@ -146,8 +155,10 @@ bool DrainUntil(CChainState& cs, size_t expected, const char* name,
         }
         if (std::chrono::steady_clock::now() >= deadline) {
             std::cerr << "    DrainUntil: DRAIN TIMED OUT after " << timeout_ms
-                      << " ms -- freed " << freed << " of " << expected
-                      << " with the participant count settled." << std::endl;
+                      << " ms -- THE INTENDED ENTRY IS STILL IN THE GRAVEYARD"
+                      << " (freed " << freed << " unrelated entr"
+                      << (freed == 1 ? "y" : "ies")
+                      << " meanwhile, participant count settled)." << std::endl;
             return false;
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(5));
@@ -372,10 +383,17 @@ int main()
         const size_t n_before = cs.GetBlockIndexSize();
         chk("exited thread: setup, the eviction happened",
             cs.EvictLowestWorkLeafNotPinned(n_before - 1));
+        // ⚠️ IDENTITY AT SETUP TOO, not just at the drain. The arm evicts "the
+        // lowest-work leaf", which it BELIEVES is the header it just added. If
+        // that belief is ever wrong the drain assertion below would be watching
+        // the wrong entry, so the belief is asserted here and fails by name.
+        const uint256 victim_hash = v2hdr.GetHash();
         chk("exited thread: the entry is in the graveyard", cs.GraveyardSize() == 1);
+        chk("exited thread: and it is THE entry this arm evicted",
+            cs.GraveyardContains(victim_hash));
 
         chk("exited thread: A THREAD THAT HAS EXITED DOES NOT PIN THE GRAVEYARD",
-            DrainUntil(cs, 1, "test-main", /*live_expected=*/1));
+            DrainUntil(cs, 1, "test-main", /*live_expected=*/1, victim_hash));
         chk("exited thread: the graveyard is empty again", cs.GraveyardSize() == 0);
     }
 
@@ -398,6 +416,9 @@ int main()
         const size_t n_before = cs.GetBlockIndexSize();
         chk("F1: setup, the eviction happened",
             cs.EvictLowestWorkLeafNotPinned(n_before - 1));
+        const uint256 f1_victim = v3hdr.GetHash();
+        chk("F1: setup, and the graveyard holds THE entry this arm evicted",
+            cs.GraveyardContains(f1_victim));
 
         // A thread that RESOLVES and never checkpoints, parked while we measure.
         std::mutex m; std::condition_variable cv;
@@ -422,7 +443,7 @@ int main()
         cv.notify_all();
         rogue.join();                   // its slot retires on exit
         chk("F1: once that thread is gone, the entry drains",
-            DrainUntil(cs, 1, "test-main", /*live_expected=*/1));
+            DrainUntil(cs, 1, "test-main", /*live_expected=*/1, f1_victim));
     }
 
     // ---- F2: A PARKED PARTICIPANT MUST NOT PIN ------------------------------
@@ -977,6 +998,72 @@ int main()
         chk("detector: and the census passes again", WaitForCensus(cs, true));
     }
 
+    // ---- F33: THE RE-RECORD MUST *COUNT*, AND A CLAMP WAS HIDING IT ---------
+    //
+    // ⚠️ ROUND-6 PANEL (kimi). The re-record branch in NoteIndexPointerResolved --
+    // the one that restores an accusation when a thread resolves after promising
+    // it holds nothing -- sets `recorded` and pushes the id. Until the previous
+    // commit it did NOT increment `live`, while BOTH withdrawal paths decrement
+    // it. So such a thread ATE ANOTHER THREAD'S ACCUSATION on its way out: an
+    // UNDER-count, and the dangerous direction, because a silently cancelled
+    // accusation is a real leaking thread the census stops reporting.
+    //
+    // ⚠️ AND THE BUG WAS INVISIBLE TO EVERY EXISTING ARM BECAUSE OF A CLAMP.
+    // Both withdrawals are `if (u.live > 0) --u.live;`. That guard is correct --
+    // it stops an underflow to SIZE_MAX -- but it also means a MISSING increment
+    // produces no visible symptom at all in a suite where the count usually
+    // returns to zero anyway. The fix was read-verified only; a fix nobody can
+    // observe failing is a fix nobody can prove. Hence this arm, which asserts
+    // the whole cycle by DELTA: 0 -> +1 on the offline resolve, +1 -> 0 on the
+    // checkpoint, and still 0 after the thread exits.
+    {
+        std::string d0;
+        const size_t base = cs.UnregisteredResolverThreads(d0);
+
+        std::mutex m; std::condition_variable cv;
+        int stage = 0;              // 0 start, 1 re-recorded, 2 withdrawn
+        bool go_withdraw = false, go_exit = false;
+
+        std::thread t([&] {
+            cs.EpochCheckpoint("f33-thread");     // a declared participant
+            const bool quiesced = cs.EpochQuiesce();
+            {
+                std::unique_lock<std::mutex> lk(m);
+                if (!quiesced) { stage = -1; cv.notify_all(); return; }
+            }
+            // Resolving while OFFLINE is the design error this branch makes SAFE
+            // rather than silent -- and the moment the accusation must come back.
+            (void)cs.GetBlockIndex(gh);
+            { std::lock_guard<std::mutex> lk(m); stage = 1; }
+            cv.notify_all();
+
+            { std::unique_lock<std::mutex> lk(m); cv.wait(lk, [&]{ return go_withdraw; }); }
+            cs.EpochCheckpoint("f33-thread");     // promises again -> withdrawal
+            { std::lock_guard<std::mutex> lk(m); stage = 2; }
+            cv.notify_all();
+
+            { std::unique_lock<std::mutex> lk(m); cv.wait(lk, [&]{ return go_exit; }); }
+        });
+
+        { std::unique_lock<std::mutex> lk(m); cv.wait(lk, [&]{ return stage != 0; }); }
+        chk("F33: the thread reached the offline resolve (quiesce was accepted)",
+            stage == 1);
+        chk("F33: an offline resolve RE-RECORDS the accusation, and COUNTS it (0 -> +1)",
+            WaitForUnregisteredDelta(cs, base, +1));
+
+        { std::lock_guard<std::mutex> lk(m); go_withdraw = true; }
+        cv.notify_all();
+        { std::unique_lock<std::mutex> lk(m); cv.wait(lk, [&]{ return stage == 2; }); }
+        chk("F33: the next checkpoint WITHDRAWS it (+1 -> 0)",
+            WaitForUnregisteredDelta(cs, base, 0));
+
+        { std::lock_guard<std::mutex> lk(m); go_exit = true; }
+        cv.notify_all();
+        t.join();
+        chk("F33: and the exit hook does not decrement a second time (still 0)",
+            WaitForUnregisteredDelta(cs, base, 0));
+    }
+
     // ---- THE TLS-TEARDOWN ARM: EXIT HOOKS RUN ON FREED STORAGE ---------------
     //
     // ⚠️ THIS IS THE ARM THAT WOULD HAVE FOUND THE PHANTOM, AND IT IS LAST BECAUSE
@@ -1024,16 +1111,44 @@ int main()
         // permanent accusation, the retirer path stores through a re-issued pointer
         // -- and separating them is the difference between "the arm is red" and
         // knowing which hook did it.
-        auto env_int = [](const char* k, int dflt) {
+        // ⚠️ AN ENV OVERRIDE OF 0 WOULD MAKE THIS ARM PASS VACUOUSLY (round-6 F31).
+        // With DIL_TLS_ARM_ACCUSED=0 DIL_TLS_ARM_MEMBERS=0 the arm spawns nothing,
+        // both counts trivially equal their baselines, and it reports PASS having
+        // measured nothing at all -- a green that means less than no test, because
+        // it occupies the slot where a real check would be. The overrides exist so
+        // the two halves can be run in ISOLATION, which needs one of them at zero;
+        // so a zero is legal for ONE of them and never for both, and a negative or
+        // unparsable value is never legal.
+        auto env_int = [](const char* k, int dflt, int floor_value) {
             const char* v = std::getenv(k);
-            return v != nullptr ? std::atoi(v) : dflt;
+            if (v == nullptr) return dflt;
+            const int parsed = std::atoi(v);
+            if (parsed < floor_value) {
+                std::cerr << "    TLS-teardown arm: " << k << "=" << v
+                          << " is below the floor of " << floor_value
+                          << " -- refusing to run an arm that cannot measure."
+                          << std::endl;
+                return -1;                      // poisons the arm; asserted below
+            }
+            return parsed;
         };
-        const int kAccused = env_int("DIL_TLS_ARM_ACCUSED", 2000);
-        const int kMembers = env_int("DIL_TLS_ARM_MEMBERS", 2000);
-        const int kChurn   = env_int("DIL_TLS_ARM_CHURN", 4);
+        const int kAccused = env_int("DIL_TLS_ARM_ACCUSED", 2000, 0);
+        const int kMembers = env_int("DIL_TLS_ARM_MEMBERS", 2000, 0);
+        const int kChurn   = env_int("DIL_TLS_ARM_CHURN", 4, 1);
         // Matches the pressure the decorrelated probe measured the defect at
         // (~8000 short-lived thread starts); see the budget note in the churn loop.
-        const long long kChurnBudget = env_int("DIL_TLS_ARM_CHURN_BUDGET", 8000);
+        const long long kChurnBudget = env_int("DIL_TLS_ARM_CHURN_BUDGET", 8000, 1);
+
+        // The floor the arm must actually REACH to have measured anything. It is a
+        // fraction of the budget rather than the budget itself because the churners
+        // stop when the work loops finish, so the exact total is scheduling-
+        // dependent -- but an order of magnitude below it is not.
+        const long long kChurnFloor = (kChurnBudget * 3) / 4;
+
+        chk("TLS teardown: the arm's parameters are usable "
+            "(no zero/negative override, at least one half armed)",
+            kAccused >= 0 && kMembers >= 0 && kChurn >= 1 &&
+            kChurnBudget >= 1 && (kAccused + kMembers) > 0);
 
         std::cout << "  [TLS-teardown arm] accused=" << kAccused
                   << " members=" << kMembers << " churn=" << kChurn
@@ -1052,7 +1167,8 @@ int main()
         // reason, never a terminate.
         std::atomic<bool> churn_stop{false};
         std::atomic<int> spawn_failures{0};
-        std::atomic<long long> churn_spawns{0};
+        std::atomic<long long> churn_spawns{0};    // SUCCEEDED spawns
+        std::atomic<long long> churn_claimed{0};   // budget claims, incl. failures
         auto spawn_join = [&](const char* what, const std::function<void()>& body) {
             try {
                 std::thread t(body);
@@ -1069,8 +1185,16 @@ int main()
             }
         };
 
+        // ⚠️ THE CHURNER THREADS' OWN START-UP WAS OUTSIDE THE CATCH (round-6 F31).
+        // spawn_join guards the threads the churners create, but `emplace_back`
+        // creating a CHURNER could itself throw system_error on a loaded host --
+        // outside any try, so the suite would die on an uncaught exception rather
+        // than report an unusable arm. The measuring apparatus must fail the way
+        // the arm's own assertions do.
         std::vector<std::thread> churners;
+        bool churners_started = true;
         for (int c = 0; c < kChurn; ++c) {
+            try {
             churners.emplace_back([&] {
                 while (!churn_stop.load(std::memory_order_relaxed)) {
                     // Short-lived threads that odr-use a thread_local WITH a
@@ -1085,16 +1209,31 @@ int main()
                     // the defect it was written for. A budget keeps the spawns dense
                     // (which is what re-issues a freed block) while capping the
                     // handle count that killed the unthrottled version.
-                    if (churn_spawns.fetch_add(1, std::memory_order_relaxed) >=
+                    // ⚠️ THE BUDGET IS CLAIMED BEFORE THE SPAWN, THE SUCCESS IS
+                    // COUNTED AFTER IT (round-6 F31). The first version
+                    // incremented one counter and printed it as "churn spawns",
+                    // so an over-budget claim and a FAILED spawn both inflated the
+                    // number the arm reported as its pressure. Two counters: one
+                    // to stop at the budget, one to prove the pressure happened.
+                    if (churn_claimed.fetch_add(1, std::memory_order_relaxed) >=
                         kChurnBudget) {
                         break;
                     }
                     if (!spawn_join("churn", [&] { cs.EpochCheckpoint("churn"); })) {
                         break;
                     }
+                    churn_spawns.fetch_add(1, std::memory_order_relaxed);
                 }
             });
+            } catch (const std::system_error& e) {
+                std::cerr << "    TLS-teardown arm: could not start churner thread "
+                          << c << " (" << e.what() << ")" << std::endl;
+                churners_started = false;
+                break;
+            }
         }
+        chk("TLS teardown: every churn thread started (the pressure source exists)",
+            churners_started && static_cast<int>(churners.size()) == kChurn);
 
         for (int i = 0; i < kAccused; ++i) {
             spawn_join("accused", [&] { (void)cs.GetBlockIndex(gh); });
@@ -1122,10 +1261,21 @@ int main()
         }
 
         std::cout << "  [TLS-teardown arm] " << churn_spawns.load()
-                  << " churn spawns, " << spawn_failures.load()
+                  << " successful churn spawns (" << churn_claimed.load()
+                  << " budget claims), " << spawn_failures.load()
                   << " spawn failures" << std::endl;
         chk("TLS teardown: the arm actually ran (no thread-resource exhaustion)",
             spawn_failures.load() == 0);
+
+        // ⚠️ AND IT REACHED THE PRESSURE IT NEEDS, not merely "finished" (round-6
+        // F31). Printing the rate made decay VISIBLE; asserting a floor makes it
+        // FAIL. Without this, a future change that quietly starves the churners
+        // leaves an arm that still passes on a tree where the defect is back --
+        // which is the exact way the 1 ms-throttle version was already nearly
+        // dead as a guard while looking correct.
+        chk("TLS teardown: the arm reached its intended pressure "
+            "(successful churn spawns at or above the floor)",
+            churn_spawns.load() >= kChurnFloor);
 
         if (rec_now > rec_base || live_now > live_base) {
             std::cerr << "    TLS-teardown arm: " << (rec_now - rec_base)
