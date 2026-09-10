@@ -556,6 +556,7 @@ void CTxIndex::StartBackgroundSync() {
 
     // R2 pin: snapshot tip ONCE at thread entry; thread walks
     // [m_last_height+1, snapshotted_tip].
+    g_chainstate.DeclareEpochParticipant("txindex-sync");
     m_sync_thread = std::thread(&CTxIndex::SyncLoop, this, snapshotted_tip);
     m_starting.store(false);        // thread is now joinable; gate released
 }
@@ -688,7 +689,7 @@ void CTxIndex::SyncLoop(int initial_snapshotted_tip) {
         // WalkBlockRange spans two or three lines and nothing is retained across
         // an iteration (tx_index.cpp documents the same discipline for m_mutex).
         // Pin duration is therefore ONE WALK PASS, not the life of the sync.
-        g_chainstate.EpochCheckpoint();
+        g_chainstate.EpochCheckpoint("txindex-sync");
 
         // PR-7G R1: each iteration walks `[m_last_height+1, current_target]`,
         // then re-reads the live tip. If the tip advanced during the walk,

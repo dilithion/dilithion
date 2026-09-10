@@ -37,6 +37,12 @@
     #define SOCKET_ERROR -1
 #endif
 
+// Deferred reclamation: this thread resolves CBlockIndex*, so it checkpoints.
+// g_chainstate is defined in src/core/globals.cpp and declared per-TU (the idiom
+// used by headers_manager.cpp / block_processing.cpp / tx_index.cpp).
+#include <consensus/chain.h>
+extern CChainState g_chainstate;
+
 // Constructor
 CHttpServer::CHttpServer(int port, bool public_api)
     : m_port(port), m_public_api(public_api),
@@ -130,6 +136,7 @@ bool CHttpServer::Start() {
     // This ensures workers are ready before accept thread starts queueing
     try {
         for (int i = 0; i < m_num_threads; i++) {
+            g_chainstate.DeclareEpochParticipant("http-worker");
             m_workers.emplace_back(&CHttpServer::WorkerThread, this);
         }
         std::cout << "[HttpServer] Started " << m_num_threads << " worker threads" << std::endl;
@@ -249,6 +256,13 @@ void CHttpServer::AcceptThread() {
 void CHttpServer::WorkerThread() {
     while (m_running.load()) {
         SOCKET client_socket;
+
+        // DEFERRED-RECLAMATION CHECKPOINT — before the blocking dequeue, not
+        // after the request. The /metrics handler and the REST branch both
+        // resolve a CBlockIndex* on THIS thread, so it is a participant; at the
+        // loop top the previous request is finished and no new one is taken.
+        // Pin bound: one HTTP request.
+        g_chainstate.EpochCheckpoint("http-worker");
 
         // Wait for work from queue (blocks until item available or shutdown)
         if (!m_work_queue.Dequeue(client_socket)) {

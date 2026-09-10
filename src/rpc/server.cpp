@@ -601,6 +601,10 @@ bool CRPCServer::Start() {
 
     // Start server thread
     m_running = true;
+    if (m_chainstate) {
+        m_chainstate->DeclareEpochParticipant("rpc-accept");
+        m_chainstate->DeclareEpochParticipant("rpc-worker");
+    }
     m_serverThread = std::thread(&CRPCServer::ServerThread, this);
 
     // RPC-002: Start worker thread pool
@@ -784,7 +788,7 @@ void CRPCServer::ServerThread() {
         // checkpointing after the request instead would be equivalent here, but
         // stating it at the blocking call makes the reason explicit — a thread
         // waiting on I/O is holding nothing, so it should say so before it waits.
-        if (m_chainstate) m_chainstate->EpochCheckpoint();
+        if (m_chainstate) m_chainstate->EpochCheckpoint("rpc-accept");
 
         int clientSocket = accept(listenSock, (struct sockaddr*)&clientAddr, &clientLen);
 
@@ -849,6 +853,22 @@ void CRPCServer::WorkerThread() {
     try {
         while (m_running) {
         int clientSocket = INVALID_SOCKET;
+
+        // DEFERRED-RECLAMATION CHECKPOINT — before the wait, not after the work.
+        //
+        // ⚠️ THIS IS THE THREAD THAT ACTUALLY RESOLVES BLOCK INDICES, not the
+        // accept thread. RPC methods run HERE, on the worker pool; the accept
+        // thread only hands a socket over. Checkpointing the accept thread alone
+        // would have left every request-handling thread a non-participant, which
+        // pins the whole graveyard for the process lifetime.
+        //
+        // At the loop top this worker has finished the previous request and taken
+        // no new one, so it holds no CBlockIndex*. The pin bound is therefore ONE
+        // REQUEST — and that includes the response write, because HandleClient
+        // does the socket write itself. That write is bounded: SO_SNDTIMEO is set
+        // to 10s per connection (RPC-017 slowloris hardening, below), so a slow
+        // client extends the pin by seconds, not indefinitely.
+        if (m_chainstate) m_chainstate->EpochCheckpoint("rpc-worker");
 
         // Wait for work or shutdown
         {

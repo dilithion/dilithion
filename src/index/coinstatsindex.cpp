@@ -654,6 +654,7 @@ void CCoinStatsIndex::StartBackgroundSync() {
     }
     const int snapshotted_tip = tip->nHeight;
 
+    g_chainstate.DeclareEpochParticipant("coinstatsindex-sync");
     m_sync_thread = std::thread(&CCoinStatsIndex::SyncLoop, this, snapshotted_tip);
     m_starting.store(false);
 }
@@ -728,7 +729,7 @@ void CCoinStatsIndex::SyncLoop(int initial_snapshotted_tip) {
         // WalkBlockRange spans two or three lines and nothing is retained across
         // an iteration (tx_index.cpp documents the same discipline for m_mutex).
         // Pin duration is therefore ONE WALK PASS, not the life of the sync.
-        g_chainstate.EpochCheckpoint();
+        g_chainstate.EpochCheckpoint("coinstatsindex-sync");
 
         const int walk_start = m_last_height.load() + 1;
         if (walk_start > current_target) {

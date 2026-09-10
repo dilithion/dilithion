@@ -35,6 +35,10 @@
 #include <iostream>
 #include <string>
 #include <vector>
+#include <chrono>
+#include <condition_variable>
+#include <mutex>
+#include <thread>
 
 namespace {
 
@@ -147,23 +151,93 @@ int main()
     // That is the SAFE direction — nothing is freed on the account of a thread
     // that made no promise — but it is a silent unbounded leak: the node behaves
     // correctly and memory grows. Worst possible shape for a defect, so the
-    // registration is asserted rather than assumed.
+    // registration is asserted at startup rather than assumed.
+    //
+    // ⚠️ TWO MECHANISMS, AND THE SECOND IS THE ONE THAT MATTERS. Comparing a
+    // declared set against a registered set catches a WIRED thread that never
+    // reached its checkpoint. It cannot catch the thread nobody wrote down —
+    // whoever adds a thread and forgets the checkpoint also forgets the
+    // declaration. So a resolve-time detector records any thread that obtains a
+    // CBlockIndex* while never having checkpointed, which needs no list at all.
     {
         std::string why;
-        // This test process has exactly one participating thread (main), which
-        // has checkpointed above.
-        chk("registration: at least one thread has registered",
-            cs.RegisteredEpochThreads() >= 1);
-        chk("registration: the census passes when the expectation is met",
-            cs.EpochRegistrationComplete(1, why));
 
-        // And it must FAIL loudly, with a diagnostic, when a participant is
-        // missing — the ninth-thread-added-later case.
+        // (0) Clean baseline: this thread has checkpointed, nothing is declared.
+        chk("registration: the census passes with no declared participants",
+            cs.EpochRegistrationComplete(why));
+
+        // (1) DECLARED BUT NEVER CHECKPOINTED — named, not merely counted.
+        cs.DeclareEpochParticipant("ghost-thread");
         why.clear();
-        const bool ok = cs.EpochRegistrationComplete(99, why);
-        chk("registration: a missing participant FAILS the census", !ok);
-        chk("registration: and the failure explains the leak, not just a count",
-            !why.empty() && why.find("PINS THE GRAVEYARD") != std::string::npos);
+        chk("registration: a declared thread that never checkpoints FAILS",
+            !cs.EpochRegistrationComplete(why));
+        chk("registration: the diagnostic NAMES the missing thread",
+            why.find("ghost-thread") != std::string::npos);
+        chk("registration: and it explains the leak, not just a count",
+            why.find("PINS THE GRAVEYARD") != std::string::npos);
+
+        // The startup gate polls to a deadline (threads start asynchronously) and
+        // must still return false rather than hanging.
+        const auto t0 = std::chrono::steady_clock::now();
+        why.clear();
+        const bool awaited = cs.AwaitEpochRegistration(300, why);
+        const auto waited_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - t0).count();
+        chk("startup gate: AwaitEpochRegistration fails when a participant is missing",
+            !awaited && why.find("ghost-thread") != std::string::npos);
+        chk("startup gate: it respects its deadline instead of hanging",
+            waited_ms >= 300 && waited_ms < 5000);
+
+        // (2) The declared thread checkpoints => the census passes.
+        std::thread ghost([&cs]() { cs.EpochCheckpoint("ghost-thread"); });
+        ghost.join();
+        why.clear();
+        chk("registration: once the declared thread checkpoints, the census passes",
+            cs.EpochRegistrationComplete(why));
+
+        // (3) THE DETECTOR: a thread that RESOLVES and never checkpoints. Nothing
+        // declares it — that is the entire point — and it is caught anyway.
+        std::mutex m;
+        std::condition_variable cv;
+        bool resolved = false, release = false;
+        std::thread rogue([&]() {
+            CBlockIndex* p = cs.GetBlockIndex(gh);   // holds a pointer, no promise
+            {
+                std::unique_lock<std::mutex> lk(m);
+                resolved = (p != nullptr);
+                cv.notify_all();
+                cv.wait(lk, [&] { return release; });
+            }
+            // Withdrawing the accusation is part of the contract: a thread that
+            // resolves during startup and checkpoints afterwards is not a leak.
+            cs.EpochCheckpoint("rogue-thread-that-came-good");
+        });
+        {
+            std::unique_lock<std::mutex> lk(m);
+            cv.wait(lk, [&] { return resolved; });
+        }
+        std::string detail;
+        chk("detector: an unregistered thread that resolved is counted",
+            cs.UnregisteredResolverThreads(detail) == 1);
+        why.clear();
+        chk("detector: and the census FAILS on it with nothing declared",
+            !cs.EpochRegistrationComplete(why));
+        chk("detector: the diagnostic says a pointer was obtained",
+            why.find("obtained a CBlockIndex*") != std::string::npos &&
+            why.find("made no promise") != std::string::npos);
+
+        {
+            std::lock_guard<std::mutex> lk(m);
+            release = true;
+        }
+        cv.notify_all();
+        rogue.join();
+        detail.clear();
+        chk("detector: the accusation is WITHDRAWN once that thread checkpoints",
+            cs.UnregisteredResolverThreads(detail) == 0);
+        why.clear();
+        chk("detector: and the census passes again",
+            cs.EpochRegistrationComplete(why));
     }
 
     Dilithion::g_chainParams = saved;

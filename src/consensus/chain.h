@@ -284,7 +284,20 @@ public:
      * provably holds no CBlockIndex* — see the quiescence proof for which point
      * that is per thread. Cheap: one relaxed atomic store into a thread-local.
      */
-    void EpochCheckpoint();
+    void EpochCheckpoint(const char* name = nullptr);
+
+    /**
+     * Declare that a thread called `name` will participate — called by whoever
+     * spawns it. The declared set and the set that has actually checkpointed are
+     * compared by EpochRegistrationComplete() at startup, so a thread that is
+     * started and never checkpoints is named rather than merely missing from a
+     * count. Deliberately built by the spawning code instead of a static list: a
+     * static list cannot know whether the txindex thread was started on THIS run.
+     */
+    void DeclareEpochParticipant(const char* name);
+
+    /** How many participants have been declared by spawn sites this run. */
+    size_t DeclaredEpochParticipants() const;
 
     /**
      * Free graveyard entries that every participating thread has moved past.
@@ -296,12 +309,41 @@ public:
     size_t RegisteredEpochThreads() const;
 
     /**
-     * Have at least `expected` threads registered? A thread that never
-     * checkpoints pins the graveyard for the process lifetime -- safe, but an
-     * unbounded and SILENT leak, which is why this is asserted at startup rather
-     * than assumed. `why` carries the diagnostic on failure.
+     * Is every participant accounted for? Fails if a DECLARED thread has never
+     * checkpointed (named in `why`), or if any thread has obtained a
+     * CBlockIndex* while never having checkpointed (observed, needs no list).
+     *
+     * A thread that never checkpoints pins the graveyard for the process
+     * lifetime -- safe, but an unbounded and SILENT leak, which is why this is
+     * asserted at startup rather than assumed. `why` carries the diagnostic.
      */
-    bool EpochRegistrationComplete(size_t expected, std::string& why) const;
+    bool EpochRegistrationComplete(std::string& why) const;
+
+    /**
+     * Poll EpochRegistrationComplete() until it passes or `timeout_ms` elapses.
+     * Called once at node startup after the last thread spawn. A failure means a
+     * declared thread never checkpointed, or a thread holds pointers without
+     * ever having checkpointed — either way the graveyard is pinned for the
+     * process lifetime, so the node refuses to run rather than leaking silently.
+     */
+    bool AwaitEpochRegistration(int timeout_ms, std::string& why);
+
+    /**
+     * How many threads have obtained a CBlockIndex* and have NEVER checkpointed.
+     *
+     * ⚠️ THIS IS THE DETECTOR THAT DOES NOT DEPEND ON A LIST BEING MAINTAINED.
+     * The participant count above is checked against a table, and the thread that
+     * leaks is added by someone who would also have forgotten the table row — so
+     * the count catches a wired thread that has not reached its checkpoint yet,
+     * and this catches the unwired thread that was never written down. It is
+     * recorded at the only place the hazard is visible without a list: the moment
+     * a raw pointer leaves cs_main. Cleared when the thread checkpoints, so
+     * resolving during startup before the first checkpoint is not counted.
+     *
+     * Non-zero means an unbounded, silent graveyard leak. `detail` names the
+     * count and the thread ids.
+     */
+    size_t UnregisteredResolverThreads(std::string& detail) const;
 
     /** Test/diagnostic: how many entries are unlinked but not yet freed. */
     size_t GraveyardSize() const {

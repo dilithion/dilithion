@@ -8102,8 +8102,60 @@ load_genesis_block:  // Bug #29: Label for automatic retry after blockchain wipe
         static constexpr float SOLO_WARN_RATIO = 0.80f;
         static constexpr float SOLO_PAUSE_RATIO = 0.90f;
 
+        // ── DEFERRED-RECLAMATION STARTUP CENSUS ────────────────────────────
+        // Every thread that resolves a CBlockIndex* must publish an epoch at a
+        // boundary where it holds none; a thread that never does pins the whole
+        // graveyard for the process lifetime. That leak is SILENT — the node runs
+        // correctly and memory grows — so it is refused at startup instead.
+        //
+        // Two things are checked (see CChainState::EpochRegistrationComplete):
+        // a DECLARED thread that never checkpointed, named; and any thread that
+        // has held a CBlockIndex* while never having checkpointed, observed at the
+        // resolve rather than read off a list. The second is what catches a thread
+        // added later by someone who never saw this comment.
+        //
+        // This main thread is itself a participant (the loop below resolves the
+        // tip on nearly every iteration), so it declares and checkpoints here,
+        // where startup is finished and it holds nothing.
+        g_chainstate.DeclareEpochParticipant("node-main-loop");
+        g_chainstate.EpochCheckpoint("node-main-loop");
+        {
+            std::string epoch_why;
+            if (!g_chainstate.AwaitEpochRegistration(15000, epoch_why)) {
+                throw std::runtime_error(
+                    "REFUSING TO START -- " + epoch_why);
+            }
+            std::cout << "[Chain] deferred reclamation: all "
+                      << g_chainstate.DeclaredEpochParticipants()
+                      << " declared epoch participants have checkpointed"
+                      << std::endl;
+        }
+
+        uint64_t epoch_census_ticks = 0;
         // Main loop
         while (g_node_state.running) {
+            // DEFERRED-RECLAMATION CHECKPOINT — the top of the node main loop.
+            // This thread resolves index pointers on nearly every iteration (the
+            // GetTip() below is the first), so it is a participant; the pin bound
+            // is one loop iteration. Placed BEFORE the per-iteration sleep, which
+            // is the instant it provably holds nothing.
+            g_chainstate.EpochCheckpoint("node-main-loop");
+
+            // Threads started AFTER the startup census (the miners, which only
+            // spawn when mining begins) are not covered by it, and neither is a
+            // thread added later that resolves without checkpointing. Re-run the
+            // census periodically and say so LOUDLY: at this point the node is
+            // live, so refusing to run is not on the table -- the graveyard simply
+            // stops draining, which is safe and unbounded, and an operator seeing
+            // memory grow needs this line in the log to know why.
+            if (++epoch_census_ticks % 300 == 0) {
+                std::string epoch_why;
+                if (!g_chainstate.EpochRegistrationComplete(epoch_why)) {
+                    std::cerr << "[Chain] ⚠️  GRAVEYARD PINNED: " << epoch_why
+                              << std::endl;
+                }
+            }
+
             std::this_thread::sleep_for(std::chrono::seconds(1));
 
             // v4.0.18: keep the RegistrationManager driving on every iteration.

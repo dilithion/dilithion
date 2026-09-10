@@ -14,6 +14,11 @@
 #include <net/serialize.h>
 #include <net/banman.h>  // For MisbehaviorType
 #include <core/chainparams.h>  // Phase 4: per-chain outbound class targets
+#include <consensus/chain.h>    // g_chainstate: deferred-reclamation epoch checkpoints
+
+// Defined in src/core/globals.cpp; declared per-TU, matching the idiom in
+// headers_manager.cpp / block_processing.cpp / tx_index.cpp.
+extern CChainState g_chainstate;
 #include <util/time.h>
 #include <util/logging.h>
 #include <util/strencodings.h>  // For strprintf
@@ -172,6 +177,15 @@ bool CConnman::Start(CPeerManager& peer_mgr, CNetMessageProcessor& msg_proc, con
             LogPrintf(NET, WARN, "[CConnman] Listening on port %d (IPv4 only, IPv6 unavailable)\n", m_options.nListenPort);
         }
     }
+
+    // Declared before the spawns. These three are the P2P threads that reach
+    // block_processing and therefore resolve CBlockIndex*; ThreadSocketHandler and
+    // ThreadOpenConnections are NOT declared because they move bytes and addresses
+    // and never touch mapBlockIndex — if that ever changes, the resolve-time
+    // detector in chain.cpp names them without anyone updating this list.
+    g_chainstate.DeclareEpochParticipant("p2p-msg-handler");
+    g_chainstate.DeclareEpochParticipant("p2p-headers-worker");
+    g_chainstate.DeclareEpochParticipant("p2p-blocks-worker");
 
     // Phase 2: Start ThreadSocketHandler
     try {
@@ -738,6 +752,15 @@ void CConnman::ThreadMessageHandler() {
     LogPrintf(NET, INFO, "[CConnman] ThreadMessageHandler started (async dispatch mode)\n");
 
     while (!flagInterruptMsgProc.load()) {
+        // DEFERRED-RECLAMATION CHECKPOINT — the loop top, which for THIS thread is
+        // the every-iteration point: its wait sits at the BOTTOM and is skipped
+        // entirely while fMoreWork is true, so a checkpoint there would never fire
+        // during IBD. Here the batch is not yet collected and nothing is resolved.
+        // Gap between checkpoints: one batch (<=500 messages) plus at most the
+        // 100ms bottom wait. Control messages are processed INLINE on this thread
+        // (getheaders/getdata/inv), and those resolve block indices.
+        g_chainstate.EpochCheckpoint("p2p-msg-handler");
+
         bool fMoreWork = false;
 
         // IBD Redesign Phase 1: Collect messages and route by type
@@ -916,6 +939,13 @@ void CConnman::HeadersWorkerThread() {
     while (!flagInterruptMsgProc.load()) {
         QueuedMessage msg;
 
+        // DEFERRED-RECLAMATION CHECKPOINT — before the wait, not after the work.
+        // At the loop top this thread has finished the previous unit and taken no
+        // new one, so it holds no CBlockIndex*. ProcessQueuedMessage below reaches
+        // block_processing, which resolves index pointers, so this thread IS a
+        // participant: without this it would pin the graveyard for the whole run.
+        g_chainstate.EpochCheckpoint("p2p-headers-worker");
+
         // Wait for work
         {
             std::unique_lock<std::mutex> lock(m_headers_queue_mutex);
@@ -958,6 +988,13 @@ void CConnman::BlocksWorkerThread() {
 
     while (!flagInterruptMsgProc.load()) {
         QueuedMessage msg;
+
+        // DEFERRED-RECLAMATION CHECKPOINT — before the wait, not after the work.
+        // At the loop top this thread has finished the previous unit and taken no
+        // new one, so it holds no CBlockIndex*. ProcessQueuedMessage below reaches
+        // block_processing, which resolves index pointers, so this thread IS a
+        // participant: without this it would pin the graveyard for the whole run.
+        g_chainstate.EpochCheckpoint("p2p-blocks-worker");
 
         // Wait for work
         {

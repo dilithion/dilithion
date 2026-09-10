@@ -12,6 +12,12 @@
 #include <cstring>
 #include <iostream>
 
+// Deferred reclamation: this thread resolves CBlockIndex* through its injected
+// callbacks, so it checkpoints. g_chainstate is defined in src/core/globals.cpp
+// and declared per-TU (the idiom used by headers_manager.cpp / tx_index.cpp).
+#include <consensus/chain.h>
+extern CChainState g_chainstate;
+
 CVDFMiner::CVDFMiner() = default;
 
 CVDFMiner::~CVDFMiner()
@@ -26,6 +32,7 @@ void CVDFMiner::Start()
 
     m_abort = false;
     m_lastHeightChangeTime = std::chrono::steady_clock::now();
+    g_chainstate.DeclareEpochParticipant("vdf-miner");
     m_thread = std::thread(&CVDFMiner::MiningLoop, this);
 }
 
@@ -116,6 +123,15 @@ void CVDFMiner::MiningLoop()
     std::cout << "[VDF Miner] Started (iterations=" << m_iterations << ")" << std::endl;
 
     while (m_running) {
+        // DEFERRED-RECLAMATION CHECKPOINT — loop top, before any wait in this
+        // round. Three injected callbacks on this thread resolve index pointers
+        // (m_templateProvider, m_tipOutputProvider, m_blockFoundCallback); all
+        // three have returned by the time control is back here. Pin bound: one
+        // VDF round. vdf_miner.cpp contains no CBlockIndex token at all — every
+        // resolve arrives through a callback, so only a call-graph census finds
+        // it, never a grep of this file.
+        g_chainstate.EpochCheckpoint("vdf-miner");
+
         // ---------------------------------------------------------------
         // 0. Start VDF immediately (no pre-computation wait)
         // ---------------------------------------------------------------

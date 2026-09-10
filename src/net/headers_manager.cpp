@@ -3234,6 +3234,11 @@ bool CHeadersManager::StartValidationThread()
     m_processor_running.store(true);
 
     try {
+        // Declared before the spawns: a declared thread that never checkpoints is
+        // named by the startup census (see the quiescence proof's wiring table).
+        g_chainstate.DeclareEpochParticipant("headers-validation");
+        g_chainstate.DeclareEpochParticipant("headers-processor");
+
         // Start hash worker threads
         m_hash_workers.reserve(m_hash_worker_count);
         for (size_t i = 0; i < m_hash_worker_count; ++i) {
@@ -3388,7 +3393,7 @@ void CHeadersManager::ValidationWorkerThread()
         // no new one, so it holds no CBlockIndex*. Publishing here means a thread
         // that then sleeps (idle node, empty queue) pins NOTHING while it sleeps;
         // the pin is one unit of work, never the duration of a wait.
-        g_chainstate.EpochCheckpoint();
+        g_chainstate.EpochCheckpoint("headers-validation");
 
         // Wait for work
         {
@@ -3494,7 +3499,7 @@ void CHeadersManager::HeaderProcessorThread()
         // no new one, so it holds no CBlockIndex*. Publishing here means a thread
         // that then sleeps (idle node, empty queue) pins NOTHING while it sleeps;
         // the pin is one unit of work, never the duration of a wait.
-        g_chainstate.EpochCheckpoint();
+        g_chainstate.EpochCheckpoint("headers-processor");
 
         // Check if paused for fork recovery - wait until unpaused
         if (m_processing_paused.load()) {

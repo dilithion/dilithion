@@ -17,6 +17,12 @@
 // OpenSSL for SHA-1 (required for WebSocket accept key)
 #include <openssl/sha.h>
 
+// Deferred reclamation: this thread resolves CBlockIndex*, so it checkpoints.
+// g_chainstate is defined in src/core/globals.cpp and declared per-TU (the idiom
+// used by headers_manager.cpp / block_processing.cpp / tx_index.cpp).
+#include <consensus/chain.h>
+extern CChainState g_chainstate;
+
 #ifdef _WIN32
     #include <winsock2.h>
     #include <ws2tcpip.h>
@@ -93,6 +99,7 @@ bool CWebSocketServer::Start() {
     }
 
     m_running = true;
+    g_chainstate.DeclareEpochParticipant("websocket-server");
     m_server_thread = std::thread(&CWebSocketServer::ServerThread, this);
     
     return true;
@@ -136,6 +143,13 @@ void CWebSocketServer::Stop() {
 
 void CWebSocketServer::ServerThread() {
     while (m_running) {
+        // DEFERRED-RECLAMATION CHECKPOINT — before accept(), which can wait
+        // indefinitely. This thread handles the client inline and reaches
+        // ExecuteRPC, i.e. the entire RPC handler table, so it resolves index
+        // pointers. Checkpointing here means an idle websocket listener pins
+        // nothing for the hours it may sit in accept(); pin bound is one request.
+        g_chainstate.EpochCheckpoint("websocket-server");
+
         struct sockaddr_storage clientAddr;
         socklen_t clientLen = sizeof(clientAddr);
         int clientSocket = accept(m_server_socket, (struct sockaddr*)&clientAddr, &clientLen);

@@ -27,6 +27,12 @@
 #include <set>
 #include <stdexcept>
 
+// Deferred reclamation: this thread resolves CBlockIndex* through its injected
+// callbacks, so it checkpoints. g_chainstate is defined in src/core/globals.cpp
+// and declared per-TU (the idiom used by headers_manager.cpp / tx_index.cpp).
+#include <consensus/chain.h>
+extern CChainState g_chainstate;
+
 #ifdef _WIN32
     #include <windows.h>  // For GlobalMemoryStatusEx
 #endif
@@ -267,6 +273,10 @@ bool CMiningController::StartMining(const CBlockTemplate& blockTemplate) {
     m_stats.Reset();
     m_stats.nStartTime = GetTime();
 
+    // Declared before the spawn: conditional participants (mining off => never
+    // declared, so a non-mining node's startup census does not expect them).
+    g_chainstate.DeclareEpochParticipant("mining-worker");
+
     // Start mining worker threads
     m_workers.clear();
     m_workers.reserve(m_nThreads);
@@ -378,6 +388,18 @@ void CMiningController::MiningWorker(uint32_t threadId) {
         const uint64_t UPGRADE_CHECK_INTERVAL = 1000;  // Check every 1000 hashes
 
         while (m_mining) {
+        // DEFERRED-RECLAMATION CHECKPOINT — loop top. This thread resolves index
+        // pointers only inside m_blockFoundCallback (the node's block-found lambda
+        // does the GetTip/GetBlockIndex work), which has returned by the time
+        // control is back here, so at this instant it holds none. Nothing in this
+        // file mentions CBlockIndex — the resolve is entirely inside an injected
+        // callback, which is why a text search of the miner misses it.
+        //
+        // Per-iteration cost is an acquire load plus a release store, single-digit
+        // nanoseconds, against a loop body that computes a RandomX hash
+        // (~100us light / ~1ms full). Not measurable.
+        g_chainstate.EpochCheckpoint("mining-worker");
+
         // BUG FIX: Periodically check for LIGHT→FULL mode upgrade
         // Only thread 0 logs to avoid spam
         if (!vm.isFullMode() && ++hashesForUpgradeCheck >= UPGRADE_CHECK_INTERVAL) {

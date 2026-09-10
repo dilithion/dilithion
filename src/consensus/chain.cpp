@@ -23,6 +23,7 @@
 #include <algorithm>
 #include <cstring>      // std::strcmp (env-var check)
 #include <mutex>        // std::once_flag (chain selector path startup log)
+#include <sstream>      // std::ostringstream (unregistered-resolver diagnostic)
 #include <set>
 #include <thread>
 #include <chrono>
@@ -304,6 +305,14 @@ bool CChainState::AddBlockIndex(const uint256& hash, std::unique_ptr<CBlockIndex
     return true;
 }
 
+namespace {
+// Defined with the epoch registry below; declared here because the two pointer
+// accessors sit above it. Records the calling thread the FIRST time it obtains a
+// CBlockIndex* while not yet being an epoch participant — see the definition for
+// why that, and not a hand-maintained thread list, is the real detector.
+void NoteIndexPointerResolved();
+}  // namespace
+
 CBlockIndex* CChainState::GetBlockIndex(const uint256& hash) {
     // CRITICAL-1 FIX: Acquire lock before accessing shared state
     std::lock_guard<std::recursive_mutex> lock(cs_main);
@@ -311,6 +320,9 @@ CBlockIndex* CChainState::GetBlockIndex(const uint256& hash) {
     // HIGH-C001 FIX: Return raw pointer (non-owning) via .get()
     auto it = mapBlockIndex.find(hash);
     if (it != mapBlockIndex.end()) {
+        // A raw pointer is about to leave the lock scope. If this thread never
+        // checkpoints, that pointer's existence is what pins the graveyard.
+        NoteIndexPointerResolved();
         return it->second.get();  // Extract raw pointer from unique_ptr
     }
     return nullptr;
@@ -366,6 +378,16 @@ namespace {
 struct EpochRegistry {
     std::mutex mu;
     std::vector<std::atomic<uint64_t>*> slots;
+
+    // THE PARTICIPANT TABLE, BUILT BY THE CODE THAT SPAWNS THE THREADS.
+    // `declared` is written at each spawn site, `registered` by each thread's
+    // first checkpoint. A name in the first and not the second is a thread that
+    // was started and never made the promise -- named, not merely counted.
+    // Deliberately not a static list: a static list cannot know whether the
+    // txindex thread was started on THIS run, and a count that includes a thread
+    // the config never spawned fails a healthy node.
+    std::set<std::string> declared;
+    std::set<std::string> registered;
 };
 
 EpochRegistry& Registry()
@@ -375,6 +397,7 @@ EpochRegistry& Registry()
 }
 
 thread_local std::atomic<uint64_t>* t_epoch_slot = nullptr;
+thread_local const char* t_epoch_name = nullptr;
 
 std::atomic<uint64_t>* MyEpochSlot()
 {
@@ -394,15 +417,106 @@ std::atomic<uint64_t>* MyEpochSlot()
     return t_epoch_slot;
 }
 
+// ── THE DETECTOR: A THREAD THAT RESOLVES AND NEVER CHECKPOINTS ──────────────
+//
+// EpochRegistrationComplete() counts participants against a table, and a table
+// is maintained by hand: the ninth thread that resolves block indices and forgets
+// to checkpoint is added by someone who would also have forgotten the table row.
+// A count alone therefore catches "a WIRED thread has not reached its checkpoint
+// yet", not "an UNWIRED thread was added" -- which is the case that actually
+// leaks. So the second one is detected mechanically instead, at the only place it
+// can be seen without a list: the moment a raw pointer leaves cs_main.
+//
+// Recorded ONCE per thread (a thread_local flag, so the mutex is touched once in
+// a thread's life and never on the hot path) and CLEARED when that thread later
+// checkpoints -- so resolving before the first checkpoint, which every thread
+// does during startup, is not an accusation. What survives to the startup census
+// is exactly: threads that hold pointers and have made no promise.
+struct UnregisteredResolvers {
+    std::mutex mu;
+    std::vector<std::thread::id> ids;   // one per offending thread, capped
+    size_t overflow{0};                 // offenders beyond the cap
+};
+
+UnregisteredResolvers& Unregistered()
+{
+    static UnregisteredResolvers u;
+    return u;
+}
+
+constexpr size_t MAX_RECORDED_OFFENDERS = 8;
+
+thread_local bool t_recorded_unregistered = false;
+
+void NoteIndexPointerResolved()
+{
+    // The hot path for a participant: one thread-local load and a predicted
+    // branch. No lock, no atomic.
+    if (t_epoch_slot != nullptr) return;
+    if (t_recorded_unregistered) return;
+    t_recorded_unregistered = true;
+
+    auto& u = Unregistered();
+    std::lock_guard<std::mutex> lk(u.mu);
+    if (u.ids.size() < MAX_RECORDED_OFFENDERS) {
+        u.ids.push_back(std::this_thread::get_id());
+    } else {
+        ++u.overflow;
+    }
+}
+
+// Called from the first checkpoint of a thread that had already resolved: it has
+// now made the promise, so the accusation is withdrawn.
+void ClearUnregisteredRecord()
+{
+    if (!t_recorded_unregistered) return;
+    t_recorded_unregistered = false;
+    auto& u = Unregistered();
+    std::lock_guard<std::mutex> lk(u.mu);
+    const auto me = std::this_thread::get_id();
+    for (size_t i = 0; i < u.ids.size(); ++i) {
+        if (u.ids[i] == me) { u.ids.erase(u.ids.begin() + i); return; }
+    }
+    if (u.overflow > 0) --u.overflow;   // was beyond the cap
+}
+
 }  // namespace
 
-void CChainState::EpochCheckpoint()
+void CChainState::EpochCheckpoint(const char* name)
 {
     // Publish "I am now at the current global epoch, and I hold no CBlockIndex*".
     // acquire on the read / release on the store: a drain that observes this value
     // must also observe everything this thread did before the checkpoint.
     const uint64_t now = m_globalEpoch.load(std::memory_order_acquire);
     MyEpochSlot()->store(now, std::memory_order_release);
+
+    // This thread may have resolved a pointer before reaching its first
+    // checkpoint -- every thread does, during startup. It is a participant now,
+    // so it is no longer an offender.
+    ClearUnregisteredRecord();
+
+    // Answer the declaration made at this thread's spawn site. Once only: the
+    // name is passed on every loop iteration and this costs a predicted branch.
+    if (name != nullptr && t_epoch_name == nullptr) {
+        t_epoch_name = name;
+        std::lock_guard<std::mutex> lk(Registry().mu);
+        Registry().registered.insert(name);
+    }
+}
+
+void CChainState::DeclareEpochParticipant(const char* name)
+{
+    // Called by whoever spawns the thread, BEFORE or AT the spawn. This is the
+    // executable half of the wiring census: it cannot drift from the set of
+    // threads that actually exist, because the same code creates both.
+    std::lock_guard<std::mutex> lk(Registry().mu);
+    Registry().declared.insert(name);
+}
+
+size_t CChainState::DeclaredEpochParticipants() const
+{
+    std::lock_guard<std::mutex> lk(Registry().mu);
+    return Registry().declared.size();
 }
 
 size_t CChainState::RegisteredEpochThreads() const
@@ -411,33 +525,98 @@ size_t CChainState::RegisteredEpochThreads() const
     return Registry().slots.size();
 }
 
-bool CChainState::EpochRegistrationComplete(size_t expected, std::string& why) const
+size_t CChainState::UnregisteredResolverThreads(std::string& detail) const
+{
+    auto& u = Unregistered();
+    std::lock_guard<std::mutex> lk(u.mu);
+    const size_t n = u.ids.size() + u.overflow;
+    if (n == 0) { detail.clear(); return 0; }
+
+    std::ostringstream os;
+    os << n << " thread(s) obtained a CBlockIndex* and have NEVER checkpointed";
+    if (!u.ids.empty()) {
+        os << " (ids:";
+        for (const auto& id : u.ids) os << ' ' << id;
+        os << ')';
+    }
+    if (u.overflow > 0) os << " (+" << u.overflow << " beyond the record cap)";
+    detail = os.str();
+    return n;
+}
+
+bool CChainState::EpochRegistrationComplete(std::string& why) const
 {
     // A THREAD THAT NEVER REGISTERS PINS THE GRAVEYARD FOREVER. That is the safe
     // direction -- nothing is freed on the account of a thread that made no
     // promise -- but it is a LEAK, and a silent one: the node runs correctly and
-    // memory grows without bound, which is the worst shape a defect can take.
+    // memory grows without bound, which is the worst shape a defect can take. So
+    // it is asserted at startup rather than trusted.
     //
-    // So it is asserted rather than trusted. The count is checked against the
-    // thread table in docs/contracts/deferred-reclamation-quiescence-proof.md; a
-    // NINTH thread added later that resolves block indices and does not
-    // checkpoint makes this fail loudly at startup instead of quietly holding the
-    // graveyard for the process lifetime.
+    // TWO INDEPENDENT FAILURES, and they catch different mistakes:
     //
-    // Deliberately a >= test with a diagnostic, not an equality: threads start
-    // asynchronously, so at any given instant fewer may have reached their first
-    // checkpoint. The caller supplies the deadline; what is forbidden is running
-    // indefinitely with a participant missing.
-    const size_t have = RegisteredEpochThreads();
-    if (have >= expected) return true;
-    why = "deferred reclamation: only " + std::to_string(have) + " of " +
-          std::to_string(expected) + " expected threads have checkpointed. A "
-          "thread that never checkpoints PINS THE GRAVEYARD FOR THE PROCESS "
+    //   (1) DECLARED BUT NOT REGISTERED. A spawn site declared a participant and
+    //       that thread has not reached its first checkpoint. Named, not counted,
+    //       so the diagnostic says which thread. Catches a checkpoint that was
+    //       removed, mis-placed after a blocking wait, or never reached.
+    //
+    //   (2) RESOLVED WITHOUT EVER CHECKPOINTING. Observed at the moment a raw
+    //       pointer left cs_main -- no list involved. This is the one that catches
+    //       the NINTH THREAD: whoever adds a thread and forgets the checkpoint is
+    //       the same person who would forget to declare it, so (1) alone would say
+    //       nothing. (2) needs nobody to remember anything.
+    std::vector<std::string> missing;
+    {
+        std::lock_guard<std::mutex> lk(Registry().mu);
+        for (const std::string& d : Registry().declared) {
+            if (Registry().registered.count(d) == 0) missing.push_back(d);
+        }
+    }
+    std::string rogue_detail;
+    const size_t rogue = UnregisteredResolverThreads(rogue_detail);
+    if (missing.empty() && rogue == 0) return true;
+
+    std::ostringstream os;
+    os << "deferred reclamation: ";
+    if (!missing.empty()) {
+        os << missing.size() << " declared thread(s) have never checkpointed [";
+        for (size_t i = 0; i < missing.size(); ++i) {
+            if (i) os << ", ";
+            os << missing[i];
+        }
+        os << "]. ";
+    }
+    if (rogue > 0) {
+        os << rogue_detail << " -- these HOLD POINTERS and made no promise. ";
+    }
+    os << "A thread that never checkpoints PINS THE GRAVEYARD FOR THE PROCESS "
           "LIFETIME -- memory grows without bound while the node behaves "
-          "correctly. Add EpochCheckpoint() at that thread's no-pointer-held "
-          "boundary, or add it to the exclusion list in the quiescence proof if "
-          "it provably never resolves a CBlockIndex*.";
+          "correctly. Add EpochCheckpoint(\"<name>\") at that thread's "
+          "no-pointer-held boundary (BEFORE any blocking wait, not after the "
+          "work), or, if it provably never resolves a CBlockIndex*, do not "
+          "declare it and add it to the exclusion list in "
+          "docs/contracts/deferred-reclamation-quiescence-proof.md.";
+    why = os.str();
     return false;
+}
+
+bool CChainState::AwaitEpochRegistration(int timeout_ms, std::string& why)
+{
+    // Threads start asynchronously, so at the instant the last one is spawned
+    // some have not yet reached their first checkpoint. That is not a defect --
+    // running INDEFINITELY with a participant missing is. So this polls to a
+    // deadline and then reports; the caller decides what a failure means.
+    //
+    // Every checkpoint is placed BEFORE its thread's blocking wait, so a thread
+    // reaches its first one as soon as it starts running -- it does not need any
+    // work to arrive. A participant still missing after seconds is therefore a
+    // thread that never checkpoints, not a thread that is merely idle.
+    const auto deadline = std::chrono::steady_clock::now() +
+                          std::chrono::milliseconds(timeout_ms);
+    for (;;) {
+        if (EpochRegistrationComplete(why)) return true;
+        if (std::chrono::steady_clock::now() >= deadline) return false;
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
 }
 
 size_t CChainState::DrainGraveyard()
@@ -3235,6 +3414,7 @@ std::vector<std::pair<int, uint256>> CChainState::GetChainSnapshot(int maxBlocks
 
 CBlockIndex* CChainState::GetTip() const {
     std::lock_guard<std::recursive_mutex> lock(cs_main);
+    if (pindexTip != nullptr) NoteIndexPointerResolved();
     return pindexTip;
 }
 

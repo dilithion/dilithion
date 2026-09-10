@@ -79,6 +79,10 @@ bool CBlockValidationQueue::Start() {
            "pin is absent. Register it in the node wiring before starting the queue.");
 
     m_running.store(true);
+    // Declare the participant BEFORE the spawn, so a thread that starts and never
+    // reaches its checkpoint is a NAMED absence at the startup census rather than
+    // an invisible one. See CChainState::DeclareEpochParticipant.
+    m_chainstate.DeclareEpochParticipant("validation-worker");
     m_worker = std::thread(&CBlockValidationQueue::ValidationWorker, this);
     return true;
 }
@@ -401,7 +405,7 @@ void CBlockValidationQueue::ValidationWorker() {
         // So the pin duration per thread is ONE UNIT OF WORK (here: one
         // ProcessBlock, bounded by validation plus a LevelDB write), never the
         // duration of a block on I/O or a wait for input.
-        m_chainstate.EpochCheckpoint();
+        m_chainstate.EpochCheckpoint("validation-worker");
 
         // Wait for blocks in queue
         {

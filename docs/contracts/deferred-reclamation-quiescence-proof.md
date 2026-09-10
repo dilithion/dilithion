@@ -1,7 +1,23 @@
 # Deferred reclamation of CBlockIndex — the quiescence proof
 
 **Branch:** `fix/blockindex-deferred-reclamation`, cut from `0f6837d0` (#129's head).
+**Base as of 2026-09-10: #129 IS MERGED** — main `4ccf3797` carries leaf-only
+eviction, so the dependency below is no longer "depends on #129" but "depends on
+main ≥ `4ccf3797`". The argument is unchanged; only its base moved.
 **Mandatory reader:** LP10 (A-5 owner).
+
+> **THE CHECKPOINT GOES BEFORE THE WAIT, BECAUSE THAT IS THE INSTANT THE THREAD
+> PROVABLY HOLDS NOTHING.** Everything else here follows from that one placement:
+> the pin per thread is ONE UNIT OF WORK, never the duration of a wait, so an idle
+> worker, an RPC server parked in `accept()` for hours, and a sync loop waiting on
+> I/O all pin exactly nothing. Checkpointing *after* the work would be backwards —
+> it would hold the graveyard for precisely the period the thread is doing nothing.
+>
+> **The exception that would break it**, and the rule that survives this document:
+> a thread that blocks on I/O *while holding* a resolved pointer. The census below
+> found that **none of the wired threads does** — every one resolves and
+> dereferences within a few lines and retains nothing across its boundary. A thread
+> that ever does must checkpoint before blocking, or drop the pointer first.
 
 > **LEAF-ONLY EVICTION IS WHAT MAKES AN ENTRY SAFE TO FREE AT ALL. Deferred
 > reclamation only makes the TIMING safe.** A grace period protects a pointer held by
@@ -54,50 +70,100 @@ I would argue against.
 
 ## The threads that can hold a `CBlockIndex*`
 
-Every `std::thread` spawned in production `src/`, filtered to those whose code
-reaches `GetBlockIndex(` / `GetTip(` / `LookupBlockIndex(`. Counts are from the
-tree-wide census (`census_blockindex_pointer_windows.py`), not from a hand list.
+> ⚠️ **THE FIRST VERSION OF THIS TABLE WAS WRONG IN THREE PLACES, AND THE WIRING
+> BUILT ON IT INHERITED ALL THREE.** It is replaced below by a call-graph census of
+> every `std::thread` in production `src/` (36 threads; each entry function followed
+> 2-3 levels deep, every row cited to `file:line`).
 
-| # | thread | spawn site | resolves | the point at which it provably holds none |
+What the first table got wrong:
+
+1. **"P2P message handler - spawn site: node main loop".** It is
+   `CConnman::ThreadMessageHandler` (`net/connman.cpp:196`), a thread of its own.
+   The node main loop is a *separate* participant, and it had no checkpoint at all.
+2. **"RPC server - `m_serverThread` - resolves `rpc/server.cpp` (6)".** The accept
+   thread resolves nothing; it accepts a socket and enqueues it. **Every RPC method
+   runs on the worker pool** (`CRPCServer::WorkerThread`, `rpc/server.cpp:613`),
+   which is where all 23 resolve sites are. The checkpoint went on the wrong thread.
+3. **"Hash worker pool - excluded, never resolves".** The exclusion is correct -
+   `FullValidateHeader` (`headers_manager.cpp:2614`) is checkpoint-height / VDF /
+   PoW-hash only - but the pool's entry function *is* `ValidationWorkerThread`, the
+   same function the table listed separately as the wired participant "Header
+   validation". One row said excluded and the other said wired, about the same
+   threads. It is wired: a checkpoint in a thread that holds nothing is always a
+   true statement and costs nothing.
+
+And it **omitted four threads that demonstrably resolve**: the HTTP worker pool, the
+WebSocket server thread, the cached-stats updater, and both miner threads.
+
+| thread | spawn | conditional | resolves - cited | checkpoint name |
 |---|---|---|---|---|
-| 1 | P2P message handler | node main loop | `block_processing.cpp` (13) | top of each message dispatch |
-| 2 | Header validation | `headers_manager` validation thread | `headers_manager.cpp` (1) | top of each `ProcessHeaders` batch |
-| 3 | **Hash worker pool** (`m_hash_workers`, `hardware_concurrency`) | `headers_manager.h:911` | **none — takes header bytes, returns hashes** | n/a, and see the note below |
-| 4 | Validation worker | `block_validation_queue` `m_worker` | `block_validation_queue.cpp` (9) | top of each `ProcessBlock` iteration |
-| 5 | IBD coordinator | node main loop | `ibd_coordinator.cpp` (9) | top of each coordinator tick |
-| 6 | **RPC server** | `rpc/server.cpp:604` `m_serverThread` | `rpc/server.cpp` (6) | **completion of each request** — see below |
-| 7 | **RPC cleanup** | `rpc/server.cpp:614` `m_cleanupThread` | none observed | n/a |
-| 8 | **TxIndex sync** | `index/tx_index.cpp:559` `SyncLoop` | `tx_index.cpp` (4) | top of each height iteration |
-| 9 | **CoinStatsIndex sync** | `index/coinstatsindex.cpp:657` `SyncLoop` | `coinstatsindex.cpp` (4) | top of each height iteration |
-| 10 | Node main loop | `dilithion-node` / `dilv-node` | those files (26) | top of each loop iteration |
-| 11 | Cached stats | `api/cached_stats.cpp` | via RPC-style accessors | treat as (6) |
+| `CConnman::ThreadMessageHandler` | `connman.cpp:196` | no | yes - control msgs inline, `dilithion-node.cpp:4411`, `:4417-4446` (`pTip->GetAncestor`) | `p2p-msg-handler` |
+| `CConnman::HeadersWorkerThread` | `connman.cpp:224` | no | yes - `headers_manager.cpp:242`, `:1219`, `:1273` | `p2p-headers-worker` |
+| `CConnman::BlocksWorkerThread` xN | `connman.cpp:238` | no | yes - `dilithion-node.cpp:6410`, `:6439`, `:6448` | `p2p-blocks-worker` |
+| `CHeadersManager::ValidationWorkerThread` xHW | `headers_manager.cpp:3245` | no | **no** - hash-only | `headers-validation` (belt and braces) |
+| `CHeadersManager::HeaderProcessorThread` | `headers_manager.cpp:3251` | no | yes | `headers-processor` |
+| `CBlockValidationQueue::ValidationWorker` | `block_validation_queue.cpp:86` | falls back to sync on failure | yes - `:626`, `:767`, `:849`, `:901` | `validation-worker` |
+| `CTxIndex::SyncLoop` | `tx_index.cpp:560` | **yes** - `config.txindex_enabled` | yes - `:713`, `:620`, `:229`, `:240` | `txindex-sync` |
+| `CCoinStatsIndex::SyncLoop` | `coinstatsindex.cpp:658` | **yes** - `config.coinstatsindex_enabled` | yes - `:741`, `:679`, `:487` | `coinstatsindex-sync` |
+| `CRPCServer::ServerThread` (accept) | `rpc/server.cpp:608` | no | **no** - accept + enqueue only | `rpc-accept` (belt and braces) |
+| **`CRPCServer::WorkerThread` xpool** | `rpc/server.cpp:613` | no | **yes - 23 sites**: `:3509`, `:3654`, `:7018`, `:8409` ... | `rpc-worker` |
+| **`CHttpServer::WorkerThread` xN** | `http_server.cpp:139` | no | **yes** - `/metrics` `dilithion-node.cpp:3982`; REST `rest_api.cpp:362`, `:369` | `http-worker` |
+| **`CWebSocketServer::ServerThread`** | `websocket.cpp:102` | **yes** - `rpcwebsocketport > 0` | **yes** - `server.cpp:7759` `ExecuteRPC` reaches the whole handler table | `websocket-server` |
+| **`CCachedChainStats::UpdateThread`** | `cached_stats.cpp:32` | no - **every node, once a second** | **yes** - `dilithion-node.cpp:3935` then a 20-deep `pprev` walk `:3943-3949` | `cached-stats` |
+| **`CMiningController::MiningWorker` xN** | `controller.cpp:274` | **yes** - mining on | **yes**, via `m_blockFoundCallback` -> `dilithion-node.cpp:6410`, `:6439` | `mining-worker` |
+| **`CVDFMiner::MiningLoop`** | `vdf_miner.cpp:29` | **yes** - mining on, post-IBD | **yes**, via three injected callbacks -> `dilithion-node.cpp:6746`, `:6753`, `:6616` | `vdf-miner` |
+| **node main loop** | `dilithion-node.cpp:8106` / `dilv-node.cpp:7868` | no | **yes, nearly every iteration** - `:8112`, `:8407`, `:8547`, `:8706-8736` | `node-main-loop` |
 
-**Thread 3 is listed to be EXCLUDED explicitly, not omitted.** The hash workers take
-header bytes and return hashes; they never touch `mapBlockIndex`. If that ever changes
-they must be added here — an omission would be invisible, which is why the row exists.
+**Deliberately NOT participants** - each checked, not assumed: `ThreadSocketHandler`
+(bytes and framing; zero `CBlockIndex` tokens in `connman.cpp`), `ThreadOpenConnections`
+(`CreateVersionMessage` uses `GetHeight()`, an `int`, `net.cpp:2238`),
+`CRPCServer::CleanupThread`, `CHttpServer::CleanupThread` / `AcceptThread`,
+`CTxMemPool::ExpirationThreadFunc`, `CAsyncBroadcaster::WorkerThread`,
+`CSignatureBatchVerifier::WorkerThread`, `CResourceMonitor::MonitorThread`,
+`ChainstateIntegrityMonitor::WorkerLoop` (`SnapshotIntegrityWindow` returns heights and
+hashes **by value** - that thread was designed not to hold pointers),
+`CRegistrationManager::WorkerMain_` (tip height is passed in as an `int`), the DigitalDNA
+collector, the P2P maintenance lambda, the RandomX init threads, and the detached
+shutdown triggers.
 
-**Threads 6 and 7 have no "iteration".** RPC is request/response, so the boundary is
-request completion rather than a loop top. That is still a well-defined point — a
-handler cannot hold a pointer resolved during a request that has returned — but it
-means the epoch bump belongs at the dispatch boundary, not in a loop.
+**⚠️ THE MINER AND CACHED-STATS ROWS ARE THE INSTRUCTIVE ONES.** `vdf_miner.cpp`
+contains **no `CBlockIndex` token at all**, and neither does `cached_stats.cpp`; every
+resolve arrives through an **injected callback** defined in the node binary. A grep of
+the thread's own file says "clean" and is wrong. Only a call-graph census finds these -
+which is why the list below is not the primary mechanism.
 
-**Threads 8 and 9 were flagged as "long-running loops over historical blocks — exactly
-the long-hold shape". Measured, they are not.** Both resolve and dereference within
-two to three lines (`tx_index.cpp:229-232`, `:240-243`: resolve, null-check,
-`GetBlockHash()`, done) and retain nothing across an iteration. `tx_index.cpp:564-567`
-documents the opposite discipline explicitly — `m_mutex` must NOT be held across chain
-reads. So they are ordinary short windows at a high repetition rate, not long holds. The
-concern was reasonable and the code does not have that shape.
+**The index sync loops were flagged as "long-running loops over historical blocks -
+exactly the long-hold shape". Measured, they are not.** Both resolve and dereference
+within two to three lines (`tx_index.cpp:229-232`, `:240-243`) and retain nothing across
+an iteration; `tx_index.cpp:564-567` documents the same discipline for `m_mutex`. Short
+windows at a high repetition rate, not long holds.
 
-**Thread 4 is covered twice over, and the second cover is the stronger one.** A queued
-block and its parent are reported by `GetPendingBlockHashes` and pinned by eviction
-clause (d), so eviction cannot free them while they are queued — **the queue path is
-protected by PINNING, not by grace.** That is what answers LP10's drain rule ("refuse to
+**The validation worker is covered twice over, and the second cover is stronger.** A
+queued block and its parent are reported by `GetPendingBlockHashes` and pinned by
+eviction clause (d), so eviction cannot free them while they are queued - **the queue
+path is protected by PINNING, not by grace.** That answers LP10's drain rule ("refuse to
 free while an entry enqueued before the epoch is in flight"): the pin makes the situation
-unreachable rather than merely survivable. It is also why the `queued_block.pindex`
-escape (`block_validation_queue.cpp:151` → `:166` → `:172` → the worker) is not a live
-UAF on this base, though it remains one on `main`, where neither the pin nor the by-hash
-re-resolve exists.
+unreachable rather than merely survivable.
+
+## ⚠️ A LIST IS THE WRONG PRIMARY MECHANISM, SO IT IS NOT THE ONLY ONE
+
+Everything above is a hand-maintained census, and its failure mode is obvious once
+stated: **the thread that leaks is added by someone who never reads this file.** A count
+checked against a table catches a *wired* thread that failed to reach its checkpoint. It
+cannot catch the thread nobody wrote down - the person who forgets the checkpoint is the
+same person who forgets the table row.
+
+So there is a second, list-free mechanism. `CChainState::GetBlockIndex()` and `GetTip()`
+are the only two ways a raw `CBlockIndex*` leaves `cs_main` - `mapBlockIndex` is private
+and every mention of it outside `chain.cpp` is in a comment (verified tree-wide). Both
+record the calling thread the first time it obtains a pointer while not yet being an
+epoch participant. The record is **cleared when that thread checkpoints**, so resolving
+during startup before the first checkpoint - which every thread does - is not an
+accusation. What survives to the startup census is exactly the set of threads that hold
+pointers and have made no promise: observed, not tabulated.
+
+Cost for a participant: one thread-local load and a predicted branch per resolve. The
+registry mutex is touched once in a thread's lifetime.
 
 ## The scheme: epoch counter, not a timer
 
@@ -145,16 +211,63 @@ memory-safe but must never be read as reachability. Nothing may walk *from* the 
 
 ## WIRING CENSUS — where EpochCheckpoint() actually is
 
-| thread | checkpoint site | pin bound |
+Every participant checkpoints **at its loop top, before its blocking wait**, and passes
+its name, which is what the startup census compares against the declarations made at the
+spawn sites.
+
+| checkpoint name | site | pin bound |
 |---|---|---|
-| Validation worker | `block_validation_queue.cpp` `ValidationWorker`, loop top **before** `m_queue_cv.wait` | one `ProcessBlock` |
-| Header validation | `headers_manager.cpp` `ValidationWorkerThread`, **before** `m_validation_cv.wait` | one validation unit |
-| Header processor | `headers_manager.cpp` `HeaderProcessorThread`, loop top | one header batch |
-| TxIndex sync | `tx_index.cpp` `SyncLoop`, loop top before the walk | one walk pass |
-| CoinStatsIndex sync | `coinstatsindex.cpp` `SyncLoop`, loop top | one walk pass |
-| RPC server | `rpc/server.cpp` `ServerThread`, **immediately before `accept()`** | one request |
-| Hash worker pool | — none, and deliberately | never resolves an index pointer |
-| P2P handler / main loop / IBD coordinator | run **on** the node main loop | one loop iteration |
+| `p2p-msg-handler` | `connman.cpp` `ThreadMessageHandler`, loop top | one batch (<=500 msgs) + the 100 ms bottom wait |
+| `p2p-headers-worker` | `connman.cpp` `HeadersWorkerThread`, before `m_headers_cv.wait` | one headers message |
+| `p2p-blocks-worker` | `connman.cpp` `BlocksWorkerThread`, before `m_blocks_cv.wait` | one block message |
+| `headers-validation` | `headers_manager.cpp` `ValidationWorkerThread`, before `m_validation_cv.wait` | one header validation |
+| `headers-processor` | `headers_manager.cpp` `HeaderProcessorThread`, loop top | one header batch |
+| `validation-worker` | `block_validation_queue.cpp`, before `m_queue_cv.wait` | one `ProcessBlock` (incl. a LevelDB write) |
+| `txindex-sync` | `tx_index.cpp` `SyncLoop`, loop top | one walk pass |
+| `coinstatsindex-sync` | `coinstatsindex.cpp` `SyncLoop`, loop top | one walk pass |
+| `rpc-accept` | `rpc/server.cpp` `ServerThread`, before `accept()` | n/a (resolves nothing) |
+| `rpc-worker` | `rpc/server.cpp` `WorkerThread`, before `m_queueCV.wait` | one RPC request, **including its response write** |
+| `http-worker` | `http_server.cpp` `WorkerThread`, before the blocking dequeue | one HTTP request |
+| `websocket-server` | `websocket.cpp` `ServerThread`, before `accept()` | one websocket request |
+| `cached-stats` | `cached_stats.cpp` `UpdateThread`, loop top | one 1 s update |
+| `mining-worker` | `controller.cpp` `MiningWorker`, hash-loop top | one hash attempt |
+| `vdf-miner` | `vdf_miner.cpp` `MiningLoop`, loop top | one VDF round |
+| `node-main-loop` | both node binaries, loop top before the 1 s sleep | one loop iteration |
+
+`mining-worker` checkpoints inside the hash loop: an acquire load plus a release store
+against a loop body that computes a RandomX hash (~100 us light / ~1 ms full). Not
+measurable.
+
+### The RPC handler that blocks on a slow client — the exception, checked in the wild
+
+COORD's question: the accept-thread checkpoint covers `accept()`, but a **handler**
+thread that resolves a pointer, then blocks on a slow client write **while still holding
+it**, is the exception this design names. Two independent answers, both measured:
+
+1. **The handlers drop the pointer before any socket write.** The architecture forces
+   it: every RPC method returns a fully-built `std::string`, and **every socket write
+   happens in a caller frame**. `rpc/server.cpp` contains no `send()` inside any method
+   body — the only write primitive is the `socket_write` lambda at `:987`, a local of
+   `HandleClient`, invoked at `:2211` after `ExecuteRPC` (`:2145`) has returned. Worked
+   example: `RPC_GetTransaction` resolves at `:3509`, last dereferences at `:3691`, then
+   returns a string; the frame holding `pTip` is gone before a byte moves. Same shape for
+   the REST branch (`rest_api.cpp:362` resolve, `:411` last deref, `server.cpp:1600`
+   write), `/metrics` (`dilithion-node.cpp:3982` resolve, `:3984` last deref,
+   `http_server.cpp:670`/`:682` write) and WebSocket (`server.cpp:7759` then `:7763`).
+   The long-poll RPCs (`waitfornewblock`, `waitforblock`, `waitforblockheight`) are the
+   sharpest case and are written correctly: the pointer lives only inside a `get_tip`
+   lambda (`:10107`, `:10140`, `:10171`) that immediately converts to `{uint256, int}`,
+   so a worker parked up to 300 s in `wait_until` holds **no** index pointer.
+2. **And the checkpoint is at that boundary anyway.** `rpc-worker` sits at the worker
+   loop top, so the pin bound is one whole request *including* the response write. That
+   write is bounded: `SO_SNDTIMEO` and `SO_RCVTIMEO` are set to **10 s** per connection
+   (`rpc/server.cpp:934-950`, the RPC-017 slowloris hardening). A slow client extends one
+   thread's pin by seconds per `send()` call, not indefinitely.
+
+So the answer is "both": the pointer is dead before the write **and** the boundary is
+checkpointed. Answer 1 is the one that would silently stop being true if a handler ever
+streamed a response while walking the chain — and answer 2 is what would keep the bound
+finite if it did.
 
 ### The blocking-thread question, settled
 
@@ -185,12 +298,40 @@ site retaining a pointer across an iteration boundary), and if one is ever added
 it must checkpoint before blocking or drop the pointer first. That is the rule to
 apply when the ninth thread arrives.
 
-### A non-participant is a silent leak, so it is asserted
+### A non-participant is a silent leak, so the node refuses to start
 
-A thread that never checkpoints reads epoch 0 and pins the **entire graveyard for
-the process lifetime**. That is the safe direction — nothing is freed on the
-account of a thread that made no promise — but it is an unbounded leak in which
-the node behaves perfectly and memory grows. `EpochRegistrationComplete()` checks
-the participant count against this table so a ninth thread that resolves block
-indices and forgets to checkpoint fails loudly at startup rather than quietly
-holding the graveyard. Its diagnostic names the leak, not just a count.
+A thread that never checkpoints reads epoch 0 and pins the **entire graveyard for the
+process lifetime**. That is the safe direction — nothing is freed on the account of a
+thread that made no promise — but it is an unbounded leak in which the node behaves
+perfectly and memory grows. The worst shape a defect can take, so it is asserted at
+startup rather than trusted.
+
+**Where it runs.** Both node binaries, immediately after the last thread spawn and
+before entering the main loop: the main thread declares and checkpoints itself, then
+`AwaitEpochRegistration(15000, why)` polls until every declared participant has
+checkpointed. On failure the node **throws and exits non-zero** with the diagnostic —
+it does not start. A 15 s deadline is generous because every checkpoint sits *before*
+its thread's wait, so a thread reaches its first one as soon as it is scheduled; it does
+not need work to arrive. A participant still missing after 15 s never checkpoints.
+
+**Two failures, one gate:**
+
+* a **declared** thread that never checkpointed — reported **by name**, so the log says
+  `[coinstatsindex-sync]`, not "12 of 13";
+* any thread that has **obtained a `CBlockIndex*`** while never having checkpointed —
+  observed at the resolve, needing no list, which is the arm that catches a thread
+  nobody declared.
+
+**Declarations are made by the code that spawns the thread**, not by a static list:
+`DeclareEpochParticipant("txindex-sync")` sits next to `std::thread(&CTxIndex::SyncLoop…)`.
+That is deliberate — a static list cannot know whether the txindex thread was started on
+*this* run, and a count that includes a thread the config never spawns would fail a
+healthy node. Conditional subsystems (txindex, coinstatsindex, websocket, mining)
+declare only when they actually start.
+
+**Threads that start later are re-checked, not ignored.** The miners spawn when mining
+begins, long after the startup gate. The main loop re-runs the census every ~300
+iterations and logs `⚠️  GRAVEYARD PINNED: <name>` if a participant is missing. Refusing
+to run is not on the table once the node is live: the consequence of the leak is that
+the graveyard stops draining, which is safe and unbounded, and the operator watching
+memory grow needs that line in the log to know why.
