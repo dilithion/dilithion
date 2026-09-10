@@ -1,11 +1,39 @@
 # Where to fix the released-CBlockIndex\* class: consumers, producer, or the free itself
 
 **Author:** 2f. **Mandatory reader:** LP10 (A-5 owner — the released-pointer class is
-its charter). **Status:** recommendation, not a decision.
+its charter).
 
-**Recommendation up front: OPTION 2 — deferred reclamation at the producer.** Reasons
-and the case against it are below; the fallback if its quiescence proof cannot be made
-cleanly is Option 3, and Option 1 should not be built at all.
+> ## STATUS, 2026-09-10: OPTION 2 WAS BUILT. This is no longer a proposal.
+>
+> It is **PR #198** (`fix/blockindex-deferred-reclamation`), and everything below is
+> preserved as the reasoning that led there — including the case against, which
+> turned out to matter more than the case for.
+>
+> **The quiescence proof this note called the open risk is exactly where the defects
+> were.** Not the mechanism: the *proof*. A 3-seat external panel and an occupancy
+> bench between them found that an unregistered resolver was being freed *under*
+> rather than pinning (the use-after-free direction, inside the fix for
+> use-after-frees), that a thread parked in a blocking wait pinned the graveyard
+> without bound — falsifying the design note's headline claim — that a thread which
+> merely *exits* did the same, that nothing in production called the drain at all,
+> and that the free-time leaf assertion was a tautology that could not fail for any
+> input. All folded; see `deferred-reclamation-quiescence-proof.md` on that branch
+> for the current argument and the measurements.
+>
+> **What that says about this note's recommendation:** Option 2 was the right choice
+> and the reasons below still hold, but "if its quiescence proof cannot be made
+> cleanly" understated the work. The proof needed a quiescent-state protocol
+> (offline/online, RCU-style), per-thread rather than per-name registration, and a
+> list-free detector at the two pointer escapes — none of which is visible from the
+> option comparison below. **A reader deciding a similar question should weight the
+> proof, not the mechanism.**
+>
+> **Machine verdict:** three ASan arms in one binary — the defect reproduces, the fix
+> is clean, and the inverse control traps, so the clean arm is not vacuous.
+
+**The recommendation as written at the time: OPTION 2 — deferred reclamation at the
+producer.** Reasons and the case against it are below; the fallback if its quiescence
+proof cannot be made cleanly is Option 3, and Option 1 should not be built at all.
 
 ---
 
