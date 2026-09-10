@@ -132,11 +132,24 @@ fi
 
 # 4. The accessor this fix depends on must still return values, not the
 #    pointer someone might restore "for efficiency".
-if ! grep -qE 'std::vector<uint256>[[:space:]]+CChainState::GetAncestorHashes' src/consensus/chain.cpp 2>/dev/null; then
-    echo "FAIL: CChainState::GetAncestorHashes is missing or no longer returns"
+# F4 (external review r2): this used to pin GetAncestorHashes, which the headers
+# manager no longer calls — so reverting ResolveLocatorHashes to the probe+resolve
+# shape passed the guard. Pin the accessor that is actually used, and pin its
+# ONE-ACQUISITION property: exactly one lock_guard in its body.
+if ! grep -qE 'std::vector<uint256>[[:space:]]+CChainState::ResolveLocatorHashes' src/consensus/chain.cpp 2>/dev/null; then
+    echo "FAIL: CChainState::ResolveLocatorHashes is missing or no longer returns"
     echo "      std::vector<uint256>. The headers manager depends on it to get"
     echo "      chain data across a lock-free window without a pointer."
     fail=1
+else
+    guards=$(awk '/std::vector<uint256> CChainState::ResolveLocatorHashes/,/^}/' src/consensus/chain.cpp              | grep -cE 'lock_guard<std::recursive_mutex>')
+    if [ "$guards" -ne 1 ]; then
+        echo "FAIL: ResolveLocatorHashes holds cs_main $guards time(s), expected exactly 1."
+        echo "      Its whole point is ONE acquisition: a probe-then-resolve shape lets"
+        echo "      the tip move between the two, which is the false-coherence defect"
+        echo "      this function was written to remove."
+        fail=1
+    fi
 fi
 
 if [ "$fail" -eq 0 ]; then
@@ -144,6 +157,6 @@ if [ "$fail" -eq 0 ]; then
     echo "  - GetTip()/GetBlockIndex() never called in headers_manager.{cpp,h}"
     echo "  - no CBlockIndex ancestor/parent walk in that TU"
     echo "  - GetLocatorImpl still takes resolved values, not a CBlockIndex*"
-    echo "  - CChainState::GetAncestorHashes still returns values"
+    echo "  - ResolveLocatorHashes returns values and holds cs_main exactly once"
 fi
 exit "$fail"

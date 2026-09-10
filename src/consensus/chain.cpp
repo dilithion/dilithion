@@ -3064,33 +3064,44 @@ std::vector<uint256> CChainState::ResolveLocatorHashes(int headersHeight,
     heightsOut.clear();
     std::vector<uint256> out;
 
-    // COST, stated because this runs under cs_main and a reviewer asked: the walk
-    // is O(log n) per height, not O(n) — CBlockIndex::GetAncestor uses the pskip
-    // skip-list (block_index.cpp:140, pskip at :161-163) and only falls back to
-    // pprev when a skip would overshoot. The schedule visits at most 64 heights
-    // and in practice ~34 for a 2e7 chain, so cs_main is held for roughly
-    // 34 * O(log n) pointer hops with no allocation beyond the two output
-    // vectors. That is why doing this inside the lock is affordable and why the
-    // two-acquisition shape bought nothing.
+    // COMPLEXITY, corrected — my previous comment here was FALSE and it mattered.
     //
-    // ONE acquisition. Everything the caller needs to build a coherent triple is
-    // read inside it: the tip height, the schedule derived from that tip, and the
-    // hashes at those heights. Do not split this into a probe plus a resolve —
-    // that is exactly the two-acquisition shape this replaced, where the tip
-    // could move between the two and the "coherent" comment was false.
+    // It claimed "O(log n) per height ... uses the pskip skip-list". pskip is
+    // INERT: block_index.cpp:14 and :32 null it, :57 copies it, and there is no
+    // BuildSkip anywhere in the tree (chain.cpp:609-611 already said so).
+    // CBlockIndex::GetAncestor therefore falls back to a LINEAR pprev walk every
+    // time. Calling it once per scheduled height would be up to 64 independent
+    // O(n) walks — and, because this function holds cs_main for all of them, it
+    // would move work INTO the lock that the code it replaced did outside it.
+    // At DilV's ~250k height that is millions of pointer chases per locator, on
+    // a path an inbound peer can drive.
+    //
+    // So: ONE descending walk. The schedule is sorted descending, and heights are
+    // picked off as the walk passes them — O(tip) pointer hops total for the
+    // whole locator instead of O(64 * tip), with the lock held for one pass.
     std::lock_guard<std::recursive_mutex> lock(cs_main);
 
-    tipHeightOut = pindexTip ? pindexTip->nHeight : 0;
-    if (!pindexTip || tipHeightOut <= 0 || pattern == nullptr) return out;
+    // Distinguish "no tip at all" from "tip is genesis": a chain at height 0 is
+    // a real chain and must still yield its genesis entry (external review F3).
+    if (!pindexTip) { tipHeightOut = -1; return out; }
+    tipHeightOut = pindexTip->nHeight;
+    if (pattern == nullptr) return out;
 
+    std::vector<int> wanted;
     for (int h : pattern(std::max(tipHeightOut, headersHeight))) {
-        if (h < 0 || h > tipHeightOut) continue;
-        uint256 hash;
-        if (const CBlockIndex* p = pindexTip->GetAncestor(h)) {
-            hash = p->GetBlockHash();
-        }
+        if (h >= 0 && h <= tipHeightOut) wanted.push_back(h);
+    }
+    if (wanted.empty()) return out;
+
+    std::sort(wanted.begin(), wanted.end(), std::greater<int>());
+    wanted.erase(std::unique(wanted.begin(), wanted.end()), wanted.end());
+
+    const CBlockIndex* walk = pindexTip;
+    for (int h : wanted) {
+        while (walk && walk->nHeight > h) walk = walk->pprev;
+        if (!walk) break;                       // chain shorter than advertised
         heightsOut.push_back(h);
-        out.push_back(hash);
+        out.push_back(walk->nHeight == h ? walk->GetBlockHash() : uint256());
     }
     return out;
 }

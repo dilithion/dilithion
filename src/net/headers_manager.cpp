@@ -1255,7 +1255,10 @@ std::map<int, uint256> CHeadersManager::ResolveChainstateHashes(int headersHeigh
     const std::vector<uint256> hashes =
         g_chainstate.ResolveLocatorHashes(headersHeight, &LocatorHeightPattern, heights, tipHeight);
 
-    if (chainstateHeightOut) *chainstateHeightOut = tipHeight;
+    // F3: -1 means NO TIP; 0 means a genesis-only chain, which is a real chain
+    // whose genesis entry must still reach the locator. Collapsing the two is
+    // how a height-0 chainstate silently produced an empty locator.
+    if (chainstateHeightOut) *chainstateHeightOut = (tipHeight < 0) ? 0 : tipHeight;
 
     // Contract check, kept: mismatched vectors would attribute hashes to the
     // WRONG heights, which is worse than an empty locator.
