@@ -507,22 +507,58 @@ static_assert(std::is_trivially_destructible<EpochThreadRecord*>::value,
               "see the header comment: a thread_local here must be trivially "
               "destructible, because its destructor would run on freed storage");
 
+// ⚠️ THE TEARDOWN CONTRACT, STATED HERE BECAUSE IT IS NOT INFERABLE FROM THE CODE.
+// EpochThreadRecordDtor `delete`s the record and leaves `t_epoch_record` DANGLING --
+// it cannot clear it, because clearing it is a write to emutls storage that is
+// already freed, which is the whole defect this design exists to avoid. So:
+//
+//   ⛔ NOTHING THAT RUNS AFTER THIS THREAD'S EPOCH HOOK MAY CALL MyEpochRecord(),
+//      OR ANY EPOCH API THAT REACHES IT (EpochCheckpoint, EpochQuiesce,
+//      NoteIndexPointerResolved, GetBlockIndex, GetTip, NoteEpochPointerHeld).
+//
+// A later pthread-key destructor, or any at-exit callback that runs on a thread whose
+// epoch hook has already fired, would take the `t_epoch_record != nullptr` fast path
+// and dereference freed memory: the same defect class as the one this replaced,
+// arriving through a different door.
+//
+// AUDITED, not assumed (2026-09-11, round-6 F30): `pthread_key_create`, `FlsAlloc`,
+// `TlsAlloc` and `__cxa_thread_atexit` appear NOWHERE ELSE in non-test `src/` -- this
+// is the only key in the tree, so there is no second destructor to order against
+// today. **Anyone adding one must order it BEFORE this key** (create it earlier;
+// winpthreads runs destructors in key-index order) **or must not touch epoch state.**
+//
+// The fast path is deliberately NOT hardened against this with an "already destroyed"
+// flag: such a flag would itself have to live in emutls to be readable here, which is
+// the circularity that produced the original bug. The contract is the mechanism.
+//
+// ⚠️ AND THE HOOK ASSUMES THE THREAD EXITS THROUGH THE pthread WRAPPER (round-6 F34).
+// winpthreads runs key destructors for threads it created and that return normally or
+// via `pthread_exit`. A thread started with raw `CreateThread`/`_beginthreadex` -- by a
+// dependency, say -- or one killed with `ExitThread`/`TerminateThread`, LEAKS its
+// record and never retires its slot. That is loud rather than silent (the census and
+// the periodic GRAVEYARD PINNED log both show it) but it is unbounded, so it is stated
+// rather than left to be rediscovered. Every thread this codebase starts is a
+// `std::thread`, which is a pthread on this platform.
 EpochThreadRecord& MyEpochRecord()
 {
     if (t_epoch_record == nullptr) {
         std::call_once(g_epoch_record_key_once, [] {
-            // Failure here is not survivable: without the key there is no exit hook,
-            // and a thread that exits without retiring its slot silently freezes
-            // reclamation for the process lifetime. Fail loudly at the first record
-            // rather than leak forever.
+            // ⚠️ ConsensusInvariant ABORTS THE PROCESS; that is the intended
+            // behaviour here and not a debug nicety. If key creation could fail
+            // non-fatally, the epoch system would carry on with NO EXIT HOOK AT
+            // ALL: every thread that exits keeps its slot at its last published
+            // epoch, DrainGraveyard's minimum freezes, and the node grows without
+            // bound while behaving perfectly. A loud abort at the first record is
+            // strictly better than a silent unbounded leak discovered in
+            // production. (Round-6 F30 asked for this to be explicit rather than
+            // implied by the word "not survivable".)
             const int rc = pthread_key_create(&g_epoch_record_key,
                                               &EpochThreadRecordDtor);
             ConsensusInvariant(rc == 0);
         });
-        // Leaked only if the key destructor never runs (the main thread at process
-        // exit). Every std::thread on this platform is a pthread, so every worker's
-        // record is freed by the hook below.
         auto* rec = new EpochThreadRecord();
+        // Same reasoning: a failed setspecific means this thread has a record that
+        // no hook will ever be handed, i.e. a permanent pin. Abort, do not degrade.
         const int rc = pthread_setspecific(g_epoch_record_key, rec);
         ConsensusInvariant(rc == 0);
         t_epoch_record = rec;
@@ -560,6 +596,21 @@ std::atomic<uint64_t> g_offline_resolves{0};
 std::atomic<uint64_t>* MyEpochSlot()
 {
     if (t_epoch_slot == nullptr) {
+        // ⚠️ THE EXIT RECORD IS OBTAINED FIRST, AND THE ORDER IS THE POINT.
+        // This used to publish the slot into the registry, cache it in
+        // t_epoch_slot, and only THEN call MyEpochRecord() to hand the slot to
+        // the exit hook. MyEpochRecord() allocates: if that `new` threw and any
+        // caller up the stack caught the exception, the slot was already
+        // registered and cached but NO EXIT HOOK OWNED IT -- so the thread would
+        // never retire it, and one unretired slot caps DrainGraveyard's minimum
+        // FOR THE PROCESS LIFETIME. A permanent, silent pin, arrived at through
+        // an allocation failure rather than a logic error.
+        //
+        // Obtaining the record first makes the failure harmless: if it throws,
+        // nothing has been published, and the next call simply tries again.
+        // Nothing between this line and the assignment below can throw.
+        EpochThreadRecord& rec = MyEpochRecord();
+
         // Leaked deliberately: the slot must outlive the thread, because a drain
         // on another thread may read it after this one exits. One machine word
         // per participating thread, bounded by the thread count, freed at exit.
@@ -570,10 +621,14 @@ std::atomic<uint64_t>* MyEpochSlot()
             std::lock_guard<std::mutex> lk(Registry().mu);
             Registry().slots.push_back(slot);
         }
+
+        // The hook retires the slot from the record it is GIVEN, so it never
+        // reads a thread_local at teardown. Set BEFORE the t_epoch_slot cache, so
+        // there is no window in which this thread is a participant with no
+        // retirer -- the two lines are noexcept, but the order still documents
+        // which one is load-bearing.
+        rec.slot = slot;
         t_epoch_slot = slot;
-        // Hand the slot to this thread's exit record. The hook retires it from the
-        // record it is GIVEN, so it never reads a thread_local at teardown.
-        MyEpochRecord().slot = slot;
     }
     return t_epoch_slot;
 }
