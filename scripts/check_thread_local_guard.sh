@@ -63,9 +63,18 @@ if ! command -v awk >/dev/null 2>&1; then
     exit 2
 fi
 
-# The floor exists so a guard that suddenly sees nothing FAILS. Raise it when the
-# tree legitimately gains declarations; never lower it to make a run pass.
-MIN_CHECKED="${DIL_TLGUARD_MIN_CHECKED:-6}"
+# The floor exists so a guard that suddenly sees FEWER declarations FAILS. Raise it
+# when the tree legitimately gains declarations; lower it only when the tree
+# legitimately loses one, and say which one, here.
+#
+# ⚠️ 6 -> 5 on 2026-09-11: round-6 F35 replaced connman.cpp's
+# `static thread_local std::random_device*` with one process-wide instance behind a
+# mutex, because the per-thread version's stated bound was wrong (it is per thread
+# that ever reaches the site, and CConnman restarts). That is a real, intended
+# reduction. THE FLOOR CAUGHT IT ON THE NEXT RUN, which is the entire point: a
+# declaration leaving the population is now a FAILURE that has to be acknowledged,
+# not a quieter pass.
+MIN_CHECKED="${DIL_TLGUARD_MIN_CHECKED:-5}"
 
 run_over() {   # $1 = directory to scan; prints the awk verdict lines
     local dir="$1" f

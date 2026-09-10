@@ -2108,13 +2108,28 @@ void CConnman::InactivityCheck() {
                     // Found by scripts/check_thread_local_guard.sh, which was written
                     // for the same defect class in the epoch code and immediately
                     // named this site -- the guard doing its job on its first run.
-                    // Leaked deliberately: one device per connman thread, bounded by
-                    // the thread count, for the life of the process. A raw pointer is
-                    // trivially destructible, so nothing of ours runs at exit.
-                    static thread_local std::random_device* rd = new std::random_device();
-                    static_assert(std::is_trivially_destructible<std::random_device*>::value,
-                                  "a thread_local's destructor would run on freed storage here");
-                    uint64_t nonce = (static_cast<uint64_t>((*rd)()) << 32) | (*rd)();
+                    // ⚠️ ONE PER PROCESS, NOT ONE PER THREAD, AND THE FIRST VERSION
+                    // OF THIS FIX GOT THE BOUND WRONG (round-6 F35). It said
+                    // "one device per connman thread, bounded by the thread count"
+                    // -- but the bound is per thread that EVER REACHES THIS SITE,
+                    // and CConnman is started and stopped repeatedly (every restart
+                    // brings a fresh InactivityCheck thread). Over a long-running
+                    // node with reconnect churn that is unbounded growth, slowly.
+                    // A leak whose bound is stated wrongly is worse than one stated
+                    // plainly: the wrong bound is what stops anyone looking again.
+                    //
+                    // std::random_device is stateless per call for our purposes here
+                    // (a ping nonce), so one shared instance behind a mutex is both
+                    // correct and genuinely bounded. The mutex cost is irrelevant at
+                    // ping frequency.
+                    static std::mutex rd_mu;
+                    static std::random_device* rd = nullptr;
+                    uint64_t nonce;
+                    {
+                        std::lock_guard<std::mutex> rd_lk(rd_mu);
+                        if (rd == nullptr) rd = new std::random_device();
+                        nonce = (static_cast<uint64_t>((*rd)()) << 32) | (*rd)();
+                    }
                     CNetMessage ping_msg = m_msg_processor->CreatePingMessage(nonce);
                     PushMessage(node.get(), ping_msg);
                     last_ping_sent[node_id] = now;

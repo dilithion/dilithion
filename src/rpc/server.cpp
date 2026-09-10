@@ -10132,10 +10132,16 @@ void CRPCServer::NotifyBlockTipChanged() {
     // `wait_for`; the waits are `wait_until`.)
     //
     // THE BOUND, stated rather than implied: a waiter that misses a wake sleeps
-    // until the NEXT block connect notifies again, or until its own deadline --
-    // the caller's timeout, capped at 300 s by ResolveWaitTimeoutMs. So a
-    // waitfornewblock can return late, never wrong: it re-reads the tip on wake and
-    // reports the truth. Latency, not correctness.
+    // until the NEXT OBSERVED NOTIFICATION -- typically the next block connect --
+    // or until its own wait deadline (the caller's timeout, capped at 300 s by
+    // ResolveWaitTimeoutMs), SUBJECT TO SCHEDULING AND MUTEX-REACQUISITION DELAYS.
+    // The qualifier is not pedantry: "wakes on the next block" would be a latency
+    // GUARANTEE, and neither the condition variable nor the scheduler offers one.
+    // What IS guaranteed is the direction -- a waitfornewblock can return LATE,
+    // never WRONG, because it re-reads the tip on wake and reports the truth.
+    // Latency, not correctness. (Round-6 F36 asked for the wording; the previous
+    // version overstated the bound in the same way the comment above it once
+    // overstated the absence of the gap.)
     //
     // WHY THE OBVIOUS FIX IS NOT APPLIED HERE. Taking g_wait_cluster_mtx in this
     // callback would close the gap -- and this callback fires from ConnectTip's
