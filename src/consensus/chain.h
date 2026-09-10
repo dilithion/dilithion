@@ -102,6 +102,23 @@ struct CBlockIndexWorkComparator {
  * Chain State Manager
  * Handles chain reorganization and maintains active chain tip
  */
+/**
+ * P2P-16 F2: one link of the active chain, by value. Exactly the three fields
+ * BulkLoadHeaders reads from a CBlockIndex — hash, header, height — so the
+ * pointer never has to leave cs_main.
+ */
+struct ActiveChainHeader {
+    uint256      hash;
+    CBlockHeader header;
+    int          height = 0;
+};
+
+namespace chaintest {
+// TEST-ONLY. Number of entries to CChainState::ResolveLocatorHashes since start.
+// Used to assert that a rejected header batch never reaches the chain walk.
+uint64_t ResolveLocatorHashesCallCount();
+}  // namespace chaintest
+
 class CChainState
 {
 private:
@@ -798,12 +815,64 @@ public:
      * instead of the pointer.
      *
      * @param heights  Heights to resolve. Order is preserved.
+     * @param tipHeightOut  Optional. Receives the tip height read under the SAME
+     *        cs_main acquisition that resolved the hashes, so a caller can build
+     *        a COHERENT snapshot instead of pairing these hashes with a height
+     *        read at some other moment (external review, PR #194).
      * @return One entry per requested height, in the same order. An entry is
      *         a NULL uint256 when that height is not on the current best chain
      *         (above the tip, or below genesis) — callers must handle that, as
      *         they already had to handle GetAncestor() returning nullptr.
      */
-    std::vector<uint256> GetAncestorHashes(const std::vector<int>& heights) const;
+    std::vector<uint256> GetAncestorHashes(const std::vector<int>& heights,
+                                           int* tipHeightOut = nullptr) const;
+
+    /**
+     * P2P-16: resolve a locator's chainstate side under ONE cs_main hold.
+     *
+     * Exists because the two-call shape it replaces could not keep its promise:
+     * a caller that reads the tip height and THEN asks for hashes takes cs_main
+     * twice, and the tip can move in between — so the height and the hashes come
+     * from different chain states. The comment there claimed coherence the code
+     * did not provide, which is the same defect class as the dropped-entry bug
+     * this whole row is about.
+     *
+     * The schedule is passed IN, so the chainstate never learns locator
+     * semantics: this reads the tip, applies `pattern` to
+     * max(tip, headersHeight), keeps the heights at or below the tip, resolves
+     * them, and returns everything from inside a single acquisition.
+     *
+     * @param headersHeight  The peeked best-header height (may be stale; that is
+     *                       fine — the returned triple is self-consistent, which
+     *                       is what a locator needs).
+     * @param pattern        The locator height schedule. Passing it in keeps the
+     *                       resolver and the walk on ONE definition.
+     * @param heightsOut     The heights actually resolved, in order.
+     * @param tipHeightOut   The tip height read under the SAME hold.
+     * @return One hash per entry of heightsOut, same order; null where absent.
+     */
+    /**
+     * P2P-16 F2: the active chain as VALUES, for bulk consumers.
+     *
+     * CHeadersManager::BulkLoadHeaders used to take std::vector<CBlockIndex*>
+     * that its callers built by walking pprev from GetTip() with cs_main
+     * RELEASED, then dereferenced them under cs_headers. Latent today (startup
+     * only, P2P not yet running) but it is the released-pointer shape in the very
+     * translation unit the P2P-16 guard watches, and it falsified this PR's claim
+     * that nothing downstream holds a chainstate pointer.
+     *
+     * The walk happens here, under cs_main, and only copies leave.
+     *
+     * @return The active chain in ASCENDING height order (genesis first), which
+     *         is the order BulkLoadHeaders needs so each entry's parent is
+     *         already present.
+     */
+    std::vector<ActiveChainHeader> GetActiveChainHeaders() const;
+
+    std::vector<uint256> ResolveLocatorHashes(int headersHeight,
+                                              std::vector<int> (*pattern)(int),
+                                              std::vector<int>& heightsOut,
+                                              int& tipHeightOut) const;
 
     /**
      * Set chain tip (used during initialization)

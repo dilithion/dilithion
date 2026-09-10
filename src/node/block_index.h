@@ -8,6 +8,13 @@
 #include <cstdint>
 #include <string>
 
+namespace bitest {
+// TEST-ONLY. See the definitions in block_index.cpp: the skip-height schedule is
+// file-static, and the GetAncestor regression test needs the real one.
+int GetSkipHeightForTest(int height);
+int InvertLowestOneForTest(int n);
+}  // namespace bitest
+
 class CBlockIndex
 {
 public:

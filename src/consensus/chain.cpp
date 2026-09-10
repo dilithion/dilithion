@@ -3076,7 +3076,93 @@ CBlockIndex* CChainState::GetTip() const {
     return pindexTip;
 }
 
-std::vector<uint256> CChainState::GetAncestorHashes(const std::vector<int>& heights) const {
+std::vector<ActiveChainHeader> CChainState::GetActiveChainHeaders() const {
+    // P2P-16 F2. ONE cs_main hold; the pointers never escape it.
+    std::vector<ActiveChainHeader> out;
+
+    std::lock_guard<std::recursive_mutex> lock(cs_main);
+    if (!pindexTip) return out;
+
+    out.reserve(static_cast<size_t>(pindexTip->nHeight) + 1);
+    for (const CBlockIndex* p = pindexTip; p != nullptr; p = p->pprev) {
+        ActiveChainHeader e;
+        e.hash   = p->GetBlockHash();
+        e.header = p->header;
+        e.height = p->nHeight;
+        out.push_back(std::move(e));
+    }
+    // Walked tip-down; BulkLoadHeaders needs parents first.
+    std::reverse(out.begin(), out.end());
+    return out;
+}
+
+// P2P-16 / external review r3 G4. Counts entries to the locator resolver - the
+// only function on this path that walks pprev under cs_main. It exists so a test
+// can assert a NEGATIVE that is otherwise invisible: that a header batch
+// rejected on size or emptiness never reaches the walk at all. Without an
+// instrument, "the cheap checks run first" is a claim about source order, not
+// about behaviour, and moving them back would break nothing observable.
+static std::atomic<uint64_t> g_resolveLocatorHashesCalls{0};
+namespace chaintest {
+uint64_t ResolveLocatorHashesCallCount() { return g_resolveLocatorHashesCalls.load(std::memory_order_relaxed); }
+}  // namespace chaintest
+
+std::vector<uint256> CChainState::ResolveLocatorHashes(int headersHeight,
+                                                       std::vector<int> (*pattern)(int),
+                                                       std::vector<int>& heightsOut,
+                                                       int& tipHeightOut) const {
+    g_resolveLocatorHashesCalls.fetch_add(1, std::memory_order_relaxed);
+    heightsOut.clear();
+    std::vector<uint256> out;
+
+    // COMPLEXITY, corrected — my previous comment here was FALSE and it mattered.
+    //
+    // It claimed "O(log n) per height ... uses the pskip skip-list". pskip is
+    // INERT: both CBlockIndex constructors null it, the copy-ctor copies that
+    // nullptr, and no BuildSkip exists anywhere in the tree - see the eviction
+    // note beside EvictLowestWorkLeafNotPinned, which says the same. (Symbols,
+    // not line numbers: the previous version of this comment cited
+    // block_index.cpp:14/:32/:57, and line numbers in a safety comment go stale
+    // silently while the comment keeps reading as if it had been checked.)
+    // CBlockIndex::GetAncestor therefore falls back to a LINEAR pprev walk every
+    // time. Calling it once per scheduled height would be up to 64 independent
+    // O(n) walks — and, because this function holds cs_main for all of them, it
+    // would move work INTO the lock that the code it replaced did outside it.
+    // At DilV's ~250k height that is millions of pointer chases per locator, on
+    // a path an inbound peer can drive.
+    //
+    // So: ONE descending walk. The schedule is sorted descending, and heights are
+    // picked off as the walk passes them — O(tip) pointer hops total for the
+    // whole locator instead of O(64 * tip), with the lock held for one pass.
+    std::lock_guard<std::recursive_mutex> lock(cs_main);
+
+    // Distinguish "no tip at all" from "tip is genesis": a chain at height 0 is
+    // a real chain and must still yield its genesis entry (external review F3).
+    if (!pindexTip) { tipHeightOut = -1; return out; }
+    tipHeightOut = pindexTip->nHeight;
+    if (pattern == nullptr) return out;
+
+    std::vector<int> wanted;
+    for (int h : pattern(std::max(tipHeightOut, headersHeight))) {
+        if (h >= 0 && h <= tipHeightOut) wanted.push_back(h);
+    }
+    if (wanted.empty()) return out;
+
+    std::sort(wanted.begin(), wanted.end(), std::greater<int>());
+    wanted.erase(std::unique(wanted.begin(), wanted.end()), wanted.end());
+
+    const CBlockIndex* walk = pindexTip;
+    for (int h : wanted) {
+        while (walk && walk->nHeight > h) walk = walk->pprev;
+        if (!walk) break;                       // chain shorter than advertised
+        heightsOut.push_back(h);
+        out.push_back(walk->nHeight == h ? walk->GetBlockHash() : uint256());
+    }
+    return out;
+}
+
+std::vector<uint256> CChainState::GetAncestorHashes(const std::vector<int>& heights,
+                                                    int* tipHeightOut) const {
     // P2P-16. The whole point is that the walk happens INSIDE this lock and only
     // copies leave it. Do not be tempted to return the CBlockIndex*s "for
     // efficiency" — that reintroduces exactly the use-after-free this replaces.
@@ -3084,6 +3170,11 @@ std::vector<uint256> CChainState::GetAncestorHashes(const std::vector<int>& heig
     out.reserve(heights.size());
 
     std::lock_guard<std::recursive_mutex> lock(cs_main);
+    // The tip height leaves under the SAME acquisition as the hashes, so the
+    // caller can pair them coherently. Reading the height separately (even from
+    // the lock-free cached accessor) lets the tip move between the two reads and
+    // silently pairs a height with hashes from a different chain state.
+    if (tipHeightOut) *tipHeightOut = pindexTip ? pindexTip->nHeight : 0;
     for (int h : heights) {
         uint256 hash;  // null by default = "not on the best chain at that height"
         if (pindexTip && h >= 0 && h <= pindexTip->nHeight) {
