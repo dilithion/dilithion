@@ -413,30 +413,52 @@ the proof the check is no longer vacuous.
   is why the registry must never be keyed to one** — and why a second *production*
   chainstate would require keying the registry by chainstate.
 
-## WIRING CENSUS — where EpochCheckpoint() actually is
+## WIRING CENSUS — checkpoints, offline scopes, and declared counts
 
-Every participant checkpoints **at its loop top, before its blocking wait**, and passes
-its name, which is what the startup census compares against the declarations made at the
-spawn sites.
+Three separate things are wired per thread, and conflating them is what produced two
+of this branch's defects:
 
-| checkpoint name | site | pin bound |
-|---|---|---|
-| `p2p-msg-handler` | `connman.cpp` `ThreadMessageHandler`, loop top | one batch (<=500 msgs) + the 100 ms bottom wait |
-| `p2p-headers-worker` | `connman.cpp` `HeadersWorkerThread`, before `m_headers_cv.wait` | one headers message |
-| `p2p-blocks-worker` | `connman.cpp` `BlocksWorkerThread`, before `m_blocks_cv.wait` | one block message |
-| `headers-validation` | `headers_manager.cpp` `ValidationWorkerThread`, before `m_validation_cv.wait` | one header validation |
-| `headers-processor` | `headers_manager.cpp` `HeaderProcessorThread`, loop top | one header batch |
-| `validation-worker` | `block_validation_queue.cpp`, before `m_queue_cv.wait` | one `ProcessBlock` (incl. a LevelDB write) |
-| `txindex-sync` | `tx_index.cpp` `SyncLoop`, loop top | one walk pass |
-| `coinstatsindex-sync` | `coinstatsindex.cpp` `SyncLoop`, loop top | one walk pass |
-| `rpc-accept` | `rpc/server.cpp` `ServerThread`, before `accept()` | n/a (resolves nothing) |
-| `rpc-worker` | `rpc/server.cpp` `WorkerThread`, before `m_queueCV.wait` | one RPC request, **including its response write** |
-| `http-worker` | `http_server.cpp` `WorkerThread`, before the blocking dequeue | one HTTP request |
-| `websocket-server` | `websocket.cpp` `ServerThread`, before `accept()` | one websocket request |
-| `cached-stats` | `cached_stats.cpp` `UpdateThread`, loop top | one 1 s update |
-| `mining-worker` | `controller.cpp` `MiningWorker`, hash-loop top | one hash attempt |
-| `vdf-miner` | `vdf_miner.cpp` `MiningLoop`, loop top | one VDF round |
-| `node-main-loop` | both node binaries, loop top before the 1 s sleep | one loop iteration |
+1. **REGISTRATION** — the first *named* checkpoint. It must happen at thread ENTRY for
+   any thread whose next act is to block, because the offline scope's checkpoint lives
+   in its **destructor** and fires only when the wait RETURNS. Wiring registration
+   through the scope alone meant an idle node's `rpc-accept`, `http-worker` and
+   `websocket-server` never registered, and the startup gate **refused to start an
+   idle node**. Caught by the node control, not by reading.
+2. **THE PIN BOUND** — a loop-top checkpoint, which is where the thread provably holds
+   nothing.
+3. **THE OFFLINE WINDOW** — `EpochOfflineScope` around each blocking wait, so a parked
+   thread pins nothing at all. Without it a loop-top checkpoint bounds the pin only
+   for a thread that keeps looping.
+
+| name | registration | loop-top checkpoint | offline scope around | declared count |
+|---|---|---|---|---|
+| `p2p-msg-handler` | loop top | `ThreadMessageHandler` top | `condMsgProc.wait_for` (bottom, 100 ms) | 1 |
+| `p2p-headers-worker` | loop top | `HeadersWorkerThread` top | `m_headers_cv.wait` | 1 |
+| `p2p-blocks-worker` | loop top | `BlocksWorkerThread` top | `m_blocks_cv.wait` | **`NUM_BLOCK_WORKERS`** |
+| `headers-validation` | loop top | `ValidationWorkerThread` top | `m_validation_cv.wait` | **pool size** |
+| `headers-processor` | loop top | `HeaderProcessorThread` top | — | 1 |
+| `validation-worker` | loop top | before `m_queue_cv.wait` | `m_queue_cv.wait` | 1 |
+| `txindex-sync` | loop top | `SyncLoop` top | — | 1 (conditional) |
+| `coinstatsindex-sync` | loop top | `SyncLoop` top | — | 1 (conditional) |
+| `rpc-accept` | **thread entry** | — | `accept()` | 1 |
+| `rpc-worker` | loop top | before `m_queueCV.wait` | `m_queueCV.wait` | **`m_threadPoolSize`** |
+| `http-worker` | **thread entry** | — | blocking `Dequeue` | **pool size** |
+| `websocket-server` | **thread entry** | — | `accept()` | 1 (conditional) |
+| `cached-stats` | loop top | `UpdateThread` top | — | 1 |
+| `mining-worker` | hash-loop top | hash-loop top | — | **`m_nThreads`** (conditional) |
+| `vdf-miner` | loop top | `MiningLoop` top | — | 1 (conditional) |
+| `node-main-loop` | before the gate | loop top, before the 1 s sleep | — | 1 |
+
+**Declared counts are per THREAD.** They were per *name* — a `std::set<std::string>` —
+so one `rpc-worker` reaching its checkpoint satisfied the census for the entire pool,
+and fifteen of sixteen could have been wired wrong. On a live relay-only node the
+census went from **11 participants to 28** when the pools began declaring their real
+sizes: the same node, counted honestly.
+
+**Threads with no offline scope are the ones that sleep rather than block** (the sync
+loops, cached-stats, the miners, the node main loop). Their pin is bounded by the sleep,
+which is 1 s or less and is the wired cadence the occupancy table measures. A thread
+that ever converts such a sleep into an indefinite wait must take a scope with it.
 
 `mining-worker` checkpoints inside the hash loop: an acquire load plus a release store
 against a loop body that computes a RandomX hash (~100 us light / ~1 ms full). Not
