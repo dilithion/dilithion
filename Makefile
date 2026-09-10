@@ -878,6 +878,13 @@ chain_selector_tests: $(CORE_OBJECTS) $(OBJ_DIR)/test/chain_selector_tests.o $(D
 	@$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS) $(LIBS)
 	@echo "$(COLOR_GREEN)✓ chain_selector_tests built successfully$(COLOR_RESET)"
 
+# Measures graveyard peak occupancy and drain cost at the ingress ceiling, so the
+# design note can carry observations instead of arithmetic.
+graveyard_occupancy_bench: $(CORE_OBJECTS) $(OBJ_DIR)/tools/graveyard_occupancy_bench.o $(DILITHIUM_OBJECTS) $(CHIAVDF_OBJECTS)
+	@echo "$(COLOR_BLUE)[LINK]$(COLOR_RESET) $@"
+	@$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS) $(LIBS)
+	@echo "$(COLOR_GREEN)✓ graveyard_occupancy_bench built successfully$(COLOR_RESET)"
+
 evict_cost_bench: $(CORE_OBJECTS) $(OBJ_DIR)/tools/evict_cost_bench.o $(DILITHIUM_OBJECTS) $(CHIAVDF_OBJECTS)
 	@echo "$(COLOR_BLUE)[LINK]$(COLOR_RESET) $@"
 	@$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS) $(LIBS)

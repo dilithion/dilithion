@@ -396,9 +396,32 @@ EpochRegistry& Registry()
     return r;
 }
 
+// A retired thread's slot value. The slots are deliberately leaked so a drain on
+// another thread can read them after the owner exits — but a DEAD thread's stale
+// epoch went on capping the minimum forever; see EpochSlotRetirer below.
+constexpr uint64_t EPOCH_SLOT_RETIRED = ~uint64_t{0};
+
+// ⚠️ THE CONSTRUCTOR IS DELIBERATELY NON-TRIVIAL AND OUT-OF-LINE, AND WITHOUT
+// THAT THE DESTRUCTOR NEVER RUNS. A thread_local with a TRIVIAL constructor needs
+// no dynamic initialisation, so the compiler emits no __cxa_thread_atexit
+// registration for it — and the destructor that retires the slot is silently never
+// called. Measured: with a trivial constructor the exited-thread arm failed; with
+// this one it passes. Referencing the object is not enough on its own.
+struct EpochSlotRetirer {
+    // ⚠️ THE SLOT POINTER IS HELD HERE, NOT READ FROM THE thread_local AT EXIT.
+    // Measured on MinGW/GCC: the destructor DOES run, and by the time it runs the
+    // sibling thread_local pointer already reads NULL — TLS teardown had cleared
+    // it — so retirement silently did nothing and every exited thread went on
+    // pinning the graveyard. An object's own storage is valid during its own
+    // destructor, so the pointer lives in the object.
+    std::atomic<uint64_t>* slot{nullptr};
+    EpochSlotRetirer();
+    ~EpochSlotRetirer();
+};
+
 thread_local std::atomic<uint64_t>* t_epoch_slot = nullptr;
 thread_local const char* t_epoch_name = nullptr;
-
+extern thread_local EpochSlotRetirer t_epoch_retirer;
 std::atomic<uint64_t>* MyEpochSlot()
 {
     if (t_epoch_slot == nullptr) {
@@ -413,8 +436,22 @@ std::atomic<uint64_t>* MyEpochSlot()
             Registry().slots.push_back(slot);
         }
         t_epoch_slot = slot;
+        // Hand the slot to this thread's retirer so its exit hook can retire it
+        // without depending on the thread_local pointer still being readable.
+        t_epoch_retirer.slot = slot;
     }
     return t_epoch_slot;
+}
+
+EpochSlotRetirer::EpochSlotRetirer() { /* forces dynamic init; see the type */ }
+
+EpochSlotRetirer::~EpochSlotRetirer()
+{
+    // Only a thread that ever checkpointed has a slot; one that never did has
+    // nothing to retire (and pins nothing, because it never made a promise).
+    if (slot != nullptr) {
+        slot->store(EPOCH_SLOT_RETIRED, std::memory_order_release);
+    }
 }
 
 // ── THE DETECTOR: A THREAD THAT RESOLVES AND NEVER CHECKPOINTS ──────────────
@@ -456,9 +493,34 @@ void ClearUnregisteredRecord();
 // stack). A thread_local with a destructor is the one hook that fires on every exit
 // path, so the record is withdrawn there too, exactly as a checkpoint withdraws it.
 struct UnregisteredRecordScope {
+    // Non-trivial and out-of-line for the same reason as EpochSlotRetirer above:
+    // a trivially-constructible thread_local gets no dynamic initialisation and
+    // therefore no destructor registration at all.
+    UnregisteredRecordScope();
     ~UnregisteredRecordScope() { ClearUnregisteredRecord(); }
 };
+UnregisteredRecordScope::UnregisteredRecordScope() { /* forces dynamic init */ }
+
 thread_local UnregisteredRecordScope t_unregistered_scope;
+
+
+// ⚠️ A PARTICIPATING THREAD THAT EXITS USED TO PIN THE GRAVEYARD FOR THE PROCESS
+// LIFETIME. Its slot kept the last epoch it published, `DrainGraveyard` takes the
+// MINIMUM across all slots, and nothing ever raised a dead thread's value again —
+// so the minimum froze and NOTHING WAS EVER FREED AFTERWARDS. This is not exotic:
+// the miner threads exit whenever mining stops, the index sync loops exit when they
+// finish syncing, the RPC and websocket threads exit on Stop(). Any one of those
+// permanently freezes reclamation, and the node then grows without bound while
+// behaving perfectly — the same silent shape as a thread that never checkpoints,
+// arrived at from the opposite direction.
+//
+// Found by the occupancy bench, not by reading: the run ended with 24,936 entries
+// still in the graveyard and a final drain freeing ZERO with every thread quiescent.
+//
+// A thread that has exited holds no CBlockIndex*, so it must never lower the
+// minimum. Retiring the slot to the maximum epoch says exactly that, and a
+// thread_local destructor is the one hook that runs on every exit path.
+thread_local EpochSlotRetirer t_epoch_retirer;
 
 void NoteIndexPointerResolved()
 {
@@ -506,6 +568,11 @@ void CChainState::EpochCheckpoint(const char* name)
     // must also observe everything this thread did before the checkpoint.
     const uint64_t now = m_globalEpoch.load(std::memory_order_acquire);
     MyEpochSlot()->store(now, std::memory_order_release);
+
+    // Touch the retirer so THIS thread's exit hook is registered: a thread_local
+    // with a non-trivial destructor is constructed on first ODR use, and without
+    // this reference a thread's slot would never be retired when it exits.
+    (void)&t_epoch_retirer;
 
     // This thread may have resolved a pointer before reaching its first
     // checkpoint -- every thread does, during startup. It is a participant now,
@@ -614,6 +681,15 @@ bool CChainState::EpochRegistrationComplete(std::string& why) const
           "docs/contracts/deferred-reclamation-quiescence-proof.md.";
     why = os.str();
     return false;
+}
+
+void CChainState::SetDeepDrainInvariantsForTest(bool on)
+{
+    // Turns the exhaustive "no live entry names this as pprev" scan back on. It is
+    // O(map) PER FREED ENTRY -- measured 0.73 ms per entry at 50,000 entries, so
+    // ~7 ms each at the 500,000 cap -- which is why production runs the O(log n)
+    // in-degree check instead and the test suites turn this on to corroborate it.
+    m_deepDrainInvariants.store(on, std::memory_order_relaxed);
 }
 
 void CChainState::SetEvictionImmediateFreeForTest(bool on)
@@ -725,10 +801,38 @@ size_t CChainState::DrainGraveyard()
         //     eviction (an entry with a surviving child has in-degree >= 1 and is
         //     not a leaf), and asserted here rather than inherited — this
         //     assertion is what makes the dependency on #129 visible if anyone
-        //     ever weakens it. O(n) and debug-only in spirit; the graveyard is
-        //     small and drains are rare relative to inserts.
-        for (const auto& kv : mapBlockIndex) {
-            ConsensusInvariant(kv.second->pprev != n);
+        //     ever weakens it.
+        //
+        //     ⚠️ THIS WAS A FULL MAP SCAN PER FREED ENTRY, i.e. O(freed x n) UNDER
+        //     cs_main, and "the graveyard is small and drains are rare" was an
+        //     assumption, not a measurement. Measured at n=50,000: 46.9 ms to free
+        //     64 entries — 0.73 ms EACH — which at the 500,000-entry cap is ~7 ms
+        //     per entry, so one drain of a 10,000-entry graveyard would hold
+        //     cs_main for over a minute. That is the same class of defect as
+        //     CON-27, introduced by an assertion rather than by the algorithm.
+        //
+        //     The maintained in-degree map answers the same question in O(log n):
+        //     an entry named as pprev by any live member has in-degree >= 1. That
+        //     check always runs.
+        //
+        //     The exhaustive scan is what validates m_inDegree ITSELF rather than
+        //     trusting it, so it is kept — behind a RUNTIME switch the test suites
+        //     turn on. ⚠️ It was first guarded with `#ifndef NDEBUG`, and that was
+        //     a false claim about this repo: NDEBUG is defined NOWHERE in this
+        //     Makefile (line 1421 says so explicitly, and the test objects even
+        //     add -UNDEBUG to keep it that way), so the "debug-only" scan would
+        //     have run in every shipped node. A per-object flag cannot help
+        //     either: chain.cpp is compiled once into CORE_OBJECTS and linked into
+        //     both the node and the tests. A runtime switch is the only shape that
+        //     actually separates them.
+        {
+            const auto it_deg = m_inDegree.find(n);
+            ConsensusInvariant(it_deg == m_inDegree.end() || it_deg->second == 0);
+        }
+        if (m_deepDrainInvariants.load(std::memory_order_relaxed)) {
+            for (const auto& kv : mapBlockIndex) {
+                ConsensusInvariant(kv.second->pprev != n);
+            }
         }
 
         e.node.reset();   // the actual free

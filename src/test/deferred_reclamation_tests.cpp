@@ -75,6 +75,10 @@ int main()
     Dilithion::g_chainParams = &params;
 
     CChainState cs;
+    // Corroborate the cheap in-degree check with the exhaustive scan: the suites
+    // are where the O(map)-per-entry version is affordable, and where it is the
+    // check that validates m_inDegree rather than trusting it.
+    cs.SetDeepDrainInvariantsForTest(true);
     ::dilithion::consensus::port::ChainSelectorAdapter ad(cs);
 
     uint256 zero;
@@ -183,6 +187,39 @@ int main()
     // ---- the active chain is untouched throughout --------------------------
     chk("the tip survived", cs.GetBlockIndex(prev) != nullptr);
     chk("genesis survived", cs.GetBlockIndex(gh) != nullptr);
+
+    // ---- A THREAD THAT EXITS MUST NOT PIN THE GRAVEYARD FOREVER -------------
+    //
+    // ⚠️ FOUND BY THE OCCUPANCY BENCH, NOT BY READING. Epoch slots are leaked on
+    // purpose so a drain can read them after their owner exits — but a DEAD
+    // thread's slot kept its last published epoch, and the drain takes the MINIMUM
+    // across all slots, so the minimum froze at that value and NOTHING WAS EVER
+    // FREED AGAIN. The bench ended a run with 24,936 entries in the graveyard and
+    // a final drain, with every thread quiescent, freeing zero.
+    //
+    // This is not an exotic case: the miner threads exit when mining stops, the
+    // index sync loops exit when they finish, the RPC and websocket threads exit
+    // on Stop(). Any one of them would freeze reclamation for the process
+    // lifetime — the same silent unbounded growth as a thread that never
+    // checkpoints, reached from the opposite direction.
+    {
+        // A short-lived participant: checkpoints once, then exits.
+        std::thread transient([&cs]() { cs.EpochCheckpoint("transient-thread"); });
+        transient.join();
+
+        // Evict a fresh victim while that thread is already gone.
+        auto v2hdr = MakeHeader(gh, 1700500123, 0x77);
+        if (!ad.ProcessNewHeader(v2hdr)) { std::cerr << "v2 rejected" << std::endl; return 2; }
+        const size_t n_before = cs.GetBlockIndexSize();
+        chk("exited thread: setup, the eviction happened",
+            cs.EvictLowestWorkLeafNotPinned(n_before - 1));
+        chk("exited thread: the entry is in the graveyard", cs.GraveyardSize() == 1);
+
+        cs.EpochCheckpoint();      // this thread promises, honestly
+        chk("exited thread: A THREAD THAT HAS EXITED DOES NOT PIN THE GRAVEYARD",
+            cs.DrainGraveyard() == 1);
+        chk("exited thread: the graveyard is empty again", cs.GraveyardSize() == 0);
+    }
 
     // ---- REGISTRATION CENSUS: a thread that never checkpoints is a LEAK ------
     //

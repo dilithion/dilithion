@@ -241,14 +241,92 @@ restoration.
 mechanism works, not that anything invokes it. Both blockers were absences, and an
 absence is invisible to a suite that supplies the missing thing itself.
 
-## What still has to be measured
+## MEASURED — the arithmetic is gone
 
-* graveyard peak occupancy at the 10,400 evictions/s ingress ceiling, both grace
-  settings, via the `evict_cost_bench` fixture — **my ~3.3 MB / ~33 MB figures are
-  arithmetic, not observations**, and are not to be quoted until measured;
-* the ASan RED arm: resolve a pointer, evict on another thread, dereference — must trap
-  on `main`, be clean here, **and trap again with the drain forced immediate**, which is
-  what proves the harness actually reaches the free rather than passing vacuously.
+Both open numbers are now observations. `graveyard_occupancy_bench` (500,000-entry
+index, evictions throttled to a sustained **10,400/s** — the ingress ceiling, not
+the evictor's own, which measures 1.29 M/s and would consume the whole evictable set
+in 19 ms and report its size as a "peak"):
+
+| configuration | peak graveyard | vs the arithmetic |
+|---|---|---|
+| **A — as wired**: 1 Hz drain, 1 Hz slowest checkpoint | **21,041 entries = 6.42 MB** | predicted 3.17 MB → **2.03x** |
+| B — 10 s drain, 10 s slowest checkpoint | 113,844 entries = 34.74 MB | predicted 31.72 MB → 1.10x |
+| C — 1 Hz drain, **10 s** slowest checkpoint | 105,666 entries = 32.25 MB | → 1.02x |
+
+**C is the row that matters.** A drain ten times faster than B's bought 2.5 MB:
+**the slowest CHECKPOINT dominates, not the drain cadence.** The number to defend is
+therefore the slowest participant's interval, and the wired shape's honest figure is
+~6.4 MB, not the ~3.3 MB this document used to carry — the arithmetic counted one
+interval where the peak spans two (one checkpoint lag plus one drain period).
+
+**Drain cost, held under `cs_main`**: max 6.1 ms / mean 2.4 ms at the 1 Hz setting;
+max 18.0 ms at the 10 s setting, where each call frees ten times as much.
+
+### ⚠️ The measurement found two defects that reading had not
+
+**1. A THREAD THAT EXITS PINNED THE GRAVEYARD FOR THE PROCESS LIFETIME.** Epoch
+slots are leaked on purpose so a drain can read them after their owner exits — but a
+dead thread's slot kept its last published epoch, the drain takes the MINIMUM across
+slots, and nothing ever raised it again. The first bench run ended with 24,936
+entries still in the graveyard and a final drain, with every thread quiescent,
+freeing **zero**.
+
+This is not exotic: the miner threads exit when mining stops, the index sync loops
+exit when they finish, the RPC and websocket threads exit on `Stop()`. Any one of
+them froze reclamation permanently — the same silent unbounded growth as a thread
+that never checkpoints, reached from the opposite direction. A thread that has exited
+holds no `CBlockIndex*`, so its slot is now retired to the maximum epoch and can
+never lower the minimum.
+
+**Two things about that fix are worth keeping**, because both were wrong first:
+a `thread_local` with a TRIVIAL constructor gets no dynamic initialisation and
+therefore **no destructor registration at all** — the retirement code existed and
+never ran; and once it did run, reading the sibling `thread_local` slot pointer
+returned NULL, because TLS teardown had already cleared it. The slot pointer now
+lives inside the retirer object, whose own storage is valid during its destructor.
+Both were found by the regression arm going red, not by reading the diff.
+
+**2. THE DRAIN'S INVARIANT WALK WAS O(map) PER FREED ENTRY.** "No live entry names
+this as `pprev`" was checked by scanning the whole of `mapBlockIndex` for every entry
+freed — measured 46.9 ms to free 64 entries at n=50,000 (0.73 ms each), i.e. ~7 ms
+each at the 500,000 cap, so one drain of a 10,000-entry graveyard would have held
+`cs_main` for over a minute. Same class as CON-27, introduced by an assertion rather
+than by the algorithm. The maintained in-degree map answers it in O(log n) and now
+carries it in production; the exhaustive scan — which validates `m_inDegree` itself
+rather than trusting it — is behind a runtime switch the suites turn on. It was first
+guarded with `#ifndef NDEBUG`, and that was a **false claim about this repo**: NDEBUG
+is defined nowhere in the Makefile (line 1421 says so, and the test objects add
+`-UNDEBUG` to keep it that way), so the "debug-only" scan would have run in every
+shipped node. Drain cost after the fix: 0.1 ms.
+
+## THE ASan VERDICT — in, and both trap arms trapped
+
+Run `34424068632`, job `102705495467`, head `4ae2798c`, step *"Deferred-reclamation
+ASan arms (2 of 3 MUST trap)"*, clang with `-fsanitize=address`. Verbatim:
+
+```
+sanitizer: PRESENT
+--- arm=deferred (exit 0) ---
+        dereference completed, value intact
+  PASS  deferred: clean, as required
+--- arm=immediate (exit 1) ---
+    ==12388==ERROR: AddressSanitizer: heap-use-after-free on address 0x512000000a10
+    SUMMARY: AddressSanitizer: heap-use-after-free src/test/blockindex_uaf_asan_arm.cpp:194 in main
+  PASS  immediate: AddressSanitizer reported heap-use-after-free
+--- arm=drained (exit 1) ---
+        drained 1 entry while still holding the pointer
+    ==12396==ERROR: AddressSanitizer: heap-use-after-free on address 0x512000000a10
+  PASS  drained: AddressSanitizer reported heap-use-after-free
+===== ASan arms: PASS (0 failed) =====
+```
+
+So: **the defect reproduces** (`immediate` — deferral off, the evictor freeing in
+place), **the fix is clean** (`deferred` — a pointer resolved before an eviction on
+another thread, still readable), and **the harness demonstrably reaches the free**
+(`drained` — the holder checkpoints while still holding, so the drain frees under it,
+and it traps at the same address). Without that third arm the clean one would prove
+nothing.
 
 ## WIRING CENSUS — where EpochCheckpoint() actually is
 

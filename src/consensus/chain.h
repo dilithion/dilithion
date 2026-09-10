@@ -284,6 +284,11 @@ private:
     // only variable; production never sets it.
     std::atomic<bool> m_immediateFreeForTest{false};
 
+    // Test-only: run the drain's exhaustive pprev scan, which is O(map) per freed
+    // entry and validates m_inDegree itself. Off in production, where the O(log n)
+    // in-degree check carries the same invariant.
+    std::atomic<bool> m_deepDrainInvariants{false};
+
     // Next graveyard size at which "this is not draining" is reported. Doubles on
     // each report, so a leak is visible early and a healthy node stays silent.
     // Guarded by cs_main, like the graveyard itself.
@@ -346,6 +351,14 @@ public:
      * is the only caller). Never set in production.
      */
     void SetEvictionImmediateFreeForTest(bool on);
+
+    /**
+     * TEST-ONLY: re-enable the drain's exhaustive "no live entry names this as
+     * pprev" scan. O(map) per freed entry (~0.73 ms per entry at 50,000 entries),
+     * so production relies on the maintained in-degree map instead; the suites
+     * turn this on so the cheap check is corroborated by the expensive one.
+     */
+    void SetDeepDrainInvariantsForTest(bool on);
 
     /**
      * How many threads have obtained a CBlockIndex* and have NEVER checkpointed.
