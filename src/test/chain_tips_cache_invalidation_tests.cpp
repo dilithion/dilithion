@@ -31,18 +31,27 @@
 //   chain.cpp:67    Cleanup()                         -> cleanup_*
 //   chain.cpp:157   AddBlockIndex (flag-merge path)   -> add_block_index_merge_*
 //   chain.cpp:181   AddBlockIndex (first-time add)    -> add_block_index_new_*
-//   chain.cpp:259   EvictLowestWorkNotOnBestChain()   -> evict_*
-//   chain.cpp:2336  SetTip()                          -> set_tip_*
-//   chain.cpp:2684  MarkBlockAsFailed()               -> mark_failed_*
-//   chain.cpp:2722  MarkBlockAsValid()                -> mark_valid_*
-//   chain.h:573     SetTipForTest()                   -> set_tip_for_test_*
-//   chain.h:759     InvalidateChainTipsCache()        -> explicit_invalidate_*
+//   chain.cpp:463   EvictLowestWorkLeafNotPinned()    -> evict_*
+//   chain.cpp:2692  SetTip()                          -> set_tip_*
+//   chain.cpp:3048  MarkBlockAsFailed()               -> mark_failed_*
+//   chain.cpp:3086  MarkBlockAsValid()                -> mark_valid_*
+//   chain.h:591     SetTipForTest()                   -> set_tip_for_test_*
+//   chain.h:911     InvalidateChainTipsCache()        -> explicit_invalidate_*
 //
-// The remaining 5 sites (chain.cpp:382 ActivateBestChain, :1836 DisconnectTip,
-// :2002 DisconnectToHeight, :2861 InvalidateBlock descendant walk, :2917
+// The remaining 5 sites (chain.cpp:587 ActivateBestChain, :2180 DisconnectTip,
+// :2346 DisconnectToHeight, :3225 FindMostWorkChainImpl, :3281
 // ActivateBestChainStep) sit on paths that need a live CBlockchainDB and real
 // blocks; they are not reachable from a unit fixture. They remain covered only
 // collectively (an all-sites deletion is killed by every case here).
+//
+// NOTE: every line number above was re-measured against THIS tree. The merge
+// that brought the leaf-only eviction fix in shifted chain.cpp by ~350 lines,
+// so the original table pointed at unrelated code. One ATTRIBUTION also
+// changed, not just an offset: the 5th uncovered site is the dirty-flip inside
+// FindMostWorkChainImpl, not an 'InvalidateBlock descendant walk'.
+// InvalidateBlockImpl (chain.cpp:3655) has no invalidation of its own — it
+// reaches the cache through MarkBlockAsFailed(), which mark_failed_* already
+// covers, so the 14-site total and this suite's coverage are both unchanged.
 
 #include <boost/test/unit_test.hpp>
 
@@ -217,7 +226,41 @@ BOOST_AUTO_TEST_CASE(add_block_index_merge_invalidates_cache)
 }
 
 // ---------------------------------------------------------------------------
-// chain.cpp:259 — EvictLowestWorkNotOnBestChain(): erases a tip outright.
+// chain.cpp:463 — EvictLowestWorkLeafNotPinned(): erases a tip outright.
+//
+// The eviction API was RENAMED and RE-SIGNATURED by the leaf-only cap fix
+// (was: EvictLowestWorkNotOnBestChain(), no arguments, 'lowest-work entry not
+// on the best chain'). The policy this case now drives is strictly narrower:
+// it frees ONLY UNPINNED LEAVES — in-degree 0 in the pprev graph — lowest
+// nChainWork first, multi-pass, until mapBlockIndex.size() <= target_max.
+// PINNED (never evicted) are: (a) every ancestor of pindexTip; (b) every
+// m_setBlockIndexCandidates member and all of its pprev ancestors; (c) every
+// entry with BLOCK_HAVE_DATA that has not yet reached BLOCK_VALID_TRANSACTIONS;
+// (d) every hash the pending-block provider reports, plus its ancestors.
+//
+// Why ForkFixture still drives a REAL eviction under that policy — this is
+// what keeps the BOOST_REQUIRE below reachable instead of vacuously red:
+//   * A is INTERIOR (in-degree 2: B and C both name it as pprev) — not a leaf.
+//   * B is a leaf but is PINNED by clause (a): SetTip(B) makes it pindexTip.
+//   * C is a leaf (nothing names it as pprev) and is pinned by NOTHING.
+//     m_setBlockIndexCandidates is empty in this fixture: the only add-path
+//     writer is ActivateBestChain (chain.cpp:739), which the fixture never
+//     calls — AddBlockIndex and SetTip do not touch the candidate set, so
+//     clause (b) pins nothing. C's nStatus is BLOCK_VALID_TRANSACTIONS with no
+//     BLOCK_HAVE_DATA, so clause (c) does not match. No pending-block provider
+//     is installed, so clause (d) is inert. C also carries LESS work than B,
+//     so it is the lowest-work eligible leaf.
+// C is therefore the unique eviction victim, exactly as it was under the old
+// policy — the SCENARIO (erasing a fork tip must invalidate the memoised
+// tip set) is preserved, not weakened to fit the new signature.
+//
+// target_max follows the production call pattern used by the sibling wiring
+// test (headers_manager_to_chain_selector_wiring_tests.cpp:407): size_before-1,
+// i.e. 'make room for exactly one new header'. That bounds the run to a single
+// eviction, so the assertions below describe one specific erasure rather than a
+// drain. (target_max == 0 means 'drain EVERY eligible leaf' — explicitly
+// test/diagnostic-only per the contract in chain.h, and it would not pin down
+// WHICH entries went.)
 // ---------------------------------------------------------------------------
 BOOST_AUTO_TEST_CASE(evict_invalidates_cache)
 {
@@ -225,13 +268,23 @@ BOOST_AUTO_TEST_CASE(evict_invalidates_cache)
     const std::string before = Tips(f.chainstate);
     BOOST_REQUIRE(before.find(f.hC.GetHex()) != std::string::npos);
 
-    BOOST_REQUIRE(f.chainstate.EvictLowestWorkNotOnBestChain());
+    const size_t size_before = f.chainstate.GetBlockIndexSize();
+    BOOST_REQUIRE_EQUAL(size_before, 3u);  // A + B + C
+
+    BOOST_REQUIRE(f.chainstate.EvictLowestWorkLeafNotPinned(size_before - 1));
+    BOOST_REQUIRE_EQUAL(f.chainstate.GetBlockIndexSize(), size_before - 1);
     BOOST_REQUIRE(f.chainstate.GetBlockIndex(f.hC) == nullptr);  // C really went
+
+    // The pinned entries survived: the policy evicted the unpinned LEAF, not
+    // merely 'the lowest-work entry'. If either of these ever fires, this case
+    // is no longer exercising the scenario its comment claims.
+    BOOST_REQUIRE(f.chainstate.GetBlockIndex(f.hB) != nullptr);  // active tip, pinned (a)
+    BOOST_REQUIRE(f.chainstate.GetBlockIndex(f.hA) != nullptr);  // interior, in-degree 2
 
     const std::string after = Tips(f.chainstate);
     BOOST_CHECK_MESSAGE(before != after,
-        "GetChainTips() served a STALE cache after EvictLowestWorkNotOnBestChain() "
-        "erased tip C. Answer both before and after:\n" + before);
+        "GetChainTips() served a STALE cache after EvictLowestWorkLeafNotPinned() "
+        "erased unpinned leaf tip C. Answer both before and after:\n" + before);
     BOOST_CHECK(after.find(f.hC.GetHex()) == std::string::npos);
 }
 

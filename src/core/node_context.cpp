@@ -10,6 +10,7 @@
 #include <net/block_tracker.h>  // IBD Redesign: Single source of truth
 #include <net/blockencodings.h>  // BIP 152: For PartiallyDownloadedBlock destructor
 #include <node/block_validation_queue.h>  // Phase 2: Async block validation
+#include <consensus/chain.h>  // PR #129: CChainState for provider deregistration on queue teardown
 #include <digital_dna/dna_registry_db.h>  // Digital DNA: LevelDB-backed registry
 #include <digital_dna/verification_manager.h>  // Phase 2: DNA Verification & Attestation
 #include <consensus/ichain_selector.h>             // Phase 5: frozen interface
@@ -23,6 +24,11 @@
 
 // Global node context instance
 NodeContext g_node_context;
+
+// PR #129: the async validation queue's PendingBlockHashProvider is registered
+// on this global (see dilithion-node.cpp). It must be cleared before the queue
+// is destroyed, since the provider lambda captures a raw queue pointer.
+extern CChainState g_chainstate;
 
 // Destructor defined here (not in header) because unique_ptr<DNARegistryDB>
 // requires the complete type for default_delete.
@@ -252,6 +258,9 @@ void NodeContext::Shutdown() {
     // Phase 2: Stop validation queue before IBD managers
     if (validation_queue) {
         validation_queue->Stop();
+        // PR #129: clear the provider (captures a raw queue pointer) BEFORE the
+        // queue is destroyed, so the callback can never outlive the queue.
+        g_chainstate.RegisterPendingBlockHashProvider(nullptr);
         validation_queue.reset();
     }
 
@@ -302,10 +311,49 @@ void NodeContext::Reset() {
     peer_manager.reset();
     connman.reset();  // Phase 2: Reset CConnman
     message_processor = nullptr;
+
+    // PR #129 round-3 (non-author reader, LOW-1): STOP THE QUEUE BEFORE THE
+    // SUBSYSTEMS ITS WORKER USES.
+    //
+    // The Stop() below was already hoisted above the provider deregistration in
+    // round 2; it was still BELOW headers_manager / orphan_manager /
+    // block_fetcher / block_tracker, and ProcessBlock reads
+    // g_node_context.orphan_manager (among others) while running. So a live
+    // Reset() could free a subsystem out from under the worker mid-block — a
+    // second instance of the same shape, one line further up, found only because
+    // someone re-read the whole function instead of the changed line.
+    //
+    // Shutdown() stops the queue before touching the IBD managers. Reset() now
+    // matches it. Test-only caller today, so this is latent rather than live,
+    // which is exactly why it is worth fixing now: nothing would have caught it.
+    if (validation_queue) {
+        validation_queue->Stop();
+    }
+
     headers_manager.reset();
     orphan_manager.reset();
     block_fetcher.reset();
     block_tracker.reset();  // IBD Redesign
+    // PR #129 round-2 (external panel, gpt6 HIGH): STOP THE WORKER BEFORE
+    // DEREGISTERING ITS PIN.
+    //
+    // This used to clear the provider first and then reset the queue, relying on
+    // the destructor's Stop() to join the worker. That leaves a window in which
+    // the worker is still inside ProcessBlock — cs_main released across ops, the
+    // in-flight block reachable by eviction — while its ONLY eviction pin has
+    // already been torn down. The block and its parent become evictable at the
+    // exact moment the code is about to resolve and use them.
+    //
+    // Shutdown() already had the correct order (Stop, then clear, then reset).
+    // Reset() did not. One fix, applied at one of two sibling teardown paths —
+    // so the order here is now identical to Shutdown()'s, deliberately.
+    //
+    // Stop() joins the worker thread, so once it returns nothing is in flight and
+    // removing the provider cannot strand anybody.
+    if (validation_queue) {
+        validation_queue->Stop();  // idempotent; already stopped above in round-3 order
+    }
+    g_chainstate.RegisterPendingBlockHashProvider(nullptr);
     validation_queue.reset();  // Phase 2: Reset validation queue
     dna_registry.reset();  // Digital DNA
     trust_manager.reset();
