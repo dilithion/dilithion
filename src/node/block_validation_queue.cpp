@@ -419,7 +419,7 @@ void CBlockValidationQueue::ValidationWorker() {
                 // quiescent-state calculation entirely, exactly as an exited thread is
                 // removed; the scope re-enters on EVERY exit path, before anything is
                 // resolved.
-                EpochOfflineScope offline(&m_chainstate, "validation-worker");
+                EpochOfflineScope offline(&m_chainstate);
                 m_queue_cv.wait(lock, [this] {
                     return !m_queue.empty() || !m_running.load();
                 });

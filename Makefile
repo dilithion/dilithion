@@ -894,6 +894,14 @@ evict_cost_bench: $(CORE_OBJECTS) $(OBJ_DIR)/tools/evict_cost_bench.o $(DILITHIU
 # under -fsanitize=address. Two of its three arms MUST CRASH; scripts/asan_uaf_arms.sh
 # is the driver that enforces that, and a plain build of this target proves only that
 # the fixture reaches the free -- not that the memory is safe.
+# A PAIRED CONTROL WHOSE PASS IS A PROCESS ABORT: it opens an illegal nested
+# EpochOfflineScope and must die on the ConsensusInvariant. Run by
+# scripts/red_arms_pr198_r1_folds.sh as the positive control for the inverted F13 arm.
+epoch_nest_probe: $(CORE_OBJECTS) $(OBJ_DIR)/test/epoch_nest_probe.o $(DILITHIUM_OBJECTS) $(CHIAVDF_OBJECTS)
+	@echo "$(COLOR_BLUE)[LINK]$(COLOR_RESET) $@"
+	@$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS) $(LIBS)
+	@echo "$(COLOR_GREEN)✓ epoch_nest_probe built successfully$(COLOR_RESET)"
+
 blockindex_uaf_asan_arm: $(CORE_OBJECTS) $(OBJ_DIR)/test/blockindex_uaf_asan_arm.o $(DILITHIUM_OBJECTS) $(CHIAVDF_OBJECTS)
 	@echo "$(COLOR_BLUE)[LINK]$(COLOR_RESET) $@"
 	@$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS) $(LIBS)

@@ -323,6 +323,16 @@ CBlockIndex* CChainState::GetBlockIndex(const uint256& hash) {
     if (it != mapBlockIndex.end()) {
         // A raw pointer is about to leave the lock scope. If this thread never
         // checkpoints, that pointer's existence is what pins the graveyard.
+        //
+        // ⚠️ AND HERE IS THE HOLE, AT THE PLACE THE POINTER IS HANDED OUT: from this
+        // moment until the caller drops it, the caller MUST NOT make an epoch claim
+        // — not a checkpoint, not a quiesce, not the exit of an EpochOfflineScope.
+        // Any of the three publishes "I hold nothing" while this pointer is live,
+        // and the entry can then be freed under it. Nothing here can detect that;
+        // the pointer is a raw pointer on the caller's stack. It is a CONTRACT, and
+        // the resolve-then-claim direction is the half that has no detector at all
+        // (the offline-resolve counter catches claim-then-resolve, the other order).
+        // See the scope-site table in the quiescence proof for the per-site review.
         NoteIndexPointerResolved(m_globalEpoch.load(std::memory_order_acquire));
         return it->second.get();  // Extract raw pointer from unique_ptr
     }
@@ -445,7 +455,9 @@ thread_local bool t_epoch_offline = false;
 
 // Set when a resolve-while-offline re-enters, so the accusation the quiesce
 // withdrew is restored on the way back through (see NoteIndexPointerResolved).
-thread_local bool t_recorded_reset_for_reresolve = false;
+// (Was a thread_local. It is set and consumed within a single call of
+// NoteIndexPointerResolved, so thread-local storage bought nothing and implied a
+// lifetime the value does not have; it is a local variable now.)
 
 // Count of resolves that happened while a thread was OFFLINE. That is a design
 // error — a thread must re-enter before it resolves — and it is made SAFE here
@@ -569,6 +581,10 @@ thread_local EpochSlotRetirer t_epoch_retirer;
 
 void NoteIndexPointerResolved(uint64_t current_epoch)
 {
+    // Set by the offline branch below and consumed a few lines later, in the same
+    // call. A local, because that is its entire lifetime.
+    bool reresolve_after_offline = false;
+
     // The hot path for a participant that is ONLINE: two thread-local loads and a
     // predicted branch. No lock, no atomic.
     if (t_epoch_slot != nullptr && !t_epoch_offline) return;
@@ -598,14 +614,13 @@ void NoteIndexPointerResolved(uint64_t current_epoch)
         // re-created at 0 — the epoch published above is the correct pin for a
         // pointer resolved at this instant, under cs_main, while the entry is still
         // linked.
-        t_recorded_reset_for_reresolve = true;
+        reresolve_after_offline = true;
     }
 
     // A thread that came back online through the path above re-records below, so
     // that a quiesce-withdrawn accusation is restored the moment its claim is
     // falsified.
-    if (t_recorded_reset_for_reresolve) {
-        t_recorded_reset_for_reresolve = false;
+    if (reresolve_after_offline) {
         auto& u2 = Unregistered();
         UnregisteredRecordScope& me2 = t_unregistered_scope;
         if (!me2.recorded) {
@@ -739,8 +754,32 @@ void CChainState::EpochCheckpoint(const char* name)
     }
 }
 
-void CChainState::EpochQuiesce()
+bool CChainState::EpochQuiesce()
 {
+    // ⚠️ FAIL CLOSED ON AN UNREGISTERED THREAD, AND REPORT WHETHER WE DID. A
+    // thread with no registered name is one whose participation nobody declared: it
+    // may have resolved a pointer and be pinning at slot 0 (see
+    // NoteIndexPointerResolved), and publishing RETIRED for it would UNPIN A HOLDER
+    // -- the exact use-after-free direction this file exists to remove, arriving
+    // through a different door. An unregistered thread therefore stays ONLINE and
+    // keeps pinning, and the scope that asked becomes inert.
+    //
+    // Reachable in production: CWebSocketServer::SocketWrite is called from
+    // SendToClient / Broadcast, which run on threads other than the websocket
+    // server thread.
+    if (t_epoch_name == nullptr) {
+        static std::atomic<bool> reported{false};
+        bool expected = false;
+        if (reported.compare_exchange_strong(expected, true)) {
+            std::cerr << "[Chain] NOTE: an epoch scope was opened on a thread with "
+                         "no registered participant name. It stays ONLINE (pinning) "
+                         "rather than publishing a promise nobody declared. If that "
+                         "thread resolves block indices, give it a named checkpoint "
+                         "at its loop top." << std::endl;
+        }
+        return false;
+    }
+
     // GO OFFLINE: "I am about to block, and I hold no CBlockIndex*."
     //
     // ⚠️ THIS EXISTS BECAUSE "CHECKPOINT BEFORE THE WAIT" WAS NOT ENOUGH, AND THE
@@ -764,26 +803,49 @@ void CChainState::EpochQuiesce()
         ConsensusInvariant(t_epoch_holds == 0);
     }
 
-    // ⚠️ NOT REENTRANT, AND NESTING SILENTLY CANCELS THE OUTER PARK. t_epoch_offline
-    // is a bool, so an inner scope's destructor re-enters the thread while the outer
-    // scope still believes it is parked — and HandleClient's scope can lexically
-    // enclose socket_write's. A counter would make nesting "work" and hide the
-    // design error; refusing it says what the scopes actually mean. The ONE legal
-    // nest is EpochOnlineWindow inside an EpochOfflineScope, which is the opposite
-    // direction and goes through EpochCheckpoint, not here.
+    // ⚠️ REFUSES AN OFFLINE *STATE*, WHICH IS NARROWER THAN "REFUSES NESTING",
+    // AND THE PREVIOUS COMMENT OVERSTATED IT. What this rejects is quiescing while
+    // the flag is already set. It does NOT reject a live outer SCOPE whose flag has
+    // since been cleared, so both of these pass:
+    //
+    //     offline -> EpochOnlineWindow (clears the flag) -> offline
+    //     offline -> an instrumented resolve (clears the flag) -> offline
+    //
+    // The first is the legal nest by design. The second is a genuine gap: a resolve
+    // inside an offline scope re-enters the thread, after which a further quiesce
+    // looks like a first one. Closing it needs protocol state per scope rather than
+    // a single bool. Recorded as the narrower guarantee that is actually true
+    // today, rather than claimed away.
+    //
+    // (The earlier example -- HandleClient's scope enclosing socket_write's -- is no
+    // longer live: F12 braced both to their own blocking calls.)
+    //
+    // A counter instead of a refusal would make nesting "work" and hide the design
+    // error, which is why this is a refusal and not a depth count.
     ConsensusInvariant(!t_epoch_offline);
 
-    // ⚠️ GOING OFFLINE IS A CLAIM, AND THE ACCUSATION IS THE SAME CLAIM INVERTED.
-    // A thread recorded as an unregistered resolver holds a slot at 0 and pins
-    // everything. If it then parks, the slot goes RETIRED and it stops pinning —
-    // but the RECORD stayed, so the census went on reporting a holder that had just
-    // declared it holds nothing. Quiescing withdraws it: the two statements cannot
-    // both be true, and the one made here is the deliberate one.
+    // ⚠️ DEFENSIVE, AND CURRENTLY UNREACHABLE AS A CLEARER — SAY SO RATHER THAN
+    // IMPLY IT STILL FIRES. The round-4 fail-closed rule above means only a thread
+    // with a registered NAME reaches this line; a name is set only by
+    // EpochCheckpoint(name), which itself calls ClearUnregisteredRecord(); and a
+    // thread with a slot is never re-recorded (NoteIndexPointerResolved records only
+    // when t_epoch_slot == nullptr). So by the time any thread can quiesce, its
+    // accusation is already withdrawn and this call finds nothing.
+    //
+    // It stays because the reasoning above is a CHAIN OF THREE PRECONDITIONS, any of
+    // which a future change could break — and if one does, the claim "offline means I
+    // hold nothing" and a standing accusation would both be live at once. Kept as a
+    // guard, not as a mechanism, and the F15 arm now asserts the unreachability
+    // instead of pretending to exercise it.
+    //
+    // Round-3 added the withdrawal here for a case round-4's fix removed. That is a
+    // fold subsuming an earlier fold, which is worth noticing rather than leaving as
+    // two fixes that look independent.
     ClearUnregisteredRecord();
 
     t_epoch_offline = true;
     MyEpochSlot()->store(EPOCH_SLOT_RETIRED, std::memory_order_release);
-
+    return true;
 }
 
 uint64_t CChainState::OfflineResolveCount()
@@ -1023,7 +1085,9 @@ size_t CChainState::DrainGraveyard()
     // The vector is already sorted: stamps come from fetch_add under cs_main, so
     // they strictly increase, and entries are appended in that order. The first
     // entry answers "is anything freeable at all?" in O(1), and a binary search
-    // finds the cutoff in O(log G). Only the freed prefix is touched.
+    // finds the cutoff in O(log G). The survivors ARE moved by the erase below —
+    // this line used to claim otherwise, which is the opposite of what a vector
+    // erase does and contradicted the corrected comment twenty lines down.
     // ⚠️ AN ENDPOINT SANITY CHECK, NOT A SORTEDNESS PROOF — and calling it the
     // latter was wrong. `front < back` passes for [2, 1, 3]: it cannot detect an
     // out-of-order interior, which is exactly what would break the binary search.

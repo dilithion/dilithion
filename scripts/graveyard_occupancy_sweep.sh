@@ -43,7 +43,9 @@ fi
 
 # entries pinned% drain_ms ckpt_ms run_ms rate parked
 CONFIGS=(
-  "A|wired (1 Hz drain, 1 Hz checkpoint)|500000 50 1000 1000 15000 10400 0"
+  "A|wired (1 Hz drain, 1 Hz checkpoint) [run 1 of 3]|500000 50 1000 1000 15000 10400 0"
+  "A2|wired [run 2 of 3] — peak is a SAMPLE, not a constant|500000 50 1000 1000 15000 10400 0"
+  "A3|wired [run 3 of 3] — quote the range, defend the upper end|500000 50 1000 1000 15000 10400 0"
   "B|slow both (10 s / 10 s)|500000 25 10000 10000 30000 10400 0"
   "C|slow participant only (1 Hz drain, 10 s checkpoint)|500000 25 1000 10000 30000 10400 0"
   "D|parked participant ONLINE — the defect|500000 25 1000 1000 15000 10400 1"
@@ -60,7 +62,15 @@ printf '%s\n' "-----------------------------------------------------------------
 rc=0
 for row in "${CONFIGS[@]}"; do
     IFS='|' read -r tag label args <<< "$row"
-    out=$($BIN $args 2>&1)
+    out=$($BIN $args 2>&1); bench_rc=$?
+    # ⚠️ THE BENCH'S EXIT STATUS WAS IGNORED. A run that printed a MEASURED block and
+    # then failed (a fixture refusal, an abort after the table) was scored as a good
+    # row. Status first, marker second.
+    if [ $bench_rc -ne 0 ]; then
+        printf '%-3s %-46s %s\n' "$tag" "$label" "BENCH EXITED $bench_rc — row rejected"
+        echo "$out" | tail -4 | sed 's/^/      /'
+        rc=$((rc+1)); continue
+    fi
     if ! echo "$out" | grep -q -- "--- MEASURED ---"; then
         printf '%-3s %-46s %s\n' "$tag" "$label" "RUN PRODUCED NO MEASUREMENT — see below"
         echo "$out" | tail -5 | sed 's/^/      /'
@@ -76,8 +86,23 @@ for row in "${CONFIGS[@]}"; do
     offl_n=$(echo "$offl"   | sed 's/ .*//')
     printf '%-3s %-46s %14s %10s %16s %8s\n' \
            "$tag" "$label" "$peak_mb" "$freed_n" "$cost_s" "$offl_n"
+
+    # ⚠️ A NON-ZERO OFFLINE-RESOLVE COUNT IS A FAILURE, NOT A COLUMN. It means some
+    # thread resolved a CBlockIndex* after publishing that it holds nothing — safe at
+    # the resolve and still a defect. Printing it in a table nobody's exit code reads
+    # is how it would be ignored.
+    if [ "${offl_n:-0}" != "0" ]; then
+        echo "      ^^ FAIL: $offl_n resolve(s) while OFFLINE in configuration $tag"
+        rc=$((rc+1))
+    fi
 done
 
+echo
+echo "CONFIG A IS RUN THREE TIMES ON PURPOSE. Its peak is sampled after each"
+echo "eviction, so it depends where the run stops relative to the drain cycle: three"
+echo "runs of the identical command have measured 6.42, 6.39 and 3.53 MB. Quote the"
+echo "RANGE and defend the upper end. A single run of A is a sample that a document"
+echo "will then treat as a constant -- which is what happened for three review rounds."
 echo
 echo "READ D AND E AS A PAIR: D is a participant that checkpoints and then parks —"
 echo "the graveyard grows at the ingress rate and NOTHING is freed for the whole run."

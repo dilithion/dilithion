@@ -476,6 +476,75 @@ detector at those two points sees every thread that acquires one. **What it does
 see** is a pointer passed from one thread to another after the fact — see the
 no-handoff obligation above.
 
+## ⚠️ ROUND 4: THE CHECK I ADDED WAS A REMOTE DENIAL OF SERVICE
+
+The one-thread-one-name check from round 3 was **remotely reachable**, and the panel
+found it 3/3 (one BLOCKER, one HIGH):
+
+* the three `wait-*` RPC handlers opened scopes hard-named `"rpc-worker"`;
+* the WebSocket server thread dispatches the **entire RPC table**
+  (`websocket.cpp`'s `SetMessageCallback` → `ExecuteRPC`) while registered as
+  `"websocket-server"`;
+* the mismatch fired `ConsensusInvariant(false)`.
+
+**A websocket client calling `waitfornewblock` aborted the node.** The check written
+to catch a wiring mistake became a remote kill switch, in a delta whose entire purpose
+is to make the node safer.
+
+**The root cause is not the check's strictness — a handler cannot know its thread.** A
+name is chosen per *site*; a slot belongs to a *thread*. So:
+
+* **names belong to threads**: a thread registers once, at its own loop-top
+  checkpoint;
+* **scopes take no name at all** and act on whatever the calling thread is registered
+  as;
+* a scope opened on a thread with **no registered name refuses, fail-closed** — it
+  stays online and keeps pinning, and the scope becomes inert. Publishing a promise
+  for an undeclared thread would *unpin a holder*, which is the use-after-free
+  direction arriving through a different door;
+* the one-thread-one-name check now applies **only to named checkpoints**, where a
+  thread really is asserting its own identity.
+
+Same class, also fixed: `CWebSocketServer::SocketWrite` is reachable from
+`SendToClient` / `Broadcast` on threads other than the websocket server thread, and
+the HTTP REST branch reaches the same handlers.
+
+### What else round 4 found
+
+* **F17 — the pause path pinned online indefinitely.** A paused validation thread
+  spins 10 ms at a time with its epoch frozen; a fork recovery can hold the pause open
+  for as long as it likes. Now offline across the sleep. **The panel named one site;
+  there are two** (`ValidationWorkerThread` and `HeaderProcessorThread`, identical
+  bodies) — found by grepping the shape rather than fixing the reported line.
+* **F18 — "bounded by the socket timeouts" was asserted, not checked.** There is no
+  `setsockopt` anywhere in `http_server.cpp`: HTTP client sockets get **no
+  `SO_SNDTIMEO`** (the RPC server sets 10 s on its own). A blackholed HTTP client pins
+  its worker **online for TCP's retransmit lifetime**. The claim is corrected at the
+  site; the two real fixes (one write funnel, plus send timeouts on accepted sockets)
+  change that server's network behaviour and are filed rather than smuggled in here.
+* **F19 — the nesting refusal is narrower than it claimed.** It rejects an offline
+  *state*, not a live outer *scope*: `offline → OnlineWindow → offline` and
+  `offline → instrumented resolve → offline` both pass, because each clears the flag.
+  The first is the legal nest; the second is a genuine gap, recorded as such.
+* **F23 — the websocket READ side was wired nowhere.** `HandleClient` blocks in
+  `SocketRead` for the whole life of a connection, and a client that simply never
+  sends pinned that thread online indefinitely. Now offline, symmetric with the write.
+
+### ⚠️ A ROUND-4 FIX SUBSUMED A ROUND-3 FIX, and the mutant is how it showed
+
+Round 3 made a resolve-after-quiesce restore the withdrawn accusation. The
+fail-closed rule makes that **unreachable**: quiesce requires a registered name, a
+name comes only from `EpochCheckpoint(name)`, that call clears the accusation, and a
+thread with a slot is never re-recorded. So no thread can reach a quiesce still
+accused.
+
+**The round-3 mutation arm then survived on the fixed tree** — correctly, because
+there was nothing left to break. A surviving mutant is ambiguous (unreachable *or*
+untested); this one was unreachable. The arm now asserts the unreachability, the
+mutant is retired with its reason, and the withdrawal call stays as a **guard** whose
+three preconditions are written down, because any one of them could be broken by a
+later change.
+
 ## ⚠️ THE PER-SITE CONTRACT *IS* THE MECHANISM — SO HERE IS EVERY SITE
 
 The round-3 panel was asked directly whether the no-pointer-across-a-boundary rule

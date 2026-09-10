@@ -371,7 +371,13 @@ public:
      * Pair it with EpochCheckpoint() on wake, BEFORE resolving anything. Prefer
      * EpochOfflineScope, which cannot forget the second half.
      */
-    void EpochQuiesce();
+    /**
+     * Go OFFLINE before a blocking wait. Returns TRUE if the thread actually went
+     * offline; FALSE if it refused because the calling thread has no registered
+     * participant name -- an undeclared thread may be pinning at slot 0 with a live
+     * pointer, and publishing a promise for it would unpin a holder.
+     */
+    bool EpochQuiesce();
 
     /**
      * How many times a thread resolved a CBlockIndex* while OFFLINE. That is a
@@ -1870,9 +1876,12 @@ public:
 class EpochOnlineWindow
 {
 public:
-    EpochOnlineWindow(CChainState* cs, const char* name) : m_cs(cs), m_name(name)
+    explicit EpochOnlineWindow(CChainState* cs) : m_cs(cs)
     {
-        if (m_cs) m_cs->EpochCheckpoint(m_name);
+        // Nameless: it re-enters the CALLING THREAD, whatever that thread is
+        // registered as. See EpochOfflineScope for why a name here was a remotely
+        // reachable abort.
+        if (m_cs) m_cs->EpochCheckpoint();
     }
     ~EpochOnlineWindow() { if (m_cs) m_cs->EpochQuiesce(); }
 
@@ -1881,7 +1890,6 @@ public:
 
 private:
     CChainState* m_cs;
-    const char* m_name;
 };
 
 class EpochOfflineScope
@@ -1890,18 +1898,36 @@ public:
     // Takes a POINTER and no-ops on null: several call sites hold the chainstate
     // as an optional pointer (rpc/server.cpp), and a nullable site must not be the
     // reason a wait goes unwrapped.
-    EpochOfflineScope(CChainState* cs, const char* name) : m_cs(cs), m_name(name)
+    // ⚠️ NAMELESS, AND THE NAME IT USED TO TAKE WAS A REMOTE DENIAL OF SERVICE.
+    //
+    // A name is chosen per SITE; a slot belongs to a THREAD. The three wait-* RPC
+    // handlers opened scopes hard-named "rpc-worker" -- but a handler runs on
+    // whichever thread dispatched it, and the WebSocket server thread dispatches the
+    // entire RPC table (websocket.cpp's SetMessageCallback -> ExecuteRPC) while
+    // registered as "websocket-server". The one-thread-one-name check then fired
+    // ConsensusInvariant(false), so A WEBSOCKET CLIENT CALLING waitfornewblock
+    // ABORTED THE NODE -- introduced by the very check meant to catch a wiring
+    // mistake, and reachable by anyone who can open a websocket.
+    //
+    // The fix is not a softer check. A HANDLER CANNOT KNOW ITS THREAD, so it must
+    // not assert one: names are established once, by each thread, at its own
+    // loop-top checkpoint, and scopes act on whatever the calling thread already is.
+    explicit EpochOfflineScope(CChainState* cs) : m_cs(cs)
     {
-        if (m_cs) m_cs->EpochQuiesce();
+        // Inert when the thread is unregistered. EpochQuiesce refuses to publish a
+        // promise nobody declared, and this scope must not then "re-enter" it: a
+        // nameless checkpoint would publish the current epoch and UNPIN a thread
+        // that may be holding a pointer at slot 0.
+        m_active = (m_cs != nullptr) && m_cs->EpochQuiesce();
     }
-    ~EpochOfflineScope() { if (m_cs) m_cs->EpochCheckpoint(m_name); }
+    ~EpochOfflineScope() { if (m_active) m_cs->EpochCheckpoint(); }
 
     EpochOfflineScope(const EpochOfflineScope&) = delete;
     EpochOfflineScope& operator=(const EpochOfflineScope&) = delete;
 
 private:
     CChainState* m_cs;
-    const char* m_name;
+    bool m_active{false};
 };
 
 #endif // DILITHION_CONSENSUS_CHAIN_H

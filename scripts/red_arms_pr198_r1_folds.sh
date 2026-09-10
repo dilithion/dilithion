@@ -67,8 +67,23 @@ arm() {
       echo "   FAIL  $label: mutant build failed"; grep -m3 'error:' /tmp/r1_mut_build.log
       rc=$((rc+1)); restore; return
   fi
-  ./deferred_reclamation_tests > /tmp/r1_mut_run.out 2>&1
+  # ⚠️ A MUTANT CAN HANG THE SUITE, AND THIS HARNESS HUNG WITH IT. The
+  # fail-closed mutation makes an arm's condition-variable handshake never complete,
+  # so the suite blocked forever and took the whole harness with it -- twenty
+  # minutes of a "running" job that would never have finished. A mutation harness
+  # must assume its mutants break things in ways that do not return.
+  #
+  # 124 is `timeout`'s signal-kill status. It is NOT scored as a kill: a mutant that
+  # deadlocks the suite tells us nothing about the named assertion, and calling it a
+  # pass would be the same error as accepting any non-zero exit.
+  timeout -k 10 180 ./deferred_reclamation_tests > /tmp/r1_mut_run.out 2>&1
   local ec=$?
+  if [ $ec -eq 124 ] || [ $ec -eq 137 ] || [ $ec -eq 143 ]; then
+      echo "   FAIL  $label: the mutant HUNG the suite (exit $ec) — no verdict."
+      echo "         A deadlocked mutant is not evidence for the named assertion;"
+      echo "         fix the arm so a broken tree FAILS instead of blocking."
+      rc=$((rc+1)); restore; return
+  fi
   # ⚠️ THE SURVIVAL CHECK IS NOT UNIVERSAL, AND PUTTING IT FIRST BROKE AN ARM. For
   # an INVERTED arm (kind=nesting) the mutant surviving IS the evidence: the fix's
   # own signature is a process abort, which a suite cannot assert from the inside.
@@ -112,9 +127,16 @@ arm() {
       # REMOVED the nest is silently accepted and the suite passes, which is what
       # this arm observes. It is therefore an inverted arm: the mutant SURVIVING is
       # the evidence, and the fix's value is that the same nest aborts without it.
-      if [ $ec -eq 0 ]; then
-          echo "   PASS  $label: refusal removed => the illegal nest is silently accepted"
+      # ⚠️ A ZERO EXIT IS NOT ENOUGH, AND THIS ARM USED TO ACCEPT ONE ON ITS OWN.
+      # Nothing proved the nest was ever REACHED: a suite that skipped the arm
+      # entirely also exits zero. The marker below is printed by the F13 arm itself,
+      # so its presence is proof the nested scopes actually ran under the mutant.
+      if [ $ec -eq 0 ] && grep -qF "F13: EpochOnlineWindow nested inside an offline scope is legal" /tmp/r1_mut_run.out; then
+          echo "   PASS  $label: refusal removed => the nest ran and was silently accepted"
           echo "         (on the real tree that same nest aborts; that is the fix)"
+      elif [ $ec -eq 0 ]; then
+          echo "   FAIL  $label: exit 0 but the nesting arm never RAN — nothing was proven"
+          rc=$((rc+1))
       else
           echo "   FAIL  $label: expected the mutant to ACCEPT the nest, got exit $ec"
           tail -3 /tmp/r1_mut_run.out | sed 's/^/         /'
@@ -173,16 +195,52 @@ assert 'MUTANT: nesting allowed' in io.open(p,encoding='utf-8').read()
 print('MUTATED')
 " "F13-NESTING" nesting
 
-arm "F15 - re-record after a quiesce-withdraw removed" "
+arm "BLOCKER - fail-closed removed (an unnamed thread may quiesce)" "
 import io
 p='$CHAIN'; s=io.open(p,encoding='utf-8').read()
-old='        t_recorded_reset_for_reresolve = true;'
+old='    if (t_epoch_name == nullptr) {'
 assert s.count(old)==1, ('anchor',s.count(old))
-s=s.replace(old,'        return;   // MUTANT: re-enter only, accusation never restored',1)
+s=s.replace(old,'    if (false) {   // MUTANT: unnamed threads may go offline',1)
 io.open(p,'w',encoding='utf-8',newline='').write(s)
-assert 'MUTANT: re-enter only' in io.open(p,encoding='utf-8').read()
+assert 'MUTANT: unnamed threads' in io.open(p,encoding='utf-8').read()
 print('MUTATED')
-" "F15: a resolve after a quiesce RE-RECORDS the accusation"
+" "F15: an ACCUSED thread cannot quiesce at all — the path is closed"
+# ⚠️ THE SIGNATURE IS F15's LINE, NOT THE BLOCKER ARM'S, AND THAT IS DELIBERATE.
+# Removing the fail-closed rule breaks the SAME property both arms rest on, and F15's
+# assertion runs first -- it exits the process immediately, because a suite that has
+# just proved quiesce does not refuse cannot trust anything after it. The earliest
+# observable failure is the honest signature; naming the later one would make this arm
+# fail for a reason unrelated to the fix.
+# ⚠️ THE F15 MUTANT WAS REMOVED, AND WHY MATTERS MORE THAN THE ARM DID.
+# Round 3 added a re-record on resolve-after-quiesce. Round 4's fail-closed rule
+# (EpochQuiesce refuses on a thread with no registered name) made that path
+# UNREACHABLE: a name comes only from EpochCheckpoint(name), which clears the
+# accusation, and a thread with a slot is never re-recorded. The mutant therefore
+# SURVIVED on the fixed tree -- correctly, because there is nothing left to break.
+# A surviving mutant is ambiguous (unreachable OR untested); here it is unreachable,
+# and the suite now asserts THAT instead of pretending to exercise the old path.
+# The round-4 fold subsumed the round-3 fold; keeping a green arm over it would have
+# hidden that.
+
+echo
+echo "=== POSITIVE CONTROL: the unmutated tree must REFUSE the illegal nest ==="
+# ⚠️ WITHOUT THIS, THE INVERTED ARM PROVES HALF A THING. It shows the mutant accepts
+# the nest; it does not show the real tree rejects it. The refusal aborts the process,
+# so it is probed in a CHILD process whose death is the evidence.
+if make epoch_nest_probe -j8 > /dev/null 2>&1; then
+  ./epoch_nest_probe > /tmp/nest_probe.out 2>&1; probe_rc=$?
+  if [ $probe_rc -ne 0 ] && grep -qF "t_epoch_offline" /tmp/nest_probe.out; then
+      echo "   PASS  control: the real tree ABORTS on offline-inside-offline (exit $probe_rc)"
+  else
+      echo "   FAIL  control: the real tree ACCEPTED the illegal nest (exit $probe_rc)"
+      tail -2 /tmp/nest_probe.out | sed 's/^/         /'
+      rc=$((rc+1))
+  fi
+else
+  echo "   FAIL  control: epoch_nest_probe did not build — the control cannot be skipped"
+  rc=$((rc+1))
+fi
+
 echo
 echo "=== the tree is back where it started ==="
 if same "$CHAIN" "$BAK"; then echo "   PASS  $CHAIN is byte-identical to the saved baseline"; else echo "   FAIL"; rc=$((rc+1)); fi

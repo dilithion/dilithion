@@ -3390,6 +3390,20 @@ void CHeadersManager::ValidationWorkerThread()
     while (m_validation_running.load()) {
         // Check if paused for fork recovery - wait until unpaused
         if (m_processing_paused.load()) {
+            // ⚠️ THE PAUSE PATH PINNED ONLINE FOR AS LONG AS THE PAUSE LASTED,
+            // and "never the duration of a wait" was false here. A fork recovery can
+            // hold this pause open indefinitely; the loop then spins 10 ms at a time
+            // with this thread's epoch frozen at its last checkpoint, pinning every
+            // entry unlinked meanwhile. It holds nothing in this branch -- it has not
+            // dequeued anything -- so it should not be in the calculation at all.
+            // Scoped to the sleep, so the next iteration re-enters before it can
+            // dequeue.
+            //
+            // (Round-4 panel named ONE of these. There are TWO, in
+            // ValidationWorkerThread and HeaderProcessorThread, with identical
+            // bodies -- the sibling was found by grepping the shape rather than
+            // fixing the line that was reported.)
+            EpochOfflineScope offline(&g_chainstate);
             std::this_thread::sleep_for(std::chrono::milliseconds(10));
             continue;
         }
@@ -3416,7 +3430,7 @@ void CHeadersManager::ValidationWorkerThread()
                 // quiescent-state calculation entirely, exactly as an exited thread is
                 // removed; the scope re-enters on EVERY exit path, before anything is
                 // resolved.
-                EpochOfflineScope offline(&g_chainstate, "headers-validation");
+                EpochOfflineScope offline(&g_chainstate);
                 m_validation_cv.wait(lock, [this] {
                     return !m_validation_running.load() || !m_validation_queue.empty() || m_processing_paused.load();
                 });
@@ -3522,6 +3536,20 @@ void CHeadersManager::HeaderProcessorThread()
 
         // Check if paused for fork recovery - wait until unpaused
         if (m_processing_paused.load()) {
+            // ⚠️ THE PAUSE PATH PINNED ONLINE FOR AS LONG AS THE PAUSE LASTED,
+            // and "never the duration of a wait" was false here. A fork recovery can
+            // hold this pause open indefinitely; the loop then spins 10 ms at a time
+            // with this thread's epoch frozen at its last checkpoint, pinning every
+            // entry unlinked meanwhile. It holds nothing in this branch -- it has not
+            // dequeued anything -- so it should not be in the calculation at all.
+            // Scoped to the sleep, so the next iteration re-enters before it can
+            // dequeue.
+            //
+            // (Round-4 panel named ONE of these. There are TWO, in
+            // ValidationWorkerThread and HeaderProcessorThread, with identical
+            // bodies -- the sibling was found by grepping the shape rather than
+            // fixing the line that was reported.)
+            EpochOfflineScope offline(&g_chainstate);
             std::this_thread::sleep_for(std::chrono::milliseconds(10));
             continue;
         }

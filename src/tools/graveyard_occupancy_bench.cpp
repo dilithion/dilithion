@@ -201,7 +201,7 @@ int main(int argc, char** argv)
             std::unique_lock<std::mutex> lk(park_m);
             if (parked_mode == 2) {
                 // THE FIX: leave the quiescent-state calculation while blocked.
-                EpochOfflineScope offline(&cs, "bench-parked");
+                EpochOfflineScope offline(&cs);
                 park_ready = true;
                 park_cv.notify_all();
                 park_cv.wait(lk, [&] { return park_release; });

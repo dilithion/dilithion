@@ -287,7 +287,7 @@ int main()
         std::thread sleeper([&] {
             cs.EpochCheckpoint("parked-thread");   // a registered participant
             std::unique_lock<std::mutex> lk(m);
-            EpochOfflineScope offline(&cs, "parked-thread");   // ...that goes offline
+            EpochOfflineScope offline(&cs);   // ...that goes offline
             parked = true;
             cv.notify_all();
             cv.wait(lk, [&] { return release; });
@@ -484,7 +484,7 @@ int main()
         std::thread t([&] {
             cs.EpochCheckpoint("f12-thread");
             {
-                EpochOfflineScope offline(&cs, "f12-thread");
+                EpochOfflineScope offline(&cs);
                 // (the "blocking call" — nothing resolves in here)
             }
             // Braced correctly, this resolve is ONLINE and must not be counted.
@@ -506,10 +506,10 @@ int main()
     {
         std::thread t([&] {
             cs.EpochCheckpoint("f13-thread");
-            EpochOfflineScope outer(&cs, "f13-thread");
+            EpochOfflineScope outer(&cs);
             {
                 // The legal nest: online inside offline. Must not fire.
-                EpochOnlineWindow inner(&cs, "f13-thread");
+                EpochOnlineWindow inner(&cs);
             }
         });
         t.join();
@@ -519,39 +519,66 @@ int main()
         // cannot catch a ConsensusInvariant and keep running.
     }
 
-    // ---- F15: A RESOLVE AFTER A QUIESCE MUST RE-PIN, NOT JUST RE-ENTER -------
+    // ---- F15, AS ROUND 4 LEFT IT: THE PATH IS NOW UNREACHABLE ---------------
     //
-    // kimi, round 3. EpochQuiesce withdraws the unregistered-resolver accusation
-    // (correctly — parking claims the thread holds nothing). If the thread then
-    // resolves anyway, the claim is false and BOTH halves must come back: the
-    // epoch re-entry AND the record. Without the record the census reports the
-    // thread as clean while it holds a pointer taken after promising it would not.
+    // Round 3 made a resolve-after-quiesce restore the withdrawn accusation. Round
+    // 4's fail-closed rule then made that path UNREACHABLE, and the honest thing is
+    // to assert the unreachability rather than keep an arm that cannot fail:
+    //
+    //   1. EpochQuiesce refuses unless the thread has a registered NAME;
+    //   2. a name is set only by EpochCheckpoint(name);
+    //   3. EpochCheckpoint clears the accusation, and a thread that has a slot is
+    //      never re-recorded (NoteIndexPointerResolved records only when the slot
+    //      is null).
+    //
+    // Therefore no thread can arrive at a quiesce still accused. THE MUTATION ARM
+    // FOR THE ROUND-3 FIX NOW SURVIVES, which is how this was noticed — a surviving
+    // mutant means the code is unreachable OR untested, and here it is the former.
     {
         std::mutex m; std::condition_variable cv;
         bool resolved = false, release = false;
-        std::thread t([&] {
+        std::thread accused([&] {
             CBlockIndex* p0 = cs.GetBlockIndex(gh);   // accused: slot 0, pinning
             (void)p0;
-            cs.EpochQuiesce();                        // withdraws the accusation
-            CBlockIndex* p1 = cs.GetBlockIndex(gh);   // ...and resolves anyway
+            const bool went_offline = cs.EpochQuiesce();   // must REFUSE
             {
                 std::unique_lock<std::mutex> lk(m);
-                resolved = (p1 != nullptr);
+                resolved = !went_offline;
                 cv.notify_all();
                 cv.wait(lk, [&] { return release; });
             }
         });
-        { std::unique_lock<std::mutex> lk(m); cv.wait(lk, [&] { return resolved; }); }
+        // ⚠️ BOUNDED, BECAUSE AN UNBOUNDED WAIT TURNS A FAILURE INTO A HANG. With
+        // the fail-closed rule mutated out, `resolved` never becomes true and this
+        // wait blocked forever -- the suite never reported, and the mutation harness
+        // that was running it hung too. A test whose failure mode is "no output" is
+        // a test that cannot report.
+        bool got_it = false;
+        {
+            std::unique_lock<std::mutex> lk(m);
+            got_it = cv.wait_for(lk, std::chrono::seconds(10), [&] { return resolved; });
+        }
+        chk("F15: an ACCUSED thread cannot quiesce at all — the path is closed",
+            got_it);
+        if (!got_it) {
+            // Release the worker so the process can still exit cleanly and report.
+            { std::lock_guard<std::mutex> lk(m); release = true; }
+            cv.notify_all();
+            accused.join();
+            std::cout << "\n  ===== deferred reclamation: FAIL (quiesce did not "
+                         "refuse for an unregistered thread) =====\n" << std::endl;
+            return 1;
+        }
 
         std::string detail;
-        chk("F15: a resolve after a quiesce RE-RECORDS the accusation",
+        chk("F15: so its accusation still stands and it still pins",
             cs.UnregisteredResolverThreads(detail) == 1);
 
         { std::lock_guard<std::mutex> lk(m); release = true; }
         cv.notify_all();
-        t.join();
+        accused.join();
         std::string d2;
-        chk("F15: and it is withdrawn again when that thread exits",
+        chk("F15: withdrawn on exit, as before",
             cs.UnregisteredResolverThreads(d2) == 0);
     }
 

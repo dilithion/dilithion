@@ -807,7 +807,7 @@ void CRPCServer::ServerThread() {
         // published just before it FREEZES for the whole wait and pins every
         // entry unlinked meanwhile. The scope re-enters before the request is
         // handled, which is the first thing that can resolve a pointer.
-            EpochOfflineScope offline(m_chainstate, "rpc-accept");
+            EpochOfflineScope offline(m_chainstate);
             clientSocket = accept(listenSock, (struct sockaddr*)&clientAddr, &clientLen);
         }
 
@@ -835,7 +835,7 @@ void CRPCServer::ServerThread() {
             // must mean "blocked in this one call", not "somewhere in this branch".
             SSL* ssl = nullptr;
             {
-                EpochOfflineScope offline(m_chainstate, "rpc-accept");
+                EpochOfflineScope offline(m_chainstate);
                 ssl = m_ssl_wrapper->AcceptSSL(clientSocket);
             }
             if (!ssl) {
@@ -917,7 +917,7 @@ void CRPCServer::WorkerThread() {
                 // quiescent-state calculation entirely, exactly as an exited thread is
                 // removed; the scope re-enters on EVERY exit path, before anything is
                 // resolved.
-                EpochOfflineScope offline(m_chainstate, "rpc-worker");
+                EpochOfflineScope offline(m_chainstate);
                 m_queueCV.wait(lock, [this] {
                     return !m_running || !m_clientQueue.empty();
                 });
@@ -1042,7 +1042,7 @@ void CRPCServer::HandleClient(int clientSocket) {
         // a response while walking the chain breaks it, and the breakage is silent
         // — the offline publication would then be a lie for the duration of the
         // write. Reviewed per site in the quiescence proof's scope-site table.
-        EpochOfflineScope offline(m_chainstate, "rpc-worker");
+        EpochOfflineScope offline(m_chainstate);
         if (ssl && m_ssl_wrapper) {
             return m_ssl_wrapper->SSLWrite(ssl, buffer, size);
         } else {
@@ -10188,9 +10188,9 @@ std::string CRPCServer::RPC_WaitForNewBlock(const std::string& params) {
     // the very counter added to find real ones, which is worse than no counter. The
     // scope must end exactly where the blocking call ends.
     {
-        EpochOfflineScope offline_park(&g_chainstate, "rpc-worker");
+        EpochOfflineScope offline_park(&g_chainstate);
         g_wait_cluster_cv.wait_until(lock, deadline, [&]() {
-            EpochOnlineWindow online(&g_chainstate, "rpc-worker");
+            EpochOnlineWindow online(&g_chainstate);
             return g_wait_cluster_shutdown.load(std::memory_order_relaxed) ||
                    get_tip().first != initial.first;
         });
@@ -10237,9 +10237,9 @@ std::string CRPCServer::RPC_WaitForBlock(const std::string& params) {
     // the very counter added to find real ones, which is worse than no counter. The
     // scope must end exactly where the blocking call ends.
     {
-        EpochOfflineScope offline_park(&g_chainstate, "rpc-worker");
+        EpochOfflineScope offline_park(&g_chainstate);
         g_wait_cluster_cv.wait_until(lock, deadline, [&]() {
-            EpochOnlineWindow online(&g_chainstate, "rpc-worker");
+            EpochOnlineWindow online(&g_chainstate);
             return g_wait_cluster_shutdown.load(std::memory_order_relaxed) ||
                    get_tip().first == wanted;
         });
@@ -10285,9 +10285,9 @@ std::string CRPCServer::RPC_WaitForBlockHeight(const std::string& params) {
     // the very counter added to find real ones, which is worse than no counter. The
     // scope must end exactly where the blocking call ends.
     {
-        EpochOfflineScope offline_park(&g_chainstate, "rpc-worker");
+        EpochOfflineScope offline_park(&g_chainstate);
         g_wait_cluster_cv.wait_until(lock, deadline, [&]() {
-            EpochOnlineWindow online(&g_chainstate, "rpc-worker");
+            EpochOnlineWindow online(&g_chainstate);
             return g_wait_cluster_shutdown.load(std::memory_order_relaxed) ||
                    get_tip().second >= target;
         });

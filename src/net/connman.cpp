@@ -905,7 +905,7 @@ void CConnman::ThreadMessageHandler() {
                 // quiescent-state calculation entirely, exactly as an exited thread is
                 // removed; the scope re-enters on EVERY exit path, before anything is
                 // resolved.
-                EpochOfflineScope offline(&g_chainstate, "p2p-msg-handler");
+                EpochOfflineScope offline(&g_chainstate);
                 condMsgProc.wait_for(lock, std::chrono::milliseconds(100), [this] {
                     return fMsgProcWake.load() || flagInterruptMsgProc.load();
                 });
@@ -987,7 +987,7 @@ void CConnman::HeadersWorkerThread() {
                 // quiescent-state calculation entirely, exactly as an exited thread is
                 // removed; the scope re-enters on EVERY exit path, before anything is
                 // resolved.
-                EpochOfflineScope offline(&g_chainstate, "p2p-headers-worker");
+                EpochOfflineScope offline(&g_chainstate);
                 m_headers_cv.wait(lock, [this] {
                     return !m_headers_queue.empty() || flagInterruptMsgProc.load();
                 });
@@ -1048,7 +1048,7 @@ void CConnman::BlocksWorkerThread() {
                 // quiescent-state calculation entirely, exactly as an exited thread is
                 // removed; the scope re-enters on EVERY exit path, before anything is
                 // resolved.
-                EpochOfflineScope offline(&g_chainstate, "p2p-blocks-worker");
+                EpochOfflineScope offline(&g_chainstate);
                 m_blocks_cv.wait(lock, [this] {
                     return !m_blocks_queue.empty() || flagInterruptMsgProc.load();
                 });
