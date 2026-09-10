@@ -622,54 +622,154 @@ detection of a different mistake, and any reading of it as protection is wrong.
   checkpoint; a scope acts on whatever the calling thread already is, and refuses
   fail-closed if that thread is unregistered.
 
-## ⚠️ OPEN ITEM — A PHANTOM ACCUSATION, MEASURED AT ~5%, NOT YET CLOSED
+## ⚠️ CLOSED — EVERY `thread_local` DESTRUCTOR ON THIS TOOLCHAIN RAN ON FREED MEMORY
 
-**This is the one thing on this branch I have not been able to fix, and it is stated
-here rather than left in a test's flake rate.**
+**This was the last open item on the branch. It is closed by mechanism, with probes,
+and it turned out to be worse than the phantom that led to it.**
 
-`deferred_reclamation_tests` fails roughly **3 runs in 50** (measured repeatedly: 2/30,
-3/40, 5/40, 3/50, 2/50, 3/50 across successive attempted fixes). Every failure has the
-same signature: `EpochRegistrationComplete` reports **one** thread that "obtained a
-CBlockIndex* and never checkpointed", naming a thread that has already exited and been
-joined. The accusation is never withdrawn, so the census fails permanently for the rest
-of the process.
+### What was observed
 
-**The product consequence, stated plainly: if this can happen in a node, the startup
-gate refuses to start a healthy node.** That is why it is an open item and not a test
-nuisance.
+`deferred_reclamation_tests` failed roughly **3 runs in 50** (measured repeatedly:
+2/30, 3/40, 5/40, 3/50, 2/50, 3/50 across six successive attempted fixes). Every
+failure had the same signature: `EpochRegistrationComplete` accusing **one** thread
+that had already exited and been joined, and never withdrawing it — so the census
+failed permanently for the rest of the process. A trace showed the withdrawal firing
+with `recorded == true` and the stored `id` **default-constructed**.
 
-### What has been ruled out, by measurement rather than reasoning
+### The mechanism
 
-| hypothesis | probe | result |
+On the toolchain this project ships on — MSYS2 `g++ 15.2`, `libwinpthread`,
+`libstdc++`, the node binary's own DLL set — **`thread_local` is emutls**:
+
+1. Each `thread_local` gets a `malloc(size + 8)` block per thread, the object at
+   `base + 8`, and emutls registers **one pthread key** whose destructor frees **all**
+   of that thread's blocks.
+2. libstdc++'s `__cxa_thread_atexit` has **no `__cxa_thread_atexit_impl`** to call on
+   this CRT (measured: absent from every `libmsvcrt*.a` and `libucrt*.a`), so it uses
+   the Win32 fallback — a per-thread list of `elt {dtor, obj, next, dll}`, 32 bytes,
+   one `new elt` per registration, held in a **second** pthread key.
+3. winpthreads runs key destructors in **key-index order**, and emutls' key is created
+   first, because the first TLS access necessarily precedes the first destructor
+   registration.
+
+**So every C++ `thread_local` destructor in this process runs after its own storage
+has been `free()`d.** Measured directly with `--wrap=free`: **300/300 and 600/600**,
+every run. Not a race — a certainty.
+
+Reading a freed block usually returns the old bytes, which is exactly why six fixes
+and 260 suite runs never pinned it down. It returns something else only when the block
+is **re-issued** inside the microsecond window between the free and the destructor —
+and the thing that re-issues it is **a thread STARTING**, whose first
+`__cxa_thread_atexit` allocates a 32-byte `elt` in the same size class. Plain heap
+churn on long-lived threads never did it (**0 in 4000**); a starting thread did, at
+**~2% per exit**.
+
+That also explains why every earlier probe read zero: *"300 accused threads,
+sequentially and in batches of 20"* has nothing **starting** at the instant one exits.
+**The rate is a function of concurrent thread start-up, not of the arms.**
+
+### ⚠️ The retirer was carrying the same defect with a much worse payload
+
+The phantom was the visible half. `~EpochSlotRetirer` read `slot` from the same freed
+block:
+
+| what `slot` read | rate per exit | consequence |
 |---|---|---|
-| TLS destructors don't always run | 300 accused threads, sequential and in batches of 20 | **0 leftover** — they run |
-| the 8-entry id cap drifts under overflow | same probe, 20 concurrent accused threads per batch | **0 leftover** — accounting holds |
-| `join()` returns before the destructor | polls added on every count assertion | narrowed, did not close |
-| an absolute global count is racy between arms | assertions converted to deltas and eventual polls | narrowed, did not close |
-| the id-keyed erase misses | count made authoritative, no lookup at teardown | **improved, did not close** |
-| a late TLS constructor clobbers `recorded` | `Touch()` forces construction before any write | did not close |
+| the correct pointer | ~95–98% | fine |
+| **NULL** | ~1–2% | the slot is **never retired** → it caps `DrainGraveyard`'s minimum for the process lifetime. The unbounded leak the retirer exists to prevent, now probabilistic. |
+| **a re-issued pointer** | ~1–3% | `slot->store(~0)` writes **eight 0xFF bytes through a wild pointer into a live foreign heap block**. |
 
-### What the trace actually showed
+**Reachable on any Windows node that mines, with no wiring bug at all.**
+`StopMining()` exits every worker on each template update and `StartMining()` restarts
+them immediately — precisely the starting-thread pressure above. `CTxIndex::SyncLoop`
+returns when it catches up; RPC, HTTP and websocket workers exit at `Stop()`.
 
-With per-thread instrumentation the withdrawal fired with `recorded == true` and the
-stored `id` **default-constructed** — printed by libstdc++ as *"thread::id of a
-non-executing thread"*. So the object reached its destructor with one member set and
-another cleared. The count-based fix removes the dependency on that id, and the
-failure rate dropped but did not reach zero, which means at least one further path
-loses the record entirely.
+The **pre-gate phantom** — a node refusing to start — is *not* reachable today: the
+only threads that exit before the gate are the `std::async` hash workers and the
+RandomX init threads, and neither resolves a `CBlockIndex*`. It is latent, and it
+becomes live the moment an unwired resolver thread is added — which is the exact class
+the detector exists to catch.
 
-### What is needed next, and it is not another attempt by me
+Linux/glibc has `__cxa_thread_atexit_impl` and is unaffected. **This is the Windows
+binary.**
 
-Six fixes aimed at this from the same angle have moved the rate around without closing
-it — a review modality at its yield limit. **This needs a decorrelated lens on the
-`UnregisteredRecordScope` lifecycle specifically**: a fresh reader, or a seat, with the
-recording path, the two withdrawal paths, the registry, and the MinGW/emutls TLS model
-in front of them. The `count-is-authoritative` change is kept because it is right on its
-own terms — a teardown path must not depend on a lookup key surviving — but it is not
-the whole answer.
+### Why none of the six earlier fixes could have worked
 
-**Nothing in this open item affects the ASan verdict**, which exercises the graveyard's
-free rule and not the census.
+| attempt | what it changed | why it could not close |
+|---|---|---|
+| polls after `join()` | when the count was read | the block is freed before the destructor either way |
+| deltas instead of absolute counts | what the arms asserted | same |
+| id-keyed erase → authoritative count | **what** was read from the freed block | narrowed it; the block is still freed |
+| `Touch()` to force construction | when the object was constructed | construction was never the problem |
+| the 8-entry cap accounting | a diagnostic list | never load-bearing |
+| TLS-destructor reliability probes | 300/300, 600/600 clean | correct, and irrelevant: the destructors DO run |
+
+Every one of them changed **what** is read from the freed block, not **that** it is
+freed. Six attempts from the same angle is a review modality at its yield limit; the
+close came from a decorrelated read with the toolchain's memory model in front of it,
+not from a seventh attempt.
+
+### The fix
+
+The exit hook must not touch emutls storage **at all**. Per-thread state now lives in
+a heap `EpochThreadRecord` owned by **our own `pthread_key_create`**, whose destructor
+is **handed the record as its argument** — pthread key values live in the pthread TLS
+array, not in emutls. It works for the unwired ninth thread too, which is the point:
+an explicit "withdraw at thread exit" call would require the very wiring whose absence
+is being detected.
+
+The two hooks were also **merged into one**. Their being separate was itself a trap: a
+thread's accusation was withdrawn by one destructor and its slot retired by another, so
+the record count could reach zero while a slot still sat at 0 pinning the whole
+graveyard. One hook, one order, one place to read.
+
+Kept from the earlier work because it is right on its own terms: **the count is
+authoritative and the id list is diagnostics.** A teardown path must not depend on a
+lookup key surviving.
+
+Also fixed, found by the same read: the **re-record branch never incremented `live`**
+while every withdrawal path decrements it — so a thread that quiesced and then resolved
+anyway **ate another thread's accusation**. An under-count, the opposite direction to
+the phantom and the more dangerous one, because a cancelled accusation is a real
+leaking thread the census stops reporting.
+
+### The evidence
+
+| check | before | after |
+|---|---|---|
+| `deferred_reclamation_tests`, 50 runs | ~47/50 | **50/50** |
+| the TLS-teardown arm (2000 accused + 2000 participant exits under 8000 short-lived thread starts) | **the process died — every run, both halves independently** | **PASS, 3/3** |
+| `scripts/check_thread_local_guard.sh` | — | **PASS**, 6 declarations, 0 unguarded; positive control fires |
+
+The arm is in the suite permanently. It is deliberately the **last** arm, because it is
+the only one that can leave the process dirty.
+
+### The guard, because a comment has no decay function
+
+Every `thread_local` in `src/` (tests excluded) must now be **trivially destructible**
+and must carry a `static_assert` saying so **within six lines of its declaration** —
+tight on purpose, so moving a declaration cannot leave its proof behind.
+`scripts/check_thread_local_guard.sh` enforces it, fails closed if it finds **zero**
+declarations (a broken instrument must not read as a pass), and has **no allowlist**: a
+`thread_local` that cannot satisfy the assert is one that must not exist.
+
+**It found a third production instance on its first run.** `src/net/connman.cpp` held a
+`static thread_local std::random_device`, which is **not** trivially destructible on
+this toolchain (measured; `std::mt19937_64` is) — so `~random_device()` was running
+`_M_fini()` on freed storage at every connman thread exit. Now a leaked pointer, one
+per thread, bounded by the thread count.
+
+### What remains unsettled, and does not gate this
+
+* Why plain `malloc`/`free` churn on long-lived threads never re-issued the block while
+  a starting thread did (0/4000 vs ~4%). LFH per-thread affinity is the hypothesis; not
+  measured, and it does not change the fix.
+* Pthread key indices and the `elt` layout are read from the libgcc / libstdc++ /
+  winpthreads sources rather than printed. The fact they predict — storage freed before
+  the destructor — is measured at 100%.
+* The `--wrap=free` tripwire is deliberately **not** ported into the build. It belongs
+  in a probe, not in a shipping link line.
+
 
 ## WIRING CENSUS — checkpoints, offline scopes, and declared counts
 

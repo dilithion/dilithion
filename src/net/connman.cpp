@@ -5,6 +5,7 @@
 // See: docs/developer/LIBEVENT-NETWORKING-PORT-PLAN.md
 
 #include <net/connman.h>
+#include <type_traits>   // static_assert on thread_local destructibility
 #include <net/netaddress.h>
 #include <net/peers.h>
 #include <net/net.h>
@@ -2093,8 +2094,27 @@ void CConnman::InactivityCheck() {
 
                 if (should_ping && m_msg_processor) {
                     // Generate random nonce for ping (CWE-676 fix: use std::random_device instead of rand())
-                    static thread_local std::random_device rd;
-                    uint64_t nonce = (static_cast<uint64_t>(rd()) << 32) | rd();
+                    //
+                    // ⚠️ A POINTER, BECAUSE A thread_local DESTRUCTOR RUNS ON FREED
+                    // STORAGE ON THIS TOOLCHAIN. GCC on mingw-w64 implements
+                    // thread_local with emutls, whose pthread key is destroyed
+                    // BEFORE the key libstdc++ uses to run C++ destructors -- so by
+                    // the time ~random_device() ran it was reading a free()d block,
+                    // and `_M_fini()` would act on whatever the heap had put there.
+                    // Measured on this toolchain: std::random_device is NOT trivially
+                    // destructible (std::mt19937_64 is), and every thread_local
+                    // destructor here runs post-free, 300/300.
+                    //
+                    // Found by scripts/check_thread_local_guard.sh, which was written
+                    // for the same defect class in the epoch code and immediately
+                    // named this site -- the guard doing its job on its first run.
+                    // Leaked deliberately: one device per connman thread, bounded by
+                    // the thread count, for the life of the process. A raw pointer is
+                    // trivially destructible, so nothing of ours runs at exit.
+                    static thread_local std::random_device* rd = new std::random_device();
+                    static_assert(std::is_trivially_destructible<std::random_device*>::value,
+                                  "a thread_local's destructor would run on freed storage here");
+                    uint64_t nonce = (static_cast<uint64_t>((*rd)()) << 32) | (*rd)();
                     CNetMessage ping_msg = m_msg_processor->CreatePingMessage(nonce);
                     PushMessage(node.get(), ping_msg);
                     last_ping_sent[node_id] = now;

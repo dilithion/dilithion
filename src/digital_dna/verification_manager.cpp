@@ -2,6 +2,7 @@
 // Distributed under the MIT software license
 
 #include <digital_dna/verification_manager.h>
+#include <type_traits>   // static_assert on thread_local destructibility
 #include <digital_dna/dna_registry_db.h>
 #include <digital_dna/trust_score.h>
 #include <dfmp/mik.h>
@@ -39,6 +40,18 @@ void VerificationManager::SetMyMIK(const std::array<uint8_t, 20>& mik,
 
 uint64_t VerificationManager::RandomNonce() {
     thread_local std::mt19937_64 rng(std::chrono::steady_clock::now().time_since_epoch().count());
+    static_assert(std::is_trivially_destructible<std::mt19937_64>::value,
+                  "a thread_local's destructor would run on freed storage here");
+    // ⚠️ On this toolchain a thread_local's destructor runs AFTER its storage has
+    // been free()d: GCC on mingw-w64 implements thread_local with emutls, and
+    // emutls' pthread key is destroyed before the key libstdc++ uses to run C++
+    // destructors. So a thread_local that is not trivially destructible reads and
+    // acts on freed memory at every thread exit. mt19937_64 has no destructor to
+    // run -- asserted rather than assumed, and enforced tree-wide by
+    // scripts/check_thread_local_guard.sh. The assert sits ON the declaration
+    // deliberately: the guard requires it within six lines, so that moving the
+    // declaration cannot leave the proof behind. See EpochThreadRecord in
+    // src/consensus/chain.cpp for what to do when state DOES need an exit hook.
     return rng();
 }
 
