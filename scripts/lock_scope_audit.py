@@ -25,6 +25,37 @@ UNLOCK = re.compile(r'\b(\w+)\s*\.unlock\s*\(\s*\)')
 RELOCK = re.compile(r'\b(\w+)\s*\.lock\s*\(\s*\)')
 FUNC   = re.compile(r'^[A-Za-z_][A-Za-z0-9_:<>,&*\s]*::(\w+)\s*\(')
 
+# ---------------------------------------------------------------------------
+# ALLOWLIST - (file, function, call, mutex) -> exact expected count.
+#
+# REVIEW FIX (#197 confirming reader): this was a per-FILE allowlist in the shell
+# wrapper, so a NEW violation appended to an already-listed file passed silently
+# - and the three listed files are the three largest TUs in the tree. "A new site
+# fails until someone classifies it" was FALSE exactly where it mattered most.
+# It is now a TUPLE with an exact count, so BOTH a different-shaped site AND one
+# MORE of an allowed shape fail.
+#
+# It lives here rather than in the wrapper because an allowlist is DATA, not
+# string manipulation - expressing it in shell cost two quoting bugs.
+#
+# Each entry carries its ARGUMENT, not just its name.
+ALLOWED = {
+    # P2P-14/15 removed the cs_main -> cs_headers direction (chain.cpp:2637), so
+    # only one direction exists and there is no cycle to close.
+    ('src/net/headers_manager.cpp', 'OnBlockActivated', 'GetBlockHeightByHash', 'cs_headers'): 1,
+
+    # EVERY other holder of g_pendingMinerWinsMutex is a bare push_back touching
+    # no chainstate, so no thread ever waits on cs_main while holding it unless it
+    # ALREADY owns cs_main - the only holder that reaches the chainstate is itself
+    # inside a block-connect callback, where cs_main is held and recursive. No
+    # thread can supply the opposite order.
+    ('src/node/dilithion-node.cpp', '?', 'GetTip', 'g_pendingMinerWinsMutex'): 1,
+    ('src/node/dilithion-node.cpp', '?', 'GetBlockIndex', 'g_pendingMinerWinsMutex'): 1,
+    ('src/node/dilv-node.cpp', '?', 'GetTip', 'g_pendingMinerWinsMutex'): 1,
+    ('src/node/dilv-node.cpp', '?', 'GetBlockIndex', 'g_pendingMinerWinsMutex'): 1,
+}
+
+
 def cs_main_accessors(chain_cpp):
     """Every CChainState method whose body acquires cs_main. Generated, not guessed."""
     src = io.open(chain_cpp, encoding='utf-8', errors='replace').read().split('\n')
@@ -88,7 +119,7 @@ def main(argv):
             if f.endswith('.cpp') and f != 'chain.cpp':
                 targets.append(os.path.join(dirpath, f))
 
-    total = 0
+    total, counts = 0, {}
     for t in sorted(targets):
         f = scan(t, acc)
         if f:
@@ -97,8 +128,33 @@ def main(argv):
             print(f"\n*** {rel}: {len(f)} chainstate call(s) inside a PRIVATE-mutex scope")
             for ln, fn, call, mxs in f:
                 print(f"   :{ln:<6} {fn:<30} g_chainstate.{call}()   holding: {','.join(mxs)}")
+                for mx in mxs:
+                    k = (rel, fn, call, mx)
+                    counts[k] = counts.get(k, 0) + 1
     print(f"\nfiles scanned: {len(targets)}   sites found: {total}")
-    return 1 if total else 0
+
+    unclassified, overcount = [], []
+    for key, got in counts.items():
+        want = ALLOWED.get(key, 0)
+        if want == 0:   unclassified.append((key, got))
+        elif got > want: overcount.append((key, got, want))
+
+    if unclassified or overcount:
+        print('')
+        for (f, fn, call, mx), got in unclassified:
+            print(f'FAIL: UNCLASSIFIED - {f} :: {fn} holds {mx} across g_chainstate.{call}()  x{got}')
+            print( '      One half of an AB-BA with the cs_main -> <private mutex> edge the block')
+            print( '      connect/disconnect callbacks create (P2P-17). Fix with unique_lock +')
+            print( '      unlock() across the call, as CCoinStatsIndex::WriteBlock, its Init(),')
+            print( '      and tx_index.cpp:520 do. If genuinely safe add the TUPLE to ALLOWED')
+            print( '      **with the argument**.')
+        for (f, fn, call, mx), got, want in overcount:
+            print(f'FAIL: {f} has {got} sites of shape ({fn}/{call}/{mx}), expected {want}.')
+            print( '      An EXTRA site of an allowed shape is still a new site - classify it.')
+        return 1
+
+    print('OK: every site is classified (tuple + exact count)')
+    return 0
 
 if __name__ == '__main__':
     sys.exit(main(sys.argv))
