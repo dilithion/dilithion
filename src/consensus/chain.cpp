@@ -3563,10 +3563,26 @@ bool CChainState::ConnectTip(CBlockIndex* pindex, const CBlock& block, bool skip
     // NOTE: cs_main IS held during these callbacks. ConnectTip is called
     // from ActivateBestChain (line 208) and reorg paths (lines 663/749/773
     // /822) which all acquire cs_main; the lock is held for the full
-    // duration of ConnectTip. (Compare with DisconnectTip, which releases
-    // cs_main BEFORE invoking its callbacks -- see line ~1425.) Callbacks
-    // that touch their own subsystem locks (cs_wallet, etc.) must order
-    // them consistently with cs_main to avoid deadlock.
+    // duration of ConnectTip.
+    //
+    // ⚠️ THIS COMMENT USED TO SEND THE READER TO A CLAIM THAT HAD ALREADY BEEN
+    // RETRACTED. It said "(Compare with DisconnectTip, which releases cs_main
+    // BEFORE invoking its callbacks -- see line ~1425.)" -- and the disconnect
+    // site itself refutes exactly that, in this file, at the comment above
+    // m_blockDisconnectCallbacks: cs_main is a RECURSIVE mutex, DisconnectTip is
+    // called from ActivateBestChain which holds it at FUNCTION scope, and an
+    // inner scope ending only decrements the recursion count. So BOTH callback
+    // families fire with cs_main HELD. There is no contrast to draw.
+    //
+    // The correction landed at the disconnect site and not at this pointer to
+    // it, so anyone starting here read a retracted claim as live -- a comment
+    // has no decay function, and a fix aimed at one site leaves its siblings.
+    //
+    // Callbacks that touch their own subsystem locks (cs_wallet, etc.) must
+    // order them consistently with cs_main to avoid deadlock. The tip-notify
+    // callback is the worked example: it must NOT take g_wait_cluster_mtx here,
+    // because the wait-* RPC predicates take that mutex and then cs_main. See
+    // CRPCServer::NotifyBlockTipChanged in src/rpc/server.cpp.
     // IBD OPTIMIZATION: Pass cached hash to avoid RandomX recomputation
     for (size_t i = 0; i < m_blockConnectCallbacks.size(); ++i) {
         try {
