@@ -3136,6 +3136,28 @@ load_genesis_block:  // Bug #29: Label for automatic retry after blockchain wipe
         // Phase 2: Initialize async block validation queue for IBD performance
         std::cout << "Initializing async block validation queue..." << std::endl;
         g_node_context.validation_queue = std::make_unique<CBlockValidationQueue>(g_chainstate, blockchain);
+        // PR #129 MEDIUM-2: register the queue's pending-block-hash provider so
+        // cap eviction pins queued/in-flight blocks AND their ancestors (prevents
+        // a cascade from freeing a queued block's parent and stalling fork
+        // adoption). Registered BEFORE Start() so the provider is live for the
+        // first eviction. The captured raw pointer is valid for the queue's
+        // lifetime; on shutdown the queue is reset before g_chainstate is torn
+        // down. (If the queue is ever reset earlier, clear the provider first.)
+        //
+        // HIGH-2 (PR #129 round-3 red-team): this registration was present in
+        // dilithion-node.cpp and MISSING here, so on dilv-node the provider was
+        // null, eviction clause (d) was skipped entirely, and the whole MEDIUM-2
+        // liveness fix — GetPendingBlockHashes(), the provider typedef, the
+        // lock-order documentation, Tests 9 and 10 — was dead code on the DilV
+        // binary. DilV has 45s blocks against DIL's 240s, so it is precisely the
+        // chain that reaches cap pressure FIRST. The twin-binary gap: a fix landed
+        // on dilithion-node.cpp and not on its released twin. Any future change to
+        // the block above must be mirrored here.
+        {
+            CBlockValidationQueue* vq = g_node_context.validation_queue.get();
+            g_chainstate.RegisterPendingBlockHashProvider(
+                [vq]() -> std::set<uint256> { return vq->GetPendingBlockHashes(); });
+        }
         if (g_node_context.validation_queue->Start()) {
             std::cout << "  [OK] Async block validation queue started" << std::endl;
         } else {
