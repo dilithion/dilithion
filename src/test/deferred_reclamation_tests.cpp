@@ -31,12 +31,15 @@
 #include <node/block_index.h>
 #include <primitives/block.h>
 
+#include <cstdlib>
 #include <cstring>
 #include <iostream>
 #include <string>
 #include <vector>
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <functional>
 #include <mutex>
 #include <thread>
 
@@ -68,8 +71,30 @@ int g_failed = 0;
 // Retry the drain to a deadline instead. The property is that reclamation becomes
 // possible promptly after the thread ends, not that it is possible in the same
 // instruction.
-size_t DrainUntil(CChainState& cs, size_t expected, const char* name,
-                  size_t live_expected, int timeout_ms = 3000)
+// ⚠️ IT RETURNS A VERDICT, NOT A COUNT, AND BOTH REASONS ARE MEASURED FAILURES OF
+// THE EARLIER SIGNATURE. It used to return `freed` and every caller wrote
+// `DrainUntil(...) == 1`, which was wrong in two directions at once:
+//
+//   (a) THE SETTLE LOOP BELOW TIMED OUT SILENTLY and fell through to the drain. The
+//       assertion that then failed said "the entry drains" while the actual cause
+//       was a thread from another arm that had not finished retiring. It could not
+//       turn a failure into a pass -- but it MISATTRIBUTED every one of them, and a
+//       misattributed diagnostic is what sends the next reader to the wrong file.
+//       It now says which half failed, in the message.
+//
+//   (b) `== expected` WAS A FALSE-FAIL WAITING TO HAPPEN. The loop breaks on
+//       `freed >= expected` and returns whatever that call yielded, so a straggler
+//       entry left in the graveyard by an earlier arm could make it return 2 against
+//       an `== 1` assertion and redden a correct tree. The property under test is
+//       "the entry becomes reclaimable", which is `>=`; anything above `expected` is
+//       reported as a NOTE so the drift is visible rather than either silent or
+//       fatal.
+//
+// Neither could produce a false PASS. They are recorded here because a suite whose
+// failures point at the wrong mechanism is the specific way this defect class has
+// cost time before.
+bool DrainUntil(CChainState& cs, size_t expected, const char* name,
+                size_t live_expected, int timeout_ms = 3000)
 {
     // ⚠️ ANY slot-0 THREAD PINS THE WHOLE GRAVEYARD, SO A STRAGGLER FROM ANOTHER ARM
     // BLOCKS THIS ONE. That is the mechanism working exactly as designed -- one
@@ -93,6 +118,15 @@ size_t DrainUntil(CChainState& cs, size_t expected, const char* name,
                std::chrono::steady_clock::now() < settle) {
             std::this_thread::sleep_for(std::chrono::milliseconds(5));
         }
+        const size_t live_now = cs.LiveEpochParticipants();
+        if (live_now > live_expected) {
+            // (a): say so, and say it is NOT the drain that failed.
+            std::cerr << "    DrainUntil: SETTLE TIMED OUT after " << timeout_ms
+                      << " ms -- " << live_now << " live participants, expected "
+                      << live_expected << ". The drain below is BLOCKED BY A "
+                      << "STRAGGLER, not by the mechanism under test." << std::endl;
+            return false;
+        }
     }
 
     const auto deadline = std::chrono::steady_clock::now() +
@@ -101,8 +135,21 @@ size_t DrainUntil(CChainState& cs, size_t expected, const char* name,
     for (;;) {
         cs.EpochCheckpoint(name);          // this thread holds nothing here
         freed += cs.DrainGraveyard();
-        if (freed >= expected) return freed;
-        if (std::chrono::steady_clock::now() >= deadline) return freed;
+        if (freed >= expected) {
+            if (freed > expected) {
+                // (b): visible, not fatal -- see the note above.
+                std::cerr << "    DrainUntil: NOTE freed " << freed << ", expected "
+                          << expected << " (an earlier arm left entries; the "
+                          << "property asserted is >=)" << std::endl;
+            }
+            return true;
+        }
+        if (std::chrono::steady_clock::now() >= deadline) {
+            std::cerr << "    DrainUntil: DRAIN TIMED OUT after " << timeout_ms
+                      << " ms -- freed " << freed << " of " << expected
+                      << " with the participant count settled." << std::endl;
+            return false;
+        }
         std::this_thread::sleep_for(std::chrono::milliseconds(5));
     }
 }
@@ -328,7 +375,7 @@ int main()
         chk("exited thread: the entry is in the graveyard", cs.GraveyardSize() == 1);
 
         chk("exited thread: A THREAD THAT HAS EXITED DOES NOT PIN THE GRAVEYARD",
-            DrainUntil(cs, 1, "test-main", /*live_expected=*/1) == 1);
+            DrainUntil(cs, 1, "test-main", /*live_expected=*/1));
         chk("exited thread: the graveyard is empty again", cs.GraveyardSize() == 0);
     }
 
@@ -375,7 +422,7 @@ int main()
         cv.notify_all();
         rogue.join();                   // its slot retires on exit
         chk("F1: once that thread is gone, the entry drains",
-            DrainUntil(cs, 1, "test-main", /*live_expected=*/1) == 1);
+            DrainUntil(cs, 1, "test-main", /*live_expected=*/1));
     }
 
     // ---- F2: A PARKED PARTICIPANT MUST NOT PIN ------------------------------
@@ -844,8 +891,11 @@ int main()
             const bool ok = WaitForCensus(cs, true);
             if (!ok) {
                 // Print WHY on failure: a census failure that says only "false" costs
-                // a debugging cycle, and this one is currently intermittent (see the
-                // OPEN ITEM in the quiescence proof).
+                // a debugging cycle. This one used to be intermittent -- an exited
+                // thread's accusation was never withdrawn, because the exit hook was
+                // reading its own freed storage. Closed; the diagnostic stays,
+                // because the next such failure will not announce its mechanism
+                // either. See the CLOSED section in the quiescence proof.
                 std::string diag;
                 cs.EpochRegistrationComplete(diag);
                 std::cerr << "  census diagnostic: " << diag << std::endl;
@@ -925,6 +975,171 @@ int main()
         chk("detector: the accusation is WITHDRAWN once that thread checkpoints",
             WaitForUnregisteredDelta(cs, detector_base, 0));
         chk("detector: and the census passes again", WaitForCensus(cs, true));
+    }
+
+    // ---- THE TLS-TEARDOWN ARM: EXIT HOOKS RUN ON FREED STORAGE ---------------
+    //
+    // ⚠️ THIS IS THE ARM THAT WOULD HAVE FOUND THE PHANTOM, AND IT IS LAST BECAUSE
+    // IT IS THE ONLY ONE THAT CAN LEAVE THE PROCESS DIRTY. It reproduces, in the
+    // suite, the defect a decorrelated read finally isolated: on this toolchain
+    // (MSYS2 g++ 15.2 / libwinpthread / libstdc++ -- the node's own DLL set)
+    // `thread_local` is emutls, and winpthreads runs the emutls key's destructor
+    // BEFORE the one libstdc++ uses for C++ destructors. So EVERY thread_local
+    // destructor in this process runs AFTER its own storage was free()d. Measured
+    // by the reader at 300/300 and 600/600 with `--wrap=free`; not a race, a
+    // certainty.
+    //
+    // Reading a freed 32-byte block usually returns the old bytes, which is why six
+    // fixes and 260 suite runs never pinned it down. It returns something else only
+    // when the block is RE-ISSUED inside the microsecond window between the free and
+    // the destructor -- and the thing that re-issues it is A THREAD STARTING, whose
+    // first `__cxa_thread_atexit` allocates a 32-byte `elt` in the same size class.
+    // Plain heap churn does not do it (0 in 4000); a starting thread does (~2%).
+    //
+    // ⚠️ WHICH IS EXACTLY WHY EVERY EARLIER PROBE READ ZERO. "300 accused threads,
+    // sequentially and in batches of 20" has nothing STARTING at the instant one
+    // exits. The rate is a function of concurrent thread start-up, not of the arms,
+    // so the arm has to create that pressure deliberately: 4 churn threads that do
+    // nothing but start and join short-lived threads.
+    //
+    // WHAT IT ASSERTS -- both halves, because the two destructors fail differently:
+    //   * the RECORD path: an accused thread whose `recorded` byte is re-issued
+    //     reads FALSE, returns early, and never decrements `live`. The accusation
+    //     is permanent and the startup gate refuses a healthy node.
+    //   * the RETIRER path, which is worse: `slot` reads NULL (~1-2% per exit) and
+    //     the slot is never retired, capping DrainGraveyard's minimum for the
+    //     process lifetime -- or reads a re-issued POINTER (~1-3%) and
+    //     `slot->store(~0)` writes eight 0xFF bytes into a live foreign heap block.
+    //
+    // Predicted RED on the pre-fix tree at ~30 phantoms and ~40 unretired slots per
+    // 2000; GREEN once the per-thread record is owned by a pthread key whose
+    // destructor takes it as an ARGUMENT and reads no thread_local at all.
+    {
+        std::string base_detail;
+        const size_t rec_base  = cs.UnregisteredResolverThreads(base_detail);
+        const size_t live_base = cs.LiveEpochParticipants();
+
+        // Overridable so the two halves can be run in ISOLATION. They fail through
+        // different destructors -- the record path returns early and leaves a
+        // permanent accusation, the retirer path stores through a re-issued pointer
+        // -- and separating them is the difference between "the arm is red" and
+        // knowing which hook did it.
+        auto env_int = [](const char* k, int dflt) {
+            const char* v = std::getenv(k);
+            return v != nullptr ? std::atoi(v) : dflt;
+        };
+        const int kAccused = env_int("DIL_TLS_ARM_ACCUSED", 2000);
+        const int kMembers = env_int("DIL_TLS_ARM_MEMBERS", 2000);
+        const int kChurn   = env_int("DIL_TLS_ARM_CHURN", 4);
+        // Matches the pressure the decorrelated probe measured the defect at
+        // (~8000 short-lived thread starts); see the budget note in the churn loop.
+        const long long kChurnBudget = env_int("DIL_TLS_ARM_CHURN_BUDGET", 8000);
+
+        std::cout << "  [TLS-teardown arm] accused=" << kAccused
+                  << " members=" << kMembers << " churn=" << kChurn
+                  << " -- baselines rec=" << rec_base << " live=" << live_base
+                  << std::endl;
+
+        // ⚠️ THE CHURN IS THROTTLED, AND THE FIRST VERSION OF THIS ARM WAS NOT.
+        // Four threads spawning as fast as they could, on top of 4000 sequential
+        // exits, exhausted the process: `std::thread` began throwing
+        // `system_error: Invalid argument` and the suite died on an uncaught
+        // exception before the arm could assert anything. An arm that kills the
+        // process it is measuring reports nothing at all -- worse than a red.
+        // A 1 ms pacing keeps the re-issue pressure (which needs a start INSIDE a
+        // microsecond window, not a high absolute rate) while staying inside the
+        // handle budget. Thread creation is wrapped so exhaustion is a FAIL with a
+        // reason, never a terminate.
+        std::atomic<bool> churn_stop{false};
+        std::atomic<int> spawn_failures{0};
+        std::atomic<long long> churn_spawns{0};
+        auto spawn_join = [&](const char* what, const std::function<void()>& body) {
+            try {
+                std::thread t(body);
+                t.join();
+                return true;
+            } catch (const std::system_error& e) {
+                if (spawn_failures.fetch_add(1) == 0) {
+                    std::cerr << "    TLS-teardown arm: could not start a " << what
+                              << " thread (" << e.what() << ") -- the arm is "
+                              << "resource-bound on this host, not measuring."
+                              << std::endl;
+                }
+                return false;
+            }
+        };
+
+        std::vector<std::thread> churners;
+        for (int c = 0; c < kChurn; ++c) {
+            churners.emplace_back([&] {
+                while (!churn_stop.load(std::memory_order_relaxed)) {
+                    // Short-lived threads that odr-use a thread_local WITH a
+                    // destructor -- that registration is the 32-byte allocation
+                    // which re-issues an exiting thread's freed block.
+                    // ⚠️ A BUDGET, NOT A SLEEP, AND THE DIFFERENCE IS THE ARM'S
+                    // POWER. The first throttle was 1 ms between spawns, which held
+                    // the process together but produced only ~120 spawns across the
+                    // whole arm -- two orders of magnitude below the pressure the
+                    // reader's probe needed, so the arm's ability to detect a
+                    // REGRESSION would have decayed silently even though it caught
+                    // the defect it was written for. A budget keeps the spawns dense
+                    // (which is what re-issues a freed block) while capping the
+                    // handle count that killed the unthrottled version.
+                    if (churn_spawns.fetch_add(1, std::memory_order_relaxed) >=
+                        kChurnBudget) {
+                        break;
+                    }
+                    if (!spawn_join("churn", [&] { cs.EpochCheckpoint("churn"); })) {
+                        break;
+                    }
+                }
+            });
+        }
+
+        for (int i = 0; i < kAccused; ++i) {
+            spawn_join("accused", [&] { (void)cs.GetBlockIndex(gh); });
+        }
+        for (int i = 0; i < kMembers; ++i) {
+            spawn_join("member", [&] { cs.EpochCheckpoint("arm-member"); });
+        }
+
+        churn_stop.store(true, std::memory_order_relaxed);
+        for (auto& t : churners) t.join();
+
+        // Both counts must come back to where they started. Polled, because the
+        // exit hooks are asynchronous with join() -- that much was always true and
+        // is not the defect.
+        const auto deadline = std::chrono::steady_clock::now() +
+                              std::chrono::seconds(5);
+        size_t rec_now = 0, live_now = 0;
+        for (;;) {
+            std::string d;
+            rec_now  = cs.UnregisteredResolverThreads(d);
+            live_now = cs.LiveEpochParticipants();
+            if (rec_now <= rec_base && live_now <= live_base) break;
+            if (std::chrono::steady_clock::now() >= deadline) break;
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        }
+
+        std::cout << "  [TLS-teardown arm] " << churn_spawns.load()
+                  << " churn spawns, " << spawn_failures.load()
+                  << " spawn failures" << std::endl;
+        chk("TLS teardown: the arm actually ran (no thread-resource exhaustion)",
+            spawn_failures.load() == 0);
+
+        if (rec_now > rec_base || live_now > live_base) {
+            std::cerr << "    TLS-teardown arm: " << (rec_now - rec_base)
+                      << " PHANTOM accusation(s) of " << kAccused
+                      << " accused exits, and " << (live_now - live_base)
+                      << " UNRETIRED slot(s) of " << kMembers
+                      << " participant exits." << std::endl;
+        }
+        chk("TLS teardown: an accused thread that EXITS withdraws its accusation, "
+            "every time, under concurrent thread start-up",
+            rec_now <= rec_base);
+        chk("TLS teardown: a participant thread that EXITS retires its slot, "
+            "every time, under concurrent thread start-up",
+            live_now <= live_base);
     }
 
     Dilithion::g_chainParams = saved;
