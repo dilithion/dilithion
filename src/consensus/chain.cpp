@@ -25,6 +25,8 @@
 #include <mutex>        // std::once_flag (chain selector path startup log)
 #include <sstream>      // std::ostringstream (unregistered-resolver diagnostic)
 #include <set>
+#include <pthread.h>
+#include <type_traits>
 #include <thread>
 #include <chrono>
 
@@ -418,40 +420,130 @@ EpochRegistry& Registry()
 
 // A retired thread's slot value. The slots are deliberately leaked so a drain on
 // another thread can read them after the owner exits — but a DEAD thread's stale
-// epoch went on capping the minimum forever; see EpochSlotRetirer below.
+// epoch went on capping the minimum forever; see EpochThreadRecordDtor below.
 constexpr uint64_t EPOCH_SLOT_RETIRED = ~uint64_t{0};
 
-// ⚠️ THE CONSTRUCTOR IS DELIBERATELY NON-TRIVIAL AND OUT-OF-LINE, AND WITHOUT
-// THAT THE DESTRUCTOR NEVER RUNS. A thread_local with a TRIVIAL constructor needs
-// no dynamic initialisation, so the compiler emits no __cxa_thread_atexit
-// registration for it — and the destructor that retires the slot is silently never
-// called. Measured: with a trivial constructor the exited-thread arm failed; with
-// this one it passes. Referencing the object is not enough on its own.
-struct EpochSlotRetirer {
-    // ⚠️ THE SLOT POINTER IS HELD HERE, NOT READ FROM THE thread_local AT EXIT.
-    // Measured on MinGW/GCC: the destructor DOES run, and by the time it runs the
-    // sibling thread_local pointer already reads NULL — TLS teardown had cleared
-    // it — so retirement silently did nothing and every exited thread went on
-    // pinning the graveyard. An object's own storage is valid during its own
-    // destructor, so the pointer lives in the object.
+// ══════════════════════════════════════════════════════════════════════════════
+// ⚠️ THE PER-THREAD EXIT RECORD. READ THIS BEFORE ADDING ANY thread_local HERE.
+// ══════════════════════════════════════════════════════════════════════════════
+//
+// EVERY C++ thread_local DESTRUCTOR IN THIS PROCESS RUNS AFTER ITS OWN STORAGE HAS
+// BEEN free()d. That is not a race and not a bug in this file — it is how the
+// toolchain we ship on is built, and it was measured, not reasoned:
+//
+//   * GCC on mingw-w64 implements `thread_local` with **emutls**: one
+//     `malloc(size + 8)` block per variable per thread, the object at base+8, and
+//     ONE pthread key whose destructor (`emutls_destroy`) frees ALL of a thread's
+//     blocks.
+//   * libstdc++'s `__cxa_thread_atexit` has no `__cxa_thread_atexit_impl` to call
+//     on this CRT (measured: absent from every `libmsvcrt*.a` / `libucrt*.a`), so
+//     it falls back to a per-thread list of `elt {dtor, obj, next, dll}` — 32 bytes,
+//     one `new elt` per registration — held in a **second** pthread key.
+//   * winpthreads runs key destructors in key-index order, and emutls' key is
+//     created first (on the first TLS access, which necessarily precedes the first
+//     destructor registration).
+//
+// So the storage is freed, and only then are the C++ destructors called on it.
+// Measured with `--wrap=free`: **300/300 and 600/600 destructors ran on a freed
+// block**, every run. Reading it usually returns the old bytes, which is why this
+// survived six fixes and 260 suite runs. It returns something else exactly when the
+// block is RE-ISSUED in the microsecond window between the free and the destructor —
+// and the thing that re-issues it is A THREAD STARTING, whose first
+// `__cxa_thread_atexit` allocates a 32-byte `elt` in the same size class. Plain heap
+// churn never did it (0 in 4000); a starting thread did, at ~2% per exit.
+//
+// WHAT THAT COST, in the two destructors this file used to have:
+//   * the record: `recorded` re-read as the low byte of a heap pointer (TRUE) with
+//     `id` overwritten by `elt.next == NULL` (a default-constructed thread::id) —
+//     the exact trace that was chased for days — or `recorded` re-read as FALSE, in
+//     which case the destructor returned early, `live` was never decremented, and
+//     **the startup gate refused a healthy node, permanently**.
+//   * the retirer, which was worse: `slot` re-read as NULL (~1–2% per exit) meant
+//     the slot was never retired and capped `DrainGraveyard`'s minimum for the
+//     process lifetime — the unbounded leak the retirer exists to prevent — and
+//     `slot` re-read as a live pointer (~1–3%) made `slot->store(~0)` an **8-byte
+//     0xFF write into a foreign heap block**. That is reachable on any Windows node
+//     that mines: `StopMining()` exits every worker on each template update and
+//     `StartMining()` restarts them immediately, which is precisely the
+//     starting-thread pressure above.
+//
+// ⚠️ THE FIX IS NOT "READ FEWER MEMBERS". Six attempts changed WHAT was read from
+// the freed block; none could work, because the block is freed either way. The exit
+// hook must not touch emutls storage AT ALL. So the per-thread state lives in a
+// heap record owned by **our own pthread key**, whose destructor receives that
+// record AS ITS ARGUMENT — pthread key VALUES live in the pthread TLS array, not in
+// emutls, and are handed to the destructor by winpthreads itself.
+//
+// RULE FOR ANYONE ADDING STATE HERE: a `thread_local` in this file may be
+// **trivially destructible only** (a pointer, an int, a bool). Anything that needs
+// to act at thread exit goes in EpochThreadRecord. There is a `static_assert` on
+// every thread_local below and a grep-guard in `scripts/check_thread_local_guard.sh`
+// so this is enforced by a machine and not by this comment.
+struct EpochThreadRecord {
+    // The detector's accusation (see NoteIndexPointerResolved).
+    bool recorded{false};
+    std::thread::id id{};
+
+    // The epoch slot this thread published into, retired at exit. Held HERE rather
+    // than read from `t_epoch_slot` at exit for the reason above.
     std::atomic<uint64_t>* slot{nullptr};
-    EpochSlotRetirer();
-    ~EpochSlotRetirer();
+
+    // TEST-ONLY hold count. It lives here rather than in a thread_local because the
+    // exit hook asserts on it, and a thread_local read at exit is a read of freed
+    // memory — the assertion would fire on garbage.
+    int holds{0};
 };
+
+void EpochThreadRecordDtor(void* p);
+
+pthread_key_t   g_epoch_record_key;
+std::once_flag  g_epoch_record_key_once;
+
+// A raw pointer: trivially destructible, so it gets no dynamic initialisation and
+// no __cxa_thread_atexit registration, and there is nothing of ours to read at
+// teardown. It is a CACHE of the pthread key's value, never the owner.
+thread_local EpochThreadRecord* t_epoch_record = nullptr;
+static_assert(std::is_trivially_destructible<EpochThreadRecord*>::value,
+              "see the header comment: a thread_local here must be trivially "
+              "destructible, because its destructor would run on freed storage");
+
+EpochThreadRecord& MyEpochRecord()
+{
+    if (t_epoch_record == nullptr) {
+        std::call_once(g_epoch_record_key_once, [] {
+            // Failure here is not survivable: without the key there is no exit hook,
+            // and a thread that exits without retiring its slot silently freezes
+            // reclamation for the process lifetime. Fail loudly at the first record
+            // rather than leak forever.
+            const int rc = pthread_key_create(&g_epoch_record_key,
+                                              &EpochThreadRecordDtor);
+            ConsensusInvariant(rc == 0);
+        });
+        // Leaked only if the key destructor never runs (the main thread at process
+        // exit). Every std::thread on this platform is a pthread, so every worker's
+        // record is freed by the hook below.
+        auto* rec = new EpochThreadRecord();
+        const int rc = pthread_setspecific(g_epoch_record_key, rec);
+        ConsensusInvariant(rc == 0);
+        t_epoch_record = rec;
+    }
+    return *t_epoch_record;
+}
 
 thread_local std::atomic<uint64_t>* t_epoch_slot = nullptr;
 thread_local const char* t_epoch_name = nullptr;
-extern thread_local EpochSlotRetirer t_epoch_retirer;
+static_assert(std::is_trivially_destructible<std::atomic<uint64_t>*>::value, "");
+static_assert(std::is_trivially_destructible<const char*>::value, "");
 // TEST-ONLY hold tracking. Production cannot know when a caller is still holding a
 // resolved pointer -- the pointer is a raw CBlockIndex* on someone's stack -- so the
 // no-pointer-across-a-boundary rule is a CONTRACT, not a checked property. A test
 // declares its holds with EpochPointerHold and turns this on; the boundary then
 // asserts instead of trusting.
 std::atomic<bool> g_epoch_hold_tracking{false};
-thread_local int t_epoch_holds = 0;
 
 // OFFLINE = "I am blocked and hold nothing". See CChainState::EpochQuiesce.
 thread_local bool t_epoch_offline = false;
+static_assert(std::is_trivially_destructible<bool>::value, "");
 
 // Set when a resolve-while-offline re-enters, so the accusation the quiesce
 // withdrew is restored on the way back through (see NoteIndexPointerResolved).
@@ -479,31 +571,11 @@ std::atomic<uint64_t>* MyEpochSlot()
             Registry().slots.push_back(slot);
         }
         t_epoch_slot = slot;
-        // Hand the slot to this thread's retirer so its exit hook can retire it
-        // without depending on the thread_local pointer still being readable.
-        t_epoch_retirer.slot = slot;
+        // Hand the slot to this thread's exit record. The hook retires it from the
+        // record it is GIVEN, so it never reads a thread_local at teardown.
+        MyEpochRecord().slot = slot;
     }
     return t_epoch_slot;
-}
-
-EpochSlotRetirer::EpochSlotRetirer() { /* forces dynamic init; see the type */ }
-
-EpochSlotRetirer::~EpochSlotRetirer()
-{
-    // ⚠️ RETIRING IS A CLAIM TOO — "this thread holds nothing, ever again" — and it
-    // was the one boundary that did not check. EpochCheckpoint and EpochQuiesce both
-    // assert the hold count under test-time tracking; this publishes the strongest
-    // statement of the three and asserted nothing. A TLS holder constructed BEFORE
-    // this object is destroyed AFTER it, so a pointer can still be live here.
-    if (g_epoch_hold_tracking.load(std::memory_order_relaxed)) {
-        ConsensusInvariant(t_epoch_holds == 0);
-    }
-
-    // Only a thread that ever checkpointed has a slot; one that never did has
-    // nothing to retire (and pins nothing, because it never made a promise).
-    if (slot != nullptr) {
-        slot->store(EPOCH_SLOT_RETIRED, std::memory_order_release);
-    }
 }
 
 // ── THE DETECTOR: A THREAD THAT RESOLVES AND NEVER CHECKPOINTS ──────────────
@@ -526,19 +598,30 @@ struct UnregisteredResolvers {
 
     // ⚠️ THE COUNT IS AUTHORITATIVE; THE ID LIST IS DIAGNOSTICS. It used to be the
     // other way round -- the count WAS ids.size() + overflow, and withdrawal was an
-    // erase-by-thread-id. That made the accounting depend on a std::thread::id
-    // surviving in a thread_local until its own destructor ran, and measurably it
-    // does not always: traced with DIL_EPOCH_DIAG, a withdrawal fired with `recorded`
-    // true and `id` DEFAULT-CONSTRUCTED ("thread::id of a non-executing thread"), so
-    // the erase matched nothing and the accusation became PERMANENT.
+    // erase-by-thread-id. The accounting therefore depended on a std::thread::id
+    // still being readable when the withdrawal ran, and at thread exit it was not:
+    // a withdrawal was traced firing with `recorded` true and `id`
+    // DEFAULT-CONSTRUCTED ("thread::id of a non-executing thread"), so the erase
+    // matched nothing and the accusation became PERMANENT.
     //
-    // That is not cosmetic. A phantom accusation fails EpochRegistrationComplete
-    // forever, so the startup gate REFUSES TO START THE NODE -- measured at roughly
-    // one run in twenty of a thread-heavy suite. Found only because the suite's flake
-    // rate refused to go away under three successive "fixes" aimed at the arms.
+    // ⚠️ AND THAT TRACE HAD A CAUSE WORTH KNOWING, because the obvious reading of
+    // it is wrong. It was NOT a torn write or a lost id. The exit hook was a
+    // thread_local destructor, and on this toolchain those run AFTER emutls has
+    // freed the storage they are destroying -- the `recorded`/`id` pair was being
+    // read out of a freed 32-byte block that a STARTING thread had already
+    // re-issued for its own `__cxa_thread_atexit` bookkeeping. `recorded` read as
+    // the low byte of a heap pointer (true), `id` as that record's null `next`
+    // (default). Making the count authoritative removed the dependency on `id` and
+    // narrowed the failure, but could not close it: the block is freed either way.
+    // The mechanism is fixed at EpochThreadRecord -- read that first.
     //
-    // A counter needs no lookup at teardown: the destructor knows only "this thread
-    // was recorded", which is a bool in the object being destroyed, and decrements.
+    // The phantom was not cosmetic. It fails EpochRegistrationComplete forever, so
+    // the startup gate REFUSES TO START A HEALTHY NODE -- measured at roughly one
+    // run in twenty of a thread-heavy suite, and only found because the flake rate
+    // refused to go away under six successive fixes aimed at the wrong layer.
+    //
+    // A counter needs no lookup at teardown: the exit hook knows only "this thread
+    // was recorded", from the record it is handed, and decrements.
     size_t live{0};                     // authoritative number of accused threads
     std::vector<std::thread::id> ids;   // best-effort, for the message only, capped
     size_t overflow{0};                 // ids beyond the cap (diagnostics only)
@@ -554,47 +637,7 @@ UnregisteredResolvers& Unregistered()
 
 constexpr size_t MAX_RECORDED_OFFENDERS = 8;
 
-struct UnregisteredRecordScope;
-extern thread_local UnregisteredRecordScope t_unregistered_scope;
 void ClearUnregisteredRecord();
-
-// A thread that resolves a pointer and then EXITS without ever checkpointing was
-// left accused for the life of the process, and the startup census would refuse to
-// start a node over a thread that no longer exists (and whose pointer died with its
-// stack). A thread_local with a destructor is the one hook that fires on every exit
-// path, so the record is withdrawn there too, exactly as a checkpoint withdraws it.
-struct UnregisteredRecordScope {
-    // ⚠️ THE STATE LIVES IN THE OBJECT, NOT IN A SIBLING thread_local, AND THAT IS
-    // NOT STYLE. The destructor used to early-out on `t_recorded_unregistered` —
-    // a separate thread_local — and at TLS teardown that flag can already read
-    // false, exactly as the epoch slot pointer already reads null. The withdrawal
-    // then never happened and a thread that resolved-without-checkpointing stayed
-    // ACCUSED FOR THE LIFE OF THE PROCESS after it exited: the census reports a
-    // leak that is not there, and every later census fails. Caught by the F1 arm's
-    // leftovers breaking four unrelated assertions, not by reading.
-    //
-    // Non-trivial, out-of-line constructor for the other half of the same trap: a
-    // trivially-constructible thread_local gets no dynamic initialisation and
-    // therefore no destructor registration at all.
-    bool recorded{false};
-    std::thread::id id{};
-
-    // ⚠️ CALL Touch() BEFORE WRITING ANY MEMBER. A thread_local with a non-trivial
-    // constructor is initialised lazily, and binding a reference to it (or taking
-    // its address) does not reliably force that initialisation on this toolchain --
-    // so a write to `recorded` could be CLOBBERED by the constructor running
-    // afterwards. The destructor then saw `recorded == false`, returned early, and
-    // the accusation was never withdrawn: a phantom that fails the census forever
-    // and makes the startup gate refuse a healthy node. A member FUNCTION call is an
-    // unambiguous odr-use and forces initialisation first.
-    void Touch() {}
-
-    UnregisteredRecordScope();
-    ~UnregisteredRecordScope();
-};
-UnregisteredRecordScope::UnregisteredRecordScope() { /* forces dynamic init */ }
-
-thread_local UnregisteredRecordScope t_unregistered_scope;
 
 
 // ⚠️ A PARTICIPATING THREAD THAT EXITS USED TO PIN THE GRAVEYARD FOR THE PROCESS
@@ -611,9 +654,61 @@ thread_local UnregisteredRecordScope t_unregistered_scope;
 // still in the graveyard and a final drain freeing ZERO with every thread quiescent.
 //
 // A thread that has exited holds no CBlockIndex*, so it must never lower the
-// minimum. Retiring the slot to the maximum epoch says exactly that, and a
-// thread_local destructor is the one hook that runs on every exit path.
-thread_local EpochSlotRetirer t_epoch_retirer;
+// minimum. Retiring the slot to the maximum epoch says exactly that.
+//
+// ⚠️ THE HOOK IS A pthread KEY DESTRUCTOR, NOT A thread_local DESTRUCTOR, and the
+// difference is the whole point — see EpochThreadRecord above. It is handed the
+// record as its ARGUMENT and reads no thread-local storage, because by the time it
+// runs, every thread_local block belonging to this thread has already been freed.
+void EpochThreadRecordDtor(void* p)
+{
+    // POSIX has already set this thread's key value to NULL before calling us, and
+    // nothing below touches thread-local storage, so no re-registration can occur
+    // and this runs exactly once per thread.
+    auto* rec = static_cast<EpochThreadRecord*>(p);
+    if (rec == nullptr) return;
+
+    // ⚠️ RETIRING IS A CLAIM TOO — "this thread holds nothing, ever again" — and it
+    // was the one boundary that did not check. EpochCheckpoint and EpochQuiesce both
+    // assert the hold count under test-time tracking; this publishes the strongest
+    // statement of the three. The count is read from the RECORD; when it lived in a
+    // thread_local this assertion was evaluating freed memory and could fire, or
+    // fail to fire, on whatever the heap had put there.
+    if (g_epoch_hold_tracking.load(std::memory_order_relaxed)) {
+        ConsensusInvariant(rec->holds == 0);
+    }
+
+    // Only a thread that ever checkpointed has a slot; one that never did has
+    // nothing to retire (and pins nothing, because it never made a promise).
+    if (rec->slot != nullptr) {
+        rec->slot->store(EPOCH_SLOT_RETIRED, std::memory_order_release);
+    }
+
+    // Withdraw the accusation, if this thread carried one. Same hook, because the
+    // two used to be separate thread_local destructors and their SPLIT was itself a
+    // trap: a thread's accusation was withdrawn by one and its slot retired by the
+    // other, so the record count could reach zero while a slot still sat at 0
+    // pinning the entire graveyard. One hook, one order, one place to read.
+    if (rec->recorded) {
+        rec->recorded = false;
+        auto& u = Unregistered();
+        std::lock_guard<std::mutex> lk(u.mu);
+        if (u.live > 0) --u.live;
+        bool listed = false;
+        for (size_t i = 0; i < u.ids.size(); ++i) {
+            if (u.ids[i] == rec->id) {
+                u.ids.erase(u.ids.begin() + i);
+                listed = true;
+                break;
+            }
+        }
+        // Not in the capped list means it was counted in `overflow`. Diagnostics
+        // only — `live` above is the authoritative number either way.
+        if (!listed && u.overflow > 0) --u.overflow;
+    }
+
+    delete rec;
+}
 
 void NoteIndexPointerResolved(uint64_t current_epoch)
 {
@@ -657,13 +752,26 @@ void NoteIndexPointerResolved(uint64_t current_epoch)
     // that a quiesce-withdrawn accusation is restored the moment its claim is
     // falsified.
     if (reresolve_after_offline) {
+        // ⚠️ THIS BRANCH RECORDED AN ACCUSATION WITHOUT COUNTING IT. It set
+        // `recorded` and pushed the id, but never `++u2.live` -- while EVERY
+        // withdrawal path (ClearUnregisteredRecord and the exit hook) does
+        // `--u2.live` off that same `recorded` flag. So a thread that quiesced and
+        // then resolved anyway ATE ANOTHER THREAD'S ACCUSATION on its way out: an
+        // UNDER-count, the opposite direction to the phantom, and the direction
+        // that matters more -- an accusation silently cancelled is a real leaking
+        // thread the census stops reporting.
+        //
+        // Found by the decorrelated reader while tracing the phantom, not by any
+        // arm here. It survived because `live` became authoritative only in the
+        // round-5 fold and this branch was written before that; the count and the
+        // flag were consistent when the count WAS the list.
         auto& u2 = Unregistered();
-        t_unregistered_scope.Touch();   // as above: construct, then write
-        UnregisteredRecordScope& me2 = t_unregistered_scope;
+        EpochThreadRecord& me2 = MyEpochRecord();
         if (!me2.recorded) {
             me2.recorded = true;
             me2.id = std::this_thread::get_id();
             std::lock_guard<std::mutex> lk2(u2.mu);
+            ++u2.live;                                 // authoritative -- see above
             if (u2.ids.size() < MAX_RECORDED_OFFENDERS) u2.ids.push_back(me2.id);
             else ++u2.overflow;
         }
@@ -683,9 +791,8 @@ void NoteIndexPointerResolved(uint64_t current_epoch)
     // a use-after-free, and it is the direction every other rule here takes.
     auto* slot = MyEpochSlot();   // created at 0, and 0 pins everything
     (void)slot;
-    t_unregistered_scope.Touch();   // force construction BEFORE any member write
 
-    UnregisteredRecordScope& me = t_unregistered_scope;
+    EpochThreadRecord& me = MyEpochRecord();
     if (me.recorded) return;
     me.recorded = true;
     me.id = std::this_thread::get_id();
@@ -704,12 +811,11 @@ void NoteIndexPointerResolved(uint64_t current_epoch)
 // now made the promise, so the accusation is withdrawn.
 void ClearUnregisteredRecord()
 {
-    // Called from a LIVE thread (a checkpoint or a quiesce), not from a destructor
-    // -- the destructor has its own copy of this loop, because at teardown it must
-    // not touch t_unregistered_scope through the thread_local accessor at all. The
-    // comment here used to describe the destructor's constraints, which made the
-    // two look interchangeable; they are not.
-    UnregisteredRecordScope& me = t_unregistered_scope;
+    // Called from a LIVE thread (a checkpoint or a quiesce). The EXIT path is
+    // EpochThreadRecordDtor, which does the same withdrawal from a record it is
+    // handed rather than one it looks up — that asymmetry is the fix, not a
+    // duplication to be tidied away. See EpochThreadRecord.
+    EpochThreadRecord& me = MyEpochRecord();
     if (!me.recorded) return;
     me.recorded = false;
     auto& u = Unregistered();
@@ -719,24 +825,6 @@ void ClearUnregisteredRecord()
         if (u.ids[i] == me.id) { u.ids.erase(u.ids.begin() + i); return; }
     }
     if (u.overflow > 0) --u.overflow;   // best-effort tidy of the diagnostic list
-}
-
-UnregisteredRecordScope::~UnregisteredRecordScope()
-{
-    // ⚠️ THE COUNT IS DECREMENTED FROM A BOOL, NOT FROM AN ID LOOKUP. Traced: this
-    // destructor can run with `recorded` true and `id` already DEFAULT-CONSTRUCTED,
-    // so an erase-by-id matched nothing and the accusation survived its thread --
-    // a phantom that fails the census forever and makes the startup gate refuse a
-    // healthy node. `recorded` is the only member this path may rely on.
-    if (!recorded) return;
-    recorded = false;
-    auto& u = Unregistered();
-    std::lock_guard<std::mutex> lk(u.mu);
-    if (u.live > 0) --u.live;
-    for (size_t i = 0; i < u.ids.size(); ++i) {
-        if (u.ids[i] == id) { u.ids.erase(u.ids.begin() + i); return; }
-    }
-    if (u.overflow > 0) --u.overflow;
 }
 
 }  // namespace
@@ -774,17 +862,20 @@ void CChainState::EpochCheckpoint(const char* name)
     // A checkpoint claims "I hold no CBlockIndex* at this instant" just as loudly
     // as a quiesce does; under test-time hold tracking it is checked the same way.
     if (g_epoch_hold_tracking.load(std::memory_order_relaxed)) {
-        ConsensusInvariant(t_epoch_holds == 0);
+        ConsensusInvariant(MyEpochRecord().holds == 0);
     }
 
     const uint64_t now = m_globalEpoch.load(std::memory_order_acquire);
     MyEpochSlot()->store(now, std::memory_order_release);
     t_epoch_offline = false;   // re-entering the quiescent-state calculation
 
-    // Touch the retirer so THIS thread's exit hook is registered: a thread_local
-    // with a non-trivial destructor is constructed on first ODR use, and without
-    // this reference a thread's slot would never be retired when it exits.
-    (void)&t_epoch_retirer;
+    // Register THIS thread's exit hook. MyEpochSlot() above already created the
+    // record and stored the slot in it, so this is a statement of intent rather
+    // than a load-bearing call -- but it is kept because the old version of this
+    // line WAS load-bearing and the reason is worth carrying: a thread that never
+    // reaches its exit hook never retires its slot, and one unretired slot caps
+    // reclamation for the process lifetime.
+    (void)MyEpochRecord();
 
     // This thread may have resolved a pointer before reaching its first
     // checkpoint -- every thread does, during startup. It is a participant now,
@@ -866,7 +957,7 @@ bool CChainState::EpochQuiesce()
     // itself and dropped its own accusation before anything objected. On a build
     // where the invariant does not abort, the damage was done. Check, then act.
     if (g_epoch_hold_tracking.load(std::memory_order_relaxed)) {
-        ConsensusInvariant(t_epoch_holds == 0);
+        ConsensusInvariant(MyEpochRecord().holds == 0);
     }
 
     // ⚠️ REFUSES AN OFFLINE *STATE*, WHICH IS NARROWER THAN "REFUSES NESTING",
@@ -1057,8 +1148,9 @@ void CChainState::NoteEpochPointerHeld(int delta)
     // Refuse the unbalanced call rather than absorbing it: a stray -1 would drive
     // the count under the holds a caller really has and quietly disable the
     // boundary assertions, which is worse than no tracking at all.
-    ConsensusInvariant(t_epoch_holds + delta >= 0);
-    t_epoch_holds += delta;
+    EpochThreadRecord& rec = MyEpochRecord();
+    ConsensusInvariant(rec.holds + delta >= 0);
+    rec.holds += delta;
 }
 
 void CChainState::SetDeepDrainInvariantsForTest(bool on)
