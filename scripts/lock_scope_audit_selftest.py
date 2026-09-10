@@ -134,6 +134,56 @@ void Probe6() {
 }
 ''', must_find=['m_firstMutex', 'm_secondMutex'], expect_rc=1)
 
+
+print('GENERATOR SOURCES (L-3) - an inline cs_main taker in chain.h must count:')
+
+CHAIN_H_INLINE = (
+    'class CChainState {\n'
+    'public:\n'
+    '    size_t InlineOnlyAccessor() const {\n'
+    '        std::lock_guard<std::recursive_mutex> lock(cs_main);\n'
+    '        return mapBlockIndex.size();\n'
+    '    }\n'
+    '    int NoLockHere() const { return 0; }\n'
+    '};\n'
+)
+
+PROBE_H = (
+    'void ProbeH() {\n'
+    '    std::lock_guard<std::mutex> lk(m_privateMutex);\n'
+    '    size_t n = g_chainstate.InlineOnlyAccessor();\n'
+    '    (void)n;\n'
+    '}\n'
+)
+
+def header_case():
+    # chain.h defines some accessors INLINE, inside the class body. The generator
+    # read chain.cpp only, so those never entered the accessor list and any call
+    # to them was invisible to the audit. The cause was a depth-0 requirement: an
+    # inline method never starts at brace depth 0.
+    #
+    # The second method (NoLockHere) is the control: a method WITHOUT a cs_main
+    # guard must not become an accessor, or the list would be "every method".
+    tmp = tempfile.mkdtemp(prefix='lsa_fix_h_')
+    try:
+        os.makedirs(os.path.join(tmp, 'src', 'consensus'), exist_ok=True)
+        os.makedirs(os.path.join(tmp, 'src', 'probe'), exist_ok=True)
+        io.open(os.path.join(tmp, 'src', 'consensus', 'chain.cpp'), 'w', encoding='utf-8').write(CHAIN_CPP)
+        io.open(os.path.join(tmp, 'src', 'consensus', 'chain.h'), 'w', encoding='utf-8').write(CHAIN_H_INLINE)
+        io.open(os.path.join(tmp, 'src', 'probe', 'probe.cpp'), 'w', encoding='utf-8').write(PROBE_H)
+        rc, out = run(tmp)
+        ok = ('InlineOnlyAccessor' in out) and ('m_privateMutex' in out) and rc == 1
+        if not ok:
+            FAILURES.append('H1: an inline chain.h cs_main taker was not treated as an accessor')
+        print('  %-58s %s' % ('H1 inline accessor defined in chain.h is generated', 'ok' if ok else 'FAIL'))
+        if not ok:
+            for l in out.strip().split('\n')[:12]:
+                print('    ' + l)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+header_case()
+
 print('NEGATIVE CONTROLS - a matcher that flags everything classifies nothing:')
 
 case('N1 no lock held at all -> NOT a site', '''

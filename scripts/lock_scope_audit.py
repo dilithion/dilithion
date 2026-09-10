@@ -4,10 +4,27 @@
 Every chainstate accessor that takes cs_main is one half of an AB-BA when a
 class holds its own mutex across the call (register P2P-17). This finds them.
 
-SCOPE, so it is not over-trusted: this detects a LOCK HELD ACROSS A CALL. It
-does NOT detect the released-pointer/lifetime class (P2P-16), where the accessor
-is called holding nothing and the returned pointer is dereferenced later.
-Verified: run against the pre-P2P-16 head it reports CLEAN for GetLocator.
+SCOPE, so it is not over-trusted. Three limits, each stated because a reader
+would otherwise have to infer them from a green line:
+
+1. This detects a LOCK HELD ACROSS A CALL. It does NOT detect the
+   released-pointer/lifetime class (P2P-16), where the accessor is called
+   holding nothing and the returned pointer is dereferenced later. Verified: run
+   against the pre-P2P-16 head it reports CLEAN for GetLocator.
+
+2. L-4 (#197 reader): an `unlock()` is treated as UNCONDITIONAL. Written as
+       if (cond) lk.unlock();
+       ... g_chainstate.GetTip() ...
+   this auditor believes the mutex is released on every path, so it would report
+   CLEAN while the !cond path still holds it. [measured] no such instance exists
+   in the tree today - the reader's M9 mutant confirmed the blind spot rather
+   than a live defect - but it is a real blind spot, not a theoretical one, and
+   it fails in the SILENT direction.
+
+3. Matching is textual. A lock taken inside a helper this file calls, or hidden
+   behind a macro, is invisible; and because the receiver is now any identifier,
+   a same-named method on an unrelated class can be over-reported. Over-reporting
+   is loud and gets classified; under-reporting is what the widening fixed.
 
 Review fixes folded (COORD reader on 732eb9e8):
   * `.lock()` now RE-MARKS a released lock as held. The first version only ever
@@ -61,8 +78,18 @@ FUNC   = re.compile(r'^[A-Za-z_][A-Za-z0-9_:<>,&*\s]*?\b(\w+)\s*\(')
 #
 # Each entry carries its ARGUMENT, not just its name.
 ALLOWED = {
-    # P2P-14/15 removed the cs_main -> cs_headers direction (chain.cpp:2637), so
-    # only one direction exists and there is no cycle to close.
+    # P2P-14/15 removed the cs_main -> cs_headers direction, so only one
+    # direction exists and there is no cycle to close.
+    #
+    # L-1 (#197 reader): this used to cite "chain.cpp:2637", which is
+    # `m_chainTipsCacheDirty = true;` - an unrelated line. The real mechanism is
+    # the TipNotifyDrain DECLARATION-ORDER block in CChainState::ActivateBestChain
+    # and its twin in DisconnectTip: `drain` is declared BEFORE the lock_guard, so
+    # it is destroyed AFTER it and the tip callbacks fire with cs_main already
+    # released. Named by SYMBOL, not by line: the reader's own replacement line
+    # numbers had already shifted by the time this was folded, because #194
+    # merged into the branch in between. That is the whole argument for symbols.
+    # `scripts/check-tip-notify-drain.sh` is what actually holds that order.
     ('src/net/headers_manager.cpp', 'OnBlockActivated', 'GetBlockHeightByHash', 'cs_headers'): 1,
 
     # M-3: these were keyed on '?' - the attribution placeholder - which is
@@ -84,21 +111,78 @@ ALLOWED = {
 }
 
 
-def cs_main_accessors(chain_cpp):
-    """Every CChainState method whose body acquires cs_main. Generated, not guessed."""
-    src = io.open(chain_cpp, encoding='utf-8', errors='replace').read().split('\n')
+# Out-of-line definitions in chain.cpp: `... CChainState::Name(` at column 0.
+DEF_CPP = re.compile(r'^[A-Za-z_][\w:<>,&*\s]*\bCChainState::(\w+)\s*\(')
+# Inline definitions in chain.h: an INDENTED member signature that OPENS a body
+# on the same line. The brace is what separates a definition from a declaration.
+DEF_H = re.compile(r'^\s+[A-Za-z_][\w:<>,&*\s]*?\b(\w+)\s*\([^;]*\)\s*(?:const\s*)?(?:noexcept\s*)?\{')
+GUARD = re.compile(r'<std::recursive_mutex>\s+\w+\(cs_main\)')
+NOT_A_METHOD = {'if', 'for', 'while', 'switch', 'catch', 'return', 'else'}
+
+
+def _scan_cpp(path):
+    """Out-of-line CChainState methods in a .cpp whose body acquires cs_main."""
+    src = io.open(path, encoding='utf-8', errors='replace').read().split('\n')
     names, cur, depth, seen = set(), None, 0, False
     for raw in src:
         line = re.sub(r'//.*$', '', raw)
-        m = re.match(r'^[A-Za-z_][\w:<>,&*\s]*\bCChainState::(\w+)\s*\(', raw)
+        m = DEF_CPP.match(raw)
         if m and depth == 0:
             cur, seen = m.group(1), False
-        if cur and re.search(r'<std::recursive_mutex>\s+\w+\(cs_main\)', line):
+        if cur and GUARD.search(line):
             seen = True
         depth += line.count('{') - line.count('}')
         if cur and depth <= 0 and seen:
             names.add(cur); cur, seen = None, False
     return names
+
+
+def _scan_header(path):
+    """Methods defined INLINE in the class body whose body acquires cs_main.
+
+    These never start at brace-depth 0 - they sit inside `class CChainState {` -
+    which is exactly why requiring depth 0 excluded all of them.
+    """
+    src = io.open(path, encoding='utf-8', errors='replace').read().split('\n')
+    names, cur, seen, want = set(), None, False, 0
+    depth = 0
+    for raw in src:
+        line = re.sub(r'//.*$', '', raw)
+        if cur is None:
+            m = DEF_H.match(raw)
+            if m and m.group(1) not in NOT_A_METHOD:
+                cur, seen, want = m.group(1), False, depth
+        if cur is not None and GUARD.search(line):
+            seen = True
+        depth += line.count('{') - line.count('}')
+        if cur is not None and depth <= want:
+            if seen:
+                names.add(cur)
+            cur, seen = None, False
+    return names
+
+
+def cs_main_accessors(chain_cpp):
+    """Every CChainState method whose body acquires cs_main. GENERATED, not guessed.
+
+    L-3 (#197 reader): this read chain.cpp ONLY, so three cs_main takers defined
+    INLINE in chain.h were absent from the list, and a call to any of them was
+    invisible to the audit - GetBlockIndexSize, InvalidateChainTipsCache and
+    HasPendingBlockHashProvider. No caller holds a private mutex across them
+    today, so nothing was actually being missed; the list was simply narrower
+    than "every accessor that takes cs_main" claimed of it.
+
+    Folded into the GENERATOR rather than hand-listed, deliberately: a
+    hand-written list is the drift this function exists to prevent, and it is how
+    the original six-entry list went stale in the first place. The accessor COUNT
+    is printed on every run, so the list growing or shrinking is visible.
+    """
+    names = _scan_cpp(chain_cpp)
+    chain_h = os.path.splitext(chain_cpp)[0] + '.h'
+    if os.path.isfile(chain_h):
+        names |= _scan_header(chain_h)
+    return names
+
 
 call_re_global = None   # set by main() once the accessor list exists
 
@@ -158,7 +242,7 @@ def main(argv):
     if not acc:
         print("ERROR: generated an EMPTY cs_main accessor list — refusing to report CLEAN")
         return 2
-    print(f"cs_main-taking CChainState accessors generated from chain.cpp: {len(acc)}")
+    print(f"cs_main-taking CChainState accessors generated from chain.cpp + chain.h: {len(acc)}")
     global call_re_global
     call_re_global = re.compile(r'\b(\w+)\s*(?:\.|->)\s*(' + '|'.join(sorted(acc)) + r')\s*\(')
 
