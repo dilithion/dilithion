@@ -11,6 +11,7 @@
 #include <net/port/misbehavior_policy.h>
 #include <consensus/chain_work.h>
 #include <primitives/block.h>
+#include <core/chainparams.h>
 #include <consensus/pow.h>
 
 #include <cassert>
@@ -114,7 +115,40 @@ void test_vdf_checker_accepts_well_formed()
 {
     std::cout << "  test_vdf_checker_accepts_well_formed..." << std::flush;
     VDFHeaderProofChecker c;
+    // 0x1d00ffff is the VDF chains' genesisNBits (DilV and regtest alike), which
+    // the checker now requires by EQUALITY — see the nBits rule in
+    // header_proof_checkers.h. main() sets g_chainParams for that reason.
     auto h = MakeVDFHeader(0x1d00ffff);
+    assert(c.CheckHeaderProof(h));
+    std::cout << " OK\n";
+}
+
+// ⚠️ THIS ARM EXISTS BECAUSE THE SUITE ABOVE BROKE, AND WHY IT BROKE MATTERS.
+// The VDF checker's nBits rule reads g_chainParams->genesisNBits and FAILS CLOSED
+// when chainparams is absent. This suite never set g_chainParams, so every
+// well-formed header was rejected the moment that rule landed.
+//
+// The correct fix was to the TEST — production always has chainparams — and NOT
+// to weaken the rule to a `g_chainParams ? ... : <permissive default>`, which is
+// the fail-OPEN shape #189 shipped once and two external seats caught. Pinning
+// the behaviour here so that a future reader who hits this failure fixes the
+// setup rather than the rule.
+void test_vdf_checker_fails_closed_without_chainparams()
+{
+    std::cout << "  test_vdf_checker_fails_closed_without_chainparams..." << std::flush;
+    VDFHeaderProofChecker c;
+    auto h = MakeVDFHeader(0x1d00ffff);
+
+    Dilithion::ChainParams* saved = Dilithion::g_chainParams;
+    Dilithion::g_chainParams = nullptr;
+    const bool accepted_without_params = c.CheckHeaderProof(h);
+    Dilithion::g_chainParams = saved;
+
+    // A missing consensus parameter must never become a permissive verdict on a
+    // work-accounting input.
+    assert(!accepted_without_params);
+    // And the same header is accepted once chainparams is back, so this arm is
+    // pinning fail-closed rather than a checker that rejects everything.
     assert(c.CheckHeaderProof(h));
     std::cout << " OK\n";
 }
@@ -237,6 +271,13 @@ void test_block_and_tx_reject_reasons_map_exhaustively()
 
 int main()
 {
+    // The VDF checker's nBits rule reads g_chainParams->genesisNBits and FAILS
+    // CLOSED without it, so this suite must set chainparams up as production
+    // does. Regtest is a VDF chain and its genesisNBits is 0x1d00ffff, the value
+    // MakeVDFHeader uses below.
+    Dilithion::g_chainParams =
+        new Dilithion::ChainParams(Dilithion::ChainParams::Regtest());
+
     std::cout << "\n=== Phase 3: HeaderProofChecker Tests ===\n" << std::endl;
 
     try {
@@ -247,6 +288,7 @@ int main()
 
         std::cout << "\n--- VDFHeaderProofChecker ---" << std::endl;
         test_vdf_checker_accepts_well_formed();
+        test_vdf_checker_fails_closed_without_chainparams();
         test_vdf_checker_rejects_non_vdf_header();
         test_vdf_checker_rejects_null_proof_hash();
         test_vdf_checker_rejects_null_output();
@@ -257,7 +299,7 @@ int main()
         test_header_reject_weights_honest_signals_score_zero();
         test_block_and_tx_reject_reasons_map_exhaustively();
 
-        std::cout << "\n=== All Phase 3 HeaderProofChecker Tests Passed (10 tests) ===" << std::endl;
+        std::cout << "\n=== All Phase 3 HeaderProofChecker Tests Passed (11 tests) ===" << std::endl;
         return 0;
     } catch (const std::exception& e) {
         std::cerr << "Test failed with exception: " << e.what() << std::endl;
