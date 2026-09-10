@@ -243,38 +243,20 @@ bool CHeadersManager::ProcessHeaders(NodeId peer, const std::vector<CBlockHeader
     // a far wider window than GetLocator's, since everything below runs between
     // the pre-fetch and the eventual GetLocatorImpl call. Resolve to values here
     // instead; nothing downstream holds a chainstate pointer any more.
-    int headersHeightPreFetched = 0;
-    {
-        std::lock_guard<std::mutex> peek(cs_headers);
-        headersHeightPreFetched = BestHeaderHeightLocked();
-    }
-
-    int chainstateHeightPreFetched = 0;
-    const std::map<int, uint256> chainstateHashesPreFetched =
-        ResolveChainstateHashes(headersHeightPreFetched, &chainstateHeightPreFetched);
-    const int startHeightPreFetched =
-        std::max(chainstateHeightPreFetched, headersHeightPreFetched);
-
-    std::lock_guard<std::mutex> lock(cs_headers);
-
-    // Phase 6 PR6.1: per-peer rate limit. Drop the batch if peer is over budget.
-    // v4.1 audit fix (twin of headers_manager.cpp:2495 fix in commit 3c5e0eb):
-    // promote log to always-on WARN. This is one of two twins of the bug that
-    // hid the rate-limit reject from operators during IBD. Always log so the
-    // diagnostic trail is visible without --verbose.
-    if (!headers.empty() && !CheckPeerHeaderRateLimit(peer, headers.size())) {
-        LogPrintf(NET, WARN,
-            "[HeadersManager] Rate-limit reject (Process): peer=%d batch=%zu "
-            "(window limit = %d/%ds)\n",
-            static_cast<int>(peer),
-            headers.size(),
-            Dilithion::g_chainParams ? Dilithion::g_chainParams->nHeaderRateLimitPerWindow : 5000,
-            Dilithion::g_chainParams ? Dilithion::g_chainParams->nHeaderRateWindowSec : 60);
-        return false;
-    }
-    if (g_verbose.load(std::memory_order_relaxed))
-        std::cout << "[HeadersManager] Lock acquired" << std::endl;
-
+    // ADMISSION CHECKS FIRST (external review r3, G4). These used to run AFTER
+    // the chainstate resolve below, so a batch that was about to be REJECTED
+    // still paid for a full descending walk of the active chain under cs_main.
+    // At DilV's current height (~250k) that resolve walks from the tip down to
+    // the oldest scheduled locator height (118920), i.e. ~131,000 pprev
+    // dereferences with cs_main held - and a peer already over its header
+    // budget could make the node pay that on every rejected batch. None of the
+    // three checks needs the chainstate, so none of them belongs after it.
+    //
+    // The rate-limit check is NOT duplicated up here: it MUTATES the per-peer
+    // window (m_peerHeaderRate), so calling it in both places would count every
+    // batch twice and silently halve the effective limit. It moves into the
+    // cs_headers scope that already exists for the height peek, which adds no
+    // new lock edge - that scope is taken and released before cs_main.
     if (headers.empty()) {
         if (g_verbose.load(std::memory_order_relaxed))
             std::cout << "[HeadersManager] Empty headers, returning true" << std::endl;
@@ -287,6 +269,52 @@ bool CHeadersManager::ProcessHeaders(NodeId peer, const std::vector<CBlockHeader
                       << " > " << MAX_HEADERS_BUFFER << "), returning false" << std::endl;
         return false;
     }
+
+    int headersHeightPreFetched = 0;
+    {
+        std::lock_guard<std::mutex> peek(cs_headers);
+
+        // Phase 6 PR6.1: per-peer rate limit. Drop the batch if peer is over budget.
+        // v4.1 audit fix: promote log to always-on WARN. This is one of two twins
+        // of the bug that hid the rate-limit reject from operators during IBD.
+        // Always log so the diagnostic trail is visible without --verbose.
+        //
+        // headers is known non-empty here, so the old `!headers.empty() &&`
+        // guard is gone. NOT CHANGED, and worth naming rather than leaving
+        // implicit: an EMPTY batch returns above without touching the window, so
+        // empty HEADERS messages are still not counted against the header
+        // budget. That is pre-existing and reasonable - an empty HEADERS is the
+        // normal end-of-chain reply - but it means this budget bounds HEADERS,
+        // not MESSAGES. Whether empty messages need their own bound is a
+        // separate question, and not one to answer inside a lock-order fix.
+        if (!CheckPeerHeaderRateLimit(peer, headers.size())) {
+            LogPrintf(NET, WARN,
+                "[HeadersManager] Rate-limit reject (Process): peer=%d batch=%zu "
+                "(window limit = %d/%ds)\n",
+                static_cast<int>(peer),
+                headers.size(),
+                Dilithion::g_chainParams ? Dilithion::g_chainParams->nHeaderRateLimitPerWindow : 5000,
+                Dilithion::g_chainParams ? Dilithion::g_chainParams->nHeaderRateWindowSec : 60);
+            return false;
+        }
+
+        headersHeightPreFetched = BestHeaderHeightLocked();
+    }
+
+    int chainstateHeightPreFetched = 0;
+    const std::map<int, uint256> chainstateHashesPreFetched =
+        ResolveChainstateHashes(headersHeightPreFetched, &chainstateHeightPreFetched);
+    const int startHeightPreFetched =
+        std::max(chainstateHeightPreFetched, headersHeightPreFetched);
+
+    std::lock_guard<std::mutex> lock(cs_headers);
+
+    // The rate-limit, empty and over-size checks used to sit here. They moved
+    // ABOVE the chainstate resolve (external review r3, G4) so a rejected batch
+    // no longer pays for a chain walk under cs_main. They are deliberately not
+    // repeated here - the rate-limit check mutates the per-peer window.
+    if (g_verbose.load(std::memory_order_relaxed))
+        std::cout << "[HeadersManager] Lock acquired" << std::endl;
 
     if (g_verbose.load(std::memory_order_relaxed))
         std::cout << "[HeadersManager] Processing " << headers.size() << " headers" << std::endl;
@@ -522,8 +550,17 @@ bool CHeadersManager::ProcessHeaders(NodeId peer, const std::vector<CBlockHeader
                     // ⚠️ KNOWN COST, NAMED NOT FIXED (external review F5; COORD ruled it
                     // out of PR #194). This locator is built from startHeightPreFetched,
                     // which was captured BEFORE this batch was processed. In headers-first
-                    // IBD that means the peer can re-send up to one batch per continuation
-                    // round, and those duplicates count against CheckPeerHeaderRateLimit.
+                    // IBD that means the peer can re-send headers it already sent, and
+                    // those duplicates count against CheckPeerHeaderRateLimit.
+                    //
+                    // The cost is PER SEND, not per round, and that is worse than it
+                    // first reads: this send sits inside the loop over the batch, and
+                    // m_pendingParentRequests dedupes PARENT HASHES, not sends. N
+                    // distinct unknown parents in one batch therefore produce N
+                    // GETHEADERS messages, every one of them carrying the SAME
+                    // pre-batch locator - so the duplicate cost multiplies by the
+                    // number of distinct missing parents, not by the number of
+                    // continuation rounds.
                     //
                     // The fix is to defer the send until cs_headers is released and rebuild
                     // from a fresh GetLocator(). That is NOT a statement move: the
@@ -1286,9 +1323,18 @@ std::map<int, uint256> CHeadersManager::ResolveChainstateHashes(int headersHeigh
     const std::vector<uint256> hashes =
         g_chainstate.ResolveLocatorHashes(headersHeight, &LocatorHeightPattern, heights, tipHeight);
 
-    // F3: -1 means NO TIP; 0 means a genesis-only chain, which is a real chain
-    // whose genesis entry must still reach the locator. Collapsing the two is
-    // how a height-0 chainstate silently produced an empty locator.
+    // F3: the RESOLVER distinguishes -1 (no tip at all) from 0 (a genesis-only
+    // chain, which is a real chain whose genesis entry must still reach the
+    // locator). Collapsing the two is how a height-0 chainstate silently
+    // produced an empty locator.
+    //
+    // ⚠️ THIS LINE RE-COLLAPSES THEM, deliberately and only here: the locator
+    // API downstream speaks in heights where 0 is the floor, so "no tip" is
+    // reported to it as height 0. The distinction is preserved where it matters
+    // (inside ResolveLocatorHashes, which returns -1 and an empty vector, so a
+    // no-tip chainstate contributes NO entries rather than a bogus genesis
+    // entry). This remap is the wrapper's own behaviour, not the resolver's, and
+    // p2p16_wrapper_agrees_with_one_resolver_snapshot pins it.
     if (chainstateHeightOut) *chainstateHeightOut = (tipHeight < 0) ? 0 : tipHeight;
 
     // Contract check, kept: mismatched vectors would attribute hashes to the
@@ -1314,13 +1360,24 @@ static std::vector<int> LocatorHeightPattern(int startHeight)
     // genesis entry — external review, PR #194. Only a NEGATIVE start is empty.
     if (startHeight < 0) return heights;
 
-    // ⚠️ GENESIS IS EMITTED IF AND ONLY IF startHeight <= 10, and the 64-entry
-    // cap is not what stops it. [measured, this exact loop] the first 10 steps
-    // are linear, so a start of 10 or less walks down to 0 and breaks there;
-    // from 11 up the doubling overshoots, `height` goes negative and the loop
-    // exits on `height >= 0` having never emitted 0. Oldest entry by start:
-    // 11->1, 13->1, 25->1, 100->28, 1000->480, 250000->118920, 10^7->1611384.
-    // The cap is never reached (33 entries at 10^7), so it is not the cause.
+    // ⚠️ GENESIS IS ALMOST NEVER EMITTED, and the 64-entry cap is not what stops
+    // it. [censused, every start 0..200000 against this exact loop] genesis is
+    // emitted if and only if
+    //     startHeight <= 10   OR   startHeight == 8 + 2^m  (m >= 2)
+    // i.e. exactly {0..10} and {12, 16, 24, 40, 72, 136, 264, 520, 1032, 2056,
+    // 4104, 8200, 16392, 32776, 65544, 131080, ...}. 27 values below 200000.
+    // Ten unit steps land on startHeight-10, after which the step doubles
+    // (2,4,8,...), so 0 is hit only when startHeight-10 is one less than a power
+    // of two; otherwise `height` skips past 0, goes negative, and the loop exits
+    // on `height >= 0` having never emitted it. Oldest entry by start: 11->1,
+    // 13->1, 25->1, 100->28, 1000->480, 250000->118920, 10^7->1611384. The cap
+    // is never reached (33 entries at 10^7), so it is not the cause.
+    //
+    // ⚠️ AN EARLIER VERSION OF THIS COMMENT SAID "if and only if startHeight <=
+    // 10". That was FALSE - 12 reaches genesis - and it was false because it was
+    // read off a SAMPLE {0,1,5,10,11,13,25,100,1000,250000,10^7} that happened
+    // to skip 12. The set above is a census. A boundary is not a measurement
+    // until every value on both sides of it has been checked.
     //
     // Consequence: a peer whose fork point lies BELOW the oldest entry cannot
     // find a common ancestor from this locator. Bitcoin Core's locator always
@@ -1478,7 +1535,14 @@ std::vector<uint256> CHeadersManager::GetLocatorImpl(const uint256& hashTip,
     // walk, one source of truth. That is what the helper's own comment claimed
     // and what this function then quietly violated across the lock boundary.
 
-    // Start from the HIGHER of the two to avoid re-requesting headers
+    // Start from the HIGHER of the two (the caller resolved that as startHeight).
+    //
+    // ⚠️ The "to avoid re-requesting headers" half of this line was removed
+    // because it is FALSE at one of the two call sites. It holds for the locator
+    // GetLocator() builds fresh. It does NOT hold for the continuation send in
+    // ProcessHeaders, which passes a start captured BEFORE its batch was
+    // processed - see the KNOWN COST note at that call site. Leaving the claim
+    // here made the code assert the opposite of the note two hundred lines up.
     for (int height : LocatorHeightPattern(startHeight)) {
         uint256 hashAtHeight;
 

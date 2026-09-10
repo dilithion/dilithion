@@ -58,6 +58,8 @@
 #include <consensus/chain.h>
 #include <node/block_index.h>
 #include <net/headers_manager.h>   // PR #194 regression test: GetLocatorImplForTest
+
+extern CChainState g_chainstate;   // defined in src/core/globals.cpp
 #include <core/chainparams.h>
 
 #include <algorithm>
@@ -748,6 +750,147 @@ BOOST_AUTO_TEST_CASE(p2p16_resolver_distinguishes_no_tip_from_genesis_only)
             "a genesis-only chain must still yield its genesis entry, got " << got.size());
         BOOST_CHECK_EQUAL(heights[0], 0);
         BOOST_CHECK_MESSAGE(got[0] == hash, "genesis entry must be the genesis hash");
+    }
+}
+
+
+// ============================================================================
+// External review r3, G4: a REJECTED header batch must never reach the chain
+// walk.
+//
+// ProcessHeaders used to resolve the chainstate side of the locator BEFORE it
+// checked the per-peer header budget, the empty case and the size cap. The
+// resolve is a descending walk of the active chain under cs_main - at DilV's
+// height that is ~131,000 pprev dereferences - so a peer already over its
+// budget could make the node pay for a full walk on every batch it was about
+// to throw away.
+//
+// The reorder is invisible to every other test: source order is not behaviour.
+// chaintest::ResolveLocatorHashesCallCount() is the instrument that makes it
+// behaviour, counting entries to the only function on this path that walks
+// pprev under cs_main.
+//
+// Core does the same thing and says so. net_processing.cpp caps the count at
+// the message boundary before the headers are even deserialised ("Bypass the
+// normal CBlock deserialization, as we don't want to risk deserializing 2000
+// full blocks", then `if (nCount > m_opts.max_headers_result) { Misbehaving;
+// return; }`), ProcessHeadersMessage returns immediately on `nCount == 0`, and
+// only then runs CheckHeadersPoW under the comment "Before we do any
+// processing, make sure these pass basic sanity checks." Nothing touches
+// cs_main until GetAntiDoSWorkThreshold, well after all of it. This ordering is
+// ported, not invented.
+// ============================================================================
+BOOST_AUTO_TEST_CASE(p2p16_rejected_batch_never_walks_the_chain)
+{
+    if (!Dilithion::g_chainParams) {
+        Dilithion::g_chainParams = new Dilithion::ChainParams(Dilithion::ChainParams::Regtest());
+    }
+    CHeadersManager mgr;
+
+    // POSITIVE CONTROL FIRST. Without it this whole case passes if the counter
+    // is simply never incremented - the instrument would be broken and the
+    // assertions below would be vacuous. An accepted batch MUST reach the walk.
+    const uint64_t c0 = chaintest::ResolveLocatorHashesCallCount();
+    std::vector<CBlockHeader> small(2);
+    mgr.ProcessHeaders(/*peer=*/101, small);
+    const uint64_t c1 = chaintest::ResolveLocatorHashesCallCount();
+    BOOST_REQUIRE_MESSAGE(c1 > c0,
+        "instrument is dead: an accepted batch did not reach ResolveLocatorHashes, "
+        "so the negative assertions below would prove nothing");
+
+    // OVERSIZE: rejected on size, must not walk.
+    //
+    // MAX_HEADERS_BUFFER is private, so 2001 is a literal here. A literal can
+    // drift away from the constant and leave this testing nothing, so the
+    // boundary is pinned BEHAVIOURALLY as well: exactly 2000 must be accepted
+    // (and therefore reach the walk), 2001 must not. If the constant moves,
+    // one of these two goes red rather than both quietly passing.
+    const uint64_t cb = chaintest::ResolveLocatorHashesCallCount();
+    std::vector<CBlockHeader> atLimit(2000);
+    mgr.ProcessHeaders(/*peer=*/104, atLimit);
+    BOOST_CHECK_MESSAGE(chaintest::ResolveLocatorHashesCallCount() > cb,
+        "a batch of exactly 2000 must NOT be rejected on size - if this fails, "
+        "MAX_HEADERS_BUFFER moved and the 2001 below no longer tests the boundary");
+
+    std::vector<CBlockHeader> huge(2001);
+    const uint64_t c2 = chaintest::ResolveLocatorHashesCallCount();
+    BOOST_CHECK_MESSAGE(!mgr.ProcessHeaders(/*peer=*/102, huge),
+        "an over-size batch must be rejected");
+    BOOST_CHECK_MESSAGE(chaintest::ResolveLocatorHashesCallCount() == c2,
+        "an over-size batch reached the chain walk - the admission checks are "
+        "back behind the resolve, and a peer can drive a full cs_main walk per "
+        "rejected batch");
+
+    // EMPTY: accepted as a no-op, must not walk either.
+    std::vector<CBlockHeader> none;
+    const uint64_t c3 = chaintest::ResolveLocatorHashesCallCount();
+    BOOST_CHECK_MESSAGE(mgr.ProcessHeaders(/*peer=*/103, none),
+        "an empty batch is valid (end-of-chain reply) and must return true");
+    BOOST_CHECK_MESSAGE(chaintest::ResolveLocatorHashesCallCount() == c3,
+        "an empty batch reached the chain walk");
+}
+
+// ============================================================================
+// External review r3, G8: pin the WRAPPER, not only the resolver.
+//
+// The resolver cases above call CChainState::ResolveLocatorHashes directly on a
+// LOCAL chainstate. The thing production calls is
+// CHeadersManager::ResolveChainstateHashes, which adds three behaviours of its
+// own that no test touched: the F3 remap of "no tip" (-1) to a chainstate
+// height of 0, dropping null hashes from the map, and degrading to an empty map
+// if the resolver ever returns mismatched vectors.
+//
+// This asserts the wrapper against ONE snapshot of the resolver taken on the
+// SAME chainstate, so it holds whatever state g_chainstate happens to be in
+// when the suite runs - no fixture ordering assumption, and no populating of a
+// global that other suites share.
+// ============================================================================
+BOOST_AUTO_TEST_CASE(p2p16_wrapper_agrees_with_one_resolver_snapshot)
+{
+    if (!Dilithion::g_chainParams) {
+        Dilithion::g_chainParams = new Dilithion::ChainParams(Dilithion::ChainParams::Regtest());
+    }
+    CHeadersManager mgr;
+
+    for (int headersHeight : {0, 5, 1000}) {
+        std::vector<int> heights;
+        int tipHeight = -99;
+        const std::vector<uint256> direct =
+            g_chainstate.ResolveLocatorHashes(headersHeight,
+                                              &hdrtest::LocatorHeightPatternForTest,
+                                              heights, tipHeight);
+        BOOST_REQUIRE_EQUAL(direct.size(), heights.size());
+
+        int wrapperHeight = -99;
+        const std::map<int, uint256> viaWrapper =
+            mgr.ResolveChainstateHashesForTest(headersHeight, &wrapperHeight);
+
+        // F3: -1 means NO TIP and must surface as 0; 0 means a real genesis-only
+        // chain. Collapsing the two is how a height-0 node emitted an empty
+        // locator and could never start syncing. This is the assertion that
+        // makes that remap machine-held instead of comment-held.
+        BOOST_CHECK_MESSAGE(wrapperHeight == (tipHeight < 0 ? 0 : tipHeight),
+            "wrapper reported chainstate height " << wrapperHeight
+            << " for a resolver tip of " << tipHeight
+            << " (headersHeight=" << headersHeight << ")");
+
+        // The map is exactly the non-null entries of that snapshot, keyed by the
+        // heights the resolver named. Not a subset, not a superset.
+        std::map<int, uint256> expected;
+        for (size_t k = 0; k < heights.size(); ++k) {
+            if (!direct[k].IsNull()) expected[heights[k]] = direct[k];
+        }
+        BOOST_CHECK_MESSAGE(viaWrapper.size() == expected.size(),
+            "wrapper map has " << viaWrapper.size() << " entries, the resolver "
+            "snapshot implies " << expected.size() << " (headersHeight="
+            << headersHeight << ")");
+        for (const auto& kv : expected) {
+            auto it = viaWrapper.find(kv.first);
+            BOOST_REQUIRE_MESSAGE(it != viaWrapper.end(),
+                "wrapper dropped height " << kv.first);
+            BOOST_CHECK_MESSAGE(it->second == kv.second,
+                "wrapper hash disagrees with the resolver at height " << kv.first);
+        }
     }
 }
 

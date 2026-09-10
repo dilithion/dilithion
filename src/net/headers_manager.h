@@ -299,9 +299,11 @@ public:
      * - Stop at 32 entries
      *
      * NOT "always include genesis" - that line was here and it is FALSE.
-     * [measured] this schedule emits genesis if and only if the start height is
-     * <= 10; above that the doubling overshoots zero and the loop exits without
-     * ever emitting it (start 1000 stops at 480; start 250000 stops at 118920).
+     * [censused, every start 0..200000] genesis is emitted if and only if
+     * startHeight <= 10 OR startHeight == 8 + 2^m for m >= 2 - that is {0..10}
+     * and {12, 16, 24, 40, 72, 136, 264, ...}, 27 values below 200000. For every
+     * other start the doubling steps past zero and the loop exits without ever
+     * emitting it (start 1000 stops at 480; start 250000 stops at 118920).
      * A peer whose fork point lies below the oldest entry cannot find a common
      * ancestor from this locator. That is PRE-EXISTING behaviour, identical on
      * origin/main, and changing it changes what goes on the wire - see the note
@@ -774,6 +776,22 @@ public:
     {
         std::lock_guard<std::mutex> lock(cs_headers);
         return GetLocatorImpl(hashTip, startHeight, chainstateHashes, chainstateHeight);
+    }
+
+    /**
+     * TEST-ONLY forwarder to ResolveChainstateHashes (external review r3, G8).
+     *
+     * The resolver-side regression tests go straight to
+     * CChainState::ResolveLocatorHashes on a LOCAL chainstate, which leaves this
+     * wrapper - the thing production actually calls - unpinned. This forwarder
+     * lets one test assert the wrapper agrees with a single snapshot of the
+     * resolver on the SAME chainstate, which is what makes the no-tip remap and
+     * the null-dropping machine-held rather than comment-held.
+     */
+    std::map<int, uint256> ResolveChainstateHashesForTest(int headersHeight,
+                                                          int* chainstateHeightOut) const
+    {
+        return ResolveChainstateHashes(headersHeight, chainstateHeightOut);
     }
 
 private:

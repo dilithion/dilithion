@@ -113,6 +113,12 @@ struct ActiveChainHeader {
     int          height = 0;
 };
 
+namespace chaintest {
+// TEST-ONLY. Number of entries to CChainState::ResolveLocatorHashes since start.
+// Used to assert that a rejected header batch never reaches the chain walk.
+uint64_t ResolveLocatorHashesCallCount();
+}  // namespace chaintest
+
 class CChainState
 {
 private:

@@ -4,26 +4,61 @@
 # and adding a python dependency to a CI-wired guard means the guard can vanish
 # on an image that lacks it.
 #
-# WHY, concretely. The previous stripper was `sed 's://.*::'`. It deleted from
-# the FIRST `//` on a line to end of line — so a line carrying a URL in a string
-# literal, e.g.
+# WHY, concretely. The stripper this replaced was `sed 's://.*::'`. It deleted
+# from the FIRST // on a line to end of line, string literals included, so
 #     const char* u = "see http://x"; auto* t = g_chainstate.GetTip();
-# had the real GetTip() call deleted before the grep ever saw it. That is a
-# FALSE PASS: the guard reports the invariant holds while the violation sits in
-# the file (mutant S10). It also could not see an inline /* */ (S11).
+# lost the real GetTip() call before the grep ever saw it. That is a FALSE PASS:
+# the guard reports the invariant holds while the violation sits in the file.
 #
-# Handled: // to end of line, /* */ inline and multi-line, "..." and '...' with
-# backslash escapes. Comment and literal bytes become spaces, so no two tokens
-# are joined and column positions do not move.
+# THEN THIS SCANNER REOPENED THE SAME CLASS, and an external round-3 seat found
+# it unanimously. C++14 digit separators are apostrophes:
+#     int64_t v = 5'000; auto* t = g_chainstate.GetTip();
+# The first version treated that ' as a char-literal opener, blanked forward to
+# the next ', and swallowed the call. Same false PASS, new spelling. The lesson
+# is that a hand-rolled lexer's DEFAULT must be to refuse, not to guess: every
+# construct below either has an explicit rule or exits 3.
 #
-# REFUSED, loudly: raw string literals R"delim(...)delim" and a // comment
-# continued onto the next line by a trailing backslash. Neither appears in the
-# files this guard checks. Rather than mis-parse them silently — which is how a
-# stripper manufactures a false PASS — emit a marker and exit 3 so the caller
-# fails closed. A stripper that cannot parse its input must never report CLEAN.
+# HANDLED: // to end of line; /* */ inline and multi-line; "..." and '...' with
+# backslash escapes; C++14 digit separators (a ' between two hex digits is a
+# token character, not a literal).
+#
+# REFUSED, loudly (exit 3, which fails the calling guard):
+#   - a raw string literal R"delim(...)delim"
+#   - ANY line whose last character is a backslash. That one rule covers
+#     backslash-continued line comments, backslash-continued string and char
+#     literals, and line-spliced tokens (`GetT\` + newline + `ip()`), all of
+#     which would otherwise be mis-tokenised into a false PASS. Neither file
+#     this guard checks contains one.
+#   - a trigraph introducer ??/ (an alternative spelling of backslash; inert
+#     under -std=c++17, refused anyway rather than assumed inert)
+#   - a string or char literal still OPEN at end of line
+# A scanner that cannot parse its input must never report CLEAN.
+#
+# Comment and literal bytes become spaces, so no two tokens are joined and no
+# column moves.
 BEGIN { inblock = 0 }
+
+function refuse(why) { print "STRIPPER-REFUSES: " why > "/dev/stderr"; exit 3 }
+
+# A ' that sits between two hex digits is a C++14 digit separator, not a
+# literal. Checked at the quote itself, where any ' inside an earlier literal
+# has already been consumed by the literal scanner.
+# NB: the locals are prev/nxt - `next` is an awk RESERVED WORD and naming a
+# parameter that is a syntax error, which makes the whole guard exit 1.
+function is_digit_separator(line, i,    prev, nxt) {
+    if (i <= 1 || i >= length(line)) return 0
+    prev = substr(line, i - 1, 1)
+    nxt = substr(line, i + 1, 1)
+    return (prev ~ /[0-9a-fA-F]/ && nxt ~ /[0-9a-fA-F]/)
+}
+
 {
     line = $0
+    lastc = substr(line, length(line), 1)
+    if (lastc == "\r") { lastc = substr(line, length(line) - 1, 1) }
+    if (lastc == "\\") refuse("line ends in a backslash (continuation or token splice)")
+    if (index(line, "??/") > 0) refuse("trigraph introducer ??/")
+
     out = ""; i = 1; n = length(line)
     while (i <= n) {
         c = substr(line, i, 1)
@@ -32,38 +67,27 @@ BEGIN { inblock = 0 }
             if (d == "*/") { inblock = 0; out = out "  "; i += 2 } else { out = out " "; i++ }
             continue
         }
-        if (d == "//") {
-            # Trailing-backslash test uses substr, NOT a regex. These files are
-            # CRLF, so $0 ends with a CR and a plain /\$/ can never match — a
-            # refusal that silently never fires is worse than no refusal. (The
-            # first version here shipped a mangled pattern and accepted the very
-            # file it was written to reject; running it is what caught that.)
-            lastc = substr(line, length(line), 1)
-            if (lastc == "\r") lastc = substr(line, length(line) - 1, 1)
-            if (lastc == "\\") {
-                print "STRIPPER-REFUSES: backslash-continued line comment" > "/dev/stderr"; exit 3
-            }
-            while (i <= n) { out = out " "; i++ }
-            continue
-        }
+        if (d == "//") { while (i <= n) { out = out " "; i++ } continue }
         if (d == "/*") { inblock = 1; out = out "  "; i += 2; continue }
         if (c == "\"" || c == "'") {
-            # Raw string literals are refused, but the test has to be made HERE,
-            # in normal state, not by scanning the line for the two characters
-            # R" - chain.cpp contains string literals ending in R (`"ERROR"`),
-            # and a line-level test cannot tell those from a raw-string prefix.
-            # It refused a clean chain.cpp on exactly that. At this point any R
-            # inside an earlier literal has already been blanked, so a preceding
-            # R here really is a prefix.
-            if (i > 1 && substr(line, i - 1, 1) == "R") {
-                print "STRIPPER-REFUSES: raw string literal" > "/dev/stderr"; exit 3
-            }
+            if (c == "'" && is_digit_separator(line, i)) { out = out c; i++; continue }
+            # Raw string literals are refused, and the test is made HERE rather
+            # than by scanning the line for the two characters R" - chain.cpp has
+            # literals ending in R ("ERROR") and a line-level test cannot tell
+            # those from a raw-string prefix. It refused a clean chain.cpp on
+            # exactly that.
+            if (c == "\"" && i > 1 && substr(line, i - 1, 1) == "R") refuse("raw string literal")
             q = c; out = out c; i++
+            closed = 0
             while (i <= n) {
                 c2 = substr(line, i, 1)
                 if (c2 == "\\") { out = out "  "; i += 2; continue }
-                if (c2 == q)    { out = out c2; i++; break }
+                if (c2 == q)    { out = out c2; i++; closed = 1; break }
                 out = out " "; i++
+            }
+            if (!closed) {
+                if (q == "\"") refuse("unterminated string literal")
+                refuse("unterminated char literal")
             }
             continue
         }
@@ -71,3 +95,4 @@ BEGIN { inblock = 0 }
     }
     print out
 }
+END { if (inblock) refuse("unterminated block comment at end of file") }

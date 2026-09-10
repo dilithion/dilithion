@@ -3077,18 +3077,34 @@ std::vector<ActiveChainHeader> CChainState::GetActiveChainHeaders() const {
     return out;
 }
 
+// P2P-16 / external review r3 G4. Counts entries to the locator resolver - the
+// only function on this path that walks pprev under cs_main. It exists so a test
+// can assert a NEGATIVE that is otherwise invisible: that a header batch
+// rejected on size or emptiness never reaches the walk at all. Without an
+// instrument, "the cheap checks run first" is a claim about source order, not
+// about behaviour, and moving them back would break nothing observable.
+static std::atomic<uint64_t> g_resolveLocatorHashesCalls{0};
+namespace chaintest {
+uint64_t ResolveLocatorHashesCallCount() { return g_resolveLocatorHashesCalls.load(std::memory_order_relaxed); }
+}  // namespace chaintest
+
 std::vector<uint256> CChainState::ResolveLocatorHashes(int headersHeight,
                                                        std::vector<int> (*pattern)(int),
                                                        std::vector<int>& heightsOut,
                                                        int& tipHeightOut) const {
+    g_resolveLocatorHashesCalls.fetch_add(1, std::memory_order_relaxed);
     heightsOut.clear();
     std::vector<uint256> out;
 
     // COMPLEXITY, corrected — my previous comment here was FALSE and it mattered.
     //
     // It claimed "O(log n) per height ... uses the pskip skip-list". pskip is
-    // INERT: block_index.cpp:14 and :32 null it, :57 copies it, and there is no
-    // BuildSkip anywhere in the tree (chain.cpp:609-611 already said so).
+    // INERT: both CBlockIndex constructors null it, the copy-ctor copies that
+    // nullptr, and no BuildSkip exists anywhere in the tree - see the eviction
+    // note beside EvictLowestWorkLeafNotPinned, which says the same. (Symbols,
+    // not line numbers: the previous version of this comment cited
+    // block_index.cpp:14/:32/:57, and line numbers in a safety comment go stale
+    // silently while the comment keeps reading as if it had been checked.)
     // CBlockIndex::GetAncestor therefore falls back to a LINEAR pprev walk every
     // time. Calling it once per scheduled height would be up to 64 independent
     // O(n) walks — and, because this function holds cs_main for all of them, it
