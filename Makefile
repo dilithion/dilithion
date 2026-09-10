@@ -878,6 +878,26 @@ chain_selector_tests: $(CORE_OBJECTS) $(OBJ_DIR)/test/chain_selector_tests.o $(D
 	@$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS) $(LIBS)
 	@echo "$(COLOR_GREEN)✓ chain_selector_tests built successfully$(COLOR_RESET)"
 
+evict_cost_bench: $(CORE_OBJECTS) $(OBJ_DIR)/tools/evict_cost_bench.o $(DILITHIUM_OBJECTS) $(CHIAVDF_OBJECTS)
+	@echo "$(COLOR_BLUE)[LINK]$(COLOR_RESET) $@"
+	@$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS) $(LIBS)
+	@echo "$(COLOR_GREEN)â evict_cost_bench built successfully$(COLOR_RESET)"
+
+leaf_index_invariant_tests: $(CORE_OBJECTS) $(OBJ_DIR)/test/leaf_index_invariant_tests.o $(DILITHIUM_OBJECTS) $(CHIAVDF_OBJECTS)
+	@echo "$(COLOR_BLUE)[LINK]$(COLOR_RESET) $@"
+	@$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS) $(LIBS)
+	@echo "$(COLOR_GREEN)✓ leaf_index_invariant_tests built successfully$(COLOR_RESET)"
+
+queue_parent_pin_publication_tests: $(CORE_OBJECTS) $(OBJ_DIR)/test/queue_parent_pin_publication_tests.o $(DILITHIUM_OBJECTS) $(CHIAVDF_OBJECTS)
+	@echo "$(COLOR_BLUE)[LINK]$(COLOR_RESET) $@"
+	@$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS) $(LIBS)
+	@echo "$(COLOR_GREEN)✓ queue_parent_pin_publication_tests built successfully$(COLOR_RESET)"
+
+regtest_cap_rejection_tests: $(CORE_OBJECTS) $(OBJ_DIR)/test/regtest_cap_rejection_tests.o $(DILITHIUM_OBJECTS) $(CHIAVDF_OBJECTS)
+	@echo "$(COLOR_BLUE)[LINK]$(COLOR_RESET) $@"
+	@$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS) $(LIBS)
+	@echo "$(COLOR_GREEN)✓ regtest_cap_rejection_tests built successfully$(COLOR_RESET)"
+
 # v4.1 mandatory upgrade — checkpoint enforcement tests (Phase 1 + Phase 2
 # startup validator + lifetime-miner snapshot assertion semantics).
 v4_1_checkpoint_enforcement_tests: $(CORE_OBJECTS) $(OBJ_DIR)/test/v4_1_checkpoint_enforcement_tests.o $(DILITHIUM_OBJECTS) $(CHIAVDF_OBJECTS)
@@ -1374,6 +1394,39 @@ $(OBJ_DIR)/test \
 $(OBJ_DIR)/test/fuzz:
 	@mkdir -p $@
 
+# ASSERTS MUST SURVIVE IN TEST OBJECTS, WHATEVER CXXFLAGS ARRIVES.
+#
+# Raised by the external panel (kimi): "confirm no CI leg defines NDEBUG for the
+# assert-based suites." Confirmed — NDEBUG appears nowhere in this Makefile or in
+# .github/workflows/, and ci.yml states that matrix.build_type sets no compiler
+# flags. So the answer today is "none".
+#
+# It is true by luck, though, and that is the part worth fixing. CXXFLAGS is
+# assigned with `?=`, so a CI job, a distro packager, or `make CXXFLAGS=...` can
+# replace it wholesale — and 23 of the standalone suites are hand-written mains
+# whose ONLY checks are assert(). Under -DNDEBUG every one of them compiles to a
+# no-op, runs in milliseconds, and EXITS 0. The roster would report them green.
+# That is a silent, total loss of coverage with a passing result, which is the
+# exact failure shape this branch keeps turning up.
+#
+# `-UNDEBUG` last on the command line makes the property hold by construction
+# instead of by inspection. Scoped to test objects only: whether production
+# builds keep asserts is a separate policy decision and is not changed here.
+#
+# ⚠️ `override` IS THE LOAD-BEARING WORD, and its absence made the first version
+# of this line useless against the very vector the comment above names. A
+# variable set on the command line beats every assignment in the makefile,
+# INCLUDING a target-specific `+=`. Measured:
+#
+#   sub:          CXXFLAGS += -UNDEBUG   ->  make CXXFLAGS=cmdline  =>  "cmdline"
+#   sub2: override CXXFLAGS += -UNDEBUG  ->  make CXXFLAGS=cmdline  =>  "cmdline -UNDEBUG"
+#
+# So without `override`, `make CXXFLAGS=-DNDEBUG` silently dropped the -UNDEBUG
+# and voided all 23 assert-only suites — the exact scenario two paragraphs up.
+# A guard that does not cover the case its own comment cites is worse than none,
+# because the comment stops anyone looking again.
+$(OBJ_DIR)/test/%.o: override CXXFLAGS += -UNDEBUG
+
 # Compile C++ source files
 $(OBJ_DIR)/%.o: src/%.cpp | $(OBJ_DIR)/attestation $(OBJ_DIR)/consensus $(OBJ_DIR)/consensus/port $(OBJ_DIR)/core $(OBJ_DIR)/crypto $(OBJ_DIR)/db $(OBJ_DIR)/dfmp $(OBJ_DIR)/index $(OBJ_DIR)/kernel $(OBJ_DIR)/miner $(OBJ_DIR)/net $(OBJ_DIR)/net/port $(OBJ_DIR)/node $(OBJ_DIR)/primitives $(OBJ_DIR)/rpc $(OBJ_DIR)/wallet $(OBJ_DIR)/util $(OBJ_DIR)/api $(OBJ_DIR)/vdf $(OBJ_DIR)/digital_dna $(OBJ_DIR)/script $(OBJ_DIR)/policy $(OBJ_DIR)/tools $(OBJ_DIR)/x402 $(OBJ_DIR)/zmq $(OBJ_DIR)/test
 	@echo "$(COLOR_BLUE)[CXX]$(COLOR_RESET)  $<"
@@ -1475,7 +1528,39 @@ libzmq-clean:
 
 # Include auto-generated header dependency files (-MMD -MP)
 # These ensure that changing any .h file triggers recompilation of all .cpp files that include it
--include $(wildcard $(OBJ_DIR)/**/*.d $(OBJ_DIR)/*.d)
+# ⚠️ `$(wildcard .../**/*.d)` DOES NOT RECURSE, AND THE MISS IS SILENT.
+#
+# GNU make's $(wildcard) is glob, not globstar: `**` behaves as a single `*`, so
+# `$(OBJ_DIR)/**/*.d` matched exactly ONE directory level, so everything two
+# levels deep was invisible to it:
+#     build/obj/consensus/port/   (1 file: chain_selector_impl)
+#     build/obj/net/port/         (4 files)
+#
+# Measured twice on differently-populated trees: 153 .d present / 148 matched,
+# and 155 / 150. The TOTAL moves with how much has been built, so the durable
+# fact is not a ratio — it is that these two directories were never covered, and
+# they are second-level only because of where the port adapters live.
+#
+# Those objects therefore had NO header dependency tracking at all. Editing a
+# header they include did not rebuild them, and because nothing reports the miss
+# the result is not a build error but a MIXED-LAYOUT BINARY: two objects compiled
+# against different definitions of the same class, linked together.
+#
+# HOW IT PRESENTS, because it does not look like a build problem. Adding two
+# members to CChainState rebuilt chain.o and left chain_selector_impl.o at its
+# previous layout. The next run threw
+#     terminate called after throwing an instance of 'std::system_error'
+#       what():  Invalid argument
+# from a std::lock_guard inside ChainSelectorAdapter::ProcessNewHeader — a mutex
+# error with no mutex bug, because that object was locking cs_main at the wrong
+# offset. Time was spent suspecting threading before object mtimes were compared.
+#
+# `find` is used instead of `wildcard` because it actually recurses. Verified by
+# positive control: touch src/consensus/chain.h, and
+# build/obj/consensus/port/chain_selector_impl.o now rebuilds (its mtime moves);
+# before this change it did not.
+DEPFILES := $(shell find $(OBJ_DIR) -name '*.d' 2>/dev/null)
+-include $(DEPFILES)
 
 # ============================================================================
 # Utility Targets

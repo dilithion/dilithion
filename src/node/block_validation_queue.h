@@ -151,6 +151,37 @@ public:
      */
     bool IsHeightQueued(int height) const;
 
+    /**
+     * @brief PR #129 MEDIUM-2: hashes the queue is currently responsible for.
+     *
+     * Returns every QUEUED block hash plus the single block currently IN-FLIGHT
+     * in the worker (popped from the queue but mid-ProcessBlock, with cs_main
+     * released between ops). CChainState registers this as its
+     * PendingBlockHashProvider and consults it during cap eviction (under
+     * cs_main) to pin these blocks AND their pprev ancestors, so a multi-pass
+     * cascade cannot free a queued block's parent out from under the worker's
+     * create path (a liveness hole under adversarial cap pressure).
+     *
+     * Pure read of queue state under m_queue_mutex; returns HASHES (not raw
+     * CBlockIndex*), which keeps the lock order cs_main -> m_queue_mutex clean
+     * (eviction holds cs_main and calls this; this never calls into CChainState).
+     *
+     * NOTE — this is ADDITIVE liveness defense; it does NOT replace the worker's
+     * by-hash re-resolve in ProcessBlock, which is the authoritative correctness
+     * path for BLOCKER-1. The parenthetical that used to sit here — "pinning
+     * guards eviction, not the AddBlockIndex flag-merge that can still re-home
+     * the canonical pointer for a hash" — is FALSE: the merge mutates the
+     * existing object in place, so the address is stable (asserted by
+     * test_height_one_header_then_data_sequence). The re-resolve is mandatory
+     * because the cached pointer predates the pin, not because a merge moves it.
+     *
+     * Returns the union of: queued hashes, the in-flight hash, and the PARENT
+     * hash of each — the parents matter because a queued block that is not yet
+     * in mapBlockIndex pins nothing via the child, which is exactly the
+     * create-path case (external panel round 2).
+     */
+    std::set<uint256> GetPendingBlockHashes() const;
+
 private:
     /**
      * @brief Validation worker thread main loop
@@ -182,6 +213,43 @@ private:
     // Priority queue for blocks (min-heap by height)
     std::priority_queue<QueuedBlock> m_queue;
     std::set<int> m_queued_heights;  // O(1) lookup for IsHeightQueued - tracks heights in queue
+    // PR #129 MEDIUM-2: hashes of blocks currently QUEUED (kept in sync with
+    // m_queue) plus the single block IN-FLIGHT in the worker. Both are guarded
+    // by m_queue_mutex. GetPendingBlockHashes() returns their union so eviction
+    // can pin them and their ancestors. The in-flight slot is essential: between
+    // the worker popping a block (removing it from m_queue / m_queued_hashes) and
+    // ProcessBlock finishing, cs_main is released across ops — exactly the
+    // BLOCKER-1 / cascade window — and the block is no longer in m_queue, so a
+    // queue-contents-only set would miss it precisely when it is most exposed.
+    std::set<uint256> m_queued_hashes;          // hashes currently in m_queue
+    uint256 m_inflight_hash;                     // hash mid-ProcessBlock (or null)
+    bool m_has_inflight{false};                  // whether m_inflight_hash is valid
+
+    // PR #129 round-2 (external panel: gpt6 HIGH, kimi MEDIUM, found
+    // independently) — PARENT HASHES, and this closes a hole the clause-(d)
+    // comment claimed was already closed.
+    //
+    // Clause (d) in EvictLowestWorkLeafNotPinned pins a pending block AND walks
+    // its pprev ancestors — but the walk starts from `mapBlockIndex.find(h)`,
+    // and on a MISS it does `continue`. A queued block that is not yet in
+    // mapBlockIndex is exactly the create-path case, so for precisely those
+    // blocks the ancestor walk never ran and THE PARENT WAS NOT PINNED. The
+    // create path could therefore evict the very parent it was about to resolve.
+    // Safety was preserved by the resolve-AFTER-evict ordering (a freed parent
+    // is observed as a clean null, not a dangling pointer); LIVENESS was not —
+    // a valid competing fork stalls under cap pressure. ProcessBlock's own
+    // comment conceded this while the clause-(d) comment asserted the opposite.
+    //
+    // Reporting the parent hash lets clause (d) pin it BY HASH, independently of
+    // whether the child is indexed yet, which is the case that was missing.
+    //
+    // A MULTISET, DELIBERATELY: several queued blocks can share one parent, and
+    // with a plain set, popping one of them would unpin a parent the others
+    // still need. Erase with `erase(find(h))` — never `erase(h)`, which removes
+    // EVERY equal element and reintroduces exactly that bug.
+    std::multiset<uint256> m_queued_parent_hashes;  // parents of queued blocks
+    uint256 m_inflight_parent_hash;                  // parent of the in-flight block
+    bool m_has_inflight_parent{false};
     mutable std::mutex m_queue_mutex;
     std::condition_variable m_queue_cv;
 
