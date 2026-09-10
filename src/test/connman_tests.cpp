@@ -495,12 +495,40 @@ void test_wake_message_handler() {
 }
 
 /**
- * Test 11: High-Load Message Throughput
- * Verify that message queues handle high throughput without data loss
- * This tests the decoupled I/O + message processing architecture
+ * Test 11: Process-queue CAP under high load (BUG #275 defence)
+ *
+ * WHAT THIS USED TO ASSERT, AND WHY IT WAS WRONG.
+ *
+ * This scenario pushed 10,000 messages and then asserted
+ *     assert(pop_count == NUM_MESSAGES);
+ * i.e. that the process queue is UNBOUNDED and LOSSLESS. It failed 12 of 12
+ * runs, deterministically, popping exactly 1000. That is not a flake and it is
+ * not a defect in CConnman: CNode::PushProcessMsg caps the queue and pops the
+ * OLDEST entry when it is full - "BUG #275: Cap process queue to prevent OOM
+ * from fast senders". The assertion asserted the ABSENCE of that defence, and
+ * predates it.
+ *
+ * The suite was quarantined as "SUSPECTED REAL: ... Message loss under load in
+ * CConnman is not a stale expectation", which is exactly backwards and pointed
+ * a maintainer at removing an OOM defence. That reason is corrected in
+ * scripts/run_test_suites.sh and the suite is live again.
+ *
+ * So this scenario now PINS the defence instead of denying it:
+ *   - a cap exists and it bites (fewer come out than went in);
+ *   - the survivors are the NEWEST, contiguous and in order - drop-OLDEST,
+ *     which nothing tested before today;
+ *   - the queue is empty afterwards;
+ *   - a throughput number is still reported, measured over a batch that fits
+ *     under the cap so the figure means what it says.
+ *
+ * The cap value is deliberately NOT hard-coded: MAX_PROCESS_QUEUE_SIZE is
+ * private, and a literal here could drift away from it and quietly stop testing
+ * anything. It is DISCOVERED by draining, and only its behaviour is asserted.
+ * Whether 1000 is the right value is a design question this test does not
+ * answer.
  */
 void test_highload_throughput() {
-    std::cout << "Testing high-load message throughput..." << std::endl;
+    std::cout << "Testing process-queue cap under high load..." << std::endl;
 
     NetProtocol::CAddress addr;
     addr.services = NetProtocol::NODE_NETWORK;
@@ -509,56 +537,141 @@ void test_highload_throughput() {
 
     CNode node(1, addr, false);
 
-    // High-load parameters
-    const int NUM_MESSAGES = 10000;
-    const int PAYLOAD_SIZE = 256;  // Bytes per message
+    const int OVERSHOOT    = 10000;  // deliberately far above any plausible cap
+    const int PAYLOAD_SIZE = 256;
 
-    // Generate test data
-    std::vector<uint8_t> payload(PAYLOAD_SIZE);
-    for (int i = 0; i < PAYLOAD_SIZE; ++i) {
-        payload[i] = static_cast<uint8_t>(i % 256);
-    }
+    // Each message carries its own index in the first four bytes, so the drain
+    // can say WHICH messages survived rather than only how many.
+    auto tagged = [PAYLOAD_SIZE](int idx) {
+        std::vector<uint8_t> p(PAYLOAD_SIZE);
+        p[0] = static_cast<uint8_t>(idx & 0xff);
+        p[1] = static_cast<uint8_t>((idx >> 8) & 0xff);
+        p[2] = static_cast<uint8_t>((idx >> 16) & 0xff);
+        p[3] = static_cast<uint8_t>((idx >> 24) & 0xff);
+        for (int i = 4; i < PAYLOAD_SIZE; ++i) p[i] = static_cast<uint8_t>(i % 256);
+        return p;
+    };
+    auto tag_of = [](const std::vector<uint8_t>& p) {
+        return static_cast<int>(p[0]) | (static_cast<int>(p[1]) << 8)
+             | (static_cast<int>(p[2]) << 16) | (static_cast<int>(p[3]) << 24);
+    };
 
-    // Start timing
-    auto start = std::chrono::steady_clock::now();
-
-    // Push many messages rapidly (simulating high network throughput)
-    for (int i = 0; i < NUM_MESSAGES; ++i) {
+    for (int i = 0; i < OVERSHOOT; ++i) {
         CProcessedMsg msg;
         msg.command = "inv";
-        msg.data = payload;
+        msg.data = tagged(i);
         node.PushProcessMsg(std::move(msg));
     }
-
-    auto push_end = std::chrono::steady_clock::now();
-    auto push_duration = std::chrono::duration_cast<std::chrono::microseconds>(push_end - start);
-
-    // Verify all messages are queued
     assert(node.HasProcessMsgs() == true);
 
-    // Pop all messages
-    int pop_count = 0;
+    std::vector<int> drained;
     CProcessedMsg popped;
     while (node.PopProcessMsg(popped)) {
-        pop_count++;
         assert(popped.command == "inv");
-        assert(popped.data.size() == PAYLOAD_SIZE);
+        assert(popped.data.size() == static_cast<size_t>(PAYLOAD_SIZE));
+        drained.push_back(tag_of(popped.data));
     }
 
-    auto pop_end = std::chrono::steady_clock::now();
-    auto total_duration = std::chrono::duration_cast<std::chrono::microseconds>(pop_end - start);
+    const int cap = static_cast<int>(drained.size());
 
-    // Verify no messages lost
-    assert(pop_count == NUM_MESSAGES);
+    // 1. A cap exists AND IT BIT. Both halves matter: if nothing were dropped
+    //    this is the old unbounded queue and the OOM defence is gone; if
+    //    everything were dropped the queue would be useless.
+    assert(cap > 0);
+    assert(cap < OVERSHOOT);
+
+    // 2. DROP-OLDEST: the survivors are the LAST `cap` messages pushed, in
+    //    order. This is what fails if the policy is changed to drop-newest, and
+    //    nothing in the tree asserted it before today.
+    for (int k = 0; k < cap; ++k) {
+        assert(drained[k] == OVERSHOOT - cap + k);
+    }
+
+    // 3. Draining empties it.
     assert(node.HasProcessMsgs() == false);
 
-    // Calculate throughput
-    double throughput = (NUM_MESSAGES * 1000000.0) / total_duration.count();  // msgs/sec
-    double data_rate = (NUM_MESSAGES * PAYLOAD_SIZE * 1000000.0) / total_duration.count() / 1024 / 1024;  // MB/s
+    // 4. Throughput over a batch that FITS - so the number is queue throughput
+    //    and not a measure of how fast we discard.
+    auto start = std::chrono::steady_clock::now();
+    for (int i = 0; i < cap; ++i) {
+        CProcessedMsg msg;
+        msg.command = "inv";
+        msg.data = tagged(i);
+        node.PushProcessMsg(std::move(msg));
+    }
+    int perf_count = 0;
+    while (node.PopProcessMsg(popped)) ++perf_count;
+    auto total_duration = std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now() - start);
+    assert(perf_count == cap);
+    assert(node.HasProcessMsgs() == false);
 
-    std::cout << "  ✓ High-load throughput: " << static_cast<int>(throughput) << " msgs/sec, "
-              << std::fixed << std::setprecision(2) << data_rate << " MB/s" << std::endl;
-    std::cout << "    (" << NUM_MESSAGES << " messages, " << total_duration.count() / 1000 << "ms)" << std::endl;
+    const double us = total_duration.count() > 0 ? static_cast<double>(total_duration.count()) : 1.0;
+    double throughput = (cap * 1000000.0) / us;
+    double data_rate  = (cap * PAYLOAD_SIZE * 1000000.0) / us / 1024 / 1024;
+
+    std::cout << "  [OK] Process queue caps at " << cap << " and keeps the NEWEST"
+              << " (dropped " << (OVERSHOOT - cap) << " of " << OVERSHOOT << ")" << std::endl;
+    std::cout << "  [OK] Throughput over a batch that fits: " << static_cast<int>(throughput)
+              << " msgs/sec, " << std::fixed << std::setprecision(2) << data_rate << " MB/s"
+              << " (" << cap << " messages, " << total_duration.count() / 1000 << "ms)" << std::endl;
+}
+
+/**
+ * Test 11b: Send-queue cap keeps the OPPOSITE end (BUG #275, second queue)
+ *
+ * The two queues cap with two DIFFERENT policies, and neither was pinned:
+ *   - PushProcessMsg pops the OLDEST to make room, so the NEWEST survive. The
+ *     code's rationale: an inbound flood must not OOM us, and the most recent
+ *     messages are the ones still worth processing.
+ *   - PushSendMsg drops the INCOMING message and returns, so the OLDEST
+ *     survive. The code's rationale: "Drop new messages when queue is full -
+ *     peer will re-request if needed."
+ *
+ * Both are defensible, and they are opposites - which is exactly why a reader
+ * cannot infer one from the other, and why each needs its own assertion.
+ *
+ * There is no public pop for the send queue, but GetSendMsg() exposes the
+ * FRONT, and the front alone distinguishes the two policies: under drop-newest
+ * the front is still the very first message pushed; under drop-oldest it would
+ * have been discarded long ago.
+ */
+void test_send_queue_cap_keeps_oldest() {
+    std::cout << "Testing send-queue cap policy (drop-newest)..." << std::endl;
+
+    NetProtocol::CAddress addr;
+    addr.services = NetProtocol::NODE_NETWORK;
+    addr.SetIPv4(0x7F000001);
+    addr.port = 8445;
+
+    CNode node(2, addr, false);
+
+    const int OVERSHOOT = 10000;  // far above any plausible cap
+    for (int i = 0; i < OVERSHOOT; ++i) {
+        std::vector<uint8_t> p(8, 0);
+        p[0] = static_cast<uint8_t>(i & 0xff);
+        p[1] = static_cast<uint8_t>((i >> 8) & 0xff);
+        p[2] = static_cast<uint8_t>((i >> 16) & 0xff);
+        p[3] = static_cast<uint8_t>((i >> 24) & 0xff);
+        node.PushSendMsg(CSerializedNetMsg("inv", std::move(p)));
+    }
+
+    assert(node.HasSendMsgs() == true);
+
+    const CSerializedNetMsg* front = node.GetSendMsg();
+    assert(front != nullptr);
+    assert(front->data.size() >= 4);
+    const int front_tag = static_cast<int>(front->data[0])
+                        | (static_cast<int>(front->data[1]) << 8)
+                        | (static_cast<int>(front->data[2]) << 16)
+                        | (static_cast<int>(front->data[3]) << 24);
+
+    // DROP-NEWEST: the first message pushed is still at the head after a flood.
+    // Flip PushSendMsg to pop_front() instead of returning and this goes red.
+    assert(front_tag == 0);
+
+    std::cout << "  [OK] Send queue kept the OLDEST under flood (front tag "
+              << front_tag << " after " << OVERSHOOT << " pushes)" << std::endl;
 }
 
 /**
@@ -653,9 +766,10 @@ int main() {
         std::cout << "\n--- Integration Tests ---\n" << std::endl;
         test_bug134_handshake_timing();
         test_highload_throughput();
+        test_send_queue_cap_keeps_oldest();
         test_connection_stress();
 
-        std::cout << "\n=== All Phase 6 Tests Passed! (12 tests) ===" << std::endl;
+        std::cout << "\n=== All Phase 6 Tests Passed! (13 tests) ===" << std::endl;
         return 0;
     } catch (const std::exception& e) {
         std::cerr << "Test failed with exception: " << e.what() << std::endl;
