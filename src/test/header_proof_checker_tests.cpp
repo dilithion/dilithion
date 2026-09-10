@@ -17,6 +17,8 @@
 #include <cassert>
 #include <cstring>
 #include <iostream>
+#include <iterator>
+#include <string>
 
 using ::dilithion::net::port::RandomXHeaderProofChecker;
 using ::dilithion::net::port::VDFHeaderProofChecker;
@@ -115,9 +117,11 @@ void test_vdf_checker_accepts_well_formed()
 {
     std::cout << "  test_vdf_checker_accepts_well_formed..." << std::flush;
     VDFHeaderProofChecker c;
-    // 0x1d00ffff is the VDF chains' genesisNBits (DilV and regtest alike), which
-    // the checker now requires by EQUALITY — see the nBits rule in
-    // header_proof_checkers.h. main() sets g_chainParams for that reason.
+    // 0x1d00ffff is the genesisNBits main() installs (Regtest, which inherits it
+    // from Testnet). The checker requires it by EQUALITY — see the nBits rule in
+    // header_proof_checkers.h; main() sets g_chainParams for that reason. DilV,
+    // the chain this rule actually protects, is asserted separately in
+    // test_vdf_checker_nbits_rule_holds_on_dilv rather than assumed equal here.
     auto h = MakeVDFHeader(0x1d00ffff);
     assert(c.CheckHeaderProof(h));
     std::cout << " OK\n";
@@ -150,6 +154,42 @@ void test_vdf_checker_fails_closed_without_chainparams()
     // And the same header is accepted once chainparams is back, so this arm is
     // pinning fail-closed rather than a checker that rejects everything.
     assert(c.CheckHeaderProof(h));
+    std::cout << " OK\n";
+}
+
+// ⚠️ THE PRODUCTION CHAIN, WHICH THIS SUITE NEVER BUILT. Every other arm runs
+// under Regtest — and `ChainParams::Regtest()` starts as `ChainParams params =
+// Testnet()` (chainparams.cpp:874), so its genesisNBits is inherited from
+// TESTNET. Testnet's is numerically equal to DilV's (both 0x1d00ffff) but its
+// producer RETARGETS via ASERT rather than emitting a constant, which is the
+// distinction that nearly shipped a testnet-banning checker predicate. A suite
+// that only ever constructs Regtest proves the rule on a chain reached by
+// inheritance from the one chain where it does not hold.
+//
+// So: assert it on DilV directly, and assert the number too — if DilV's
+// genesisNBits is ever retuned, this arm says so rather than silently passing
+// because MakeVDFHeader happens to use the same literal.
+void test_vdf_checker_nbits_rule_holds_on_dilv()
+{
+    std::cout << "  test_vdf_checker_nbits_rule_holds_on_dilv..." << std::flush;
+    VDFHeaderProofChecker c;
+
+    static Dilithion::ChainParams s_dilv_params = Dilithion::ChainParams::DilV();
+    Dilithion::ChainParams* saved = Dilithion::g_chainParams;
+    Dilithion::g_chainParams = &s_dilv_params;
+
+    // Pin the constant this suite's headers are built against, on the real chain.
+    assert(s_dilv_params.genesisNBits == 0x1d00ffff);
+
+    const bool accepts_genesis_nbits = c.CheckHeaderProof(MakeVDFHeader(0x1d00ffff));
+    // The discriminating half: EQUALITY, not "any plausible nBits". A neighbouring
+    // value must be refused, or "accept everything" would pass the line above.
+    const bool rejects_other_nbits = c.CheckHeaderProof(MakeVDFHeader(0x1d00fffe));
+
+    Dilithion::g_chainParams = saved;
+
+    assert(accepts_genesis_nbits);
+    assert(!rejects_other_nbits);
     std::cout << " OK\n";
 }
 
@@ -198,21 +238,31 @@ void test_vdf_chain_work_uses_same_helper_as_randomx()
 // Three-enum bridge — drift detection
 // ============================================================================
 
+// The roster lives in maybe_punish_node.h, beside the enum, so this suite and
+// peer_scorer_banman_integration_tests iterate the SAME list. A per-suite copy
+// would let one of them quietly stop covering a newly added reason.
+using ::dilithion::net::port::kAllHeaderRejectReasons;
+
 void test_header_reject_reason_maps_exhaustively()
 {
     std::cout << "  test_header_reject_reason_maps_exhaustively..." << std::flush;
     using R = HeaderRejectReason;
     using T = ::dilithion::net::MisbehaviorType;
-    // Every value of HeaderRejectReason must produce a non-Unknown
-    // MisbehaviorType. Catches drift if a future contributor adds an
-    // enum entry without updating the map.
-    assert(MapHeaderRejectToMisbehaviorType(R::InvalidProof)                  != T::UnknownMessage);
-    assert(MapHeaderRejectToMisbehaviorType(R::InvalidHeaderFields)           != T::UnknownMessage);
-    assert(MapHeaderRejectToMisbehaviorType(R::NonContinuousChain)            != T::UnknownMessage);
-    assert(MapHeaderRejectToMisbehaviorType(R::InsufficientChainWork)         != T::UnknownMessage);
-    assert(MapHeaderRejectToMisbehaviorType(R::RedownloadCommitmentMismatch)  != T::UnknownMessage);
-    assert(MapHeaderRejectToMisbehaviorType(R::MemoryBoundExceeded)           != T::UnknownMessage);
-    assert(MapHeaderRejectToMisbehaviorType(R::FutureTimestamp)               != T::UnknownMessage);
+
+    for (HeaderRejectReason r : kAllHeaderRejectReasons) {
+        const auto mapped = MapHeaderRejectToMisbehaviorType(r);
+        if (r == R::LocalStateUnavailable) {
+            // THE ONE REASON WITH NO MISBEHAVIOR LABEL, asserted positively so
+            // that "map everything to InvalidHeader" cannot pass this suite. It
+            // is our own missing state, not something a peer did.
+            assert(!mapped.has_value());
+            continue;
+        }
+        // Every other reason must carry a deliberate label — and never the
+        // weight-1 catch-all, which is what an unmapped enumerator would fall to.
+        assert(mapped.has_value());
+        assert(*mapped != T::UnknownMessage);
+    }
     std::cout << " OK\n";
 }
 
@@ -233,17 +283,101 @@ void test_header_reject_weights_honest_signals_score_zero()
     //     REDOWNLOAD emits exactly this: commitments recorded against the
     //     phase-1 chain, phase 2 re-requests and compares against the OLD ones.
     //
-    // Measured by ENUMERATION: Core v28.0 net_processing.cpp has 21 Misbehaving()
-    // sites; none is for a low-work chain and none is for a commitment mismatch.
+    // Measured by ENUMERATION: Core v28.0 net_processing.cpp has 18 Misbehaving()
+    // CALL SITES; none is for a low-work chain and none is for a commitment
+    // mismatch. (Not 21 — `grep -c` also counts the declaration at :555, the
+    // definition at :1939 and a comment at :3087.)
     assert(HeaderRejectWeight(R::RedownloadCommitmentMismatch) == 0);
     assert(HeaderRejectWeight(R::InsufficientChainWork) == 0);
 
-    // THE DISCRIMINATING HALF. Zeroing the two honest-emittable reasons must not
-    // quietly disarm the scorer: signals an honest peer genuinely cannot emit
-    // keep their weight. Without these, "everything scores 0" would pass.
-    assert(HeaderRejectWeight(R::InvalidProof) == 100);  // InvalidPoW default
-    assert(HeaderRejectWeight(R::MemoryBoundExceeded) == 20);  // OversizedMessage default
-    assert(HeaderRejectWeight(R::NonContinuousChain) == 20);   // NonContinuousHeaders default
+    // The F4 per-reason census zeroed two more, both upstream-grounded:
+    //   FutureTimestamp       — Core net_processing.cpp:1992-1994 lists
+    //                           BLOCK_TIME_FUTURE among the results that break
+    //                           WITHOUT punishment. Clock skew is honest.
+    //   UnanchoredFirstHeader — Core net_processing.cpp:3130-3134 routes a first
+    //                           header whose prev is unknown to
+    //                           HandleUnconnectingHeaders, commented "this could
+    //                           be benign": a getheaders, no Misbehaving.
+    assert(HeaderRejectWeight(R::FutureTimestamp) == 0);
+    assert(HeaderRejectWeight(R::UnanchoredFirstHeader) == 0);
+
+    // Our own fault is never the peer's.
+    assert(HeaderRejectWeight(R::LocalStateUnavailable) == 0);
+
+    // THE DISCRIMINATING HALF. Zeroing five reasons must not quietly disarm the
+    // scorer: signals an honest peer genuinely cannot emit keep their weight.
+    // Without these, "everything scores 0" would pass this suite.
+    assert(HeaderRejectWeight(R::InvalidProof) == 100);         // InvalidPoW default
+    assert(HeaderRejectWeight(R::InvalidHeaderFields) == 50);   // InvalidHeader default
+    assert(HeaderRejectWeight(R::MemoryBoundExceeded) == 20);   // OversizedMessage default
+    // THE SPLIT, PINNED. DiscontinuousBatch keeps 20 — Core scores exactly this
+    // at net_processing.cpp:2727-2729 — while UnanchoredFirstHeader, its former
+    // other half, is 0 above. A revert that re-merges them fails one of the two.
+    assert(HeaderRejectWeight(R::DiscontinuousBatch) == 20);    // NonContinuousHeaders default
+
+    // NON-VACUITY: the roster and the two classes must partition it. If a future
+    // reason is added to kAllHeaderRejectReasons and given a weight but no assert
+    // above, these counts stop matching.
+    int scored = 0, unscored = 0;
+    for (HeaderRejectReason r : kAllHeaderRejectReasons) {
+        (HeaderRejectWeight(r) > 0 ? scored : unscored)++;
+    }
+    assert(scored == 4);
+    assert(unscored == 5);
+    std::cout << " OK\n";
+}
+
+// A counting IPeerScorer. Reads the DECISION the wrapper made, not the table it
+// consulted — the weight table and the wrapper are two independent gates, and a
+// test that only reads HeaderRejectWeight() back would see neither of them fail.
+class CountingScorer final : public ::dilithion::net::IPeerScorer {
+public:
+    int calls = 0;
+    int last_weight = -1;
+
+    bool Misbehaving(::dilithion::net::NodeId,
+                     ::dilithion::net::MisbehaviorType,
+                     const std::string& = "") override
+    {
+        ++calls;
+        return false;
+    }
+    bool Misbehaving(::dilithion::net::NodeId, int weight,
+                     const std::string& = "") override
+    {
+        ++calls;
+        last_weight = weight;
+        return false;
+    }
+    int  GetScore(::dilithion::net::NodeId) const override { return 0; }
+    void ResetScore(::dilithion::net::NodeId) override {}
+    void SetBanThreshold(int) override {}
+    int  GetBanThreshold() const override { return 100; }
+    void DecayAll() override {}
+};
+
+void test_zero_weight_reasons_never_reach_the_scorer()
+{
+    std::cout << "  test_zero_weight_reasons_never_reach_the_scorer..." << std::flush;
+    using ::dilithion::net::port::MaybePunishNodeForHeaders;
+
+    // A zero-weight Misbehaving() call is not harmless: it creates the peer's
+    // score entry and emits a line that reads as misbehavior. For an honest peer
+    // emitting an honest signal, the correct number of scorer calls is ZERO.
+    for (HeaderRejectReason r : kAllHeaderRejectReasons) {
+        CountingScorer scorer;
+        const bool banned = MaybePunishNodeForHeaders(scorer, /*peer=*/7, r, "detail");
+        if (HeaderRejectWeight(r) == 0) {
+            assert(scorer.calls == 0);
+            assert(!banned);
+        } else {
+            // The discriminating half again: the wrapper must still forward the
+            // scored reasons, at exactly the table's weight. Without this,
+            // "return false always" would pass the clause above.
+            assert(scorer.calls == 1);
+            assert(scorer.last_weight == HeaderRejectWeight(r));
+        }
+    }
     std::cout << " OK\n";
 }
 
@@ -275,8 +409,12 @@ int main()
     // CLOSED without it, so this suite must set chainparams up as production
     // does. Regtest is a VDF chain and its genesisNBits is 0x1d00ffff, the value
     // MakeVDFHeader uses below.
-    Dilithion::g_chainParams =
-        new Dilithion::ChainParams(Dilithion::ChainParams::Regtest());
+    // Static, not `new`: this suite sets g_chainParams to nullptr and back in
+    // test_vdf_checker_fails_closed_without_chainparams, and a leaked allocation
+    // here made that swap look free. Storage outlives every test either way.
+    static Dilithion::ChainParams s_regtest_params =
+        Dilithion::ChainParams::Regtest();
+    Dilithion::g_chainParams = &s_regtest_params;
 
     std::cout << "\n=== Phase 3: HeaderProofChecker Tests ===\n" << std::endl;
 
@@ -289,6 +427,7 @@ int main()
         std::cout << "\n--- VDFHeaderProofChecker ---" << std::endl;
         test_vdf_checker_accepts_well_formed();
         test_vdf_checker_fails_closed_without_chainparams();
+        test_vdf_checker_nbits_rule_holds_on_dilv();
         test_vdf_checker_rejects_non_vdf_header();
         test_vdf_checker_rejects_null_proof_hash();
         test_vdf_checker_rejects_null_output();
@@ -297,9 +436,10 @@ int main()
         std::cout << "\n--- MaybePunishNodeFor* enum bridges ---" << std::endl;
         test_header_reject_reason_maps_exhaustively();
         test_header_reject_weights_honest_signals_score_zero();
+        test_zero_weight_reasons_never_reach_the_scorer();
         test_block_and_tx_reject_reasons_map_exhaustively();
 
-        std::cout << "\n=== All Phase 3 HeaderProofChecker Tests Passed (11 tests) ===" << std::endl;
+        std::cout << "\n=== All Phase 3 HeaderProofChecker Tests Passed (13 tests) ===" << std::endl;
         return 0;
     } catch (const std::exception& e) {
         std::cerr << "Test failed with exception: " << e.what() << std::endl;
