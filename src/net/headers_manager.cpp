@@ -1150,7 +1150,7 @@ void CHeadersManager::OnBlockActivated(const CBlockHeader& header, const uint256
     }
 }
 
-void CHeadersManager::BulkLoadHeaders(const std::vector<CBlockIndex*>& chain)
+void CHeadersManager::BulkLoadHeaders(const std::vector<ActiveChainHeader>& chain)
 {
     std::lock_guard<std::mutex> lock(cs_headers);
 
@@ -1160,10 +1160,15 @@ void CHeadersManager::BulkLoadHeaders(const std::vector<CBlockIndex*>& chain)
 
     const HeaderWithChainWork* pprev = nullptr;
 
-    for (const auto* pindex : chain) {
-        const uint256& hash = pindex->GetBlockHash();
-        const CBlockHeader& header = pindex->header;
-        int height = pindex->nHeight;
+    // P2P-16 F2: values, not pointers. These used to be CBlockIndex* that the
+    // caller walked from GetTip() with cs_main RELEASED and this function then
+    // dereferenced under cs_headers — the released-pointer shape, in the very TU
+    // the P2P-16 guard watches. CChainState::GetActiveChainHeaders() now does
+    // the walk under cs_main and hands over copies.
+    for (const ActiveChainHeader& entry : chain) {
+        const uint256& hash = entry.hash;
+        const CBlockHeader& header = entry.header;
+        int height = entry.height;
 
         // Calculate chain work from parent
         uint256 chainWork = CalculateChainWork(header, pprev);
@@ -1192,9 +1197,9 @@ void CHeadersManager::BulkLoadHeaders(const std::vector<CBlockIndex*>& chain)
 
     // Set best header to the tip (last element)
     if (!chain.empty()) {
-        const CBlockIndex* tip = chain.back();
-        hashBestHeader = tip->GetBlockHash();
-        nBestHeight = tip->nHeight;
+        const ActiveChainHeader& tip = chain.back();
+        hashBestHeader = tip.hash;
+        nBestHeight = tip.height;
         InvalidateBestChainCache();
     }
 

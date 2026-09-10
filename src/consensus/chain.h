@@ -102,6 +102,17 @@ struct CBlockIndexWorkComparator {
  * Chain State Manager
  * Handles chain reorganization and maintains active chain tip
  */
+/**
+ * P2P-16 F2: one link of the active chain, by value. Exactly the three fields
+ * BulkLoadHeaders reads from a CBlockIndex — hash, header, height — so the
+ * pointer never has to leave cs_main.
+ */
+struct ActiveChainHeader {
+    uint256      hash;
+    CBlockHeader header;
+    int          height = 0;
+};
+
 class CChainState
 {
 private:
@@ -834,6 +845,24 @@ public:
      * @param tipHeightOut   The tip height read under the SAME hold.
      * @return One hash per entry of heightsOut, same order; null where absent.
      */
+    /**
+     * P2P-16 F2: the active chain as VALUES, for bulk consumers.
+     *
+     * CHeadersManager::BulkLoadHeaders used to take std::vector<CBlockIndex*>
+     * that its callers built by walking pprev from GetTip() with cs_main
+     * RELEASED, then dereferenced them under cs_headers. Latent today (startup
+     * only, P2P not yet running) but it is the released-pointer shape in the very
+     * translation unit the P2P-16 guard watches, and it falsified this PR's claim
+     * that nothing downstream holds a chainstate pointer.
+     *
+     * The walk happens here, under cs_main, and only copies leave.
+     *
+     * @return The active chain in ASCENDING height order (genesis first), which
+     *         is the order BulkLoadHeaders needs so each entry's parent is
+     *         already present.
+     */
+    std::vector<ActiveChainHeader> GetActiveChainHeaders() const;
+
     std::vector<uint256> ResolveLocatorHashes(int headersHeight,
                                               std::vector<int> (*pattern)(int),
                                               std::vector<int>& heightsOut,

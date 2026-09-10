@@ -44,6 +44,12 @@ namespace NetProtocol {
 // Test-only view of the locator height schedule (PR #194 regression test).
 // The schedule is the single source of truth shared by the map-resolver and the
 // walk; exposing it lets a test pin "one walk, not two" directly.
+// P2P-16 F2: BulkLoadHeaders takes the active chain BY VALUE. Forward-declared
+// rather than including consensus/chain.h, which would pull the chainstate into
+// every TU that sees this header; an incomplete type is fine for a
+// const-reference parameter in a declaration.
+struct ActiveChainHeader;
+
 namespace hdrtest { std::vector<int> LocatorHeightPatternForTest(int startHeight); }
 
 /**
@@ -282,7 +288,7 @@ public:
      *
      * @param chain Blocks from genesis (front) to tip (back)
      */
-    void BulkLoadHeaders(const std::vector<CBlockIndex*>& chain);
+    void BulkLoadHeaders(const std::vector<ActiveChainHeader>& chain);
 
     /**
      * @brief Generate block locator for sync

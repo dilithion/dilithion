@@ -3057,6 +3057,26 @@ CBlockIndex* CChainState::GetTip() const {
     return pindexTip;
 }
 
+std::vector<ActiveChainHeader> CChainState::GetActiveChainHeaders() const {
+    // P2P-16 F2. ONE cs_main hold; the pointers never escape it.
+    std::vector<ActiveChainHeader> out;
+
+    std::lock_guard<std::recursive_mutex> lock(cs_main);
+    if (!pindexTip) return out;
+
+    out.reserve(static_cast<size_t>(pindexTip->nHeight) + 1);
+    for (const CBlockIndex* p = pindexTip; p != nullptr; p = p->pprev) {
+        ActiveChainHeader e;
+        e.hash   = p->GetBlockHash();
+        e.header = p->header;
+        e.height = p->nHeight;
+        out.push_back(std::move(e));
+    }
+    // Walked tip-down; BulkLoadHeaders needs parents first.
+    std::reverse(out.begin(), out.end());
+    return out;
+}
+
 std::vector<uint256> CChainState::ResolveLocatorHashes(int headersHeight,
                                                        std::vector<int> (*pattern)(int),
                                                        std::vector<int>& heightsOut,
