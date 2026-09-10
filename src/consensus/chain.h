@@ -798,12 +798,17 @@ public:
      * instead of the pointer.
      *
      * @param heights  Heights to resolve. Order is preserved.
+     * @param tipHeightOut  Optional. Receives the tip height read under the SAME
+     *        cs_main acquisition that resolved the hashes, so a caller can build
+     *        a COHERENT snapshot instead of pairing these hashes with a height
+     *        read at some other moment (external review, PR #194).
      * @return One entry per requested height, in the same order. An entry is
      *         a NULL uint256 when that height is not on the current best chain
      *         (above the tip, or below genesis) — callers must handle that, as
      *         they already had to handle GetAncestor() returning nullptr.
      */
-    std::vector<uint256> GetAncestorHashes(const std::vector<int>& heights) const;
+    std::vector<uint256> GetAncestorHashes(const std::vector<int>& heights,
+                                           int* tipHeightOut = nullptr) const;
 
     /**
      * Set chain tip (used during initialization)

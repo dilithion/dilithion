@@ -243,16 +243,17 @@ bool CHeadersManager::ProcessHeaders(NodeId peer, const std::vector<CBlockHeader
     // a far wider window than GetLocator's, since everything below runs between
     // the pre-fetch and the eventual GetLocatorImpl call. Resolve to values here
     // instead; nothing downstream holds a chainstate pointer any more.
-    const int chainstateHeightPreFetched = g_chainstate.GetHeight();
-
     int headersHeightPreFetched = 0;
     {
         std::lock_guard<std::mutex> peek(cs_headers);
         headersHeightPreFetched = BestHeaderHeightLocked();
     }
 
-    const std::map<int, uint256> chainstateHashesPreFetched = ResolveChainstateHashes(
-        std::max(chainstateHeightPreFetched, headersHeightPreFetched), chainstateHeightPreFetched);
+    int chainstateHeightPreFetched = 0;
+    const std::map<int, uint256> chainstateHashesPreFetched =
+        ResolveChainstateHashes(headersHeightPreFetched, &chainstateHeightPreFetched);
+    const int startHeightPreFetched =
+        std::max(chainstateHeightPreFetched, headersHeightPreFetched);
 
     std::lock_guard<std::mutex> lock(cs_headers);
 
@@ -522,7 +523,7 @@ bool CHeadersManager::ProcessHeaders(NodeId peer, const std::vector<CBlockHeader
                     // Calling RequestHeaders() would call GetLocator() which tries to relock cs_headers,
                     // causing a deadlock (std::mutex is not recursive).
                     // Pass pre-fetched tip to avoid cs_main/cs_headers lock inversion.
-                    std::vector<uint256> locator = GetLocatorImpl(uint256(), chainstateHashesPreFetched, chainstateHeightPreFetched);
+                    std::vector<uint256> locator = GetLocatorImpl(uint256(), startHeightPreFetched, chainstateHashesPreFetched, chainstateHeightPreFetched);
 
                     // Send GETHEADERS message directly
                     auto* connman = g_node_context.connman.get();
@@ -1231,19 +1232,26 @@ int CHeadersManager::BestHeaderHeightLocked() const
     return (it != mapHeaders.end()) ? it->second.height : 0;
 }
 
-std::map<int, uint256> CHeadersManager::ResolveChainstateHashes(int startHeight,
-                                                                int chainstateHeight) const
+std::map<int, uint256> CHeadersManager::ResolveChainstateHashes(int headersHeight,
+                                                                int* chainstateHeightOut) const
 {
     // P2P-16. ONE cs_main acquisition (inside GetAncestorHashes), values out.
     // Only the heights the locator walk can actually reach at or below the
     // chainstate tip are asked for — above that the walk uses headers-manager
     // data, which is safe under cs_headers.
     std::map<int, uint256> resolved;
-    if (chainstateHeight <= 0) return resolved;
+
+    // The chainstate height comes back from the SAME cs_main acquisition that
+    // resolves the hashes, so the pair is coherent. Probe with an empty request
+    // first to learn it, then ask for exactly the heights the walk will visit.
+    int tipHeight = 0;
+    (void)g_chainstate.GetAncestorHashes({}, &tipHeight);
+    if (chainstateHeightOut) *chainstateHeightOut = tipHeight;
+    if (tipHeight <= 0) return resolved;
 
     std::vector<int> wanted;
-    for (int h : LocatorHeightPattern(startHeight)) {
-        if (h <= chainstateHeight) wanted.push_back(h);
+    for (int h : LocatorHeightPattern(std::max(tipHeight, headersHeight))) {
+        if (h <= tipHeight) wanted.push_back(h);
     }
     if (wanted.empty()) return resolved;
 
@@ -1275,7 +1283,9 @@ std::map<int, uint256> CHeadersManager::ResolveChainstateHashes(int startHeight,
 static std::vector<int> LocatorHeightPattern(int startHeight)
 {
     std::vector<int> heights;
-    if (startHeight <= 0) return heights;
+    // startHeight == 0 is a real chain (genesis only) and must still yield the
+    // genesis entry — external review, PR #194. Only a NEGATIVE start is empty.
+    if (startHeight < 0) return heights;
 
     int height = startHeight;
     int step = 1;
@@ -1290,6 +1300,13 @@ static std::vector<int> LocatorHeightPattern(int startHeight)
     }
     return heights;
 }
+
+namespace hdrtest {
+std::vector<int> LocatorHeightPatternForTest(int startHeight)
+{
+    return LocatorHeightPattern(startHeight);
+}
+}  // namespace hdrtest
 
 std::vector<uint256> CHeadersManager::GetLocator(const uint256& hashTip)
 {
@@ -1330,22 +1347,26 @@ std::vector<uint256> CHeadersManager::GetLocator(const uint256& hashTip)
     // needs cs_headers — so read it in its own short scope, release, then do the
     // one cs_main resolve, then take cs_headers for the real work. At no point
     // is cs_main held under cs_headers, which is the constraint P2P-14/15 left.
-    const int chainstateHeight = g_chainstate.GetHeight();
-
     int headersHeight = 0;
     {
         std::lock_guard<std::mutex> peek(cs_headers);
         headersHeight = BestHeaderHeightLocked();
     }
 
+    // ONE snapshot: the start, the chainstate height and the hashes are captured
+    // together and threaded through as a coherent triple. GetLocatorImpl must NOT
+    // re-derive any of them — see the banner there (external review, PR #194).
+    int chainstateHeight = 0;
     const std::map<int, uint256> chainstateHashes =
-        ResolveChainstateHashes(std::max(chainstateHeight, headersHeight), chainstateHeight);
+        ResolveChainstateHashes(headersHeight, &chainstateHeight);
+    const int startHeight = std::max(chainstateHeight, headersHeight);
 
     std::lock_guard<std::mutex> lock(cs_headers);
-    return GetLocatorImpl(hashTip, chainstateHashes, chainstateHeight);
+    return GetLocatorImpl(hashTip, startHeight, chainstateHashes, chainstateHeight);
 }
 
 std::vector<uint256> CHeadersManager::GetLocatorImpl(const uint256& hashTip,
+                                                     int startHeight,
                                                      const std::map<int, uint256>& chainstateHashes,
                                                      int chainstateHeight) const
 {
@@ -1376,59 +1397,41 @@ std::vector<uint256> CHeadersManager::GetLocatorImpl(const uint256& hashTip,
     // the cs_headers lock (P2P-16) — no chainstate pointer survives into here.
 
     // Get headers_manager's best header height
-    const int headersHeight = BestHeaderHeightLocked();
+    // ⛔ DO NOT RE-DERIVE THE START HERE. External review, PR #194, convergent
+    // HIGH: this used to recompute headersHeight under cs_headers and walk its
+    // own loop from max(chainstateHeight, that). The caller had already resolved
+    // chainstateHashes against the start it PEEKED a moment earlier, so whenever
+    // the header height advanced in between — which is every advancing batch
+    // during IBD — the two walks visited different heights, every lookup below
+    // the chainstate tip missed, and locator entries were SILENTLY DROPPED.
+    //
+    // The start is now captured ONCE by the caller and threaded in, and the walk
+    // below iterates the SAME LocatorHeightPattern() used to build the map. One
+    // walk, one source of truth. That is what the helper's own comment claimed
+    // and what this function then quietly violated across the lock boundary.
 
     // Start from the HIGHER of the two to avoid re-requesting headers
-    int startHeight = std::max(chainstateHeight, headersHeight);
+    for (int height : LocatorHeightPattern(startHeight)) {
+        uint256 hashAtHeight;
 
-    if (startHeight > 0) {
-        int height = startHeight;
-        int step = 1;
-        int nStep = 0;
-
-        while (height >= 0) {
-            uint256 hashAtHeight;
-
-            // Use chainstate for heights it covers (verified fork-safe)
-            if (height <= chainstateHeight) {
-                // P2P-16: resolved BY VALUE under cs_main before this lock was
-                // taken. This used to be pTip->GetAncestor(height) on a pointer
-                // from GetTip(), which releases cs_main before returning — so
-                // the walk ran while the header thread could evict that
-                // CBlockIndex. A miss here behaves exactly as GetAncestor()
-                // returning nullptr did: no entry, same as before.
-                auto it = chainstateHashes.find(height);
-                if (it != chainstateHashes.end()) {
-                    hashAtHeight = it->second;
-                }
-            } else {
-                // Above chainstate: use headers_manager's best chain RandomX hashes
-                // BUG FIX: GetBestChainHashAtHeight now returns RandomX hash, not SHA256
-                hashAtHeight = GetBestChainHashAtHeight(height);
+        if (height <= chainstateHeight) {
+            // P2P-16: resolved BY VALUE under cs_main before this lock was taken.
+            // A miss behaves exactly as GetAncestor() returning nullptr did.
+            auto it = chainstateHashes.find(height);
+            if (it != chainstateHashes.end()) {
+                hashAtHeight = it->second;
             }
-
-            if (!hashAtHeight.IsNull()) {
-                locator.push_back(hashAtHeight);
-            }
-
-            // Stop at genesis
-            if (height == 0)
-                break;
-
-            // Exponential backoff after 10 entries
-            if (nStep >= 10) {
-                step *= 2;
-            }
-
-            height -= step;
-            nStep++;
-
-            // Limit total locator size (safety check)
-            if (locator.size() >= 32) {
-                break;
-            }
+        } else {
+            hashAtHeight = GetBestChainHashAtHeight(height);
         }
 
+        if (!hashAtHeight.IsNull()) {
+            locator.push_back(hashAtHeight);
+            if (locator.size() >= 32) break;
+        }
+    }
+
+    {
         if (!locator.empty()) {
             return locator;
         }

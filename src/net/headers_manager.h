@@ -41,6 +41,11 @@ namespace NetProtocol {
     class CGetHeadersMessage;
 }
 
+// Test-only view of the locator height schedule (PR #194 regression test).
+// The schedule is the single source of truth shared by the map-resolver and the
+// walk; exposing it lets a test pin "one walk, not two" directly.
+namespace hdrtest { std::vector<int> LocatorHeightPatternForTest(int startHeight); }
+
 /**
  * @class CHeadersManager
  * @brief Manages header chain synchronization and validation
@@ -730,7 +735,28 @@ private:
      * @param chainstateHeight Pre-fetched chainstate height
      * @return Vector of block hashes for locator
      */
+public:
+    /**
+     * TEST-ONLY forwarder to GetLocatorImpl (PR #194 regression test).
+     *
+     * The defect being pinned is WIRING, not arithmetic: the walk must consume
+     * the start it is GIVEN and look its chainstate entries up in the map the
+     * caller resolved for that start. A test that exercises the height-schedule
+     * function alone cannot see that — mine did not, and its RED arm survived.
+     * This reaches the real code path.
+     */
+    std::vector<uint256> GetLocatorImplForTest(const uint256& hashTip,
+                                               int startHeight,
+                                               const std::map<int, uint256>& chainstateHashes,
+                                               int chainstateHeight) const
+    {
+        std::lock_guard<std::mutex> lock(cs_headers);
+        return GetLocatorImpl(hashTip, startHeight, chainstateHashes, chainstateHeight);
+    }
+
+private:
     std::vector<uint256> GetLocatorImpl(const uint256& hashTip,
+                                        int startHeight,
                                         const std::map<int, uint256>& chainstateHashes,
                                         int chainstateHeight) const;
 
@@ -750,7 +776,8 @@ private:
      * to the chainstate, which takes cs_main, and cs_main under cs_headers is
      * the inversion P2P-14/15 closed.
      */
-    std::map<int, uint256> ResolveChainstateHashes(int startHeight, int chainstateHeight) const;
+    std::map<int, uint256> ResolveChainstateHashes(int headersHeight,
+                                                   int* chainstateHeightOut) const;
 
     /**
      * @struct PeerSyncState

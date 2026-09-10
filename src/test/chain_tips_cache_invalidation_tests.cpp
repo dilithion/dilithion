@@ -57,6 +57,8 @@
 
 #include <consensus/chain.h>
 #include <node/block_index.h>
+#include <net/headers_manager.h>   // PR #194 regression test: GetLocatorImplForTest
+#include <core/chainparams.h>
 
 #include <algorithm>
 #include <cstring>
@@ -491,6 +493,113 @@ BOOST_AUTO_TEST_CASE(p2p16_get_ancestor_hashes_matches_the_walk_it_replaced)
     // --- EMPTY INPUT: empty out, no crash. The locator helper can legitimately
     // produce an empty height list (startHeight <= 0).
     BOOST_CHECK(chainstate.GetAncestorHashes({}).empty());
+}
+
+
+// ============================================================================
+// PR #194 external review, convergent HIGH: the locator must not silently drop
+// entries when the header height ADVANCES between the prefetch and the walk.
+//
+// The defect: GetLocator peeked the headers height, resolved the chainstate
+// hashes against the pattern from that start, then GetLocatorImpl RE-DERIVED the
+// start under cs_headers and walked its own loop. Any advance in between made
+// the two walks visit different heights, so every lookup below the chainstate
+// tip missed and those entries vanished from the locator — on every advancing
+// batch during IBD, silently, with no error path.
+//
+// This pins the invariant that makes that impossible: the walk visits exactly
+// the heights the pattern names for the start it was GIVEN. If someone
+// re-introduces a second derivation, the two walks diverge and this goes red.
+// ============================================================================
+BOOST_AUTO_TEST_CASE(p2p16_locator_pattern_is_one_walk_not_two)
+{
+    // The schedule is deterministic: 10 linear steps, then doubling, and every
+    // height it names must be <= the start and strictly descending.
+    for (int start : {0, 1, 9, 10, 11, 50, 1000, 250000}) {
+        const std::vector<int> pattern = hdrtest::LocatorHeightPatternForTest(start);
+
+        if (start == 0) {
+            BOOST_REQUIRE_MESSAGE(pattern.size() == 1 && pattern[0] == 0,
+                "a genesis-only chain (start 0) must still yield the genesis entry, got "
+                << pattern.size() << " entries");
+            continue;
+        }
+
+        BOOST_REQUIRE_MESSAGE(!pattern.empty(), "empty pattern for start " << start);
+        BOOST_CHECK_EQUAL(pattern.front(), start);
+        // NOT asserted: "reaches genesis". The schedule caps at 64 heights and
+        // the walk caps at 32 ENTRIES, so terminating above 0 is the contract,
+        // not a defect. My first version asserted my expectation instead of the
+        // contract and went red on a correct tree.
+        BOOST_CHECK_MESSAGE(pattern.size() <= 64,
+            "the schedule must stay within its cap for start " << start
+            << ", got " << pattern.size());
+
+        for (size_t i = 1; i < pattern.size(); ++i) {
+            BOOST_REQUIRE_MESSAGE(pattern[i] < pattern[i - 1],
+                "pattern must strictly descend (start " << start << ", index " << i << ")");
+            BOOST_REQUIRE_MESSAGE(pattern[i] >= 0,
+                "pattern must not go below genesis (start " << start << ")");
+        }
+    }
+
+    // ---- THE WIRING, which is the actual defect. ----
+    //
+    // My first version of this test asserted properties of the height schedule
+    // alone. Its RED arm SURVIVED: mutating the call site inside GetLocatorImpl
+    // (walk from startHeight + 7) left a pure-function test completely unmoved.
+    // A test that cannot see the defect is not a regression test, so this one
+    // goes through the real code path instead.
+    //
+    // Construction: resolve a map for start S, then ask the walk to run with
+    // start S. Every chainstate-side entry it emits must come from that map. If
+    // the walk consumes a DIFFERENT start — which is what the bug did, by
+    // re-deriving it under cs_headers — it looks up heights the map never
+    // resolved, those lookups miss, and the entries are silently dropped.
+    // CHeadersManager reaches chainparams during construction/use.
+    if (!Dilithion::g_chainParams) {
+        Dilithion::g_chainParams = new Dilithion::ChainParams(Dilithion::ChainParams::Regtest());
+    }
+    CHeadersManager mgr;
+    const int kStart = 1000;
+    const int kChainstateHeight = 1000;
+
+    std::map<int, uint256> resolved;
+    for (int h : hdrtest::LocatorHeightPatternForTest(kStart)) {
+        if (h <= kChainstateHeight) {
+            uint256 fake;
+            fake.data[0] = static_cast<uint8_t>(h & 0xff);
+            fake.data[1] = static_cast<uint8_t>((h >> 8) & 0xff);
+            fake.data[31] = 0x7f;                 // never null
+            resolved[h] = fake;
+        }
+    }
+    BOOST_REQUIRE(!resolved.empty());
+
+    const std::vector<uint256> loc =
+        mgr.GetLocatorImplForTest(uint256(), kStart, resolved, kChainstateHeight);
+
+    BOOST_CHECK_MESSAGE(!loc.empty(),
+        "the walk produced NO entries from a fully-resolved map — it is not using "
+        "the start it was given");
+
+    // Every emitted entry must be one we resolved. A walk on a different start
+    // would either drop entries (shorter) or emit something we never supplied.
+    size_t fromMap = 0;
+    for (const uint256& e : loc) {
+        for (const auto& kv : resolved) {
+            if (kv.second == e) { ++fromMap; break; }
+        }
+    }
+    BOOST_CHECK_MESSAGE(fromMap == loc.size(),
+        "every chainstate-side locator entry must come from the resolved map; "
+        << (loc.size() - fromMap) << " of " << loc.size() << " did not — the walk "
+        "and the resolver disagree about the start");
+
+    BOOST_CHECK_MESSAGE(loc.size() == resolved.size(),
+        "the walk emitted " << loc.size() << " entries from a map of "
+        << resolved.size() << " fully-resolved heights — a shortfall is exactly "
+        "the silent dropped-entry bug (walk start != resolve start)");
 }
 
 BOOST_AUTO_TEST_SUITE_END()

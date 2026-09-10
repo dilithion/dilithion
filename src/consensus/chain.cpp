@@ -3057,7 +3057,8 @@ CBlockIndex* CChainState::GetTip() const {
     return pindexTip;
 }
 
-std::vector<uint256> CChainState::GetAncestorHashes(const std::vector<int>& heights) const {
+std::vector<uint256> CChainState::GetAncestorHashes(const std::vector<int>& heights,
+                                                    int* tipHeightOut) const {
     // P2P-16. The whole point is that the walk happens INSIDE this lock and only
     // copies leave it. Do not be tempted to return the CBlockIndex*s "for
     // efficiency" — that reintroduces exactly the use-after-free this replaces.
@@ -3065,6 +3066,11 @@ std::vector<uint256> CChainState::GetAncestorHashes(const std::vector<int>& heig
     out.reserve(heights.size());
 
     std::lock_guard<std::recursive_mutex> lock(cs_main);
+    // The tip height leaves under the SAME acquisition as the hashes, so the
+    // caller can pair them coherently. Reading the height separately (even from
+    // the lock-free cached accessor) lets the tip move between the two reads and
+    // silently pairs a height with hashes from a different chain state.
+    if (tipHeightOut) *tipHeightOut = pindexTip ? pindexTip->nHeight : 0;
     for (int h : heights) {
         uint256 hash;  // null by default = "not on the best chain at that height"
         if (pindexTip && h >= 0 && h <= pindexTip->nHeight) {
