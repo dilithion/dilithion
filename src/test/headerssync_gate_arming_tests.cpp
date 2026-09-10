@@ -141,13 +141,59 @@ void test_zero_threshold_makes_rejection_impossible()
 
 }  // namespace
 
+
+// ============================================================================
+// ⛔ TWO ARMS ARE SKIPPED, AND THE SKIP IS PRINTED RATHER THAN THE ARMS DELETED
+// ============================================================================
+//
+// LP-10 F5/D-2 removed the empty-batch transition (Core refuses an empty batch
+// outright, headerssync.cpp:74). PeerSurvivesPresync drove the manager with an
+// EMPTY vector — the only way it could, and here is why, MEASURED by probe:
+//
+//     n=3     init=1  before=PRESYNC  ret=0  after=NONE(erased)
+//     n=2000  init=1  before=PRESYNC  ret=0  after=NONE(erased)
+//
+// A real batch of ANY size is rejected identically, because CHeadersManager
+// selects its proof checker on IsDilV(), so REGTEST is handed
+// RandomXHeaderProofChecker and every synthesisable header fails its proof check
+// before the work comparison is reached. So these two arms cannot be re-derived
+// on this branch at all.
+//
+// PR #201 (fix/lp10-vdf-checker-selection) routes regtest to the VDF checker,
+// whose rule a fabricated header CAN satisfy. When it merges, delete this block
+// and re-derive the two arms with a real single-header batch and
+// full_headers_available = false, exactly as
+// headerssync_accumulator_seeding_tests::RunPresyncDecision now does.
+//
+// THEY ARE SKIPPED OUT LOUD, NOT REMOVED. A deleted arm is invisible; a printed
+// SKIP is a standing statement of what this suite is NOT covering today. The
+// property itself — seed vs threshold decides promotion — IS still covered, at
+// the state-machine level, by headerssync_accumulator_seeding_tests' A/B pair.
+// What is not covered until #201 lands is the MANAGER-LEVEL wiring of it.
+void print_skipped_arms()
+{
+    std::cout << "  SKIPPED (blocked on PR #201, regtest gets the RandomX checker):"
+              << std::endl
+              << "    - test_below_threshold_is_rejected_and_at_threshold_is_accepted"
+              << std::endl
+              << "    - test_zero_threshold_makes_rejection_impossible"
+              << std::endl
+              << "    property still covered at state-machine level by "
+                 "headerssync_accumulator_seeding_tests"
+              << std::endl;
+}
+
 int main()
 {
     Dilithion::g_chainParams = new Dilithion::ChainParams(Dilithion::ChainParams::Regtest());
     std::cout << "headerssync_gate_arming_tests" << std::endl;
     test_threshold_is_injectable_and_observable();
-    test_below_threshold_is_rejected_and_at_threshold_is_accepted();
-    test_zero_threshold_makes_rejection_impossible();
-    std::cout << "headerssync_gate_arming_tests: ALL PASS" << std::endl;
+    print_skipped_arms();
+    // NOT "ALL PASS". Two arms are skipped (see print_skipped_arms), and a green
+    // summary line over a skip is the false signal this mission keeps hitting —
+    // a reader scanning roster output would take it for full coverage. The count
+    // is stated instead, so restoring the arms also restores the wording.
+    std::cout << "headerssync_gate_arming_tests: 1 PASS, 2 SKIPPED (blocked on PR #201)"
+              << std::endl;
     return 0;
 }
