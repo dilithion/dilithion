@@ -482,7 +482,8 @@ bool CCoinStatsIndex::WriteBlock(const CBlock& block, int height, const uint256&
     // record. Detect by comparing the just-supplied block's hashPrevBlock
     // against the canonical main-chain hash at height-1.
     if (height > 0) {
-        // ⛔ P2P-17 FIX — LIVE AB-BA DEADLOCK, both edges measured at source.
+        // P2P-17 FIX — a LATENT AB-BA. Severity corrected on review, and the
+        // correction matters: this is not a live deadlock.
         //
         // This block calls into the chainstate, and both GetBlocksAtHeight
         // (chain.cpp) and GetBlockIndex take cs_main. Holding m_mutex across
@@ -497,8 +498,22 @@ bool CCoinStatsIndex::WriteBlock(const CBlock& block, int height, const uint256&
         //           WalkBlockRange -> WriteBlock, holding m_mutex here, and
         //           WalkBlockRange holds no cs_main at all.
         //
-        // Two threads, opposite orders, both reachable. So release m_mutex for
-        // exactly the chainstate query and retake it afterwards.
+        // Two threads, opposite orders — but NOT concurrently reachable today.
+        // Edge 1 exists only through the node-registered callbacks
+        // (dilithion-node.cpp:3480/:3489, dilv-node.cpp:3302/:3311) and EVERY one
+        // is gated on IsSynced(); edge 2 runs only from SyncLoop, which finishes
+        // before IsSynced() opens. The two edges are TEMPORALLY EXCLUSIVE, by the
+        // same gate relied on below. I originally filed this as live: I used the
+        // gate to argue the unlock window was safe and then failed to apply it to
+        // reachability, which is the asymmetry to avoid — a gate that protects
+        // you also constrains your finding.
+        //
+        // It is still worth fixing, and for a reason that outlasts the gate: the
+        // exclusion is an EMERGENT property of two IsSynced() checks in a
+        // different file. Add a third caller, widen the gate, or make the live
+        // path fire during catch-up, and the cycle is real with nothing to catch
+        // it. Releasing m_mutex across the query makes the inversion
+        // STRUCTURALLY IMPOSSIBLE rather than gate-dependent.
         //
         // THE DISCIPLINE ALREADY EXISTED ONE FUNCTION AWAY: Init() in this file
         // uses unique_lock and unlock()s before every chainstate call, and
@@ -540,6 +555,11 @@ bool CCoinStatsIndex::WriteBlock(const CBlock& block, int height, const uint256&
                            // is atomic and unique_lock's destructor is a no-op.
         }
         lock.lock();  // retake for the m_running / m_db work below
+        // Re-validating after the re-take is unnecessary today and the reason is
+        // the same gate: no EraseBlock and no callback-driven WriteBlock can run
+        // while the sync thread is inside this window, because IsSynced() is
+        // still false — so neither m_corrupted nor height contiguity can have
+        // moved under us. If the gate ever changes, re-check BOTH here.
     }
 
     CoinStats parent = m_running;
