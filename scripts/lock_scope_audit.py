@@ -20,10 +20,31 @@ Review fixes folded (COORD reader on 732eb9e8):
 """
 import io, re, sys, os
 
-LOCK   = re.compile(r'\b(?:std::)?(?:lock_guard|unique_lock|scoped_lock)\s*<[^>]*>\s+(\w+)\s*\(\s*([A-Za-z_][A-Za-z0-9_:.>-]*)\s*\)')
+# M-2 (#197 reader): the first version required explicit template arguments and
+# a parenthesised initialiser, so THREE legal spellings walked straight past it -
+# CTAD (`std::lock_guard lock(m);`, valid since C++17 and used in this tree),
+# brace-init (`std::lock_guard<std::mutex> lock{m};`), and scoped_lock over
+# several mutexes (only the first was ever captured). Each one is a lock this
+# auditor would not have seen a chainstate call held across.
+#   <...>  optional          -> CTAD
+#   [({]   either bracket    -> brace-init
+#   ([^)}]*) all arguments   -> every mutex in a scoped_lock, split by the caller
+LOCK   = re.compile(r'\b(?:std::)?(?:lock_guard|unique_lock|scoped_lock)\s*'
+                    r'(?:<[^>]*>)?\s+(\w+)\s*[({]\s*([^)}]*?)\s*[)}]')
 UNLOCK = re.compile(r'\b(\w+)\s*\.unlock\s*\(\s*\)')
 RELOCK = re.compile(r'\b(\w+)\s*\.lock\s*\(\s*\)')
-FUNC   = re.compile(r'^[A-Za-z_][A-Za-z0-9_:<>,&*\s]*::(\w+)\s*\(')
+# M-3 (#197 reader): attribution used to require a `Class::method(` signature, so
+# a site inside a FREE function - or inside a lambda within one - was reported as
+# function '?', and '?' was then used as an allowlist KEY. That key is
+# location-agnostic: it says "one unattributed site of this shape somewhere in
+# this file", so removing the classified site and adding a different one
+# elsewhere keeps the count at 1 and passes silently.
+#
+# The four allowlisted node sites are exactly that shape - they sit in a lambda
+# passed to RegisterBlockConnectCallback inside main(). Matching plain function
+# definitions as well as methods attributes them to `main`, and '?' is now
+# REFUSED as an allowlist key (see the check in main()).
+FUNC   = re.compile(r'^[A-Za-z_][A-Za-z0-9_:<>,&*\s]*?\b(\w+)\s*\(')
 
 # ---------------------------------------------------------------------------
 # ALLOWLIST - (file, function, call, mutex) -> exact expected count.
@@ -44,15 +65,22 @@ ALLOWED = {
     # only one direction exists and there is no cycle to close.
     ('src/net/headers_manager.cpp', 'OnBlockActivated', 'GetBlockHeightByHash', 'cs_headers'): 1,
 
+    # M-3: these were keyed on '?' - the attribution placeholder - which is
+    # location-agnostic: it means "one unattributed site of this shape SOMEWHERE
+    # in this file", so deleting the classified site and adding a different one
+    # elsewhere kept the count at 1 and passed silently. They sit inside a lambda
+    # passed to RegisterBlockConnectCallback within main(); FUNC now names that
+    # enclosing function, and '?' is refused as a key outright.
+    #
     # EVERY other holder of g_pendingMinerWinsMutex is a bare push_back touching
     # no chainstate, so no thread ever waits on cs_main while holding it unless it
     # ALREADY owns cs_main - the only holder that reaches the chainstate is itself
     # inside a block-connect callback, where cs_main is held and recursive. No
     # thread can supply the opposite order.
-    ('src/node/dilithion-node.cpp', '?', 'GetTip', 'g_pendingMinerWinsMutex'): 1,
-    ('src/node/dilithion-node.cpp', '?', 'GetBlockIndex', 'g_pendingMinerWinsMutex'): 1,
-    ('src/node/dilv-node.cpp', '?', 'GetTip', 'g_pendingMinerWinsMutex'): 1,
-    ('src/node/dilv-node.cpp', '?', 'GetBlockIndex', 'g_pendingMinerWinsMutex'): 1,
+    ('src/node/dilithion-node.cpp', 'main', 'GetTip', 'g_pendingMinerWinsMutex'): 1,
+    ('src/node/dilithion-node.cpp', 'main', 'GetBlockIndex', 'g_pendingMinerWinsMutex'): 1,
+    ('src/node/dilv-node.cpp', 'main', 'GetTip', 'g_pendingMinerWinsMutex'): 1,
+    ('src/node/dilv-node.cpp', 'main', 'GetBlockIndex', 'g_pendingMinerWinsMutex'): 1,
 }
 
 
@@ -72,8 +100,25 @@ def cs_main_accessors(chain_cpp):
             names.add(cur); cur, seen = None, False
     return names
 
+call_re_global = None   # set by main() once the accessor list exists
+
 def scan(path, accessors):
-    call_re = re.compile(r'g_chainstate\.(' + '|'.join(sorted(accessors)) + r')\s*\(')
+    # M-1 (#197 reader): this matched ONLY `g_chainstate.`, so every chainstate
+    # call made through any other receiver was invisible - and there are many:
+    # `m_chainstate->` in rpc/server.cpp and rpc/rest_api.cpp, plus the classes
+    # that hold a `CChainState&` member (block_validation_queue,
+    # chain_selector_impl, ...). The audit's "every site is classified" line was
+    # therefore true only of direct calls on the global.
+    #
+    # Now ANY receiver counts: `<ident>.` or `<ident>->` followed by one of the
+    # generated accessor names. A receiver is REQUIRED (no bare call), which
+    # keeps CChainState's own internal calls out - chain.cpp is excluded from the
+    # scan anyway - and the receiver is reported so a reader can judge it.
+    #
+    # This can over-report: another class with a method of the same name, called
+    # under a private mutex, will be listed. That is the fail-LOUD direction and
+    # the allowlist is the place to classify it. Under-reporting was the bug.
+    call_re = re.compile(r'\b(\w+)\s*(?:\.|->)\s*(' + '|'.join(sorted(accessors)) + r')\s*\(')
     src = io.open(path, encoding='utf-8', errors='replace').read().split('\n')
     depth, held, func, out = 0, [], '?', []
     for i, raw in enumerate(src, 1):
@@ -83,7 +128,11 @@ def scan(path, accessors):
             func = m.group(1)
         lk = LOCK.search(line)
         if lk:
-            held.append({'d': depth, 'var': lk.group(1), 'mx': lk.group(2), 'rel': False})
+            # group(2) may hold SEVERAL mutexes (std::scoped_lock a(m1, m2)).
+            # Record one entry per mutex under the same variable name, so an
+            # unlock()/lock() on that variable moves all of them together.
+            for mx in [m.strip() for m in lk.group(2).split(',') if m.strip()]:
+                held.append({'d': depth, 'var': lk.group(1), 'mx': mx, 'rel': False})
         for h in held:
             u = UNLOCK.search(line)
             if u and h['var'] == u.group(1):
@@ -95,7 +144,7 @@ def scan(path, accessors):
         if c:
             live = [h['mx'] for h in held if not h['rel'] and 'cs_main' not in h['mx']]
             if live:
-                out.append((i, func, c.group(1), sorted(set(live))))
+                out.append((i, func, c.group(2), sorted(set(live)), c.group(1)))
         depth += line.count('{') - line.count('}')
         held = [h for h in held if h['d'] <= depth]
     return out
@@ -110,6 +159,8 @@ def main(argv):
         print("ERROR: generated an EMPTY cs_main accessor list — refusing to report CLEAN")
         return 2
     print(f"cs_main-taking CChainState accessors generated from chain.cpp: {len(acc)}")
+    global call_re_global
+    call_re_global = re.compile(r'\b(\w+)\s*(?:\.|->)\s*(' + '|'.join(sorted(acc)) + r')\s*\(')
 
     targets = []
     for dirpath, _dirs, files in os.walk(os.path.join(root, 'src')):
@@ -119,19 +170,56 @@ def main(argv):
             if f.endswith('.cpp') and f != 'chain.cpp':
                 targets.append(os.path.join(dirpath, f))
 
-    total, counts = 0, {}
+    total, counts, unattributed = 0, {}, []
     for t in sorted(targets):
         f = scan(t, acc)
         if f:
             total += len(f)
             rel = os.path.relpath(t, root).replace(os.sep, '/')
             print(f"\n*** {rel}: {len(f)} chainstate call(s) inside a PRIVATE-mutex scope")
-            for ln, fn, call, mxs in f:
-                print(f"   :{ln:<6} {fn:<30} g_chainstate.{call}()   holding: {','.join(mxs)}")
+            for ln, fn, call, mxs, recv in f:
+                print(f"   :{ln:<6} {fn:<30} {recv}.{call}()   holding: {','.join(mxs)}")
                 for mx in mxs:
                     k = (rel, fn, call, mx)
                     counts[k] = counts.get(k, 0) + 1
+                    if fn == '?':
+                        unattributed.append((rel, ln, call, mx))
     print(f"\nfiles scanned: {len(targets)}   sites found: {total}")
+
+    # M-1: state the POPULATION this auditor can see, not only what it flagged.
+    # Before the receiver was widened this matched `g_chainstate.` alone, so the
+    # "every site is classified" line below was true only of DIRECT calls on the
+    # global. [censused] 86 of 319 accessor calls in production .cpp files (27%)
+    # reach the chainstate through another receiver - 81 via `m_chainstate`, 5
+    # via a plain `chainstate`. None of those 86 sits inside a private-mutex
+    # scope, so the old verdict was accidentally right while its coverage claim
+    # was a quarter short. Printing the split lets the next reader see that
+    # difference instead of inferring it.
+    by_recv = {}
+    for t in sorted(targets):
+        for raw in io.open(t, encoding='utf-8', errors='replace').read().split('\n'):
+            for mm in call_re_global.finditer(re.sub(r'//.*$', '', raw)):
+                by_recv[mm.group(1)] = by_recv.get(mm.group(1), 0) + 1
+    tot_calls = sum(by_recv.values())
+    direct = by_recv.get('g_chainstate', 0)
+    print("accessor CALLS visible to this auditor: %d (%d via g_chainstate, %d via another receiver)"
+          % (tot_calls, direct, tot_calls - direct))
+    if tot_calls - direct:
+        others = ', '.join("%s x%d" % (k, v) for k, v in sorted(by_recv.items()) if k != 'g_chainstate')
+        print("  non-global receivers: " + others)
+        print("  (a receiver-based match can over-report a same-named method on another class;")
+        print("   that is the fail-LOUD direction, and ALLOWED is where such a site gets classified)")
+
+    if unattributed:
+        print('')
+        for rel, ln, call, mx in unattributed:
+            print(f'FAIL: UNATTRIBUTED - {rel}:{ln} holds {mx} across {call}() but this')
+            print( '      auditor could not name the enclosing function, so the site cannot be')
+            print( '      keyed in ALLOWED except by a wildcard - and a wildcard key is')
+            print( '      location-agnostic: delete the classified site, add a different one')
+            print( '      elsewhere in the file, and the count stays 1 and passes silently.')
+            print( '      Fix the attribution (FUNC) or restructure the code so it has a name.')
+        return 1
 
     unclassified, overcount = [], []
     for key, got in counts.items():

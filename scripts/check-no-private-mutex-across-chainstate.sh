@@ -30,6 +30,20 @@ PY=$(command -v python3 || command -v python) || {
     exit 1
 }
 
+# The auditor's own FIXTURES run first. Its two regexes were each too narrow and
+# neither narrowness showed in its output: widening the receiver changed no
+# verdict on this tree (none of the 86 non-global accessor calls sits under a
+# private mutex), so "finds nothing new" and "finds nothing" were
+# indistinguishable until something proved it CAN find. The fixtures are that
+# proof - one per receiver form, one per lock form, plus negative controls - and
+# they run BEFORE the audit so a broken matcher cannot report a clean tree.
+if ! fixt=$("$PY" scripts/lock_scope_audit_selftest.py 2>&1); then
+    echo "FAIL: the lock-scope auditor's own fixtures do not pass, so its verdict"
+    echo "      on this tree means nothing. Fix the auditor before trusting it."
+    printf '%s\n' "$fixt"
+    exit 1
+fi
+
 out=$("$PY" scripts/lock_scope_audit.py . 2>&1); rc=$?
 if [ "$rc" -eq 0 ]; then
     echo "PASS: no unclassified private mutex held across a chainstate call"
