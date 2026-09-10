@@ -599,6 +599,15 @@ bool CChainState::EpochRegistrationComplete(std::string& why) const
     return false;
 }
 
+void CChainState::SetEvictionImmediateFreeForTest(bool on)
+{
+    // Never called from production code -- grep is the enforcement, and the only
+    // caller is src/test/blockindex_uaf_asan_arm.cpp. Turning this on reproduces
+    // the pre-deferral behaviour exactly: the evictor destroys the CBlockIndex at
+    // the unlink, while other threads may still hold pointers to it.
+    m_immediateFreeForTest.store(on, std::memory_order_relaxed);
+}
+
 bool CChainState::AwaitEpochRegistration(int timeout_ms, std::string& why)
 {
     // Threads start asynchronously, so at the instant the last one is spawned
@@ -1252,9 +1261,19 @@ bool CChainState::EvictLowestWorkLeafNotPinned(size_t target_max) {
         {
             auto node = std::move(mapBlockIndex[victim_key]);
             mapBlockIndex.erase(victim_key);
-            m_graveyard.push_back(GraveyardEntry{
-                std::move(node),
-                m_globalEpoch.fetch_add(1, std::memory_order_acq_rel) + 1});
+            if (m_immediateFreeForTest.load(std::memory_order_relaxed)) {
+                // TEST-ONLY: free in place, which is what this code did before
+                // deferral existed. It is here so the ASan arms can compare the
+                // defect and the fix IN ONE BINARY, on one fixture, with deferral
+                // as the single variable -- rather than comparing two builds and
+                // arguing that nothing else differed. `node` goes out of scope
+                // here and the CBlockIndex is destroyed at this instant.
+                node.reset();
+            } else {
+                m_graveyard.push_back(GraveyardEntry{
+                    std::move(node),
+                    m_globalEpoch.fetch_add(1, std::memory_order_acq_rel) + 1});
+            }
         }
         evicted_any = true;
     }

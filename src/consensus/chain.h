@@ -278,6 +278,12 @@ private:
     // entries older than the minimum across all of them.
     std::atomic<uint64_t> m_globalEpoch{1};
 
+    // TEST-ONLY. When set, eviction frees the entry in place instead of parking it
+    // in the graveyard -- the behaviour this branch replaced. It exists so the
+    // ASan arms can put the defect and the fix in ONE binary with deferral as the
+    // only variable; production never sets it.
+    std::atomic<bool> m_immediateFreeForTest{false};
+
 public:
     /**
      * Bump this thread's epoch. Called at the boundary where the calling thread
@@ -327,6 +333,14 @@ public:
      * process lifetime, so the node refuses to run rather than leaking silently.
      */
     bool AwaitEpochRegistration(int timeout_ms, std::string& why);
+
+    /**
+     * TEST-ONLY: make eviction free the entry in place, as it did before deferred
+     * reclamation existed. The ASan arms use it to reproduce the use-after-free
+     * and the fix in one binary on one fixture (src/test/blockindex_uaf_asan_arm.cpp
+     * is the only caller). Never set in production.
+     */
+    void SetEvictionImmediateFreeForTest(bool on);
 
     /**
      * How many threads have obtained a CBlockIndex* and have NEVER checkpointed.

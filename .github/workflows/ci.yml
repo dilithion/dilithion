@@ -430,6 +430,26 @@ jobs:
         ASAN_OPTIONS=detect_leaks=0 ./headers_manager_to_chain_selector_wiring_tests
         echo "✅ eviction/UAF regression suite passed under ASan"
 
+    # The memory-safety VERDICT for deferred reclamation. Unlike every other step
+    # in this job, this one requires two of its three arms to CRASH:
+    #
+    #   deferred  -> clean: a pointer resolved before an eviction on another thread
+    #                is still readable. The fix.
+    #   immediate -> heap-use-after-free: the same fixture with deferral off, which
+    #                is what the evictor did before this branch. The defect.
+    #   drained   -> heap-use-after-free: deferral on, but the holder checkpoints
+    #                while still holding, so the drain frees under it. The INVERSE
+    #                CONTROL -- without it, a clean `deferred` arm could mean the
+    #                fixture never reached the free, and every other assertion in
+    #                this branch would be resting on a vacuous green.
+    #
+    # The driver fails the job if a trap arm does NOT trap, and refuses to report a
+    # verdict at all if the binary was built without the sanitizer. No `|| true`.
+    - name: Deferred-reclamation ASan arms (2 of 3 MUST trap)
+      run: |
+        make blockindex_uaf_asan_arm -j$(nproc)
+        bash scripts/asan_uaf_arms.sh
+
   sanitizer-ubsan:
     name: UndefinedBehaviorSanitizer
     runs-on: ubuntu-24.04
