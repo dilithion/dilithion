@@ -388,6 +388,13 @@ public:
     static uint64_t OfflineResolveCount();
 
     /**
+     * Has the CALLING thread declared itself (registered a participant name)? Only
+     * a declared thread may publish an epoch promise; an undeclared one may be
+     * pinning a pointer it resolved, so both scope types are inert on it.
+     */
+    static bool IsEpochParticipant();
+
+    /**
      * Free graveyard entries that every participating thread has moved past.
      * Safe to call from anywhere; takes cs_main. Returns the number freed.
      */
@@ -1886,17 +1893,31 @@ public:
     explicit EpochOnlineWindow(CChainState* cs) : m_cs(cs)
     {
         // Nameless: it re-enters the CALLING THREAD, whatever that thread is
-        // registered as. See EpochOfflineScope for why a name here was a remotely
+        // registered as. See EpochOfflineScope for why a NAME here was a remotely
         // reachable abort.
-        if (m_cs) m_cs->EpochCheckpoint();
+        //
+        // ⚠️ AND INERT ON AN UNNAMED THREAD, for the same reason the offline scope
+        // is. This constructor used to call EpochCheckpoint() unconditionally, so on
+        // an undeclared thread it advanced the epoch and cleared the accusation —
+        // unpinning a possible slot-0 holder, which is precisely what the offline
+        // scope's own comment says must never happen. Two comments a dozen lines
+        // apart, one of them not implemented. The gate now lives in
+        // EpochCheckpoint itself, so both scopes inherit it; m_online records
+        // whether it took effect so the destructor does not quiesce a thread that
+        // never went online.
+        if (m_cs) {
+            m_cs->EpochCheckpoint();
+            m_online = m_cs->IsEpochParticipant();
+        }
     }
-    ~EpochOnlineWindow() { if (m_cs) m_cs->EpochQuiesce(); }
+    ~EpochOnlineWindow() { if (m_online) m_cs->EpochQuiesce(); }
 
     EpochOnlineWindow(const EpochOnlineWindow&) = delete;
     EpochOnlineWindow& operator=(const EpochOnlineWindow&) = delete;
 
 private:
     CChainState* m_cs;
+    bool m_online{false};
 };
 
 class EpochOfflineScope

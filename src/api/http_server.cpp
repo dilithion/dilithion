@@ -223,6 +223,14 @@ void CHttpServer::Stop() {
 }
 
 // Accept thread main loop - STRESS TEST FIX: Only accepts connections and queues them
+// ⚠️ DELIBERATELY NOT AN EPOCH PARTICIPANT, AND SAYING SO IS THE POINT. This is the
+// one spawned thread in the HTTP server with neither a registration nor a scope, so
+// an enumeration of "which threads participate" would otherwise show a hole here and
+// a reader could not tell an omission from a decision. It accepts a socket and hands
+// it to the work queue: it never resolves a CBlockIndex*, never dereferences one, and
+// holds nothing across its accept(). If it ever gains work that touches the block
+// index -- anything reaching mapBlockIndex -- it needs a named checkpoint at this
+// loop's top, and the resolve-time detector in chain.cpp will name it in the meantime.
 void CHttpServer::AcceptThread() {
     std::cout << "[HttpServer] Accept thread started" << std::endl;
 

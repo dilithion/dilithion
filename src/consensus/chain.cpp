@@ -490,6 +490,15 @@ EpochSlotRetirer::EpochSlotRetirer() { /* forces dynamic init; see the type */ }
 
 EpochSlotRetirer::~EpochSlotRetirer()
 {
+    // ⚠️ RETIRING IS A CLAIM TOO — "this thread holds nothing, ever again" — and it
+    // was the one boundary that did not check. EpochCheckpoint and EpochQuiesce both
+    // assert the hold count under test-time tracking; this publishes the strongest
+    // statement of the three and asserted nothing. A TLS holder constructed BEFORE
+    // this object is destroyed AFTER it, so a pointer can still be live here.
+    if (g_epoch_hold_tracking.load(std::memory_order_relaxed)) {
+        ConsensusInvariant(t_epoch_holds == 0);
+    }
+
     // Only a thread that ever checkpointed has a slot; one that never did has
     // nothing to retire (and pins nothing, because it never made a promise).
     if (slot != nullptr) {
@@ -514,8 +523,25 @@ EpochSlotRetirer::~EpochSlotRetirer()
 // is exactly: threads that hold pointers and have made no promise.
 struct UnregisteredResolvers {
     std::mutex mu;
-    std::vector<std::thread::id> ids;   // one per offending thread, capped
-    size_t overflow{0};                 // offenders beyond the cap
+
+    // ⚠️ THE COUNT IS AUTHORITATIVE; THE ID LIST IS DIAGNOSTICS. It used to be the
+    // other way round -- the count WAS ids.size() + overflow, and withdrawal was an
+    // erase-by-thread-id. That made the accounting depend on a std::thread::id
+    // surviving in a thread_local until its own destructor ran, and measurably it
+    // does not always: traced with DIL_EPOCH_DIAG, a withdrawal fired with `recorded`
+    // true and `id` DEFAULT-CONSTRUCTED ("thread::id of a non-executing thread"), so
+    // the erase matched nothing and the accusation became PERMANENT.
+    //
+    // That is not cosmetic. A phantom accusation fails EpochRegistrationComplete
+    // forever, so the startup gate REFUSES TO START THE NODE -- measured at roughly
+    // one run in twenty of a thread-heavy suite. Found only because the suite's flake
+    // rate refused to go away under three successive "fixes" aimed at the arms.
+    //
+    // A counter needs no lookup at teardown: the destructor knows only "this thread
+    // was recorded", which is a bool in the object being destroyed, and decrements.
+    size_t live{0};                     // authoritative number of accused threads
+    std::vector<std::thread::id> ids;   // best-effort, for the message only, capped
+    size_t overflow{0};                 // ids beyond the cap (diagnostics only)
 };
 
 UnregisteredResolvers& Unregistered()
@@ -552,6 +578,16 @@ struct UnregisteredRecordScope {
     // therefore no destructor registration at all.
     bool recorded{false};
     std::thread::id id{};
+
+    // ⚠️ CALL Touch() BEFORE WRITING ANY MEMBER. A thread_local with a non-trivial
+    // constructor is initialised lazily, and binding a reference to it (or taking
+    // its address) does not reliably force that initialisation on this toolchain --
+    // so a write to `recorded` could be CLOBBERED by the constructor running
+    // afterwards. The destructor then saw `recorded == false`, returned early, and
+    // the accusation was never withdrawn: a phantom that fails the census forever
+    // and makes the startup gate refuse a healthy node. A member FUNCTION call is an
+    // unambiguous odr-use and forces initialisation first.
+    void Touch() {}
 
     UnregisteredRecordScope();
     ~UnregisteredRecordScope();
@@ -622,6 +658,7 @@ void NoteIndexPointerResolved(uint64_t current_epoch)
     // falsified.
     if (reresolve_after_offline) {
         auto& u2 = Unregistered();
+        t_unregistered_scope.Touch();   // as above: construct, then write
         UnregisteredRecordScope& me2 = t_unregistered_scope;
         if (!me2.recorded) {
             me2.recorded = true;
@@ -646,7 +683,7 @@ void NoteIndexPointerResolved(uint64_t current_epoch)
     // a use-after-free, and it is the direction every other rule here takes.
     auto* slot = MyEpochSlot();   // created at 0, and 0 pins everything
     (void)slot;
-    (void)&t_unregistered_scope;  // ensure this thread's withdrawal hook exists
+    t_unregistered_scope.Touch();   // force construction BEFORE any member write
 
     UnregisteredRecordScope& me = t_unregistered_scope;
     if (me.recorded) return;
@@ -655,8 +692,9 @@ void NoteIndexPointerResolved(uint64_t current_epoch)
 
     auto& u = Unregistered();
     std::lock_guard<std::mutex> lk(u.mu);
+    ++u.live;                                  // authoritative
     if (u.ids.size() < MAX_RECORDED_OFFENDERS) {
-        u.ids.push_back(me.id);
+        u.ids.push_back(me.id);                // best-effort, for the diagnostic
     } else {
         ++u.overflow;
     }
@@ -676,22 +714,25 @@ void ClearUnregisteredRecord()
     me.recorded = false;
     auto& u = Unregistered();
     std::lock_guard<std::mutex> lk(u.mu);
+    if (u.live > 0) --u.live;           // authoritative, needs no lookup
     for (size_t i = 0; i < u.ids.size(); ++i) {
-        // The id comes from the OBJECT rather than std::this_thread::get_id() so
-        // that this body stays valid if it is ever reached from a teardown path.
         if (u.ids[i] == me.id) { u.ids.erase(u.ids.begin() + i); return; }
     }
-    if (u.overflow > 0) --u.overflow;   // was beyond the cap
+    if (u.overflow > 0) --u.overflow;   // best-effort tidy of the diagnostic list
 }
 
 UnregisteredRecordScope::~UnregisteredRecordScope()
 {
-    // Withdraw directly rather than through the free function: at this point the
-    // object is mid-destruction but its members are still valid.
+    // ⚠️ THE COUNT IS DECREMENTED FROM A BOOL, NOT FROM AN ID LOOKUP. Traced: this
+    // destructor can run with `recorded` true and `id` already DEFAULT-CONSTRUCTED,
+    // so an erase-by-id matched nothing and the accusation survived its thread --
+    // a phantom that fails the census forever and makes the startup gate refuse a
+    // healthy node. `recorded` is the only member this path may rely on.
     if (!recorded) return;
     recorded = false;
     auto& u = Unregistered();
     std::lock_guard<std::mutex> lk(u.mu);
+    if (u.live > 0) --u.live;
     for (size_t i = 0; i < u.ids.size(); ++i) {
         if (u.ids[i] == id) { u.ids.erase(u.ids.begin() + i); return; }
     }
@@ -702,6 +743,31 @@ UnregisteredRecordScope::~UnregisteredRecordScope()
 
 void CChainState::EpochCheckpoint(const char* name)
 {
+    // ⚠️ A NAMELESS CHECKPOINT ON AN UNNAMED THREAD IS INERT, AND THE HEADER ALREADY
+    // SAID WHY BEFORE THE CODE DID IT. EpochOfflineScope's constructor gates its
+    // re-entry behind m_active precisely because "a nameless checkpoint would
+    // publish the current epoch and UNPIN a thread that may be holding a pointer at
+    // slot 0" — and then EpochOnlineWindow's constructor called this unconditionally,
+    // which is that same unpin through the other scope. Convergent 3/3 in round 5,
+    // and a contradiction between two comments a dozen lines apart in one header.
+    //
+    // The rule the whole mechanism rests on: A THREAD PUBLISHES A PROMISE ONLY IF IT
+    // HAS DECLARED ITSELF. An unnamed thread has declared nothing, may be pinning at
+    // slot 0 after a resolve, and must stay exactly where it is. Naming yourself is
+    // how you become able to make promises — EpochCheckpoint(name) below.
+    if (name == nullptr && t_epoch_name == nullptr) {
+        static std::atomic<bool> reported{false};
+        bool expected = false;
+        if (reported.compare_exchange_strong(expected, true)) {
+            std::cerr << "[Chain] NOTE: a nameless checkpoint was made by a thread "
+                         "with no registered participant name. Ignored: an "
+                         "undeclared thread must not publish a promise, because it "
+                         "may be pinning a pointer it resolved. Give that thread a "
+                         "named checkpoint at its loop top." << std::endl;
+        }
+        return;
+    }
+
     // Publish "I am now at the current global epoch, and I hold no CBlockIndex*".
     // acquire on the read / release on the store: a drain that observes this value
     // must also observe everything this thread did before the checkpoint.
@@ -848,6 +914,11 @@ bool CChainState::EpochQuiesce()
     return true;
 }
 
+bool CChainState::IsEpochParticipant()
+{
+    return t_epoch_name != nullptr;
+}
+
 uint64_t CChainState::OfflineResolveCount()
 {
     return g_offline_resolves.load(std::memory_order_relaxed);
@@ -901,7 +972,7 @@ size_t CChainState::UnregisteredResolverThreads(std::string& detail) const
 {
     auto& u = Unregistered();
     std::lock_guard<std::mutex> lk(u.mu);
-    const size_t n = u.ids.size() + u.overflow;
+    const size_t n = u.live;            // authoritative; ids/overflow are for text
     if (n == 0) { detail.clear(); return 0; }
 
     std::ostringstream os;

@@ -91,12 +91,30 @@ for row in "${CONFIGS[@]}"; do
     # thread resolved a CBlockIndex* after publishing that it holds nothing — safe at
     # the resolve and still a defect. Printing it in a table nobody's exit code reads
     # is how it would be ignored.
-    if [ "${offl_n:-0}" != "0" ]; then
+    # ⚠️ A MISSING FIELD IS NOT A ZERO. This read `${offl_n:-0}`, so a bench that
+    # stopped printing the offline-resolve line -- a rename, a reordered report, an
+    # older binary -- would have been scored as "0 offline resolves" forever. The
+    # field must be PRESENT and an integer; absence is a failure of the measurement,
+    # not a passing measurement.
+    if ! echo "$offl_n" | grep -qE '^[0-9]+$'; then
+        echo "      ^^ FAIL: configuration $tag reported no parsable offline-resolve"
+        echo "         count (got '$offl_n') — the measurement is incomplete, not clean"
+        rc=$((rc+1))
+    elif [ "$offl_n" != "0" ]; then
         echo "      ^^ FAIL: $offl_n resolve(s) while OFFLINE in configuration $tag"
         rc=$((rc+1))
     fi
 done
 
+echo
+echo "EVERY PEAK HERE IS A SAMPLE, AND THE LONGER THE DRAIN PERIOD THE WIDER THE"
+echo "SPREAD. The peak is read after each eviction, so it depends where the run stops"
+echo "in the drain cycle, and the swing is about ONE CYCLE OF ACCUMULATION:"
+echo "  A (1 s cycle) : ~1 s x 10,400/s x 305 B  ~=  3 MB of swing  (3.5-6.4 observed)"
+echo "  B (10 s cycle): ~10 s x 10,400/s x 305 B ~= 32 MB of swing  (34.8-63.5 observed)"
+echo "B and C are single runs and inherit that spread -- do not quote either as a point"
+echo "value. A is repeated below because it is the WIRED setting and the one the design"
+echo "note cites."
 echo
 echo "CONFIG A IS RUN THREE TIMES ON PURPOSE. Its peak is sampled after each"
 echo "eviction, so it depends where the run stops relative to the drain cycle: three"

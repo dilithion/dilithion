@@ -10123,10 +10123,33 @@ uint256 TraverseAndExtract(int height,
 // the chainstate's outer try/catch already protects the loop, but we keep
 // the body trivial so even pathological CV state cannot raise.
 void CRPCServer::NotifyBlockTipChanged() {
-    // No need to acquire the mutex for notify_all -- waiters re-check their
-    // predicate under the mutex on wake, and notify_all has well-defined
-    // memory ordering w.r.t. wait_for. Avoids contention if many block
-    // connects fire in quick succession during IBD.
+    // ⚠️ THIS NOTIFY CAN BE LOST, AND THE COMMENT HERE USED TO DENY IT. It said
+    // "no need to acquire the mutex ... waiters re-check their predicate under the
+    // mutex on wake", which is true of a waiter that IS parked and false of one that
+    // is not yet. A waiter evaluates its predicate, sees no tip change, and then
+    // parks; a notify_all landing in that gap -- between the predicate returning
+    // false and the wait actually beginning -- reaches nobody. (It also said
+    // `wait_for`; the waits are `wait_until`.)
+    //
+    // THE BOUND, stated rather than implied: a waiter that misses a wake sleeps
+    // until the NEXT block connect notifies again, or until its own deadline --
+    // the caller's timeout, capped at 300 s by ResolveWaitTimeoutMs. So a
+    // waitfornewblock can return late, never wrong: it re-reads the tip on wake and
+    // reports the truth. Latency, not correctness.
+    //
+    // WHY THE OBVIOUS FIX IS NOT APPLIED HERE. Taking g_wait_cluster_mtx in this
+    // callback would close the gap -- and this callback fires from ConnectTip's
+    // m_blockConnectCallbacks loop WITH cs_main HELD, while the wait-* predicates
+    // take g_wait_cluster_mtx and then cs_main (via get_tip()). Adding the mutex
+    // here creates exactly the AB-BA that does not exist today. The correct fix is
+    // to defer the notify past the cs_main release (a post-drain notify) and take
+    // the mutex there, which changes the block-connect notify path -- consensus
+    // adjacent, and its own review. FILED, not smuggled into a reclamation PR.
+    //
+    // ⚠️ AND THIS DELTA MARGINALLY WIDENS THE GAP, which is the honest reason to
+    // prioritise that filed fix: the wait-* predicates now run an EpochOnlineWindow,
+    // whose destructor quiesces between the predicate returning false and the park.
+    // A few more instructions in the window that was already there.
     g_wait_cluster_cv.notify_all();
 }
 

@@ -211,6 +211,16 @@ print('MUTATED')
 # just proved quiesce does not refuse cannot trust anything after it. The earliest
 # observable failure is the honest signature; naming the later one would make this arm
 # fail for a reason unrelated to the fix.
+arm "F25 - nameless-checkpoint gate removed (a window may unpin an unnamed holder)" "
+import io
+p='$CHAIN'; s=io.open(p,encoding='utf-8').read()
+old='    if (name == nullptr && t_epoch_name == nullptr) {'
+assert s.count(old)==1, ('anchor',s.count(old))
+s=s.replace(old,'    if (false) {   // MUTANT: nameless checkpoints publish for anyone',1)
+io.open(p,'w',encoding='utf-8',newline='').write(s)
+assert 'MUTANT: nameless checkpoints' in io.open(p,encoding='utf-8').read()
+print('MUTATED')
+" "F25: BOTH SCOPE TYPES ARE INERT ON AN UNNAMED THREAD — it still pins"
 # ⚠️ THE F15 MUTANT WAS REMOVED, AND WHY MATTERS MORE THAN THE ARM DID.
 # Round 3 added a re-record on resolve-after-quiesce. Round 4's fail-closed rule
 # (EpochQuiesce refuses on a thread with no registered name) made that path

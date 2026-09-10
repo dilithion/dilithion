@@ -279,7 +279,12 @@ in 19 ms and report its size as a "peak"):
 
 ⚠️ **AND THEY VARY RUN TO RUN BY ~2x, WHICH A SINGLE QUOTED FIGURE HID.** The
 wired setting measured **6.42, 6.39 and 3.53 MB** on three consecutive runs of the
-same command. Peak occupancy is sampled after each eviction, so it depends on where
+same command, and **6.43 / 6.40 / 3.61 MB** when the sweep repeated it later.
+
+**The spread is about one drain cycle of accumulation, so it scales with the cycle**:
+config B (a 10 s drain period) swung **34.79 → 63.46 MB** between sweeps, which is
+~10 s × 10,400/s × 305 B ≈ 32 MB — exactly one cycle. B and C are single runs and
+must not be quoted as point values either. Peak occupancy is sampled after each eviction, so it depends on where
 the run ends relative to the 1 Hz drain cycle — a run that stops just before a drain
 reports roughly twice one that stops just after. The honest statement for the wired
 setting is **3.5–6.4 MB**, and the number to quote is the **upper** end.
@@ -616,6 +621,55 @@ detection of a different mistake, and any reading of it as protection is wrong.
   **aborted the node**. Names are established once per thread at its own loop-top
   checkpoint; a scope acts on whatever the calling thread already is, and refuses
   fail-closed if that thread is unregistered.
+
+## ⚠️ OPEN ITEM — A PHANTOM ACCUSATION, MEASURED AT ~5%, NOT YET CLOSED
+
+**This is the one thing on this branch I have not been able to fix, and it is stated
+here rather than left in a test's flake rate.**
+
+`deferred_reclamation_tests` fails roughly **3 runs in 50** (measured repeatedly: 2/30,
+3/40, 5/40, 3/50, 2/50, 3/50 across successive attempted fixes). Every failure has the
+same signature: `EpochRegistrationComplete` reports **one** thread that "obtained a
+CBlockIndex* and never checkpointed", naming a thread that has already exited and been
+joined. The accusation is never withdrawn, so the census fails permanently for the rest
+of the process.
+
+**The product consequence, stated plainly: if this can happen in a node, the startup
+gate refuses to start a healthy node.** That is why it is an open item and not a test
+nuisance.
+
+### What has been ruled out, by measurement rather than reasoning
+
+| hypothesis | probe | result |
+|---|---|---|
+| TLS destructors don't always run | 300 accused threads, sequential and in batches of 20 | **0 leftover** — they run |
+| the 8-entry id cap drifts under overflow | same probe, 20 concurrent accused threads per batch | **0 leftover** — accounting holds |
+| `join()` returns before the destructor | polls added on every count assertion | narrowed, did not close |
+| an absolute global count is racy between arms | assertions converted to deltas and eventual polls | narrowed, did not close |
+| the id-keyed erase misses | count made authoritative, no lookup at teardown | **improved, did not close** |
+| a late TLS constructor clobbers `recorded` | `Touch()` forces construction before any write | did not close |
+
+### What the trace actually showed
+
+With per-thread instrumentation the withdrawal fired with `recorded == true` and the
+stored `id` **default-constructed** — printed by libstdc++ as *"thread::id of a
+non-executing thread"*. So the object reached its destructor with one member set and
+another cleared. The count-based fix removes the dependency on that id, and the
+failure rate dropped but did not reach zero, which means at least one further path
+loses the record entirely.
+
+### What is needed next, and it is not another attempt by me
+
+Six fixes aimed at this from the same angle have moved the rate around without closing
+it — a review modality at its yield limit. **This needs a decorrelated lens on the
+`UnregisteredRecordScope` lifecycle specifically**: a fresh reader, or a seat, with the
+recording path, the two withdrawal paths, the registry, and the MinGW/emutls TLS model
+in front of them. The `count-is-authoritative` change is kept because it is right on its
+own terms — a teardown path must not depend on a lookup key surviving — but it is not
+the whole answer.
+
+**Nothing in this open item affects the ASan verdict**, which exercises the graveyard's
+free rule and not the census.
 
 ## WIRING CENSUS — checkpoints, offline scopes, and declared counts
 
