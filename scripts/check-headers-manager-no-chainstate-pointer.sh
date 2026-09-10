@@ -1,5 +1,7 @@
 #!/bin/bash
-# P2P-16 structural guard: no released chainstate pointer in the headers manager.
+# P2P-16 structural guard: the headers manager never CALLS a released-pointer
+# accessor. Read "WHAT THIS PROVES" below before relying on it — the claim is
+# deliberately narrower than the file name suggests.
 #
 # WHY THIS EXISTS.
 #
@@ -22,10 +24,34 @@
 # every test would still pass, because the failure needs an eviction to land
 # inside a specific window. So the invariant gets a structural check.
 #
-# THE INVARIANT, chosen to be complete by construction rather than by search:
-# GetTip() is the only way a released chainstate pointer enters this file. If it
-# is never CALLED here, no such pointer can exist here — no matter what future
-# code does. That is a stronger claim than "no dereference looks unsafe".
+# WHAT THIS PROVES, AND WHAT IT DOES NOT — measured, not asserted.
+#
+# The claim here was NARROWED to match a mutant table, because a broad claim
+# resting on a grep is the false-confidence failure this PR has already paid for
+# twice. One mutant per shape, appended to the real files and run against this
+# guard:
+#
+#   S1  g_chainstate.GetTip() call                 CAUGHT
+#   S2  g_chainstate.GetBlockIndex() call          CAUGHT  (added after it MISSED)
+#   S6  alias via `auto p = ...GetTip()`           CAUGHT  (still a call)
+#   S4  p->GetAncestor(h) walk                     CAUGHT
+#   S7  the same call in headers_manager.h         CAUGHT  (added after it MISSED)
+#   S3  a bare `CBlockIndex* p` declaration        MISSED
+#   S5  a bare `p->nHeight` dereference            MISSED
+#
+# So this guard proves exactly two things:
+#   (1) neither GetTip() nor GetBlockIndex() — the two accessors that RELEASE
+#       cs_main and hand back a pointer — is CALLED in headers_manager.{cpp,h};
+#   (2) no CBlockIndex ancestor/parent walk appears in the .cpp.
+#
+# It does NOT prove "no released chainstate pointer can exist here". A pointer
+# arriving by another route — a parameter, a member, another object's accessor —
+# and dereferenced as `p->nHeight` is INVISIBLE to it (S3, S5). Catching those
+# means parsing C++ types rather than grepping: aliases, `auto`, dot-access,
+# inline code in headers and `//` inside string literals all have to be handled,
+# and a half-correct parser that reports CLEAN is worse than an honest narrow
+# check. Claim (1) is complete by construction for the two named entry points,
+# which is what makes it worth having at all.
 #
 # ON THE TWO ARMS, stated precisely because the weaker phrasing overclaims
 # (review fold, LOW): the HIT arm of the resolved-value lookup is EXECUTED by the
@@ -61,14 +87,15 @@ code_only() {
 # 1. GetTip() must not be CALLED in the headers manager. This is the entry
 #    point for the whole released-pointer class; close it and the class cannot
 #    appear in this translation unit at all.
-hits=$(code_only "$HM" | grep -cE '\bGetTip[[:space:]]*\(')
+hits=$(( $(code_only "$HM" | grep -cE '\b(GetTip|GetBlockIndex)[[:space:]]*\(') + $(code_only "$HH" | grep -cE '\b(GetTip|GetBlockIndex)[[:space:]]*\(') ))
 if [ "$hits" -ne 0 ]; then
-    echo "FAIL: headers_manager.cpp CALLS GetTip() ($hits site(s))."
+    echo "FAIL: the headers manager CALLS GetTip()/GetBlockIndex() ($hits site(s))."
     echo "      GetTip() releases cs_main before returning, so the CBlockIndex*"
     echo "      it hands back can be freed by eviction at any time. Walking it"
     echo "      without cs_main is P2P-16, a peer-triggerable use-after-free."
     echo "      Use CChainState::GetAncestorHashes() — it returns VALUES."
-    code_only "$HM" | grep -nE '\bGetTip[[:space:]]*\(' | head -5
+    code_only "$HM" | grep -nE '\b(GetTip|GetBlockIndex)[[:space:]]*\(' | head -5
+    code_only "$HH" | grep -nE '\b(GetTip|GetBlockIndex)[[:space:]]*\(' | head -5
     fail=1
 fi
 
@@ -113,8 +140,8 @@ if ! grep -qE 'std::vector<uint256>[[:space:]]+CChainState::GetAncestorHashes' s
 fi
 
 if [ "$fail" -eq 0 ]; then
-    echo "PASS: no released chainstate pointer in the headers manager"
-    echo "  - GetTip() is never called there (the class cannot appear in that TU)"
+    echo "PASS: the released-pointer accessors are not called in the headers manager"
+    echo "  - GetTip()/GetBlockIndex() never called in headers_manager.{cpp,h}"
     echo "  - no CBlockIndex ancestor/parent walk in that TU"
     echo "  - GetLocatorImpl still takes resolved values, not a CBlockIndex*"
     echo "  - CChainState::GetAncestorHashes still returns values"
