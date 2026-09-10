@@ -189,11 +189,32 @@ void CSignatureBatchVerifier::WorkerThread() {
             // worker dequeues each task exactly once, and Add() incremented before
             // enqueue. A zero here would mean a double-dequeue / double-decrement
             // regression, which would otherwise wrap size_t and hang Wait()
-            // forever (silent validator-thread DoS). Guard the decrement so the
-            // underflow protection holds in release builds (NDEBUG) too, not just
-            // debug: if the count is already zero, log loudly and skip the
-            // fetch_sub rather than wrapping size_t. The load is under
+            // forever (silent validator-thread DoS). The load is under
             // complete_mutex so it is consistent with the fetch_sub that follows.
+            //
+            // ⚠️ WHICH OF THE TWO STATEMENTS BELOW ACTUALLY RUNS DEPENDS ON THE
+            // BUILD, AND THIS COMMENT USED TO IMPLY THE WRONG ONE. It said the
+            // guard holds "in release builds (NDEBUG) too, not just debug", which
+            // reads as though a release build of this repo defines NDEBUG. It does
+            // not: NDEBUG appears nowhere in this Makefile or in any CI leg
+            // (Makefile:1399-1400 states exactly that), so in EVERY SANCTIONED
+            // BUILD — debug or release, node or test — the assert() below is live
+            // and ABORTS THE PROCESS. The std::cerr line is then unreachable, and
+            // an abort is the correct outcome: it beats wrapping a size_t and
+            // hanging every future Wait() forever.
+            //
+            // The log-and-skip branch is NOT dead code, though. `make
+            // CXXFLAGS=-DNDEBUG` is an unsanctioned but perfectly possible
+            // invocation, and #129's `$(OBJ_DIR)/test/%.o: override CXXFLAGS +=
+            // -UNDEBUG` (Makefile:1428) protects TEST objects only — a
+            // command-line NDEBUG still compiles the assert out of the production
+            // objects, and this file is one of them. In that build the runtime
+            // check is the ONLY thing standing between a double-decrement and a
+            // silent validator-thread DoS, so it stays.
+            //
+            // In short: the assert is the guard for every build we ship, the
+            // runtime branch is the guard for a build we do not. Both are
+            // deliberate; neither is theatre.
             if (session->pending_count.load() == 0) {
                 assert(false && "CBatchSession pending_count underflow (double-decrement?)");
                 std::cerr << "[SignatureVerifier] ERROR: pending_count underflow "
