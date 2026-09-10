@@ -203,18 +203,35 @@ HeadersSyncState::ProcessingResult HeadersSyncState::ProcessNextHeaders(
             }
         }
 
-        // Check if buffer is large enough to return headers
-        if (m_redownloaded_headers.size() >= m_params.redownload_buffer_size ||
-            m_process_all_remaining_headers) {
+        // ⛔ POP EXACTLY ONCE. This block used to call
+        // PopHeadersReadyForAcceptance() twice and ASSIGN each result:
+        //
+        //     if (buffer full || process_all) result.pow_validated_headers = Pop();
+        //     ...
+        //     if (commitments empty)          result.pow_validated_headers = Pop();
+        //
+        // When BOTH conditions held, the first Pop drained the buffer into the
+        // result and the second Pop — now running on an empty buffer, because Pop
+        // clears it — returned an empty vector and OVERWROTE the first. Measured
+        // by a reviewer's probe (P5): 2 headers in, 0 out. Validated headers were
+        // silently dropped, with no error and no log line.
+        //
+        // Capturing `finished` once also removes a second read of
+        // m_header_commitments, which Finalize() clears — so the old code read a
+        // field for `request_more` and then re-read it after a call that could
+        // change it.
+        const bool finished  = m_header_commitments.empty();
+        const bool drain_now = m_redownloaded_headers.size() >= m_params.redownload_buffer_size
+                               || m_process_all_remaining_headers;
+
+        if (drain_now || finished) {
             result.pow_validated_headers = PopHeadersReadyForAcceptance();
         }
 
         result.success = true;
-        result.request_more = !m_header_commitments.empty();
+        result.request_more = !finished;
 
-        // If no more commitments to verify, we're done
-        if (m_header_commitments.empty()) {
-            result.pow_validated_headers = PopHeadersReadyForAcceptance();
+        if (finished) {
             Finalize();
         }
     }
@@ -410,15 +427,35 @@ bool HeadersSyncState::ValidateAndStoreRedownloadedHeader(const CBlockHeader& he
         }
     }
 
-    // 2. Check continuity
-    if (!m_redownloaded_headers.empty()) {
-        if (header.hashPrevBlock != m_redownload_buffer_last_hash) {
-            std::cerr << "[HeadersSyncState] Chain discontinuity in REDOWNLOAD" << std::endl;
-            return false;
-        }
-    } else {
-        // First redownloaded header
-        m_redownload_buffer_first_prev_hash = header.hashPrevBlock;
+    // 2. Check continuity — UNCONDITIONALLY, first header included.
+    //
+    // ⛔ THIS SITE PREVIOUSLY EXEMPTED THE FIRST HEADER, and the blocker-2 commit
+    // message claimed the exemption was closed by the transition reseed. IT WAS
+    // NOT — a reviewer's probe (P1) drove a first REDOWNLOAD header with a garbage
+    // hashPrevBlock and it returned success. The claim was wrong and this is the
+    // code that makes it true.
+    //
+    // The old shape was:
+    //     if (!m_redownloaded_headers.empty()) { ...check... }
+    //     else { m_redownload_buffer_first_prev_hash = header.hashPrevBlock; }
+    //
+    // Two defects in four lines. The check was SKIPPED for the first header, and
+    // the else-branch then took the anchor FROM THE PEER — so even after
+    // EnterRedownloadPhase seeded both hash fields from m_chain_start_hash, the
+    // very first header overwrote the anchor with a value the peer chose. The
+    // reseed was correct and was immediately clobbered.
+    //
+    // Unconditional now, which is what upstream does: EnterRedownloadPhase sets
+    // m_redownload_buffer_last_hash = m_chain_start_hash, so the first header's
+    // hashPrevBlock MUST equal the chain start or the chain is not anchored to it.
+    // Nothing assigns m_redownload_buffer_first_prev_hash here any more — the
+    // reseed owns it, and PopHeadersReadyForAcceptance reconstructs from it.
+    if (header.hashPrevBlock != m_redownload_buffer_last_hash) {
+        std::cerr << "[HeadersSyncState] Chain discontinuity in REDOWNLOAD"
+                  << (m_redownloaded_headers.empty()
+                      ? " (FIRST header does not connect to chain start)" : "")
+                  << std::endl;
+        return false;
     }
 
     // 3. Check commitment if at commitment position

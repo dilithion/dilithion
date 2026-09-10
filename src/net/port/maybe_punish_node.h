@@ -95,9 +95,17 @@ MapHeaderRejectToMisbehaviorType(HeaderRejectReason reason)
 //
 // ⚠️ LP-10 A-2 / blocker 3 — TWO reasons now score ZERO, and this reverses an
 // earlier decision (Q6=B). Both were NEW POLICY WITH NO UPSTREAM COUNTERPART.
-// Measured by ENUMERATION, not by count: Bitcoin Core v28.0 net_processing.cpp
-// has 21 Misbehaving() call sites; NONE is for a low-work chain and NONE is for
-// a commitment mismatch. Core logs "Ignoring low-work chain (height=%u) from
+// Measured by ENUMERATION: Bitcoin Core v28.0 net_processing.cpp has 18
+// Misbehaving() CALL SITES; NONE is for a low-work chain and NONE is for
+// a commitment mismatch.
+//
+// ⚠️ CORRECTED FROM "21", AND THE CORRECTION IS THE POINT. 21 is what
+// `grep -c 'Misbehaving('` returns — but three of those lines are a DECLARATION
+// (:555), the DEFINITION (:1939) and a COMMENT (:3087), none of which is a call.
+// The first version of this note said "measured by enumeration, not by count"
+// while quoting a line count, which is the precise error it was claiming to
+// avoid. The conclusion is unaffected: all 18 real call sites were read, and
+// none scores a low-work chain or a commitment mismatch. Core logs "Ignoring low-work chain (height=%u) from
 // peer=%d" and, on a !success return from ProcessNextHeaders, resets
 // m_headers_sync and erases the peer's presync stats. No scoring, no ban.
 //
