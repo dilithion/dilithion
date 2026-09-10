@@ -609,10 +609,13 @@ detection of a different mistake, and any reading of it as protection is wrong.
   `HandleClient`'s scope can lexically enclose `socket_write`'s). A counter would make
   the nest "work" and hide the design error. `EpochOnlineWindow` inside an offline
   scope is the one legal nest and goes through `EpochCheckpoint`.
-* **One thread, one name.** A named checkpoint whose name differs from the one this
-  thread already registered under aborts. Names are chosen per *site* while slots
-  belong to *threads*, so a thread opening scopes under two names would silently
-  under-count one pool's registrations.
+* **One thread, one name — and SCOPES CARRY NO NAME AT ALL.** A *named checkpoint*
+  whose name differs from the one this thread already registered under aborts. That
+  check is safe only because scopes no longer name anything: when they did, a handler
+  running on a differently-named thread hit it, and `waitfornewblock` over a websocket
+  **aborted the node**. Names are established once per thread at its own loop-top
+  checkpoint; a scope acts on whatever the calling thread already is, and refuses
+  fail-closed if that thread is unregistered.
 
 ## WIRING CENSUS — checkpoints, offline scopes, and declared counts
 

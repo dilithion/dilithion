@@ -1831,9 +1831,16 @@ private:
  * RAII for the offline/online protocol: quiesce on entry, re-enter on exit.
  *
  *     {
- *         EpochOfflineScope offline(&chainstate, "rpc-worker");
+ *         EpochOfflineScope offline(&chainstate);   // NO NAME — see below
  *         m_queueCV.wait(lock, pred);          // parked, pinning nothing
  *     }                                        // re-entered BEFORE any resolve
+ *
+ * ⚠️ THIS EXAMPLE USED TO PASS A NAME, AND THE NAMED FORM IS GONE FOR A REASON: it
+ * made `waitfornewblock` over a websocket abort the node. A handler cannot know
+ * which thread is running it, so it must not assert one. Names are registered once
+ * per thread at its own loop-top checkpoint; scopes act on whatever the calling
+ * thread already is. A stale example in the header that DEFINES the primitive is
+ * the worst place for this, because it is what the next caller copies.
  *
  * The destructor runs on every path out of the block, including an exception and
  * an early `break`, which is the reason this is a scope object and not two calls:
