@@ -221,6 +221,162 @@ int main()
         chk("exited thread: the graveyard is empty again", cs.GraveyardSize() == 0);
     }
 
+    // ---- F1: A RESOLVER WITH NO SLOT MUST PIN, NOT BE FREED UNDER -----------
+    //
+    // ⚠️ EXTERNAL PANEL, ROUND 1, 3/3 HIGH — AND IT WAS THE UAF DIRECTION. A
+    // thread that resolved a pointer and had never checkpointed owned no slot, so
+    // DrainGraveyard's minimum ignored it completely and went on freeing the entry
+    // it was holding. The startup gate refuses such a node, but the PERIODIC census
+    // only LOGS while the drain keeps freeing — so between a post-gate spawn and
+    // the next census, an unregistered resolver was read-after-free bait. The
+    // comment in the node main loop even called that state "safe".
+    //
+    // NoteIndexPointerResolved now creates the slot at 0, and 0 is below every
+    // stamp, so the drain refuses everything while such a thread exists: a loud
+    // leak instead of a use-after-free.
+    {
+        auto v3hdr = MakeHeader(gh, 1700500177, 0x55);
+        if (!ad.ProcessNewHeader(v3hdr)) { std::cerr << "v3 rejected" << std::endl; return 2; }
+        const size_t n_before = cs.GetBlockIndexSize();
+        chk("F1: setup, the eviction happened",
+            cs.EvictLowestWorkLeafNotPinned(n_before - 1));
+
+        // A thread that RESOLVES and never checkpoints, parked while we measure.
+        std::mutex m; std::condition_variable cv;
+        bool resolved = false, release = false;
+        std::thread rogue([&] {
+            CBlockIndex* p = cs.GetBlockIndex(gh);   // holds a pointer, no promise
+            {
+                std::unique_lock<std::mutex> lk(m);
+                resolved = (p != nullptr);
+                cv.notify_all();
+                cv.wait(lk, [&] { return release; });
+            }
+        });
+        { std::unique_lock<std::mutex> lk(m); cv.wait(lk, [&] { return resolved; }); }
+
+        cs.EpochCheckpoint();          // this thread is a good citizen
+        chk("F1: THE DRAIN REFUSES WHILE AN UNREGISTERED RESOLVER HOLDS A POINTER",
+            cs.DrainGraveyard() == 0);
+        chk("F1: and the entry is still in the graveyard", cs.GraveyardSize() == 1);
+
+        { std::lock_guard<std::mutex> lk(m); release = true; }
+        cv.notify_all();
+        rogue.join();                   // its slot retires on exit
+
+        cs.EpochCheckpoint();
+        chk("F1: once that thread is gone, the entry drains",
+            cs.DrainGraveyard() == 1);
+    }
+
+    // ---- F2: A PARKED PARTICIPANT MUST NOT PIN ------------------------------
+    //
+    // ⚠️ EXTERNAL PANEL, 3/3 — and it falsified this branch's headline claim. The
+    // design note said "an RPC server parked in accept() pins exactly nothing".
+    // FALSE: a slot holding epoch E pins every entry unlinked after E for as long
+    // as the thread stays parked. At the measured ingress ceiling, one parked hour
+    // is ~37M entries. EpochQuiesce takes a blocked thread out of the calculation
+    // entirely, and EpochOfflineScope pairs it with the re-entry so no wake path
+    // can forget.
+    {
+        auto v4hdr = MakeHeader(gh, 1700500188, 0x44);
+        if (!ad.ProcessNewHeader(v4hdr)) { std::cerr << "v4 rejected" << std::endl; return 2; }
+
+        std::mutex m; std::condition_variable cv;
+        bool parked = false, release = false;
+        std::thread sleeper([&] {
+            cs.EpochCheckpoint("parked-thread");   // a registered participant
+            std::unique_lock<std::mutex> lk(m);
+            EpochOfflineScope offline(&cs, "parked-thread");   // ...that goes offline
+            parked = true;
+            cv.notify_all();
+            cv.wait(lk, [&] { return release; });
+        });
+        { std::unique_lock<std::mutex> lk(m); cv.wait(lk, [&] { return parked; }); }
+
+        // Evict AFTER that thread published its epoch and parked. Without the
+        // offline state its slot pins this entry for the whole park.
+        const size_t n_before = cs.GetBlockIndexSize();
+        chk("F2: setup, the eviction happened while a participant was parked",
+            cs.EvictLowestWorkLeafNotPinned(n_before - 1));
+        cs.EpochCheckpoint();
+        chk("F2: A PARKED PARTICIPANT DOES NOT PIN THE GRAVEYARD",
+            cs.DrainGraveyard() == 1);
+
+        { std::lock_guard<std::mutex> lk(m); release = true; }
+        cv.notify_all();
+        sleeper.join();
+        chk("F2: and no resolve happened while offline",
+            CChainState::OfflineResolveCount() == 0);
+    }
+
+    // ---- F3: THE DRAIN MUST NOT WALK THE GRAVEYARD WHEN NOTHING IS FREEABLE --
+    //
+    // Panel 3/3 MEDIUM (CON-27's class): every 1 Hz call used to copy the whole
+    // graveyard under cs_main even in the pinned regime, so the lock hold grew
+    // linearly with time-since-pin. Stamps are strictly increasing and the vector
+    // is insertion-ordered, so the front entry answers "anything freeable?" in
+    // O(1). This arm pins the ORDER the fast path depends on, which is the part a
+    // future change could silently break.
+    {
+        cs.SetDeepDrainInvariantsForTest(true);   // asserts sortedness in the drain
+        std::mutex m; std::condition_variable cv;
+        bool parked = false, release = false;
+        std::thread pinner([&] {
+            cs.EpochCheckpoint("pinner");     // pins at the CURRENT epoch
+            std::unique_lock<std::mutex> lk(m);
+            parked = true; cv.notify_all();
+            cv.wait(lk, [&] { return release; });   // deliberately NOT offline
+        });
+        { std::unique_lock<std::mutex> lk(m); cv.wait(lk, [&] { return parked; }); }
+
+        size_t evicted = 0;
+        for (int i = 0; i < 8; ++i) {
+            auto h = MakeHeader(gh, static_cast<uint32_t>(1700500200 + i),
+                                static_cast<uint8_t>(0xA0 + i));
+            if (!ad.ProcessNewHeader(h)) break;
+            if (cs.EvictLowestWorkLeafNotPinned(cs.GetBlockIndexSize() - 1)) ++evicted;
+        }
+        chk("F3: setup, several entries were unlinked while a thread was pinned",
+            evicted >= 4 && cs.GraveyardSize() == evicted);
+        cs.EpochCheckpoint();
+        chk("F3: in the PINNED regime the drain frees nothing (and asserts order)",
+            cs.DrainGraveyard() == 0);
+        chk("F3: the graveyard is intact", cs.GraveyardSize() == evicted);
+
+        { std::lock_guard<std::mutex> lk(m); release = true; }
+        cv.notify_all();
+        pinner.join();
+        cs.EpochCheckpoint();
+        chk("F3: once the pin is gone the whole prefix drains at once",
+            cs.DrainGraveyard() == evicted);
+        chk("F3: and the graveyard is empty", cs.GraveyardSize() == 0);
+    }
+
+    // ---- F4: THE FREE-TIME LEAF CHECK MUST BE ABLE TO FAIL ------------------
+    //
+    // Panel (gpt6, grok) MEDIUM: the free-time in-degree assertion was a
+    // TAUTOLOGY. LeafIndexOnErase erased the victim's row at UNLINK, so at free
+    // time `it == end()` always held and the check could not fail for any input.
+    // The row is now kept until the free. This arm pins the property the fix
+    // creates — the row EXISTS at free time and reads zero — which is what a
+    // reader cannot verify from the assertion itself.
+    {
+        auto v5hdr = MakeHeader(gh, 1700500233, 0x33);
+        if (!ad.ProcessNewHeader(v5hdr)) { std::cerr << "v5 rejected" << std::endl; return 2; }
+        const size_t n_before = cs.GetBlockIndexSize();
+        chk("F4: setup, the eviction happened",
+            cs.EvictLowestWorkLeafNotPinned(n_before - 1));
+        chk("F4: the unlinked entry KEEPS its in-degree row until it is freed",
+            cs.InDegreeRowsForTest() == cs.GetBlockIndexSize() + cs.GraveyardSize());
+        cs.EpochCheckpoint();
+        chk("F4: it drains", cs.DrainGraveyard() == 1);
+        chk("F4: and the row is erased at the free, not before",
+            cs.InDegreeRowsForTest() == cs.GetBlockIndexSize());
+        chk("F4: the side index still matches a brute-force recomputation",
+            cs.LeafIndexMatchesBruteForce());
+    }
+
     // ---- REGISTRATION CENSUS: a thread that never checkpoints is a LEAK ------
     //
     // A non-participating thread pins the graveyard for the process lifetime.

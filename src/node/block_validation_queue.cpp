@@ -410,9 +410,20 @@ void CBlockValidationQueue::ValidationWorker() {
         // Wait for blocks in queue
         {
             std::unique_lock<std::mutex> lock(m_queue_mutex);
-            m_queue_cv.wait(lock, [this] {
-                return !m_queue.empty() || !m_running.load();
-            });
+            {
+                // OFFLINE FOR THE DURATION OF THE WAIT. Checkpointing before the wait
+                // publishes an epoch that then FREEZES while this thread is parked, pinning
+                // every entry unlinked afterwards -- a server asleep in accept() for an hour
+                // pins an hour of evictions, which is what made the design note's "parked
+                // threads pin nothing" false. Going offline removes this thread from the
+                // quiescent-state calculation entirely, exactly as an exited thread is
+                // removed; the scope re-enters on EVERY exit path, before anything is
+                // resolved.
+                EpochOfflineScope offline(&m_chainstate, "validation-worker");
+                m_queue_cv.wait(lock, [this] {
+                    return !m_queue.empty() || !m_running.load();
+                });
+            }
 
             if (!m_running.load() && m_queue.empty()) {
                 break;  // Shutting down

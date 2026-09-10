@@ -6,18 +6,34 @@ eviction, so the dependency below is no longer "depends on #129" but "depends on
 main ≥ `4ccf3797`". The argument is unchanged; only its base moved.
 **Mandatory reader:** LP10 (A-5 owner).
 
-> **THE CHECKPOINT GOES BEFORE THE WAIT, BECAUSE THAT IS THE INSTANT THE THREAD
-> PROVABLY HOLDS NOTHING.** Everything else here follows from that one placement:
-> the pin per thread is ONE UNIT OF WORK, never the duration of a wait, so an idle
-> worker, an RPC server parked in `accept()` for hours, and a sync loop waiting on
-> I/O all pin exactly nothing. Checkpointing *after* the work would be backwards —
-> it would hold the graveyard for precisely the period the thread is doing nothing.
+> ## ⚠️ THE SENTENCE THIS DOCUMENT USED TO OPEN WITH WAS FALSE
 >
-> **The exception that would break it**, and the rule that survives this document:
-> a thread that blocks on I/O *while holding* a resolved pointer. The census below
-> found that **none of the wired threads does** — every one resolves and
-> dereferences within a few lines and retains nothing across its boundary. A thread
-> that ever does must checkpoint before blocking, or drop the pointer first.
+> It said: *"the checkpoint goes before the wait, so the pin per thread is one unit
+> of work — an RPC server parked in `accept()` for hours pins exactly nothing."*
+> **A 3/3 external panel falsified it, and the bench then measured it.** Publishing
+> epoch E before blocking does not release anything: the slot **stays at E for the
+> whole park**, and every entry unlinked afterwards is retained. Measured, at the
+> 10,400/s ingress ceiling with one participant parked: **47.60 MB in 15 seconds
+> and still growing — 0 entries freed in the entire run.** An hour of park is
+> ~37M entries, ~11 GB. Attacker-influenceable, and the note called it safe.
+>
+> **THE CORRECT RULE IS A QUIESCENT-STATE PROTOCOL — offline/online, as in RCU.**
+> A thread about to block calls `EpochQuiesce()`, which publishes the retired
+> value: it leaves the minimum calculation entirely, exactly as an exited thread
+> does. On wake it re-enters with `EpochCheckpoint()` **before it resolves
+> anything**. `EpochOfflineScope` pairs the two so no wake path — including an
+> exception or an early `break` — can perform half of it. Same bench, same
+> configuration, with the park inside the scope: **6.41 MB peak, 146,486 entries
+> freed during the run.** Unbounded became bounded.
+>
+> The old sentence survives in one narrower form, and it is still the reason the
+> checkpoint sits where it does: **at the top of a loop, before the wait, a thread
+> provably holds nothing** — that is what makes it safe to publish there at all.
+> What it does not do is bound the pin for a thread that then stops looping.
+>
+> **The exception that remains**: a thread that blocks *while holding* a resolved
+> pointer. It must not go offline (offline means "I hold nothing"), and it must not
+> stay online either — it must drop the pointer first. The census found none.
 
 > **LEAF-ONLY EVICTION IS WHAT MAKES AN ENTRY SAFE TO FREE AT ALL. Deferred
 > reclamation only makes the TIMING safe.** A grace period protects a pointer held by
@@ -254,6 +270,13 @@ in 19 ms and report its size as a "peak"):
 | B — 10 s drain, 10 s slowest checkpoint | 113,844 entries = 34.74 MB | predicted 31.72 MB → 1.10x |
 | C — 1 Hz drain, **10 s** slowest checkpoint | 105,666 entries = 32.25 MB | → 1.02x |
 
+⚠️ **THESE ARE OBSERVATIONS AT THESE SETTINGS, NOT A BOUND.** 6.42 MB is what a
+1 Hz drain and a 1 Hz slowest checkpoint produced on this machine at this ingress
+rate; it is not a ceiling. The ceiling is set by the slowest participant's interval,
+and a participant that parks without going offline has no interval at all — see the
+round-1 panel section below, where the same bench measures 47.60 MB and still
+climbing.
+
 **C is the row that matters.** A drain ten times faster than B's bought 2.5 MB:
 **the slowest CHECKPOINT dominates, not the drain cadence.** The number to defend is
 therefore the slowest participant's interval, and the wired shape's honest figure is
@@ -327,6 +350,68 @@ another thread, still readable), and **the harness demonstrably reaches the free
 (`drained` — the holder checkpoints while still holding, so the drain frees under it,
 and it traps at the same address). Without that third arm the clean one would prove
 nothing.
+
+## ⚠️ EXTERNAL PANEL, ROUND 1 (head 42a287cd) — FOUR CONFIRMED DEFECTS
+
+Three named seats, 3 of 3 responding, aggregate **NO-GO**; no seat asked for a
+redesign. Full page: `dilithion-strategy/missions/pr129-eviction-uaf/REVIEW_external_pr198_r1_42a287cd.md`.
+Every fold below carries a RED-first arm (`scripts/red_arms_pr198_r1_folds.sh`).
+
+**F1 — a thread that resolves and NEVER checkpoints was not pinning; it was being
+freed under.** The drain's minimum runs over the slot registry, and a slot existed
+only after a first checkpoint — so an unregistered resolver was simply absent from
+the calculation, and the drain went on freeing the entry it held. The startup gate
+refuses such a node, but the *periodic* census only LOGS while the drain keeps
+freeing, and the node-loop comment called that state "safe". **It was the
+use-after-free direction, in the mechanism that exists to remove use-after-frees.**
+Fixed: the resolve itself creates the slot at **0**, which is below every stamp, so
+the drain refuses everything while such a thread lives — a loud leak instead. And
+registration is now **counted per thread**: a `std::set<std::string>` meant one
+`rpc-worker` reaching its checkpoint satisfied the census for the entire pool.
+
+**F2 — a parked participant pinned forever.** The headline defect, above.
+
+**F3 — the drain was O(graveyard) per call in the pinned regime.** Every 1 Hz call
+walked and rebuilt the whole vector under `cs_main` even when nothing could be
+freed, so the lock hold grew linearly with time-since-pin (CON-27's class; the
+6.1 ms figure was measured in the *draining* regime, where it does not appear).
+Stamps are strictly increasing and the vector is insertion-ordered, so the front
+entry answers "anything freeable?" in O(1) and a binary search finds the cutoff.
+Measured in the pinned regime at G≈156,000: **max 1.0 ms / mean 0.5 ms with the
+full walk, 0.0 ms with the fast path.** Honest magnitude: the walk costs ~3.2 ns
+per entry, so at fifteen seconds of pin it is small — its danger is that it grows
+with G, and G grows at the ingress rate. The memory ceiling bites first.
+
+**F4 — the free-time leaf check was a tautology.** `LeafIndexOnErase` erased the
+victim's in-degree row at **unlink**, so at free time `it == end()` always held and
+`ConsensusInvariant(it == end || second == 0)` could not fail for any input. The row
+is now kept until the free, asserted zero there, and erased. The mutant that
+restores the old erase **aborts on that assertion at the first drain** — which is
+the proof the check is no longer vacuous.
+
+### Obligations the panel asked to be stated, not fixed
+
+* **No handoff across a thread's exit.** `~EpochSlotRetirer` retires the slot the
+  instant the thread ends, so a pointer *queued, captured or stored* by that thread
+  before exiting would be outside the proof. The 62-site census found no site that
+  hands a resolved `CBlockIndex*` to another thread or stores one beyond its call —
+  every escape is a stack pointer used within the call. The queue path is the one
+  that comes closest, and it is covered from the other side: `queued_block.pindex`
+  is re-resolved by hash and its entry is pinned by eviction clause (d) while it is
+  in flight. **If a future change queues a raw index pointer, this proof breaks and
+  the drain-time invariants will not catch it.**
+* **Shutdown.** Nothing frees the graveyard at teardown. `CChainState`'s destruction
+  releases it with everything else; no code path clears the slots or drains at
+  `Stop()`. That is deliberate — a drain during teardown would need every thread to
+  still be checkpointing — and it means the graveyard's contents are freed by
+  process exit, not by reclamation. Stated so nobody adds a "tidy" drain into a
+  shutdown path where the participants are already gone.
+* **One `CChainState` per process.** `m_globalEpoch` is a member; the slot registry
+  and the thread-locals are process-wide. That is sound only while exactly one
+  chainstate exists and is never re-created. `g_chainstate` (`src/core/globals.cpp`)
+  is the only production instance. **Tests construct their own `CChainState`, which
+  is why the registry must never be keyed to one** — and why a second *production*
+  chainstate would require keying the registry by chainstate.
 
 ## WIRING CENSUS — where EpochCheckpoint() actually is
 

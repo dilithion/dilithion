@@ -275,7 +275,7 @@ bool CMiningController::StartMining(const CBlockTemplate& blockTemplate) {
 
     // Declared before the spawn: conditional participants (mining off => never
     // declared, so a non-mining node's startup census does not expect them).
-    g_chainstate.DeclareEpochParticipant("mining-worker");
+    g_chainstate.DeclareEpochParticipant("mining-worker", m_nThreads);
 
     // Start mining worker threads
     m_workers.clear();

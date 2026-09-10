@@ -19,7 +19,8 @@
 // every 10 s pins ten seconds of evictions no matter how often the drain runs.
 //
 // USAGE
-//   graveyard_occupancy_bench [entries] [pinned_pct] [drain_ms] [checkpoint_ms] [run_ms]
+//   graveyard_occupancy_bench [entries] [pinned_pct] [drain_ms] [checkpoint_ms]
+//                             [run_ms] [target_rate] [parked_mode]
 //
 // Defaults reproduce the wired production shape: a 1 Hz drain from the node main
 // loop and a 1 Hz slowest checkpoint.
@@ -30,6 +31,8 @@
 
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
+#include <mutex>
 #include <cstring>
 #include <iomanip>
 #include <iostream>
@@ -99,6 +102,14 @@ int main(int argc, char** argv)
     // "peak" is just the size of that set. The throttled run is the one that
     // answers the occupancy question.
     const double target_rate   = (argc > 6) ? std::stod(argv[6])  : 10400.0;
+    // PARKED-PARTICIPANT ARM (external panel round 1, finding 3). 0 = none;
+    // 1 = a participant parks for the whole run WITHOUT going offline, which is
+    // what "checkpoint before the wait" produced and what the design note wrongly
+    // called "pins nothing"; 2 = the same thread parks inside an EpochOfflineScope,
+    // which is the fix. Run 1 and 2 and compare the peaks — that difference is the
+    // measurement, and it is also the pinned-regime drain-cost measurement, since
+    // arm 1 IS the pinned regime.
+    const int    parked_mode   = (argc > 7) ? std::stoi(argv[7])  : 0;
 
     std::cout << "\n=== graveyard occupancy: " << entries << " entries, "
               << pinned_pct << "% pinned, drain every " << drain_ms
@@ -148,6 +159,14 @@ int main(int argc, char** argv)
     std::cout << "  pinned (active chain) : " << pinned_target << "\n";
     std::cout << "  evictable             : " << (entries - pinned_target) << "\n\n";
 
+    // ⚠️ THIS THREAD IS A PARTICIPANT AND MUST SAY SO BEFORE THE RUN. It resolved
+    // the pinned tip above, and since the round-1 fold a thread that resolves
+    // without ever checkpointing gets a slot at 0 that PINS THE WHOLE GRAVEYARD --
+    // which is the intended safe direction, and which silently made this bench
+    // report "freed 0" for every configuration until the checkpoint below was
+    // added. The bench was measuring its own missing promise.
+    cs.EpochCheckpoint("bench-main");
+
     const long rss_before = CurrentRssKb();
 
     // ── the participants. `checkpoint_ms` is the SLOWEST one, which is the one
@@ -170,6 +189,36 @@ int main(int argc, char** argv)
                 std::chrono::milliseconds(std::max(1, checkpoint_ms / 10)));
         }
     });
+
+    // ── the parked participant, if this arm asked for one.
+    std::mutex park_m;
+    std::condition_variable park_cv;
+    bool park_ready = false, park_release = false;
+    std::thread parked;
+    if (parked_mode != 0) {
+        parked = std::thread([&] {
+            cs.EpochCheckpoint("bench-parked");   // a registered participant
+            std::unique_lock<std::mutex> lk(park_m);
+            if (parked_mode == 2) {
+                // THE FIX: leave the quiescent-state calculation while blocked.
+                EpochOfflineScope offline(&cs, "bench-parked");
+                park_ready = true;
+                park_cv.notify_all();
+                park_cv.wait(lk, [&] { return park_release; });
+            } else {
+                // THE DEFECT: an epoch published and then frozen for the whole park.
+                park_ready = true;
+                park_cv.notify_all();
+                park_cv.wait(lk, [&] { return park_release; });
+            }
+        });
+        std::unique_lock<std::mutex> lk(park_m);
+        park_cv.wait(lk, [&] { return park_ready; });
+        std::cout << "  parked participant    : mode " << parked_mode
+                  << (parked_mode == 2 ? " (OFFLINE — the fix)"
+                                       : " (checkpointed then parked — the defect)")
+                  << "\n";
+    }
 
     // ── the drain, on its own thread at the wired cadence, timed per call.
     std::atomic<uint64_t> freed_total{0};
@@ -218,12 +267,20 @@ int main(int argc, char** argv)
         --target;
         if (!cs.EvictLowestWorkLeafNotPinned(target)) break;  // nothing evictable
         ++evictions;
+        // The evicting thread holds nothing between calls; without this its slot
+        // would sit at the pre-run epoch and pin every entry it just unlinked.
+        cs.EpochCheckpoint("bench-main");
         const size_t g = cs.GraveyardSize();
         if (g > peak_entries) peak_entries = g;
     }
     const double elapsed_ms = MsSince(t_start);
 
     stop.store(true);
+    if (parked.joinable()) {
+        { std::lock_guard<std::mutex> lk(park_m); park_release = true; }
+        park_cv.notify_all();
+        parked.join();
+    }
     slow.join();
     fast.join();
     drainer.join();
@@ -255,6 +312,8 @@ int main(int argc, char** argv)
     std::cout << "  freed after the run   : " << final_freed << "\n";
     std::cout << "  graveyard at exit     : " << cs.GraveyardSize() << "\n";
     std::cout << "  checkpoints           : " << checkpoints.load() << "\n";
+    std::cout << "  resolves while OFFLINE: " << CChainState::OfflineResolveCount()
+              << "  (non-zero = a mispaired quiesce/checkpoint somewhere)\n";
     std::cout << "  RSS                   : " << rss_before << " -> " << rss_after
               << " KB (delta " << (rss_after - rss_before) << " KB)\n\n";
 

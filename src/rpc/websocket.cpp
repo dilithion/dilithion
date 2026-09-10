@@ -142,17 +142,34 @@ void CWebSocketServer::Stop() {
 }
 
 void CWebSocketServer::ServerThread() {
+    // REGISTER AT ENTRY, THEN GO OFFLINE WHILE BLOCKED.
+    //
+    // ⚠️ THE OFFLINE SCOPE ALONE DOES NOT REGISTER THIS THREAD. A name reaches
+    // the registry on its first NAMED checkpoint, and the scope's checkpoint is in
+    // its DESTRUCTOR — which runs only when the wait RETURNS. On an idle node no
+    // request ever arrives, so this thread would never register and the startup
+    // census would refuse to start the node. Registering here, once, before the
+    // first block, is what makes the census a statement about threads that EXIST
+    // rather than threads that have been handed work.
+    g_chainstate.EpochCheckpoint("websocket-server");
+
     while (m_running) {
         // DEFERRED-RECLAMATION CHECKPOINT — before accept(), which can wait
         // indefinitely. This thread handles the client inline and reaches
         // ExecuteRPC, i.e. the entire RPC handler table, so it resolves index
         // pointers. Checkpointing here means an idle websocket listener pins
         // nothing for the hours it may sit in accept(); pin bound is one request.
-        g_chainstate.EpochCheckpoint("websocket-server");
-
         struct sockaddr_storage clientAddr;
         socklen_t clientLen = sizeof(clientAddr);
-        int clientSocket = accept(m_server_socket, (struct sockaddr*)&clientAddr, &clientLen);
+        int clientSocket;
+        {
+        // OFFLINE WHILE BLOCKED. accept() can wait indefinitely; an epoch
+        // published just before it FREEZES for the whole wait and pins every
+        // entry unlinked meanwhile. The scope re-enters before the request is
+        // handled, which is the first thing that can resolve a pointer.
+            EpochOfflineScope offline(&g_chainstate, "websocket-server");
+            clientSocket = accept(m_server_socket, (struct sockaddr*)&clientAddr, &clientLen);
+        }
 
         if (clientSocket == INVALID_SOCKET) {
             if (m_running) {

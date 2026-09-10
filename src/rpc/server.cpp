@@ -603,7 +603,9 @@ bool CRPCServer::Start() {
     m_running = true;
     if (m_chainstate) {
         m_chainstate->DeclareEpochParticipant("rpc-accept");
-        m_chainstate->DeclareEpochParticipant("rpc-worker");
+        // The request-handling pool declares its size: every worker resolves index
+        // pointers, so one worker's checkpoint must not certify the pool.
+        m_chainstate->DeclareEpochParticipant("rpc-worker", m_threadPoolSize);
     }
     m_serverThread = std::thread(&CRPCServer::ServerThread, this);
 
@@ -768,6 +770,17 @@ bool CRPCServer::InitializePermissions(const std::string& configPath,
 }
 
 void CRPCServer::ServerThread() {
+    // REGISTER AT ENTRY, THEN GO OFFLINE WHILE BLOCKED.
+    //
+    // ⚠️ THE OFFLINE SCOPE ALONE DOES NOT REGISTER THIS THREAD. A name reaches
+    // the registry on its first NAMED checkpoint, and the scope's checkpoint is in
+    // its DESTRUCTOR — which runs only when the wait RETURNS. On an idle node no
+    // request ever arrives, so this thread would never register and the startup
+    // census would refuse to start the node. Registering here, once, before the
+    // first block, is what makes the census a statement about threads that EXIST
+    // rather than threads that have been handed work.
+    if (m_chainstate) m_chainstate->EpochCheckpoint("rpc-accept");
+
     // Phase 1.1: Wrap thread entry point in try/catch to prevent silent crashes
     try {
         while (m_running) {
@@ -788,9 +801,15 @@ void CRPCServer::ServerThread() {
         // checkpointing after the request instead would be equivalent here, but
         // stating it at the blocking call makes the reason explicit — a thread
         // waiting on I/O is holding nothing, so it should say so before it waits.
-        if (m_chainstate) m_chainstate->EpochCheckpoint("rpc-accept");
-
-        int clientSocket = accept(listenSock, (struct sockaddr*)&clientAddr, &clientLen);
+        int clientSocket;
+        {
+        // OFFLINE WHILE BLOCKED. accept() can wait indefinitely; an epoch
+        // published just before it FREEZES for the whole wait and pins every
+        // entry unlinked meanwhile. The scope re-enters before the request is
+        // handled, which is the first thing that can resolve a pointer.
+            EpochOfflineScope offline(m_chainstate, "rpc-accept");
+            clientSocket = accept(listenSock, (struct sockaddr*)&clientAddr, &clientLen);
+        }
 
         if (clientSocket == INVALID_SOCKET) {
             if (m_running) {
@@ -875,9 +894,20 @@ void CRPCServer::WorkerThread() {
             std::unique_lock<std::mutex> lock(m_queueMutex);
 
             // Wait until there's work in the queue or we're shutting down
-            m_queueCV.wait(lock, [this] {
-                return !m_running || !m_clientQueue.empty();
-            });
+            {
+                // OFFLINE FOR THE DURATION OF THE WAIT. Checkpointing before the wait
+                // publishes an epoch that then FREEZES while this thread is parked, pinning
+                // every entry unlinked afterwards -- a server asleep in accept() for an hour
+                // pins an hour of evictions, which is what made the design note's "parked
+                // threads pin nothing" false. Going offline removes this thread from the
+                // quiescent-state calculation entirely, exactly as an exited thread is
+                // removed; the scope re-enters on EVERY exit path, before anything is
+                // resolved.
+                EpochOfflineScope offline(m_chainstate, "rpc-worker");
+                m_queueCV.wait(lock, [this] {
+                    return !m_running || !m_clientQueue.empty();
+                });
+            }
 
             // Check if we're shutting down
             if (!m_running && m_clientQueue.empty()) {

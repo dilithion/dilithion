@@ -259,7 +259,12 @@ bool CConnman::Start(CPeerManager& peer_mgr, CNetMessageProcessor& msg_proc, con
     // the census only ever asks for declared-minus-registered.
     g_chainstate.DeclareEpochParticipant("p2p-msg-handler");
     g_chainstate.DeclareEpochParticipant("p2p-headers-worker");
-    g_chainstate.DeclareEpochParticipant("p2p-blocks-worker");
+    // ⚠️ DECLARED WITH A COUNT, BECAUSE THIS IS A POOL. The registry used to
+    // hold a SET OF NAMES, so one worker reaching its first checkpoint
+    // satisfied the census for every sibling: fifteen of sixteen could have
+    // been wired wrong and the gate would still have passed.
+    g_chainstate.DeclareEpochParticipant("p2p-blocks-worker",
+                                        m_blocks_worker_threads.size());
 
 
     LogPrintf(NET, INFO, "[CConnman] Started successfully (with async headers + %d parallel block workers)\n", NUM_BLOCK_WORKERS);
@@ -886,9 +891,20 @@ void CConnman::ThreadMessageHandler() {
         // Wait for more work
         if (!fMoreWork && !flagInterruptMsgProc.load()) {
             std::unique_lock<std::mutex> lock(mutexMsgProc);
-            condMsgProc.wait_for(lock, std::chrono::milliseconds(100), [this] {
-                return fMsgProcWake.load() || flagInterruptMsgProc.load();
-            });
+            {
+                // OFFLINE FOR THE DURATION OF THE WAIT. Checkpointing before the wait
+                // publishes an epoch that then FREEZES while this thread is parked, pinning
+                // every entry unlinked afterwards -- a server asleep in accept() for an hour
+                // pins an hour of evictions, which is what made the design note's "parked
+                // threads pin nothing" false. Going offline removes this thread from the
+                // quiescent-state calculation entirely, exactly as an exited thread is
+                // removed; the scope re-enters on EVERY exit path, before anything is
+                // resolved.
+                EpochOfflineScope offline(&g_chainstate, "p2p-msg-handler");
+                condMsgProc.wait_for(lock, std::chrono::milliseconds(100), [this] {
+                    return fMsgProcWake.load() || flagInterruptMsgProc.load();
+                });
+            }
             fMsgProcWake.store(false);
         }
     }
@@ -957,9 +973,20 @@ void CConnman::HeadersWorkerThread() {
         // Wait for work
         {
             std::unique_lock<std::mutex> lock(m_headers_queue_mutex);
-            m_headers_cv.wait(lock, [this] {
-                return !m_headers_queue.empty() || flagInterruptMsgProc.load();
-            });
+            {
+                // OFFLINE FOR THE DURATION OF THE WAIT. Checkpointing before the wait
+                // publishes an epoch that then FREEZES while this thread is parked, pinning
+                // every entry unlinked afterwards -- a server asleep in accept() for an hour
+                // pins an hour of evictions, which is what made the design note's "parked
+                // threads pin nothing" false. Going offline removes this thread from the
+                // quiescent-state calculation entirely, exactly as an exited thread is
+                // removed; the scope re-enters on EVERY exit path, before anything is
+                // resolved.
+                EpochOfflineScope offline(&g_chainstate, "p2p-headers-worker");
+                m_headers_cv.wait(lock, [this] {
+                    return !m_headers_queue.empty() || flagInterruptMsgProc.load();
+                });
+            }
 
             if (flagInterruptMsgProc.load()) {
                 break;
@@ -1007,9 +1034,20 @@ void CConnman::BlocksWorkerThread() {
         // Wait for work
         {
             std::unique_lock<std::mutex> lock(m_blocks_queue_mutex);
-            m_blocks_cv.wait(lock, [this] {
-                return !m_blocks_queue.empty() || flagInterruptMsgProc.load();
-            });
+            {
+                // OFFLINE FOR THE DURATION OF THE WAIT. Checkpointing before the wait
+                // publishes an epoch that then FREEZES while this thread is parked, pinning
+                // every entry unlinked afterwards -- a server asleep in accept() for an hour
+                // pins an hour of evictions, which is what made the design note's "parked
+                // threads pin nothing" false. Going offline removes this thread from the
+                // quiescent-state calculation entirely, exactly as an exited thread is
+                // removed; the scope re-enters on EVERY exit path, before anything is
+                // resolved.
+                EpochOfflineScope offline(&g_chainstate, "p2p-blocks-worker");
+                m_blocks_cv.wait(lock, [this] {
+                    return !m_blocks_queue.empty() || flagInterruptMsgProc.load();
+                });
+            }
 
             if (flagInterruptMsgProc.load()) {
                 break;

@@ -3254,7 +3254,10 @@ bool CHeadersManager::StartValidationThread()
         // after the spawn is safe in the other direction: a thread that checkpoints
         // before its declaration lands is simply already in the registered set, and
         // the census only ever asks for declared-minus-registered.
-        g_chainstate.DeclareEpochParticipant("headers-validation");
+        // The hash-worker pool declares its size: one worker's checkpoint must not
+        // stand in for its siblings (the registry counts threads, not names).
+        g_chainstate.DeclareEpochParticipant("headers-validation",
+                                             m_hash_workers.size());
         g_chainstate.DeclareEpochParticipant("headers-processor");
 
         return true;
@@ -3404,9 +3407,20 @@ void CHeadersManager::ValidationWorkerThread()
         {
             std::unique_lock<std::mutex> lock(m_validation_mutex);
 
-            m_validation_cv.wait(lock, [this] {
-                return !m_validation_running.load() || !m_validation_queue.empty() || m_processing_paused.load();
-            });
+            {
+                // OFFLINE FOR THE DURATION OF THE WAIT. Checkpointing before the wait
+                // publishes an epoch that then FREEZES while this thread is parked, pinning
+                // every entry unlinked afterwards -- a server asleep in accept() for an hour
+                // pins an hour of evictions, which is what made the design note's "parked
+                // threads pin nothing" false. Going offline removes this thread from the
+                // quiescent-state calculation entirely, exactly as an exited thread is
+                // removed; the scope re-enters on EVERY exit path, before anything is
+                // resolved.
+                EpochOfflineScope offline(&g_chainstate, "headers-validation");
+                m_validation_cv.wait(lock, [this] {
+                    return !m_validation_running.load() || !m_validation_queue.empty() || m_processing_paused.load();
+                });
+            }
 
             if (!m_validation_running.load()) {
                 break;

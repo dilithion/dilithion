@@ -136,10 +136,14 @@ bool CHttpServer::Start() {
     // This ensures workers are ready before accept thread starts queueing
     try {
         for (int i = 0; i < m_num_threads; i++) {
-            g_chainstate.DeclareEpochParticipant("http-worker");
             m_workers.emplace_back(&CHttpServer::WorkerThread, this);
         }
         std::cout << "[HttpServer] Started " << m_num_threads << " worker threads" << std::endl;
+        // Declared AFTER the spawns succeed, with the pool's size: a declaration
+        // made before a std::thread constructor that throws leaves a name nobody
+        // will ever answer for, and the startup census would refuse to start the
+        // node over a thread that does not exist.
+        g_chainstate.DeclareEpochParticipant("http-worker", m_workers.size());
 
         // Launch accept thread
         m_accept_thread = std::thread(&CHttpServer::AcceptThread, this);
@@ -254,6 +258,17 @@ void CHttpServer::AcceptThread() {
 
 // Worker thread main loop - STRESS TEST FIX: Processes requests from queue
 void CHttpServer::WorkerThread() {
+    // REGISTER AT ENTRY, THEN GO OFFLINE WHILE BLOCKED.
+    //
+    // ⚠️ THE OFFLINE SCOPE ALONE DOES NOT REGISTER THIS THREAD. A name reaches
+    // the registry on its first NAMED checkpoint, and the scope's checkpoint is in
+    // its DESTRUCTOR — which runs only when the wait RETURNS. On an idle node no
+    // request ever arrives, so this thread would never register and the startup
+    // census would refuse to start the node. Registering here, once, before the
+    // first block, is what makes the census a statement about threads that EXIST
+    // rather than threads that have been handed work.
+    g_chainstate.EpochCheckpoint("http-worker");
+
     while (m_running.load()) {
         SOCKET client_socket;
 
@@ -262,10 +277,16 @@ void CHttpServer::WorkerThread() {
         // resolve a CBlockIndex* on THIS thread, so it is a participant; at the
         // loop top the previous request is finished and no new one is taken.
         // Pin bound: one HTTP request.
-        g_chainstate.EpochCheckpoint("http-worker");
-
         // Wait for work from queue (blocks until item available or shutdown)
-        if (!m_work_queue.Dequeue(client_socket)) {
+        bool got_work;
+        {
+            // OFFLINE WHILE BLOCKED: Dequeue parks until a request arrives, and an
+            // epoch published before it would freeze for the whole idle period.
+            // The scope re-enters before HandleRequest, which is what resolves.
+            EpochOfflineScope offline(&g_chainstate, "http-worker");
+            got_work = m_work_queue.Dequeue(client_socket);
+        }
+        if (!got_work) {
             break;  // Shutdown signaled
         }
 

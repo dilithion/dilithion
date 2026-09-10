@@ -274,8 +274,17 @@ private:
     };
     std::vector<GraveyardEntry> m_graveyard;
 
-    // Bumped by each participating thread at its call boundary; the drain frees
-    // entries older than the minimum across all of them.
+    // ⚠️ THIS COMMENT SAID "bumped by each participating thread at its call
+    // boundary" AND THAT WAS FALSE — an external seat caught it and it cost the
+    // panel a round, because the free rule only makes sense once you know who
+    // bumps. THE EVICTOR IS THE ONLY WRITER: it does one fetch_add per unlink,
+    // under cs_main, and stamps the graveyard entry with the POST-bump value.
+    // EpochCheckpoint only ever LOADS this counter and stores the value into the
+    // calling thread's own slot. That asymmetry is what makes equality-freeing
+    // correct: a thread that checkpointed at G and then resolved a still-linked
+    // pointer holds slot G, while that pointer's eventual unlink stamps G+1 or
+    // later, so `stamp <= min(slots)` can never free something a thread took
+    // after its last checkpoint.
     std::atomic<uint64_t> m_globalEpoch{1};
 
     // TEST-ONLY. When set, eviction frees the entry in place instead of parking it
@@ -310,10 +319,33 @@ public:
      * count. Deliberately built by the spawning code instead of a static list: a
      * static list cannot know whether the txindex thread was started on THIS run.
      */
-    void DeclareEpochParticipant(const char* name);
+    void DeclareEpochParticipant(const char* name, size_t count = 1);
 
-    /** How many participants have been declared by spawn sites this run. */
+    /** How many participant THREADS have been declared by spawn sites this run. */
     size_t DeclaredEpochParticipants() const;
+
+    /**
+     * Go OFFLINE before a blocking wait: publish "I hold no CBlockIndex* and I am
+     * not participating in the quiescent-state calculation until I say otherwise."
+     *
+     * ⚠️ CHECKPOINTING BEFORE THE WAIT IS NOT ENOUGH, and the design note claimed
+     * otherwise. A slot holding epoch E pins every entry unlinked after E for as
+     * long as the thread stays parked — an RPC server asleep in accept() for an
+     * hour pins an hour of evictions. Going offline removes the thread from the
+     * minimum entirely, exactly as an exited thread is removed.
+     *
+     * Pair it with EpochCheckpoint() on wake, BEFORE resolving anything. Prefer
+     * EpochOfflineScope, which cannot forget the second half.
+     */
+    void EpochQuiesce();
+
+    /**
+     * How many times a thread resolved a CBlockIndex* while OFFLINE. That is a
+     * mispaired quiesce/checkpoint; the resolve is made safe (it re-enters under
+     * cs_main before the pointer escapes) but counted, because a non-zero value
+     * means some wake path resolves before it re-enters.
+     */
+    static uint64_t OfflineResolveCount();
 
     /**
      * Free graveyard entries that every participating thread has moved past.
@@ -321,8 +353,12 @@ public:
      */
     size_t DrainGraveyard();
 
-    /** How many threads have checkpointed at least once (i.e. are participants). */
-    size_t RegisteredEpochThreads() const;
+    /** How many threads are participating RIGHT NOW — retired and offline slots
+     *  excluded. See the implementation for why the old name was wrong. */
+    size_t LiveEpochParticipants() const;
+
+    /** Total epoch slots ever created, retired ones included (diagnostics only). */
+    size_t EverRegisteredEpochSlots() const;
 
     /**
      * Is every participant accounted for? Fails if a DECLARED thread has never
@@ -359,6 +395,12 @@ public:
      * turn this on so the cheap check is corroborated by the expensive one.
      */
     void SetDeepDrainInvariantsForTest(bool on);
+
+    /** Test-only: how many in-degree rows exist (live entries plus graveyard). */
+    size_t InDegreeRowsForTest() const {
+        std::lock_guard<std::recursive_mutex> lock(cs_main);
+        return m_inDegree.size();
+    }
 
     /**
      * How many threads have obtained a CBlockIndex* and have NEVER checkpointed.
@@ -1723,6 +1765,40 @@ private:
     private:
         CChainState& m_chainstate;
     };
+};
+
+
+/**
+ * RAII for the offline/online protocol: quiesce on entry, re-enter on exit.
+ *
+ *     {
+ *         EpochOfflineScope offline(&chainstate, "rpc-worker");
+ *         m_queueCV.wait(lock, pred);          // parked, pinning nothing
+ *     }                                        // re-entered BEFORE any resolve
+ *
+ * The destructor runs on every path out of the block, including an exception and
+ * an early `break`, which is the reason this is a scope object and not two calls:
+ * a wake path that forgot to re-enter would resolve pointers while unpinned, and
+ * that is the one hazard the offline state introduces.
+ */
+class EpochOfflineScope
+{
+public:
+    // Takes a POINTER and no-ops on null: several call sites hold the chainstate
+    // as an optional pointer (rpc/server.cpp), and a nullable site must not be the
+    // reason a wait goes unwrapped.
+    EpochOfflineScope(CChainState* cs, const char* name) : m_cs(cs), m_name(name)
+    {
+        if (m_cs) m_cs->EpochQuiesce();
+    }
+    ~EpochOfflineScope() { if (m_cs) m_cs->EpochCheckpoint(m_name); }
+
+    EpochOfflineScope(const EpochOfflineScope&) = delete;
+    EpochOfflineScope& operator=(const EpochOfflineScope&) = delete;
+
+private:
+    CChainState* m_cs;
+    const char* m_name;
 };
 
 #endif // DILITHION_CONSENSUS_CHAIN_H
