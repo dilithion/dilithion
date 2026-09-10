@@ -578,6 +578,10 @@ void test_highload_throughput() {
     //    this is the old unbounded queue and the OOM defence is gone; if
     //    everything were dropped the queue would be useless.
     assert(cap > 0);
+    // If this fires, either the cap is gone or it is >= OVERSHOOT. The message
+    // "cap did not bite" would be misleading in the second case, so: raise
+    // OVERSHOOT rather than relaxing this, and only conclude "no cap" once
+    // OVERSHOOT is comfortably above MAX_PROCESS_QUEUE_SIZE.
     assert(cap < OVERSHOOT);
 
     // 2. DROP-OLDEST: the survivors are the LAST `cap` messages pushed, in
@@ -631,10 +635,16 @@ void test_highload_throughput() {
  * Both are defensible, and they are opposites - which is exactly why a reader
  * cannot infer one from the other, and why each needs its own assertion.
  *
- * There is no public pop for the send queue, but GetSendMsg() exposes the
- * FRONT, and the front alone distinguishes the two policies: under drop-newest
- * the front is still the very first message pushed; under drop-oldest it would
- * have been discarded long ago.
+ * Two things are asserted, and the first version of this test only had the
+ * second:
+ *   (a) the cap EXISTS and bit - fewer messages survive than were pushed;
+ *   (b) the survivors are the OLDEST - the very first message pushed is still
+ *       at the head after a flood.
+ * Without (a) the cap could be deleted outright and this scenario would stay
+ * green, because (b) is also true of an unbounded queue. That gap was real: an
+ * earlier comment here claimed "there is no public pop for the send queue",
+ * which is wrong - MarkBytesSent() pops the front once a message is fully sent,
+ * and it is public. The drain below uses it.
  */
 void test_send_queue_cap_keeps_oldest() {
     std::cout << "Testing send-queue cap policy (drop-newest)..." << std::endl;
@@ -658,6 +668,8 @@ void test_send_queue_cap_keeps_oldest() {
 
     assert(node.HasSendMsgs() == true);
 
+    // (b) POLICY: the first message pushed is still at the head after a flood.
+    //     Flip PushSendMsg to pop_front() and this goes red.
     const CSerializedNetMsg* front = node.GetSendMsg();
     assert(front != nullptr);
     assert(front->data.size() >= 4);
@@ -665,13 +677,28 @@ void test_send_queue_cap_keeps_oldest() {
                         | (static_cast<int>(front->data[1]) << 8)
                         | (static_cast<int>(front->data[2]) << 16)
                         | (static_cast<int>(front->data[3]) << 24);
-
-    // DROP-NEWEST: the first message pushed is still at the head after a flood.
-    // Flip PushSendMsg to pop_front() instead of returning and this goes red.
     assert(front_tag == 0);
 
-    std::cout << "  [OK] Send queue kept the OLDEST under flood (front tag "
-              << front_tag << " after " << OVERSHOOT << " pushes)" << std::endl;
+    // (a) EXISTENCE: drain the queue and count. MarkBytesSent(size of the front)
+    //     retires exactly one message per call. Delete the cap from PushSendMsg
+    //     and this is the assertion that fails - the policy check above would
+    //     not, since an unbounded queue also keeps the oldest at the head.
+    int retained = 0;
+    while (node.HasSendMsgs()) {
+        const CSerializedNetMsg* m = node.GetSendMsg();
+        assert(m != nullptr);
+        node.MarkBytesSent(m->data.size());
+        ++retained;
+        assert(retained <= OVERSHOOT);   // a drain that cannot terminate
+    }
+    assert(retained > 0);
+    // If this fires, either PushSendMsg has no cap or the cap is >= OVERSHOOT;
+    // in the latter case raise OVERSHOOT rather than relaxing the assertion.
+    assert(retained < OVERSHOOT);
+
+    std::cout << "  [OK] Send queue caps at " << retained << " and kept the OLDEST"
+              << " (front tag " << front_tag << ", dropped "
+              << (OVERSHOOT - retained) << " of " << OVERSHOOT << ")" << std::endl;
 }
 
 /**

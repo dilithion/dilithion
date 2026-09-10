@@ -241,7 +241,7 @@ ThreadMessageHandler (msghand thread):
 ## Phase 6: Testing and Validation (2-3 days) ✅ COMPLETE
 
 ### Tasks
-- [x] Unit tests (12 tests in `src/test/connman_tests.cpp`):
+- [x] Unit tests (13 tests in `src/test/connman_tests.cpp`):
   - [x] Test select() timeout behavior - `test_select_timeout_behavior()`
   - [x] Test message queue ordering - `test_message_queue_ordering()`
   - [x] Test send message queue - `test_send_message_queue()`
@@ -252,7 +252,13 @@ ThreadMessageHandler (msghand thread):
   - [x] Test message queue thread safety - `test_message_queue_thread_safety()`
 - [x] Integration tests:
   - [x] Multi-node handshake timing (BUG #134 regression test) - `test_bug134_handshake_timing()`
-  - [x] High-load message throughput - `test_highload_throughput()` (1.5M msgs/sec, 377 MB/s)
+  - [x] Process-queue cap under high load - `test_highload_throughput()`
+        (pins the BUG #275 cap: it bites, keeps the NEWEST, and reports
+        throughput over a batch that fits under the cap. The old figure
+        here, "1.5M msgs/sec, 377 MB/s", was measured over a run that was
+        mostly discarding messages, so it did not mean what it said.)
+  - [x] Send-queue cap policy - `test_send_queue_cap_keeps_oldest()`
+        (the OPPOSITE policy: drops the incoming message, keeps the oldest)
   - [x] Connection/disconnection stress test - `test_connection_stress()` (50 cycles)
 - [x] Platform tests:
   - [x] Windows build and run (MSYS2/MinGW64) ✅
