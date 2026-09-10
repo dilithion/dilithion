@@ -65,6 +65,25 @@ bool SelectsVdfCheckerUnder(const Dilithion::ChainParams& params)
     return uses_vdf;
 }
 
+
+// Same shape, but reporting whether the manager considers the network SUPPORTED
+// at all, and whether the sync entry point actually refuses.
+struct Support { bool supported; bool init_accepted; };
+
+Support SupportUnder(const Dilithion::ChainParams& params)
+{
+    Dilithion::ChainParams* saved = Dilithion::g_chainParams;
+    Dilithion::g_chainParams = new Dilithion::ChainParams(params);
+    CHeadersManager mgr;
+    const bool supported = mgr.ProofCheckerSupportsNetwork();
+    // The refusal must be at the GATE, not merely reported by an accessor: a
+    // flag nobody acts on is what this whole finding is about.
+    const bool init_ok = mgr.InitializeDoSProtectedSync(/*peer=*/1, uint256());
+    delete Dilithion::g_chainParams;
+    Dilithion::g_chainParams = saved;
+    return {supported, init_ok};
+}
+
 // THE DISCRIMINATING PAIR. Every VDF-from-genesis network must select the VDF
 // checker; the RandomX chain must not. Testnet and regtest are the arms that
 // were RED before the fix — under IsDilV() both returned false.
@@ -132,6 +151,41 @@ void test_the_two_predicates_really_disagree()
 
 }  // namespace
 
+
+// ⛔ TESTNET IS UNSUPPORTED, AND THE GATE REFUSES IT — the half a comment could
+// not enforce.
+//
+// Testnet is VDF-from-genesis (vdfActivationHeight = 0, vdfExclusiveHeight = 0)
+// but is NOT in the producer's constant branch `IsDilV() || IsRegtest()`
+// (pow.cpp:1142-1146): it retargets via ASERT. So NEITHER checker is correct —
+// the VDF checker's nBits-equality rule is violated by testnet's own honest
+// headers, and the RandomX checker wants a hash under target from a header never
+// mined against one.
+//
+// The previous draft picked the lesser-wrong checker and wrote the gap into a
+// comment. This asserts the gap is MACHINE-ENFORCED: the network reports
+// unsupported AND InitializeDoSProtectedSync refuses.
+void test_testnet_is_refused_rather_than_given_a_wrong_checker()
+{
+    std::cout << "  test_testnet_is_refused_rather_than_given_a_wrong_checker..." << std::flush;
+
+    const Support testnet = SupportUnder(Dilithion::ChainParams::Testnet());
+    Check("testnet reports UNSUPPORTED", !testnet.supported);
+    Check("testnet sync is REFUSED at the gate", !testnet.init_accepted);
+
+    // THE DISCRIMINATING HALF. Without it, "refuse everything" passes the two
+    // checks above and would silently disable header sync on every network.
+    for (const auto& p : { Dilithion::ChainParams::DilV(),
+                           Dilithion::ChainParams::Regtest(),
+                           Dilithion::ChainParams::Mainnet() }) {
+        const Support ok = SupportUnder(p);
+        Check("supported network reports SUPPORTED", ok.supported);
+        Check("supported network sync is ACCEPTED", ok.init_accepted);
+    }
+
+    std::cout << " done" << std::endl;
+}
+
 int main()
 {
     std::cout << "proof_checker_selection_tests" << std::endl;
@@ -139,6 +193,7 @@ int main()
     test_the_two_predicates_really_disagree();
     test_vdf_chains_select_the_vdf_checker();
     test_randomx_chain_keeps_the_randomx_checker();
+    test_testnet_is_refused_rather_than_given_a_wrong_checker();
 
     if (g_failures != 0) {
         std::cerr << "proof_checker_selection_tests: " << g_failures

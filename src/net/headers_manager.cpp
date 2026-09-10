@@ -119,27 +119,28 @@ CHeadersManager::CHeadersManager()
     // ships VDFHeaderProofChecker; DIL ships RandomXHeaderProofChecker.
     // The HeadersSyncState instances we construct below get a non-owning
     // pointer to this; lifetime: owned by manager, outlives all states.
-    // ⛔ SELECT ON IsVdfFromGenesis(), NOT IsDilV(). The comment fifteen lines
-    // below already diagnoses this exact hazard for the genesis-hash key —
+    // ⚠️ WHAT THIS SITE USED TO SELECT ON, AND WHY THAT IS NOT THE ANSWER.
+    // It selected on IsDilV(). That was wrong: the comment fifteen lines below
+    // already diagnosed the identical hazard for the genesis-hash key --
     // "Selecting on IsDilV() alone disagreed with it on TESTNET and REGTEST
-    // (both VDF-from-genesis but network != DILV) … Route through the shared
-    // dispatcher" — and that site was fixed while THIS one, two lines above it,
-    // was not. Fixing the named site and leaving its sibling, with the
-    // explanation sitting between them.
+    // (both VDF-from-genesis but network != DILV) ... Route through the shared
+    // dispatcher" -- and that site was repaired while THIS one, two lines above
+    // it, was not, with the explanation sitting between them.
     //
-    // WHAT IT BROKE: testnet and regtest are VDF chains (vdfActivationHeight = 0,
-    // vdfExclusiveHeight = 0) whose network is not DILV, so they were handed
-    // RandomXHeaderProofChecker — which calls CheckProofOfWork(header.GetHash(),
-    // nBits) on a VDF header. A VDF header's hash is not mined against a target,
-    // so every honest testnet/regtest VDF header FAILS its proof check.
+    // WHAT IT BROKE: regtest is a VDF chain whose network is not DILV, so it was
+    // handed RandomXHeaderProofChecker, which calls
+    // CheckProofOfWork(header.GetHash(), nBits) on a VDF header. A VDF header's
+    // hash is not mined against a target, so honest regtest VDF headers failed
+    // their proof check.
     //
-    // Dormant today only because the DoS-protected path has no production
-    // callers; it becomes a live testnet header-sync break the day the gate is
-    // armed, which is why it lands before any activation contract.
-    //
-    // IsVdfFromGenesis() (chainparams.h) is the shared dispatcher genesis.cpp
-    // already routes through; this makes the checker agree with the genesis it
-    // is checking against.
+    // ⛔ AND THE OBVIOUS REPAIR -- "route through IsVdfFromGenesis() like the
+    // dispatcher below" -- IS ALSO WRONG. An earlier draft of this very commit
+    // did exactly that. The paragraph that said so has been REMOVED rather than
+    // left standing above its own correction: a superseded instruction carrying
+    // the same ⛔ marker as the rule that replaced it is worse than no comment,
+    // and leaving it here would have been this mission's own sibling defect in
+    // its comment form. The reasoning is preserved below, where it is correct.
+
     // ⛔ MIRROR THE PRODUCER'S PREDICATE EXACTLY. NOT IsVdfFromGenesis().
     //
     // The VDF checker enforces nBits == genesisNBits, and that rule is only
@@ -167,6 +168,28 @@ CHeadersManager::CHeadersManager()
     m_uses_vdf_proof_checker =
         Dilithion::g_chainParams &&
         (Dilithion::g_chainParams->IsDilV() || Dilithion::g_chainParams->IsRegtest());
+
+    // ⛔ THE TESTNET GAP, MADE MACHINE-ENFORCED INSTEAD OF SILENT.
+    //
+    // Testnet is VDF-from-genesis (vdfActivationHeight = 0, vdfExclusiveHeight
+    // = 0) but is NOT in the producer's constant branch, so NEITHER checker is
+    // correct for it: the VDF checker's nBits-equality rule is violated by its
+    // own honest, ASERT-retargeted headers, and the RandomX checker demands a
+    // hash under target from a header that was never mined against one.
+    //
+    // Selecting the lesser-wrong checker and saying so in a comment is what the
+    // previous draft did. A comment is not a guard — this mission has now had
+    // three claims-in-comments turn out to be stale — so the gap is recorded in
+    // a FLAG that the sync entry point refuses on. If someone arms the gate on
+    // testnet, they get a refusal naming the reason, not a peer-banning header
+    // sync that looks like it works.
+    //
+    // A-3 owns the real rule: a predicate that mirrors ASERT rather than
+    // asserting a constant. Until it exists, this network is unsupported and
+    // says so.
+    m_proof_checker_supports_network =
+        Dilithion::g_chainParams != nullptr &&
+        !(Dilithion::g_chainParams->IsVdfFromGenesis() && !m_uses_vdf_proof_checker);
     if (m_uses_vdf_proof_checker) {
         m_proof_checker =
             std::make_unique<::dilithion::net::port::VDFHeaderProofChecker>();
@@ -835,6 +858,19 @@ bool CHeadersManager::ShouldUseDoSProtection(NodeId peer) const
 
 bool CHeadersManager::InitializeDoSProtectedSync(NodeId peer, const uint256& minimum_work)
 {
+    // Refuse before any state is created. See m_proof_checker_supports_network
+    // in the constructor: on a VDF-from-genesis network outside the producer's
+    // constant branch (testnet today) neither checker is correct, and starting a
+    // DoS-protected sync there would reject every honest header.
+    if (!m_proof_checker_supports_network) {
+        LogPrintf(NET, WARN,
+            "[HeadersManager] DoS-protected header sync REFUSED for peer=%d: "
+            "no correct proof checker exists for this network (VDF from genesis, "
+            "but difficulty retargets). A-3 owns the retargeting rule.\n",
+            static_cast<int>(peer));
+        return false;
+    }
+
     std::lock_guard<std::mutex> lock(cs_headers);
 
     // Don't reinitialize if already exists

@@ -487,6 +487,17 @@ public:
     bool UsesVdfProofChecker() const { return m_uses_vdf_proof_checker; }
 
     /**
+     * @brief False when NO correct proof checker exists for this network.
+     *
+     * True for DIL (RandomX) and for the VDF chains whose producer emits a
+     * constant nBits (DilV, regtest). FALSE for a VDF-from-genesis network that
+     * RETARGETS — testnet today — where the VDF checker's equality rule and the
+     * RandomX checker's hash-under-target rule are both wrong.
+     * InitializeDoSProtectedSync refuses when this is false.
+     */
+    bool ProofCheckerSupportsNetwork() const { return m_proof_checker_supports_network; }
+
+    /**
      * @brief Check if we should fetch headers from this peer
      *
      * Rate limiting: Don't request too frequently from same peer
@@ -857,6 +868,7 @@ private:
 
     //! Records which branch the constructor's checker selection took.
     bool m_uses_vdf_proof_checker{false};
+    bool m_proof_checker_supports_network{false};
 
     // Bug #150 Fix: Best chain cache for fork-safe height lookups
     mutable std::map<int, uint256> m_bestChainCache;  ///< Height -> Hash on best chain
