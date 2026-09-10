@@ -105,6 +105,15 @@ echo
 if [ $HAVE_ASAN -eq 0 ]; then
     echo "===== NO VERDICT: built without -fsanitize=address ====="
     echo "The clean arm passing here says the fixture runs, nothing more."
+    # ⚠️ IN CI THIS MUST BE A FAILURE, NOT A SHRUG. Exiting 0 here would let a job
+    # whose sanitizer flags silently went missing print a tick while testing
+    # nothing — the exact vacuous green this script exists to refuse. Interactive
+    # runs on a machine without libasan still exit 0 (they are useful for checking
+    # the fixture), so the CALLER states which it is.
+    if [ "${REQUIRE_ASAN:-0}" = "1" ]; then
+        echo "REQUIRE_ASAN=1 was set: a build that cannot detect anything is a FAILURE."
+        exit 4
+    fi
     [ $rc -eq 0 ] && exit 0 || exit 1
 fi
 echo "===== ASan arms: $([ $rc -eq 0 ] && echo PASS || echo FAIL) ($rc failed) ====="

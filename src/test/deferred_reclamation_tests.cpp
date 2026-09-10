@@ -99,6 +99,45 @@ int main()
     if (!ad.ProcessNewHeader(victimHdr)) { std::cerr << "victim rejected" << std::endl; return 2; }
     const uint256 victimHash = victimHdr.GetHash();
 
+    // ---- 0. NOBODY HAS CHECKPOINTED YET: THE DRAIN MUST FREE NOTHING ---------
+    //
+    // ⚠️ THIS ARM EXISTS BECAUSE THE CODE DID THE OPPOSITE, AND EVERY TEST IN THIS
+    // FILE MISSED IT. `safe_epoch` started at the global epoch and was only ever
+    // LOWERED by a registered slot, so with NO registered threads nothing lowered
+    // it and the drain freed the entire graveyard on the spot — while a thread
+    // that had resolved a pointer without checkpointing was still holding one.
+    // The suite missed it because its very first act was to checkpoint the main
+    // thread, so the registry was never empty by the time anything was measured.
+    //
+    // It therefore has to run FIRST: the registry is process-global and a single
+    // checkpoint anywhere populates it for the life of the process.
+    {
+        const size_t n_before = cs.GetBlockIndexSize();
+        CBlockIndex* early = cs.GetBlockIndex(victimHash);
+        chk("empty registry: setup, the victim resolves before anyone checkpoints",
+            early != nullptr);
+        const bool evicted_early = cs.EvictLowestWorkLeafNotPinned(n_before - 1);
+        chk("empty registry: setup, the eviction happened", evicted_early);
+        chk("empty registry: the entry is in the graveyard", cs.GraveyardSize() == 1);
+        chk("empty registry: A DRAIN WITH NO REGISTERED THREADS FREES NOTHING",
+            cs.DrainGraveyard() == 0);
+        chk("empty registry: and the entry is still there", cs.GraveyardSize() == 1);
+        chk("empty registry: so the pointer resolved before it is still readable",
+            early != nullptr && early->nHeight == 1);
+    }
+
+    // Re-add the victim for the rest of the suite (the arm above evicted it), then
+    // clear the graveyard so the assertions below count only their own entry. This
+    // thread checkpoints first, which is honest here: `early` above is not read
+    // again, so the promise it publishes is true.
+    if (!ad.ProcessNewHeader(victimHdr)) {
+        std::cerr << "victim re-add rejected" << std::endl; return 2;
+    }
+    cs.EpochCheckpoint();
+    cs.DrainGraveyard();
+    chk("empty registry: once a thread HAS registered and passed, the entry drains",
+        cs.GraveyardSize() == 0);
+
     // THE RESOLVE THAT THE 62 SITES DO: obtain the pointer, then let cs_main go.
     CBlockIndex* held = cs.GetBlockIndex(victimHash);
     chk("setup: the victim resolved before eviction", held != nullptr);

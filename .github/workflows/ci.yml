@@ -448,7 +448,9 @@ jobs:
     - name: Deferred-reclamation ASan arms (2 of 3 MUST trap)
       run: |
         make blockindex_uaf_asan_arm -j$(nproc)
-        bash scripts/asan_uaf_arms.sh
+        # REQUIRE_ASAN=1: if this job's sanitizer flags ever go missing, the driver
+        # must FAIL rather than skip the trap arms and print a tick.
+        REQUIRE_ASAN=1 bash scripts/asan_uaf_arms.sh
 
   sanitizer-ubsan:
     name: UndefinedBehaviorSanitizer

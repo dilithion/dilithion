@@ -284,6 +284,11 @@ private:
     // only variable; production never sets it.
     std::atomic<bool> m_immediateFreeForTest{false};
 
+    // Next graveyard size at which "this is not draining" is reported. Doubles on
+    // each report, so a leak is visible early and a healthy node stays silent.
+    // Guarded by cs_main, like the graveyard itself.
+    size_t m_graveyardWarnAt{1024};
+
 public:
     /**
      * Bump this thread's epoch. Called at the boundary where the calling thread

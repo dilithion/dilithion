@@ -3234,11 +3234,6 @@ bool CHeadersManager::StartValidationThread()
     m_processor_running.store(true);
 
     try {
-        // Declared before the spawns: a declared thread that never checkpoints is
-        // named by the startup census (see the quiescence proof's wiring table).
-        g_chainstate.DeclareEpochParticipant("headers-validation");
-        g_chainstate.DeclareEpochParticipant("headers-processor");
-
         // Start hash worker threads
         m_hash_workers.reserve(m_hash_worker_count);
         for (size_t i = 0; i < m_hash_worker_count; ++i) {
@@ -3251,6 +3246,16 @@ bool CHeadersManager::StartValidationThread()
         m_header_processor_thread = std::thread(&CHeadersManager::HeaderProcessorThread, this);
         if (g_verbose.load(std::memory_order_relaxed))
             std::cout << "[HeadersManager] Header processor thread started" << std::endl;
+
+        // ⚠️ DECLARED AFTER THE SPAWNS SUCCEED, NOT BEFORE THEM. A declaration made
+        // before a std::thread constructor that then THROWS leaves a name nobody will
+        // ever answer for, and the startup census refuses to start the node over a
+        // thread that does not exist — a false positive that bricks a node. Declaring
+        // after the spawn is safe in the other direction: a thread that checkpoints
+        // before its declaration lands is simply already in the registered set, and
+        // the census only ever asks for declared-minus-registered.
+        g_chainstate.DeclareEpochParticipant("headers-validation");
+        g_chainstate.DeclareEpochParticipant("headers-processor");
 
         return true;
     } catch (const std::exception& e) {

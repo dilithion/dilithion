@@ -200,6 +200,47 @@ Every entry, at the moment it is actually freed:
 memory-safe but must never be read as reachability. Nothing may walk *from* the map
 *into* the graveyard — which is what "unlinked" buys.
 
+## ⚠️ TWO BLOCKERS AN EXTERNAL REVIEWER FOUND THAT EVERY TEST HERE MISSED
+
+Both were found by a single external seat on the raw diff, and both are the same
+shape: **the suite exercised the mechanism by calling it itself, so nothing noticed
+that production never did.**
+
+**1. NOTHING IN PRODUCTION CALLED `DrainGraveyard()`.** Every checkpoint was wired,
+the census gate refused to start a node with a missing participant, the graveyard
+filled correctly on every eviction — and no code path ever freed any of it. A node
+would have run perfectly and grown without bound. The tests all passed because each
+one calls `DrainGraveyard()` directly; the wiring test for the checkpoints had no
+counterpart for the drain.
+
+It is now called from the node main loop, once a second, in both binaries — a brief
+`cs_main` acquisition off every hot path. And because "nobody drains" is exactly the
+kind of absence that is invisible in a passing test, the evictor now carries a
+**tripwire**: when the graveyard passes 1024 entries (then 2048, 4096 …) it logs
+`GRAVEYARD NOT DRAINING`, which also catches the other cause of the same symptom —
+a registered thread that has stopped checkpointing and is pinning every entry.
+
+**2. AN EMPTY REGISTRY FREED THE WHOLE GRAVEYARD, AND THE COMMENT CLAIMED THE
+OPPOSITE.** `safe_epoch` started at the global epoch and was only ever *lowered* by
+a registered slot. With no registered threads, nothing lowered it, the
+`safe_epoch == 0` guard never fired (the global epoch starts at 1), and every entry
+was freed immediately. Reachable interleaving: a thread resolves a pointer before
+any thread has checkpointed → an eviction unlinks it → a drain runs → the entry is
+freed → the thread dereferences. That is precisely the use-after-free this document
+exists to remove, reintroduced by the mechanism meant to prevent it.
+
+The suite missed it because its first act was to checkpoint the main thread, so the
+registry was never empty by the time anything was measured. The rule is now explicit
+— **no participants means no promises, so nothing may be freed** — and the arm that
+tests it runs FIRST in the file, because the registry is process-global and one
+checkpoint anywhere populates it for the life of the process. The arm was
+RED-checked: with the guard removed it fails, and the tree is green again after
+restoration.
+
+**The lesson worth keeping**: a test that calls the mechanism itself proves the
+mechanism works, not that anything invokes it. Both blockers were absences, and an
+absence is invisible to a suite that supplies the missing thing itself.
+
 ## What still has to be measured
 
 * graveyard peak occupancy at the 10,400 evictions/s ingress ceiling, both grace

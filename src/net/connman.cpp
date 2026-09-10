@@ -178,15 +178,6 @@ bool CConnman::Start(CPeerManager& peer_mgr, CNetMessageProcessor& msg_proc, con
         }
     }
 
-    // Declared before the spawns. These three are the P2P threads that reach
-    // block_processing and therefore resolve CBlockIndex*; ThreadSocketHandler and
-    // ThreadOpenConnections are NOT declared because they move bytes and addresses
-    // and never touch mapBlockIndex — if that ever changes, the resolve-time
-    // detector in chain.cpp names them without anyone updating this list.
-    g_chainstate.DeclareEpochParticipant("p2p-msg-handler");
-    g_chainstate.DeclareEpochParticipant("p2p-headers-worker");
-    g_chainstate.DeclareEpochParticipant("p2p-blocks-worker");
-
     // Phase 2: Start ThreadSocketHandler
     try {
         threadSocketHandler = std::thread(&CConnman::ThreadSocketHandler, this);
@@ -253,6 +244,23 @@ bool CConnman::Start(CPeerManager& peer_mgr, CNetMessageProcessor& msg_proc, con
         }
         return false;
     }
+
+    // These three P2P threads reach block_processing and therefore resolve
+    // CBlockIndex*; ThreadSocketHandler and ThreadOpenConnections are NOT declared
+    // because they move bytes and addresses and never touch mapBlockIndex — and if
+    // that ever changes, the resolve-time detector in chain.cpp names them without
+    // anyone updating this list.
+    // ⚠️ DECLARED AFTER THE SPAWNS SUCCEED, NOT BEFORE THEM. A declaration made
+    // before a std::thread constructor that then THROWS leaves a name nobody will
+    // ever answer for, and the startup census refuses to start the node over a
+    // thread that does not exist — a false positive that bricks a node. Declaring
+    // after the spawn is safe in the other direction: a thread that checkpoints
+    // before its declaration lands is simply already in the registered set, and
+    // the census only ever asks for declared-minus-registered.
+    g_chainstate.DeclareEpochParticipant("p2p-msg-handler");
+    g_chainstate.DeclareEpochParticipant("p2p-headers-worker");
+    g_chainstate.DeclareEpochParticipant("p2p-blocks-worker");
+
 
     LogPrintf(NET, INFO, "[CConnman] Started successfully (with async headers + %d parallel block workers)\n", NUM_BLOCK_WORKERS);
     return true;

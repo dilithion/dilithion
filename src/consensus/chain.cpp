@@ -448,6 +448,18 @@ constexpr size_t MAX_RECORDED_OFFENDERS = 8;
 
 thread_local bool t_recorded_unregistered = false;
 
+void ClearUnregisteredRecord();
+
+// A thread that resolves a pointer and then EXITS without ever checkpointing was
+// left accused for the life of the process, and the startup census would refuse to
+// start a node over a thread that no longer exists (and whose pointer died with its
+// stack). A thread_local with a destructor is the one hook that fires on every exit
+// path, so the record is withdrawn there too, exactly as a checkpoint withdraws it.
+struct UnregisteredRecordScope {
+    ~UnregisteredRecordScope() { ClearUnregisteredRecord(); }
+};
+thread_local UnregisteredRecordScope t_unregistered_scope;
+
 void NoteIndexPointerResolved()
 {
     // The hot path for a participant: one thread-local load and a predicted
@@ -455,6 +467,11 @@ void NoteIndexPointerResolved()
     if (t_epoch_slot != nullptr) return;
     if (t_recorded_unregistered) return;
     t_recorded_unregistered = true;
+
+    // Touch the scope object so this thread's destructor is registered: a
+    // thread_local with a non-trivial destructor is only constructed on first ODR
+    // use, and without this reference the withdrawal-on-exit above never runs.
+    (void)&t_unregistered_scope;
 
     auto& u = Unregistered();
     std::lock_guard<std::mutex> lk(u.mu);
@@ -619,6 +636,12 @@ bool CChainState::AwaitEpochRegistration(int timeout_ms, std::string& why)
     // reaches its first one as soon as it starts running -- it does not need any
     // work to arrive. A participant still missing after seconds is therefore a
     // thread that never checkpoints, not a thread that is merely idle.
+    // The deadline is generous ON PURPOSE. Every checkpoint is placed BEFORE its
+    // thread's blocking wait, so a thread reaches its first one as soon as it is
+    // scheduled — it needs no work to arrive. Seconds would be enough on an idle
+    // machine; the callers pass a minute so that a loaded or virtualised host
+    // cannot be refused a start over scheduling latency. A participant still
+    // missing after that is a thread that never checkpoints, not a slow one.
     const auto deadline = std::chrono::steady_clock::now() +
                           std::chrono::milliseconds(timeout_ms);
     for (;;) {
@@ -635,17 +658,30 @@ size_t CChainState::DrainGraveyard()
 
     // The minimum epoch across every registered thread. A thread sitting at 0 has
     // never checkpointed, so it makes no promise and pins the whole graveyard —
-    // the SAFE direction, and it is why this returns 0 rather than freeing
-    // optimistically during startup before any thread has reached a boundary.
-    uint64_t safe_epoch = m_globalEpoch.load(std::memory_order_acquire);
+    // the SAFE direction.
+    //
+    // ⚠️ AN EMPTY REGISTRY USED TO FREE EVERYTHING, AND THE COMMENT HERE CLAIMED
+    // THE OPPOSITE. `safe_epoch` starts at the global epoch and is only ever
+    // LOWERED by a registered slot — so with NO slots at all nothing lowered it,
+    // the `safe_epoch == 0` guard never fired (the global epoch starts at 1), and
+    // every graveyard entry was freed on the spot. The reachable interleaving:
+    // a thread resolves a pointer before any thread has checkpointed, an eviction
+    // unlinks it, a drain runs, the entry is freed, the thread dereferences ->
+    // use-after-free, i.e. exactly the defect this file exists to remove. Found by
+    // an external reviewer, not by this branch's own tests, all of which happened
+    // to checkpoint the main thread first. NO PARTICIPANTS MEANS NO PROMISES:
+    // nothing may be freed.
+    uint64_t safe_epoch;
     {
         std::lock_guard<std::mutex> lk(Registry().mu);
+        if (Registry().slots.empty()) return 0;
+        safe_epoch = m_globalEpoch.load(std::memory_order_acquire);
         for (std::atomic<uint64_t>* slot : Registry().slots) {
             const uint64_t v = slot->load(std::memory_order_acquire);
             if (v < safe_epoch) safe_epoch = v;
         }
     }
-    if (safe_epoch == 0) return 0;   // some thread has never checkpointed
+    if (safe_epoch == 0) return 0;   // some registered thread has never checkpointed
 
     size_t freed = 0;
     std::vector<GraveyardEntry> keep;
@@ -1273,6 +1309,25 @@ bool CChainState::EvictLowestWorkLeafNotPinned(size_t target_max) {
                 m_graveyard.push_back(GraveyardEntry{
                     std::move(node),
                     m_globalEpoch.fetch_add(1, std::memory_order_acq_rel) + 1});
+
+                // ⚠️ A GRAVEYARD THAT NEVER DRAINS IS A SILENT LEAK, and this
+                // branch shipped exactly that for one commit: every checkpoint was
+                // wired and NOTHING IN PRODUCTION CALLED DrainGraveyard(), so the
+                // node behaved perfectly and grew without bound. The drain is now
+                // called from the node main loop, and this is the tripwire that
+                // makes its absence — or a thread pinning the graveyard forever —
+                // visible in the log instead of only in RSS. Rate-limited by
+                // doubling, so a growing graveyard reports at 1k, 2k, 4k ... and a
+                // healthy one never reports at all.
+                if (m_graveyard.size() >= m_graveyardWarnAt) {
+                    std::cerr << "[Chain] ⚠️  GRAVEYARD NOT DRAINING: "
+                              << m_graveyard.size() << " unlinked block-index "
+                              << "entries are awaiting reclamation. Either no "
+                              << "thread is calling DrainGraveyard(), or a "
+                              << "registered thread has stopped checkpointing and "
+                              << "is pinning every entry." << std::endl;
+                    m_graveyardWarnAt *= 2;
+                }
             }
         }
         evicted_any = true;

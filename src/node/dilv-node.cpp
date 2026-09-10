@@ -7883,7 +7883,7 @@ load_genesis_block:  // Bug #29: Label for automatic retry after blockchain wipe
         g_chainstate.EpochCheckpoint("node-main-loop");
         {
             std::string epoch_why;
-            if (!g_chainstate.AwaitEpochRegistration(15000, epoch_why)) {
+            if (!g_chainstate.AwaitEpochRegistration(60000, epoch_why)) {
                 throw std::runtime_error(
                     "REFUSING TO START -- " + epoch_why);
             }
@@ -7902,6 +7902,21 @@ load_genesis_block:  // Bug #29: Label for automatic retry after blockchain wipe
             // is one loop iteration. Placed BEFORE the per-iteration sleep, which
             // is the instant it provably holds nothing.
             g_chainstate.EpochCheckpoint("node-main-loop");
+
+            // ── THE DRAIN. ⚠️ THIS WAS MISSING FOR A COMMIT, AND ITS ABSENCE WAS
+            // A SILENT UNBOUNDED LEAK: every checkpoint was wired, the graveyard
+            // filled on every eviction, and NOTHING IN PRODUCTION EVER FREED IT.
+            // The node behaved perfectly and grew. Found by an external reviewer,
+            // not by this branch's own tests — every one of which called
+            // DrainGraveyard() itself, which is exactly how a test can confirm a
+            // mechanism works while nothing invokes it.
+            //
+            // Here, once a second, is the right place: it takes cs_main briefly,
+            // frees only what every registered thread has passed, and is off every
+            // hot path. A stalled main loop stops the drain rather than corrupting
+            // anything — the graveyard grows, and the tripwire in the evictor says
+            // so in the log.
+            g_chainstate.DrainGraveyard();
 
             // Threads started AFTER the startup census (the miners, which only
             // spawn when mining begins) are not covered by it, and neither is a
