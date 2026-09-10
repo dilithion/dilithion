@@ -611,22 +611,54 @@ std::atomic<uint64_t>* MyEpochSlot()
         // Nothing between this line and the assignment below can throw.
         EpochThreadRecord& rec = MyEpochRecord();
 
-        // Leaked deliberately: the slot must outlive the thread, because a drain
-        // on another thread may read it after this one exits. One machine word
-        // per participating thread, bounded by the thread count, freed at exit.
-        // Reclaiming it would need the very lifetime machinery this file exists
-        // to provide.
-        auto* slot = new std::atomic<uint64_t>(0);
+        // ⚠️ THE SLOT IS OWNED UNTIL IT IS PUBLISHED (round-7 F38). The previous
+        // comment here claimed "nothing between this line and the assignment
+        // below can throw". THAT WAS FALSE and I wrote it: the `new` can throw,
+        // the mutex lock can throw, and push_back can throw on reallocation. The
+        // consequences were harmless -- an exception before push_back leaked one
+        // word, after it left a registered slot no thread published into, which
+        // reads as a permanently quiescent participant rather than a pin -- but
+        // an overstated safety sentence is exactly what stops the next reader
+        // checking, which is the same mistake as the wrong leak bound below.
+        // unique_ptr makes the harmless part structural instead of argued.
+        std::unique_ptr<std::atomic<uint64_t>> owned(new std::atomic<uint64_t>(0));
+        std::atomic<uint64_t>* slot = owned.get();
         {
             std::lock_guard<std::mutex> lk(Registry().mu);
-            Registry().slots.push_back(slot);
+            Registry().slots.push_back(slot);   // may throw; `owned` still frees
         }
+        // Published: the registry now owns it for the life of the process.
+        (void)owned.release();
+
+        // ⚠️ AND THE BOUND ON THAT LEAK IS *NOT* THE THREAD COUNT (round-7 F39).
+        // This said "one machine word per participating thread, bounded by the
+        // thread count, freed at exit" -- THE SAME MISTAKE I had just corrected
+        // for connman's random_device one round earlier, in the same file, in my
+        // own hand. Slots are retained per thread that EVER participated: the
+        // exit hook RETIRES a slot (publishes the maximum epoch) and never
+        // reclaims it, deliberately, because a drain on another thread may read
+        // it after the owner is gone. So on a node whose miners restart on every
+        // template update, this grows for the life of the process at one word
+        // plus one vector entry per thread ever seen -- not per thread alive.
+        //
+        // ACCEPTED, with the cost stated rather than hidden behind a wrong bound:
+        // 8 bytes plus a pointer per historical participant. Reuse would need a
+        // free-list whose safety is the very lifetime problem this file exists to
+        // solve -- a retired slot cannot be recycled until every thread that
+        // might read it has passed an epoch, which is the same proof obligation
+        // one level down. If it ever matters, the trigger is DrainGraveyard's
+        // per-call cost, which is O(slots) and is already reported by
+        // graveyard_occupancy_bench on every run.
+        //
+        // Twice now the wrong bound was the SAME error: naming the population as
+        // "threads" when it is "threads that ever reached here". See
+        // lessons_learned.md, "A LEAK WHOSE BOUND IS STATED WRONGLY".
 
         // The hook retires the slot from the record it is GIVEN, so it never
         // reads a thread_local at teardown. Set BEFORE the t_epoch_slot cache, so
         // there is no window in which this thread is a participant with no
-        // retirer -- the two lines are noexcept, but the order still documents
-        // which one is load-bearing.
+        // retirer -- both assignments are noexcept, and the order documents which
+        // one is load-bearing.
         rec.slot = slot;
         t_epoch_slot = slot;
     }

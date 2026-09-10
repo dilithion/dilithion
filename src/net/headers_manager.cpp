@@ -3823,9 +3823,35 @@ void CHeadersManager::HeaderProcessorThread()
         {
             std::unique_lock<std::mutex> lock(m_raw_queue_mutex);
 
-            m_raw_queue_cv.wait(lock, [this] {
-                return !m_processor_running.load() || !m_raw_header_queue.empty() || m_processing_paused.load();
-            });
+            // ⚠️ AN IDLE PROCESSOR PINNED THE WHOLE GRAVEYARD (round-7 F45). The
+            // PAUSE path a few lines above goes offline across its sleep; this
+            // wait -- the one a HEALTHY, IDLE node sits in essentially all the
+            // time -- did not. So a node with no headers arriving kept this
+            // thread's epoch frozen at its last loop-top checkpoint, and
+            // DrainGraveyard's minimum froze with it: nothing unlinked during the
+            // idle period could ever be freed. That is the exact shape of the
+            // parked-participant defect the round-1 panel found in the RPC server
+            // (47.60 MB and climbing over 15 s), reached by a different door, and
+            // the proof's own wiring table disclosed the gap with a "—" rather
+            // than closing it.
+            //
+            // ⚠️ POINTER-FREE IS NOT PIN-FREE. This thread holds nothing here --
+            // it has not dequeued anything yet -- and that is precisely why the
+            // old reasoning felt safe and was wrong: a thread pins by its
+            // PUBLISHED EPOCH, not by holding a pointer.
+            //
+            // No inverse-scope subtlety: this predicate reads two atomics and a
+            // queue emptiness flag, and resolves no CBlockIndex*, so the plain
+            // offline scope is correct here (compare the wait-* RPC handlers,
+            // whose predicates DO resolve and therefore need EpochOnlineWindow).
+            // The scope is braced to the WAIT, not to the enclosing block, so the
+            // thread is back online before it can dequeue anything.
+            {
+                EpochOfflineScope offline(&g_chainstate);
+                m_raw_queue_cv.wait(lock, [this] {
+                    return !m_processor_running.load() || !m_raw_header_queue.empty() || m_processing_paused.load();
+                });
+            }
 
             if (!m_processor_running.load()) {
                 break;

@@ -709,14 +709,14 @@ private:
     //      OnBlockActivated, which takes cs_headers — so cs_main → cs_headers.
     //      The reverse edge, cs_headers → cs_main, exists on the header-processing
     //      path (ProcessHeaders holds cs_headers and reaches AddBlockIndex /
-    //      EvictLowestWorkNotOnBestChain, both of which take cs_main). TSan
+    //      EvictLowestWorkLeafNotPinned, both of which take cs_main). TSan
     //      CONSTRUCTS the resulting deadlock: docs/p2p14-lock-inversion/ —
     //      registered arm 2 lock-order-inversions, unregistered arm 0.
     //
     //   2. POINTER LIFETIME. Handing a raw CBlockIndex* to a callback that runs
     //      after the lock is released is a use-after-free waiting to happen:
     //      CBlockIndex objects ARE destroyed at runtime (mapBlockIndex.erase in
-    //      EvictLowestWorkNotOnBestChain), and the headers thread itself drives
+    //      EvictLowestWorkLeafNotPinned), and the headers thread itself drives
     //      that eviction. Eviction spares the active chain, so the tip is safe
     //      only until a reorg makes it non-active.
     //
@@ -1068,7 +1068,7 @@ public:
      *
      * ⚠️ RELEASED POINTER. This takes cs_main, reads pindexTip, and RELEASES
      * cs_main before returning. The CBlockIndex it points at is owned by
-     * mapBlockIndex and can be destroyed by EvictLowestWorkNotOnBestChain the
+     * mapBlockIndex and can be destroyed by EvictLowestWorkLeafNotPinned the
      * moment this returns. Dereferencing the result — including a
      * GetAncestor/pprev walk — with cs_main NOT held is a use-after-free
      * (register P2P-16). Use GetAncestorHashes() when you need chain data

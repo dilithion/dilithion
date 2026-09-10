@@ -49,7 +49,7 @@ The instruction was to cut from `0ecd033e` (main). I did not, and the reason is 
 hard dependency rather than convenience — **deferred reclamation ALONE cannot fix the
 class on `main`.**
 
-`main`'s evictor (`EvictLowestWorkNotOnBestChain`) has no leaf or in-degree concept at
+`main`'s evictor (`EvictLowestWorkLeafNotPinned`) has no leaf or in-degree concept at
 all — measured: zero occurrences of `in_degree` in `chain.cpp` on `0ecd033e`. It selects
 the lowest-work entry not on the active chain and frees it, **which can be an INTERIOR
 fork node whose higher-work child still names it as `pprev`**. That is precisely the UAF
@@ -113,11 +113,11 @@ WebSocket server thread, the cached-stats updater, and both miner threads.
 
 | thread | spawn | conditional | resolves - cited | checkpoint name |
 |---|---|---|---|---|
-| `CConnman::ThreadMessageHandler` | `connman.cpp:196` | no | yes - control msgs inline, `dilithion-node.cpp:4411`, `:4417-4446` (`pTip->GetAncestor`) | `p2p-msg-handler` |
-| `CConnman::HeadersWorkerThread` | `connman.cpp:224` | no | yes - `headers_manager.cpp:242`, `:1219`, `:1273` | `p2p-headers-worker` |
-| `CConnman::BlocksWorkerThread` xN | `connman.cpp:238` | no | yes - `dilithion-node.cpp:6410`, `:6439`, `:6448` | `p2p-blocks-worker` |
-| `CHeadersManager::ValidationWorkerThread` xHW | `headers_manager.cpp:3245` | no | **no** - hash-only | `headers-validation` (belt and braces) |
-| `CHeadersManager::HeaderProcessorThread` | `headers_manager.cpp:3251` | no | yes | `headers-processor` |
+| `CConnman::ThreadMessageHandler` | `connman.cpp:192` | no | yes - control msgs inline, `dilithion-node.cpp:4409` (`GetBlockIndex`), `:4415` (`GetTip`) | `p2p-msg-handler` |
+| `CConnman::HeadersWorkerThread` | `connman.cpp:220` | no | **no longer** - see the note below | `p2p-headers-worker` (belt and braces) |
+| `CConnman::BlocksWorkerThread` xN | `connman.cpp:234` | no | yes - `dilithion-node.cpp:6408`, `:6437`, `:6446` | `p2p-blocks-worker` |
+| `CHeadersManager::ValidationWorkerThread` xHW | `headers_manager.cpp:3503` | no | **no** - hash-only | `headers-validation` (belt and braces) |
+| `CHeadersManager::HeaderProcessorThread` | `headers_manager.cpp:3509` | no | **no longer** - see the note below | `headers-processor` (belt and braces) |
 | `CBlockValidationQueue::ValidationWorker` | `block_validation_queue.cpp:86` | falls back to sync on failure | yes - `:626`, `:767`, `:849`, `:901` | `validation-worker` |
 | `CTxIndex::SyncLoop` | `tx_index.cpp:560` | **yes** - `config.txindex_enabled` | yes - `:713`, `:620`, `:229`, `:240` | `txindex-sync` |
 | `CCoinStatsIndex::SyncLoop` | `coinstatsindex.cpp:658` | **yes** - `config.coinstatsindex_enabled` | yes - `:741`, `:679`, `:487` | `coinstatsindex-sync` |
@@ -129,6 +129,26 @@ WebSocket server thread, the cached-stats updater, and both miner threads.
 | **`CMiningController::MiningWorker` xN** | `controller.cpp:274` | **yes** - mining on | **yes**, via `m_blockFoundCallback` -> `dilithion-node.cpp:6410`, `:6439` | `mining-worker` |
 | **`CVDFMiner::MiningLoop`** | `vdf_miner.cpp:29` | **yes** - mining on, post-IBD | **yes**, via three injected callbacks -> `dilithion-node.cpp:6746`, `:6753`, `:6616` | `vdf-miner` |
 | **node main loop** | `dilithion-node.cpp:8106` / `dilv-node.cpp:7868` | no | **yes, nearly every iteration** - `:8112`, `:8407`, `:8547`, `:8706-8736` | `node-main-loop` |
+
+> ⚠️ **EVERY CITATION IN THE TABLE ABOVE WAS STALE, AND TWO ROWS WERE WRONG IN
+> SUBSTANCE** (round-7 F44, re-derived 2026-09-10 on `11f0c525`). COORD reported two
+> drifted line numbers; grepping the *shape* rather than fixing the reported lines
+> found that **all eleven** citations had moved — the spawn citations pointed into
+> `Stop()`, the resolve citations into unrelated code. A table of eleven `file:line`
+> claims is eleven things with no decay function, and it decayed as a block.
+>
+> **The two substantive corrections:** `headers_manager.cpp` now contains **zero live
+> resolves** — #194 removed the released-pointer sites from it entirely, so
+> `HeadersWorkerThread` and `HeaderProcessorThread` no longer obtain a `CBlockIndex*`
+> at all. Verified with #194's own comment stripper (`strip-cxx-comments.awk`), not by
+> eye: every remaining `GetTip()`/`GetBlockIndex(` token in that file is inside a
+> comment. Both threads keep their checkpoints as belt and braces, and the table now
+> says *why* they have one rather than implying a resolve that no longer happens.
+>
+> **A table like this should be generated, not maintained.** It is left hand-written
+> for now because the generator is a larger change than this round, but that is the
+> real fix and it is recorded here as the reason this keeps happening.
+
 
 **Deliberately NOT participants** - each checked, not assumed: `ThreadSocketHandler`
 (bytes and framing; zero `CBlockIndex` tokens in `connman.cpp`), `ThreadOpenConnections`
@@ -794,10 +814,27 @@ of this branch's defects:
 | `p2p-headers-worker` | loop top | `HeadersWorkerThread` top | `m_headers_cv.wait` | 1 |
 | `p2p-blocks-worker` | loop top | `BlocksWorkerThread` top | `m_blocks_cv.wait` | **`NUM_BLOCK_WORKERS`** |
 | `headers-validation` | loop top | `ValidationWorkerThread` top | `m_validation_cv.wait` | **pool size** |
-| `headers-processor` | loop top | `HeaderProcessorThread` top | — | 1 |
+| `headers-processor` | loop top | `HeaderProcessorThread` top | `m_raw_queue_cv.wait` **(round-7 F45)** | 1 |
 | `validation-worker` | loop top | before `m_queue_cv.wait` | `m_queue_cv.wait` | 1 |
 | `txindex-sync` | loop top | `SyncLoop` top | — | 1 (conditional) |
 | `coinstatsindex-sync` | loop top | `SyncLoop` top | — | 1 (conditional) |
+
+> ⚠️ **THE `headers-processor` ROW CARRIED A `—` FOR THREE ROUNDS, AND A DASH IS NOT A
+> DECISION** (round-7 F45). It meant "this thread has no offline scope", and the row
+> disclosed that honestly — but disclosure is not closure, and nothing turned the
+> disclosure back into a task. Meanwhile `HeaderProcessorThread` is the thread a
+> HEALTHY, IDLE node sits in essentially all the time: its `m_raw_queue_cv.wait` ran
+> ONLINE, so an idle node froze `DrainGraveyard`'s minimum at that thread's last
+> loop-top epoch and nothing unlinked during the idle period could be freed. Same
+> shape as the parked RPC participant the round-1 panel found (47.60 MB and climbing
+> over 15 s), through a different door.
+>
+> Note what made it invisible: the thread **holds nothing** at that wait. **Pointer-free
+> is not pin-free** — a thread pins by its PUBLISHED EPOCH. The pause path a dozen
+> lines above was already offline; the wait that matters more was not.
+>
+> **A `—` in this table is now a finding, not a footnote.** Any row that has one must
+> say why the thread cannot park with an epoch published, or get a scope.
 | `rpc-accept` | **thread entry** | — | `accept()` | 1 |
 | `rpc-worker` | loop top | before `m_queueCV.wait` | `m_queueCV.wait` | **`m_threadPoolSize`** |
 | `http-worker` | **thread entry** | — | blocking `Dequeue` | **pool size** |

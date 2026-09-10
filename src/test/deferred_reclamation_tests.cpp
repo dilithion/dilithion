@@ -93,6 +93,21 @@ int g_failed = 0;
 // Neither could produce a false PASS. They are recorded here because a suite whose
 // failures point at the wrong mechanism is the specific way this defect class has
 // cost time before.
+// ⚠️ THE ADVERSARIAL CASE FOR THIS CANNOT BE BUILT, AND THAT IS THE ANSWER, NOT AN
+// EXCUSE (round-7 F42). The obvious test -- an older unrelated entry that drains
+// while the intended one stays pinned -- is UNCONSTRUCTIBLE in this design, because
+// pinning is PROCESS-GLOBAL: DrainGraveyard takes the minimum across all slots and
+// frees a prefix, so it cannot free one entry while another older one is retained.
+// Either everything up to the safe epoch goes or nothing does.
+//
+// So the ORDERING INVARIANT is what makes the aggregate sufficient, and it is
+// written here rather than assumed: entries are appended in unlink order, the drain
+// frees a PREFIX by unlink epoch, and the entry under test is the LAST one evicted
+// before the assertion -- therefore anything freed alongside it was unlinked EARLIER
+// and its own arm has already finished with it. The identity check below is kept
+// anyway, because it costs one hash comparison and it removes the need to re-derive
+// that argument every time an arm is added. Belt, with the braces written down.
+//
 // ⚠️ AND IT TAKES THE IDENTITY OF THE ENTRY UNDER TEST, BECAUSE A COUNT IS NOT AN
 // IDENTITY (round-6 F32). This observed only CUMULATIVE frees: "the drain freed at
 // least one entry" is satisfied by an OLDER, UNRELATED entry that an earlier arm
@@ -1017,8 +1032,31 @@ int main()
     // the whole cycle by DELTA: 0 -> +1 on the offline resolve, +1 -> 0 on the
     // checkpoint, and still 0 after the thread exits.
     {
+        // ⚠️ A SECOND, INDEPENDENT ACCUSATION IS HELD OPEN THROUGHOUT (round-7
+        // F41). With a ZERO baseline the `if (u.live > 0)` clamp masks an EXTRA
+        // decrement exactly as it masks a missing increment: the count is already
+        // 0, so a spurious `--live` at the exit hook changes nothing observable
+        // and the arm passes. Parking one unrelated accused thread for the whole
+        // arm makes the baseline non-zero, so a double-withdrawal shows up as the
+        // count going BELOW baseline instead of being clamped into invisibility.
+        std::mutex hm; std::condition_variable hcv;
+        bool holder_ready = false, holder_release = false;
+        std::thread holder([&] {
+            (void)cs.GetBlockIndex(gh);          // accused, and stays accused
+            std::unique_lock<std::mutex> lk(hm);
+            holder_ready = true;
+            hcv.notify_all();
+            hcv.wait(lk, [&]{ return holder_release; });
+        });
+        {
+            std::unique_lock<std::mutex> lk(hm);
+            hcv.wait_for(lk, std::chrono::seconds(5), [&]{ return holder_ready; });
+        }
+
         std::string d0;
         const size_t base = cs.UnregisteredResolverThreads(d0);
+        chk("F33: the baseline is NON-ZERO, so the >0 clamp cannot hide an "
+            "extra decrement", base >= 1);
 
         std::mutex m; std::condition_variable cv;
         int stage = 0;              // 0 start, 1 re-recorded, 2 withdrawn
@@ -1045,15 +1083,27 @@ int main()
             { std::unique_lock<std::mutex> lk(m); cv.wait(lk, [&]{ return go_exit; }); }
         });
 
-        { std::unique_lock<std::mutex> lk(m); cv.wait(lk, [&]{ return stage != 0; }); }
+        // ⚠️ EVERY WAIT HERE IS BOUNDED (round-7 F41). The first version waited
+        // forever on `stage == 2`, and the worker sets `stage = -1` and RETURNS if
+        // EpochQuiesce refuses -- so a regression in the quiesce path would HANG
+        // THE SUITE rather than fail it. A test that hangs on a real defect is a
+        // test that gets killed by a timeout and reported as infrastructure.
+        auto wait_for_stage = [&](int want, int timeout_ms) {
+            std::unique_lock<std::mutex> lk(m);
+            return cv.wait_for(lk, std::chrono::milliseconds(timeout_ms),
+                               [&]{ return stage == want || stage == -1; })
+                   && stage == want;
+        };
+
         chk("F33: the thread reached the offline resolve (quiesce was accepted)",
-            stage == 1);
+            wait_for_stage(1, 5000));
         chk("F33: an offline resolve RE-RECORDS the accusation, and COUNTS it (0 -> +1)",
             WaitForUnregisteredDelta(cs, base, +1));
 
         { std::lock_guard<std::mutex> lk(m); go_withdraw = true; }
         cv.notify_all();
-        { std::unique_lock<std::mutex> lk(m); cv.wait(lk, [&]{ return stage == 2; }); }
+        chk("F33: the thread reached its second checkpoint",
+            wait_for_stage(2, 5000));
         chk("F33: the next checkpoint WITHDRAWS it (+1 -> 0)",
             WaitForUnregisteredDelta(cs, base, 0));
 
@@ -1062,6 +1112,10 @@ int main()
         t.join();
         chk("F33: and the exit hook does not decrement a second time (still 0)",
             WaitForUnregisteredDelta(cs, base, 0));
+
+        { std::lock_guard<std::mutex> lk(hm); holder_release = true; }
+        hcv.notify_all();
+        holder.join();
     }
 
     // ---- THE TLS-TEARDOWN ARM: EXIT HOOKS RUN ON FREED STORAGE ---------------
@@ -1119,36 +1173,70 @@ int main()
         // the two halves can be run in ISOLATION, which needs one of them at zero;
         // so a zero is legal for ONE of them and never for both, and a negative or
         // unparsable value is never legal.
-        auto env_int = [](const char* k, int dflt, int floor_value) {
+        // ⚠️ atoi WAS THE WRONG TOOL AND MADE "abc" A LEGAL ZERO (round-7 F40).
+        // std::atoi returns 0 for any unparsable string, so DIL_TLS_ARM_ACCUSED=abc
+        // silently became 0 -- i.e. a typo in a CI invocation disarmed the arm and
+        // reported PASS. Whole-string parsing with a range, refusing anything it
+        // cannot fully consume.
+        auto env_int = [](const char* k, long long dflt, long long lo, long long hi) -> long long {
             const char* v = std::getenv(k);
-            if (v == nullptr) return dflt;
-            const int parsed = std::atoi(v);
-            if (parsed < floor_value) {
-                std::cerr << "    TLS-teardown arm: " << k << "=" << v
-                          << " is below the floor of " << floor_value
-                          << " -- refusing to run an arm that cannot measure."
+            if (v == nullptr || *v == '\0') return dflt;
+            char* end = nullptr;
+            errno = 0;
+            const long long parsed = std::strtoll(v, &end, 10);
+            if (end == v || *end != '\0' || errno == ERANGE) {
+                std::cerr << "    TLS-teardown arm: " << k << "=\"" << v
+                          << "\" is not a whole number -- refusing to guess."
                           << std::endl;
-                return -1;                      // poisons the arm; asserted below
+                return -1;
+            }
+            if (parsed < lo || parsed > hi) {
+                std::cerr << "    TLS-teardown arm: " << k << "=" << parsed
+                          << " is outside [" << lo << ", " << hi
+                          << "] -- refusing to run an arm that cannot measure."
+                          << std::endl;
+                return -1;
             }
             return parsed;
         };
-        const int kAccused = env_int("DIL_TLS_ARM_ACCUSED", 2000, 0);
-        const int kMembers = env_int("DIL_TLS_ARM_MEMBERS", 2000, 0);
-        const int kChurn   = env_int("DIL_TLS_ARM_CHURN", 4, 1);
+
+        const long long kAccused = env_int("DIL_TLS_ARM_ACCUSED", 2000, 0, 200000);
+        const long long kMembers = env_int("DIL_TLS_ARM_MEMBERS", 2000, 0, 200000);
+        const long long kChurn   = env_int("DIL_TLS_ARM_CHURN", 4, 1, 64);
         // Matches the pressure the decorrelated probe measured the defect at
         // (~8000 short-lived thread starts); see the budget note in the churn loop.
-        const long long kChurnBudget = env_int("DIL_TLS_ARM_CHURN_BUDGET", 8000, 1);
+        // ⚠️ THE BUDGET HAS A NON-VACUOUS MINIMUM (F40). With budget=1 the floor
+        // below computed to 0 and asserted nothing at all -- a legal configuration
+        // that turned the pressure assertion into a tautology. The minimum is the
+        // pressure at which the defect was actually observed, so a run below it is
+        // a DIAGNOSTIC run and says so rather than pretending to be a verdict.
+        const long long kChurnBudget =
+            env_int("DIL_TLS_ARM_CHURN_BUDGET", 8000, 1, 200000);
+        constexpr long long kQualifyingBudget = 4000;
 
         // The floor the arm must actually REACH to have measured anything. It is a
         // fraction of the budget rather than the budget itself because the churners
         // stop when the work loops finish, so the exact total is scheduling-
         // dependent -- but an order of magnitude below it is not.
         const long long kChurnFloor = (kChurnBudget * 3) / 4;
+        chk("TLS teardown: the pressure floor is not vacuous",
+            kChurnFloor >= 1);
 
         chk("TLS teardown: the arm's parameters are usable "
-            "(no zero/negative override, at least one half armed)",
+            "(parsed whole numbers, in range, at least one half armed)",
             kAccused >= 0 && kMembers >= 0 && kChurn >= 1 &&
             kChurnBudget >= 1 && (kAccused + kMembers) > 0);
+
+        // ⚠️ AND IT SAYS WHICH KIND OF RUN THIS IS. A reduced run is useful for
+        // isolating a half; it is NOT evidence about the mechanism, and a reader
+        // scanning for "PASS" cannot tell the two apart unless the arm says so.
+        const bool qualifying = (kAccused >= 500 && kMembers >= 500 &&
+                                 kChurnBudget >= kQualifyingBudget && kChurn >= 2);
+        std::cout << "  [TLS-teardown arm] "
+                  << (qualifying ? "QUALIFYING run (a verdict about the mechanism)"
+                                 : "REDUCED DIAGNOSTIC run -- NOT a verdict; the "
+                                   "defect needs full pressure to appear")
+                  << std::endl;
 
         std::cout << "  [TLS-teardown arm] accused=" << kAccused
                   << " members=" << kMembers << " churn=" << kChurn

@@ -26,7 +26,7 @@
 // header). Its victim search deliberately SKIPS every entry on the active chain
 // (chain.cpp:226-231, walking pindexTip -> genesis). So when the index is at cap
 // and the active chain accounts for ALL of it, there is no victim:
-// EvictLowestWorkNotOnBestChain() returns false and the caller REJECTS the new
+// EvictLowestWorkLeafNotPinned() returns false and the caller REJECTS the new
 // header.
 //
 // On the production networks that state is unreachable -- the cap is 500000
@@ -151,7 +151,7 @@ int main()
                   << chainstate.GetBlockIndexSize() << " and a cap of " << cap << "."
                   << std::endl;
         std::cout << "  Every entry is on the active chain, so "
-                  << "EvictLowestWorkNotOnBestChain() finds no victim, returns false,"
+                  << "EvictLowestWorkLeafNotPinned() finds no victim, returns false,"
                   << std::endl;
         std::cout << "  and ProcessNewHeader fails closed. No attacker, no spam -- "
                   << "just a chain longer than the cap." << std::endl;
