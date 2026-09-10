@@ -50,6 +50,8 @@
 #   S11 inline block comment before the paren         CAUGHT  (added after MISS)
 #   S14 C++14 digit separator (5'000) preceding a
 #       real GetTip() call on the same line           CAUGHT  (added after MISS)
+#   S22 a u8'a' char-literal prefix on a line that
+#       also carries a real GetTip() call             CAUGHT  (added after MISS)
 #   S18 qualified member: p->CBlockIndex::pprev       CAUGHT  (added after MISS)
 #   S19 a CBlockIndex walk in the .h                  CAUGHT  (added after MISS)
 #   S15 unterminated string literal                   REFUSED (guard fails closed)
@@ -75,8 +77,16 @@
 # S14 is the same class again, found by a third external round after this
 # scanner was already written: C++14 digit separators are apostrophes, the
 # scanner treated 5'000 as a char literal, blanked forward and swallowed a real
-# call. The scanner now refuses (exit 3) on every construct it cannot tokenise
-# rather than guessing - see scripts/strip-cxx-comments.awk.
+# call. S22 is the SAME class a THIRD time, found by the in-house read of the fix
+# for S14: a u8'a' char-literal prefix reads as <hexdigit>'<hexdigit>, so the
+# separator rule claimed it, the closing quote then opened a run, and
+#     char c = u8'a'; auto* t = g_chainstate.GetTip(); int z = 1'000;
+# came out with the call erased and exit 0.
+#
+# Three instances of one class, each found by a different reader, is the reason
+# the scanner's default is now to REFUSE rather than to guess: every construct
+# named below has an explicit rule or exits 3 - see
+# scripts/strip-cxx-comments.awk.
 #
 # So, precisely:
 #   (1) neither GetTip() nor GetBlockIndex() is CALLED BY NAME in

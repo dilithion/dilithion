@@ -913,7 +913,10 @@ private:
     //
     // Window + limit live in chainparams (Cursor v1.5+ per-spec fix B1):
     //   * ChainParams.nHeaderRateWindowSec       (default 60)
-    //   * ChainParams.nHeaderRateLimitPerWindow  (default 1000)
+    //   * ChainParams.nHeaderRateLimitPerWindow  (default 5000, chainparams.h)
+    //     NB: this comment said "default 1000" and had done since the v4.1 bump
+    //     to 5000. Re-derived from chainparams.h rather than trusted - the same
+    //     class of stale doc the rest of this PR has been correcting.
     // SSOT: per-chain tunable, no longer hardcoded here.
     struct PeerHeaderRate {
         int64_t window_start_unix_sec = 0;

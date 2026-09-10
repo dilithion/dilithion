@@ -45,6 +45,35 @@ function refuse(why) { print "STRIPPER-REFUSES: " why > "/dev/stderr"; exit 3 }
 # has already been consumed by the literal scanner.
 # NB: the locals are prev/nxt - `next` is an awk RESERVED WORD and naming a
 # parameter that is a syntax error, which makes the whole guard exit 1.
+# A char literal may carry an encoding prefix: u8'a', u'a', U'a', L'a'.
+# ONLY u8' can fool the digit-separator test - because 8 is a hex digit and so is
+# a typical literal body, so `u8'a'` reads as <hexdigit>'<hexdigit> - and that is
+# not theoretical: with one further apostrophe later on the line (a digit
+# separator, say) the quote that should have CLOSED the char literal instead
+# opens a run that blanks everything between, and
+#     char c = u8'a'; auto* t = g_chainstate.GetTip(); int z = 1'000;
+# came out of the scanner with the real GetTip() call erased and exit 0. A FALSE
+# PASS, the exact class this scanner exists to prevent, found by an in-house read
+# after the round-3 fold had already closed one instance of it.
+#
+# u'/U'/L' cannot fool it (u, U and L are not hex digits, so the separator test
+# already fails), but they are matched here anyway: the header claims every
+# construct has a rule or exits 3, and that claim should be true by construction
+# rather than by luck.
+function is_char_literal_prefix(line, i,    p1, p2, p3) {
+    if (i < 2) return 0
+    p1 = substr(line, i - 1, 1)
+    p2 = (i >= 3) ? substr(line, i - 2, 1) : ""
+    p3 = (i >= 4) ? substr(line, i - 3, 1) : ""
+    if (p1 == "8" && (p2 == "u" || p2 == "U")) {
+        if (p3 == "" || p3 !~ /[A-Za-z0-9_]/) return 1
+    }
+    if (p1 == "u" || p1 == "U" || p1 == "L") {
+        if (p2 == "" || p2 !~ /[A-Za-z0-9_]/) return 1
+    }
+    return 0
+}
+
 function is_digit_separator(line, i,    prev, nxt) {
     if (i <= 1 || i >= length(line)) return 0
     prev = substr(line, i - 1, 1)
@@ -70,7 +99,7 @@ function is_digit_separator(line, i,    prev, nxt) {
         if (d == "//") { while (i <= n) { out = out " "; i++ } continue }
         if (d == "/*") { inblock = 1; out = out "  "; i += 2; continue }
         if (c == "\"" || c == "'") {
-            if (c == "'" && is_digit_separator(line, i)) { out = out c; i++; continue }
+            if (c == "'" && !is_char_literal_prefix(line, i) && is_digit_separator(line, i)) { out = out c; i++; continue }
             # Raw string literals are refused, and the test is made HERE rather
             # than by scanning the line for the two characters R" - chain.cpp has
             # literals ending in R ("ERROR") and a line-level test cannot tell

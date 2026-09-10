@@ -828,6 +828,54 @@ BOOST_AUTO_TEST_CASE(p2p16_rejected_batch_never_walks_the_chain)
         "an empty batch is valid (end-of-chain reply) and must return true");
     BOOST_CHECK_MESSAGE(chaintest::ResolveLocatorHashesCallCount() == c3,
         "an empty batch reached the chain walk");
+
+    // RATE-LIMITED: the expensive case, and the one this arm originally missed
+    // (in-house read of the round-3 fold, LOW 4). Size and emptiness are cheap
+    // to re-check; a peer over its header budget is the attacker-controlled path
+    // the reorder exists for, so it is the one that most needs pinning.
+    //
+    // The limit is read from chainparams rather than hard-coded - a literal here
+    // would drift the way MAX_HEADERS_BUFFER nearly did - and batches are sent
+    // until one MUST exceed it, so this holds for any configured limit.
+    const int limit = Dilithion::g_chainParams->nHeaderRateLimitPerWindow;
+    const int kBatch = 2000;   // the largest size that is accepted
+    std::vector<CBlockHeader> full(kBatch);
+    const NodeId ratePeer = 200;
+
+    // NOTE on what is and is not asserted here. ProcessHeaders also returns
+    // false for a batch whose HEADERS fail validation, and these are synthetic
+    // default-constructed headers, so its return value cannot be used to mean
+    // "the rate check passed" - asserting that was this arm's first bug.
+    //
+    // The resolver counter can, and it is not circular: the resolve runs after
+    // the rate check and BEFORE any header validation, so an in-budget batch
+    // reaches the walk whatever its headers look like, and an over-budget one
+    // returns from the rate branch before the walk. The property being pinned is
+    // therefore the TRANSITION - the counter advances for every batch inside the
+    // window and stops advancing on the one that exceeds it. If the resolve were
+    // moved back ahead of the rate check, the counter would keep advancing past
+    // the limit and this goes red.
+    int sent = 0, idx = 0;
+    while (sent + kBatch <= limit) {
+        const uint64_t before = chaintest::ResolveLocatorHashesCallCount();
+        mgr.ProcessHeaders(ratePeer, full);
+        BOOST_CHECK_MESSAGE(chaintest::ResolveLocatorHashesCallCount() > before,
+            "batch " << idx << " is inside the budget (" << (sent + kBatch)
+            << " <= " << limit << ") and should have reached the resolve");
+        sent += kBatch;
+        ++idx;
+    }
+
+    // The next batch pushes this peer over its window and must be rejected
+    // WITHOUT the node paying for a chain walk under cs_main first.
+    const uint64_t c4 = chaintest::ResolveLocatorHashesCallCount();
+    BOOST_CHECK_MESSAGE(!mgr.ProcessHeaders(ratePeer, full),
+        "a batch that exceeds the per-peer header budget must be rejected "
+        "(sent=" << sent << " + " << kBatch << " > " << limit << ")");
+    BOOST_CHECK_MESSAGE(chaintest::ResolveLocatorHashesCallCount() == c4,
+        "a RATE-LIMITED batch reached the chain walk - this is the case the "
+        "reorder exists for: a peer already over budget could otherwise drive a "
+        "full descending walk under cs_main on every batch it sends");
 }
 
 // ============================================================================
@@ -892,6 +940,55 @@ BOOST_AUTO_TEST_CASE(p2p16_wrapper_agrees_with_one_resolver_snapshot)
                 "wrapper hash disagrees with the resolver at height " << kv.first);
         }
     }
+}
+
+
+// ============================================================================
+// In-house read of the round-3 fold, LOW (1): the G5 census was COMMENT-HELD.
+//
+// The schedule case above spot-checks eight start heights. The closed form it
+// is supposed to protect - genesis is emitted iff startHeight <= 10 OR
+// startHeight == 8 + 2^m for m >= 2 - lived only in a comment, and a comment is
+// exactly what was wrong before: the previous claim ("iff <= 10") was read off a
+// sample that happened to skip 12. Asserting the form over a RANGE is what stops
+// the same mistake from being made again by the next person to touch the loop.
+// ============================================================================
+BOOST_AUTO_TEST_CASE(p2p16_genesis_membership_matches_the_closed_form)
+{
+    // startHeight - 10 must be one less than a power of two for the doubling to
+    // land exactly on zero, which is the same thing as startHeight == 8 + 2^m.
+    auto closed_form = [](int s) {
+        if (s < 0)  return false;
+        if (s <= 10) return true;
+        const int d = s - 8;
+        return d >= 4 && (d & (d - 1)) == 0;   // a power of two, at least 4
+    };
+
+    const int kMax = 65600;   // past 8 + 2^16 = 65544, so the form is exercised
+    int members = 0;
+    for (int s = 0; s <= kMax; ++s) {
+        const std::vector<int> p = hdrtest::LocatorHeightPatternForTest(s);
+        // The schedule descends, so genesis - if present at all - is last.
+        const bool emits_genesis = !p.empty() && p.back() == 0;
+        BOOST_REQUIRE_MESSAGE(emits_genesis == closed_form(s),
+            "genesis membership disagrees with the closed form at start " << s
+            << ": schedule says " << emits_genesis << ", form says " << closed_form(s));
+        if (emits_genesis) ++members;
+    }
+
+    // 11 values in 0..10, plus 8+2^m for m = 2..16 (12,16,24,...,65544) = 15.
+    BOOST_CHECK_MESSAGE(members == 26,
+        "expected 26 genesis-emitting starts in 0.." << kMax << ", counted " << members);
+
+    // The named cases from the correction, so a failure says WHICH end moved.
+    BOOST_CHECK(closed_form(10));    // last of the linear run
+    BOOST_CHECK(!closed_form(11));   // first miss
+    BOOST_CHECK(closed_form(12));    // the value the old sample skipped
+    BOOST_CHECK(!closed_form(13));
+    BOOST_CHECK(closed_form(16));
+    BOOST_CHECK(closed_form(24));
+    BOOST_CHECK(!closed_form(25));
+    BOOST_CHECK(!closed_form(1000));
 }
 
 BOOST_AUTO_TEST_SUITE_END()

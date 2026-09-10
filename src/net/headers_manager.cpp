@@ -564,8 +564,9 @@ bool CHeadersManager::ProcessHeaders(NodeId peer, const std::vector<CBlockHeader
                     //
                     // The fix is to defer the send until cs_headers is released and rebuild
                     // from a fresh GetLocator(). That is NOT a statement move: the
-                    // cs_headers guard at :244 is FUNCTION-scope, this send sits inside the
-                    // batch loop, and eight returns follow it — so it needs the
+                    // cs_headers guard taken at the top of ProcessHeaders is
+                    // FUNCTION-scope, this send sits inside the batch loop, and eight
+                    // returns follow it — so it needs the
                     // collect-then-dispatch shape used by TipNotifyDrain, with every one of
                     // those returns shown to flush or to not reach the send. A return that
                     // skips the dispatch silently drops a GETHEADERS, which is the same
