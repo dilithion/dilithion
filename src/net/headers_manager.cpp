@@ -119,7 +119,55 @@ CHeadersManager::CHeadersManager()
     // ships VDFHeaderProofChecker; DIL ships RandomXHeaderProofChecker.
     // The HeadersSyncState instances we construct below get a non-owning
     // pointer to this; lifetime: owned by manager, outlives all states.
-    if (Dilithion::g_chainParams && Dilithion::g_chainParams->IsDilV()) {
+    // ⛔ SELECT ON IsVdfFromGenesis(), NOT IsDilV(). The comment fifteen lines
+    // below already diagnoses this exact hazard for the genesis-hash key —
+    // "Selecting on IsDilV() alone disagreed with it on TESTNET and REGTEST
+    // (both VDF-from-genesis but network != DILV) … Route through the shared
+    // dispatcher" — and that site was fixed while THIS one, two lines above it,
+    // was not. Fixing the named site and leaving its sibling, with the
+    // explanation sitting between them.
+    //
+    // WHAT IT BROKE: testnet and regtest are VDF chains (vdfActivationHeight = 0,
+    // vdfExclusiveHeight = 0) whose network is not DILV, so they were handed
+    // RandomXHeaderProofChecker — which calls CheckProofOfWork(header.GetHash(),
+    // nBits) on a VDF header. A VDF header's hash is not mined against a target,
+    // so every honest testnet/regtest VDF header FAILS its proof check.
+    //
+    // Dormant today only because the DoS-protected path has no production
+    // callers; it becomes a live testnet header-sync break the day the gate is
+    // armed, which is why it lands before any activation contract.
+    //
+    // IsVdfFromGenesis() (chainparams.h) is the shared dispatcher genesis.cpp
+    // already routes through; this makes the checker agree with the genesis it
+    // is checking against.
+    // ⛔ MIRROR THE PRODUCER'S PREDICATE EXACTLY. NOT IsVdfFromGenesis().
+    //
+    // The VDF checker enforces nBits == genesisNBits, and that rule is only
+    // sound where the PRODUCER emits a constant. GetNextWorkRequired's constant
+    // branch is `IsDilV() || IsRegtest()` (pow.cpp:1142-1146) -- TESTNET IS NOT
+    // IN IT. Testnet has vdfActivationHeight = 0 and vdfExclusiveHeight = 0, so
+    // IsVdfFromGenesis() is TRUE for it, but it falls through to ASERT
+    // RETARGETING and its honest headers carry non-genesis nBits.
+    //
+    // Selecting on IsVdfFromGenesis() would therefore hand testnet a checker
+    // whose equality rule its own honest headers violate -- banning honest peers,
+    // the exact defect this class of guard exists to avoid. An earlier draft of
+    // this fix did precisely that; an external seat caught it.
+    //
+    // THE RULE: the checker's predicate must mirror the producer's, because the
+    // checker is asserting a property only the producer can guarantee. Two
+    // predicates verified separately against different things are not the same
+    // predicate.
+    //
+    // ⚠️ TESTNET IS LEFT ON THE RandomX CHECKER AND REMAINS BROKEN — knowingly.
+    // Its VDF headers fail CheckProofOfWork either way, so this change does not
+    // regress it; it declines to swap one breakage for a subtler one. Testnet
+    // headers-sync needs its own rule (equality does not apply under retargeting)
+    // and that is an activation prerequisite, tracked separately.
+    m_uses_vdf_proof_checker =
+        Dilithion::g_chainParams &&
+        (Dilithion::g_chainParams->IsDilV() || Dilithion::g_chainParams->IsRegtest());
+    if (m_uses_vdf_proof_checker) {
         m_proof_checker =
             std::make_unique<::dilithion::net::port::VDFHeaderProofChecker>();
     } else {

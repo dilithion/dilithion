@@ -476,6 +476,16 @@ public:
      */
     void OnPeerDisconnected(NodeId peer);
 
+    //! Which proof checker this manager selected for the configured chain.
+    //!
+    //! Reports the DECISION, not the object, so it stays meaningful if the
+    //! concrete checker types ever change. Exists because the selection was
+    //! cross-wired — it keyed on IsDilV(), which is false on testnet and regtest
+    //! even though both are VDF-from-genesis — and a defect nothing can observe
+    //! is a defect nothing can regression-test. The alternative was asserting on
+    //! a proxy, which would not have caught the original bug either.
+    bool UsesVdfProofChecker() const { return m_uses_vdf_proof_checker; }
+
     /**
      * @brief Check if we should fetch headers from this peer
      *
@@ -844,6 +854,9 @@ private:
     // based on g_chainParams (RandomXHeaderProofChecker for DIL,
     // VDFHeaderProofChecker for DilV).
     std::unique_ptr<::dilithion::net::IHeaderProofChecker> m_proof_checker;
+
+    //! Records which branch the constructor's checker selection took.
+    bool m_uses_vdf_proof_checker{false};
 
     // Bug #150 Fix: Best chain cache for fork-safe height lookups
     mutable std::map<int, uint256> m_bestChainCache;  ///< Height -> Hash on best chain
