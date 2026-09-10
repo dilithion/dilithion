@@ -42,12 +42,66 @@ namespace {
 // hitting.
 bool NBitsIsSaneForWorkAccounting(uint32_t nBits)
 {
-    // Zero mantissa is the saturation trigger, and the only one:
+    // Zero mantissa is the SATURATION trigger, and the only one:
     // ComputeChainWork's other paths clamp rather than saturate.
     if ((nBits & 0x00FFFFFFu) == 0) return false;
     // A zero word is a subset of the above, kept explicit for readers.
     if (nBits == 0) return false;
     return true;
+}
+
+// ⛔ AND SATURATION WAS NEVER THE WHOLE PROBLEM. The guard above closes exactly
+// one shape and leaves an equally large hole open, MEASURED against
+// ComputeChainWork rather than reasoned about:
+//
+//   nBits        size  mantissa   work (top 4 bytes, LE MSB-side)
+//   0x1d00ffff    29   0x00ffff   00000000…  (DilV genesis — ~2^80, honest)
+//   0x1e000000    30   0x000000   ffffffff…  (saturated — REJECTED above)
+//   0x00000001     0   0x000001   ff000000…  (~2^255 — ACCEPTED above)
+//   0x00000002     0   0x000002   ff000000…  (~2^255 — ACCEPTED above)
+//   0x01000001     1   0x000001   ff000000…  (~2^255 — ACCEPTED above)
+//
+// A SMALL exponent puts the quotient at the TOP of the 256-bit word, so one
+// header claims within a factor of two of the maximum without ever tripping the
+// mantissa test. Enumerating shapes was the wrong instrument: the next encoding
+// nobody thought of is worth the same.
+//
+// So bound the PROPERTY the gate exists to defend instead of the encoding. The
+// PRESYNC gate's entire purpose is that a peer must present a chain whose
+// CUMULATIVE work reaches nMinimumChainWork; a single header reaching it alone
+// means the accounting has stopped meaning anything. That bound is objective,
+// needs no new constant, and does not enumerate anything.
+//
+// The honest margin is not close: nMinimumChainWork accumulates over hundreds of
+// thousands of blocks, so a real block's contribution is smaller by many orders
+// of magnitude. Nothing an honest producer emits comes near this.
+//
+// NOT A CONSENSUS CHANGE: this rejects a peer's INPUT to a dormant DoS gate.
+// ComputeChainWork itself is shared consensus code and is untouched — a real
+// chain's work accounting still behaves exactly as before.
+//
+// ⚠️ RESIDUAL, STATED RATHER THAN ABSORBED: this bounds work, it does not make
+// nBits well-formed. Core decides that in SetCompact (fNegative / fOverflow /
+// zero) and returns ZERO work for a malformed target rather than maximum;
+// ComputeChainWork has no such decode, and giving it one is a consensus change
+// that belongs in its own review. Until then a malformed-but-small-work nBits
+// still passes here — it just cannot inflate the gate.
+bool SingleHeaderWorkIsWithinBound(uint32_t nBits, const uint256& minimum_required_work)
+{
+    // A zero bound means no gate is configured (test callers, and any caller
+    // before nMinimumChainWork is set). Bounding against zero would reject every
+    // header, so the check is inert rather than fail-closed here: this function
+    // guards the gate's arithmetic, and with no gate there is nothing to inflate.
+    bool bound_is_zero = true;
+    for (int i = 0; i < 32; ++i) {
+        if (minimum_required_work.data[i] != 0) { bound_is_zero = false; break; }
+    }
+    if (bound_is_zero) return true;
+
+    const uint256 single = ::dilithion::consensus::ComputeChainWork(nBits);
+    // >= and not >: a single header that exactly meets the minimum satisfies the
+    // gate on its own, which is the thing being prevented.
+    return !::dilithion::consensus::ChainWorkGreaterOrEqual(single, minimum_required_work);
 }
 
 }  // namespace
@@ -350,6 +404,23 @@ bool HeadersSyncState::ValidateAndProcessSingleHeader(const CBlockHeader& header
     // IHeaderProofChecker if injected. Falls back to the legacy inline
     // `IsVDFBlock()` branch + CheckProofOfWork path if no checker was
     // passed (un-migrated test callsites).
+    // ⛔ FAIL CLOSED WHEN THERE IS NO CHECKER AND THE HEADER IS A VDF BLOCK.
+    // The fallback below reads `else if (!header.IsVDFBlock())`, so before this
+    // clause a VDF header arriving with no injected checker was subjected to NO
+    // proof check of any kind — and its nBits still fed the work accumulator a
+    // few lines down. That is the fail-OPEN shape #189 shipped once: an absent
+    // input silently becoming a permissive verdict.
+    //
+    // Production always injects a checker (CHeadersManager selects one per
+    // network), so this refuses a state production does not reach rather than
+    // changing any live behaviour. A test that wants VDF headers must inject the
+    // VDF checker — which is the point.
+    if (!m_proof_checker && header.IsVDFBlock()) {
+        std::cerr << "[HeadersSyncState] VDF header with no proof checker — refusing"
+                  << std::endl;
+        return false;
+    }
+
     if (m_proof_checker) {
         if (!m_proof_checker->CheckHeaderProof(header)) {
             std::cerr << "[HeadersSyncState] Invalid proof for header "
@@ -380,6 +451,12 @@ bool HeadersSyncState::ValidateAndProcessSingleHeader(const CBlockHeader& header
     }
 
     // 3. Basic sanity checks
+    if (!SingleHeaderWorkIsWithinBound(header.nBits, m_minimum_required_work)) {
+        std::cerr << "[HeadersSyncState] PRESYNC: single-header work reaches the "
+                     "minimum-chain-work gate on its own, nBits 0x"
+                  << std::hex << header.nBits << std::dec << std::endl;
+        return false;
+    }
     if (!NBitsIsSaneForWorkAccounting(header.nBits)) {
         std::cerr << "[HeadersSyncState] Rejecting header with unusable nBits 0x"
                   << std::hex << header.nBits << std::dec << std::endl;
@@ -406,6 +483,12 @@ bool HeadersSyncState::ValidateAndStoreRedownloadedHeader(const CBlockHeader& he
     // PRESYNC had the weak `nBits == 0` guard and this path had nothing, so a
     // saturating nBits rejected in phase 1 would have been accepted in phase 2 --
     // a guard present at one site and absent at its sibling.
+    if (!SingleHeaderWorkIsWithinBound(header.nBits, m_minimum_required_work)) {
+        std::cerr << "[HeadersSyncState] REDOWNLOAD: single-header work reaches the "
+                     "minimum-chain-work gate on its own, nBits 0x"
+                  << std::hex << header.nBits << std::dec << std::endl;
+        return false;
+    }
     if (!NBitsIsSaneForWorkAccounting(header.nBits)) {
         std::cerr << "[HeadersSyncState] REDOWNLOAD: unusable nBits 0x"
                   << std::hex << header.nBits << std::dec << std::endl;
@@ -414,6 +497,23 @@ bool HeadersSyncState::ValidateAndStoreRedownloadedHeader(const CBlockHeader& he
 
     // 1. Phase 3: route through IHeaderProofChecker if injected (same
     // pattern as ValidateAndProcessSingleHeader above).
+    // ⛔ FAIL CLOSED WHEN THERE IS NO CHECKER AND THE HEADER IS A VDF BLOCK.
+    // The fallback below reads `else if (!header.IsVDFBlock())`, so before this
+    // clause a VDF header arriving with no injected checker was subjected to NO
+    // proof check of any kind — and its nBits still fed the work accumulator a
+    // few lines down. That is the fail-OPEN shape #189 shipped once: an absent
+    // input silently becoming a permissive verdict.
+    //
+    // Production always injects a checker (CHeadersManager selects one per
+    // network), so this refuses a state production does not reach rather than
+    // changing any live behaviour. A test that wants VDF headers must inject the
+    // VDF checker — which is the point.
+    if (!m_proof_checker && header.IsVDFBlock()) {
+        std::cerr << "[HeadersSyncState] VDF header with no proof checker — refusing"
+                  << std::endl;
+        return false;
+    }
+
     uint256 hash = header.GetHash();
     if (m_proof_checker) {
         if (!m_proof_checker->CheckHeaderProof(header)) {

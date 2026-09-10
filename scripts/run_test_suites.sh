@@ -280,6 +280,7 @@ fast|test_passphrase_validator|60|SUSPECTED REAL (policy): 2 of 16 cases -- two 
 fast|chain_case_2_5_equivalence_tests|180|UNTRIAGED: scenario_2 (connect-replacement-fails-then-recovers) now truncates the chain and triggers auto_rebuild instead of recovering (chain_case_2_5_equivalence_tests.cpp:304). Behaviour change in ActivateBestChainStep; needs a chainstate owner to say which side is right.|
 fast|headerssync_gate_arming_tests|120||
 fast|headerssync_accumulator_seeding_tests|120||
+fast|headerssync_work_bound_tests|120||
 fast|minimum_chain_work_kat_tests|120||
 fast|vdf_consensus_test|300||
 fast|vdf_lottery_test|300||

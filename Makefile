@@ -1109,6 +1109,11 @@ headerssync_accumulator_seeding_tests: $(CORE_OBJECTS) $(OBJ_DIR)/test/headerssy
 	@$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS) $(LIBS)
 	@echo "$(COLOR_GREEN)✓ headerssync_accumulator_seeding_tests built successfully$(COLOR_RESET)"
 
+headerssync_work_bound_tests: $(CORE_OBJECTS) $(OBJ_DIR)/test/headerssync_work_bound_tests.o $(DILITHIUM_OBJECTS) $(CHIAVDF_OBJECTS)
+	@echo "$(COLOR_BLUE)[LINK]$(COLOR_RESET) $@"
+	@$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS) $(LIBS)
+	@echo "$(COLOR_GREEN)✓ headerssync_work_bound_tests built successfully$(COLOR_RESET)"
+
 # LP-10 (2026-09-07): KAT pinning nMinimumChainWork + the work UNITS.
 minimum_chain_work_kat_tests: $(CORE_OBJECTS) $(OBJ_DIR)/test/minimum_chain_work_kat_tests.o $(DILITHIUM_OBJECTS) $(CHIAVDF_OBJECTS)
 	@echo "$(COLOR_BLUE)[LINK]$(COLOR_RESET) $@"

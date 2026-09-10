@@ -95,8 +95,15 @@ enum class HeaderRejectReason {
     // LocalStateUnavailable.
     InvalidProof,
 
-    // weight 50. nVersion <= 0, or an nBits unusable for work accounting
-    // (chain_work.h NBitsUsableForWork). No honest producer emits either.
+    // weight 50. nVersion <= 0, or an nBits unusable for work accounting — a
+    // zero mantissa, which makes ComputeChainWork saturate to the maximum, or an
+    // exponent small enough to put the quotient at the top of the 256-bit word.
+    // No honest producer emits either.
+    //
+    // (An earlier draft of this line cited `chain_work.h NBitsUsableForWork`.
+    // That symbol lives on fix/lp10-live-nbits-mantissa and is NOT on this
+    // branch, so the citation pointed at nothing. Naming the condition instead
+    // of a symbol keeps the comment true on whichever branch it is read.)
     InvalidHeaderFields,
 
     // weight 20. The headers WITHIN one message do not chain to each other.
