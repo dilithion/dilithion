@@ -2804,15 +2804,33 @@ bool CChainState::DisconnectTip(CBlockIndex* pindex, bool force_skip_utxo) {
     // lock-order class. Callbacks therefore keep firing with cs_main HELD, on
     // purpose, and that is now a documented property rather than an oversight.
     //
-    // THE CLASS IS CLOSED FROM THE OTHER SIDE. cs_main -> <consumer lock> only
-    // deadlocks if something supplies <consumer lock> -> cs_main. That reverse
-    // edge is what scripts/check-no-private-mutex-across-chainstate.sh now fails
-    // the build on, tree-wide, wired into tests-fast/tests-full (register
-    // P2P-17, which was exactly such a reverse edge and is fixed).
+    // THE REVERSE EDGE IS GUARDED — and F4 (external panel round 1) is right
+    // that the previous wording ("THE CLASS IS CLOSED ... tree-wide") claimed
+    // more than a grep can prove, so here is exactly what it proves.
+    //
+    // cs_main -> <consumer lock> only deadlocks if something supplies
+    // <consumer lock> -> cs_main. scripts/check-no-private-mutex-across-chainstate.sh
+    // fails the build on that reverse edge, wired into tests-fast/tests-full
+    // (register P2P-17 was exactly such an edge and is fixed).
+    //
+    // WHAT IT PROVES: over every non-test .cpp, a per-line TEXTUAL scan finds no
+    // UNCLASSIFIED site where a private mutex is visibly held across a call to a
+    // CChainState accessor that takes cs_main. Receiver-agnostic; the accessor
+    // list is generated from chain.cpp + chain.h, not hand-written.
+    //
+    // WHAT IT DOES NOT PROVE, and these are review's job, not the guard's:
+    //   * INTERPROCEDURAL reach - a helper that takes the lock, or one that
+    //     reaches the chainstate on your behalf, is invisible to it;
+    //   * a lock taken with a bare `m.lock()`, or behind a macro;
+    //   * a conditional `unlock()`, which it reads as unconditional;
+    //   * anything in a file it does not scan.
+    // The limits are enumerated at the head of scripts/lock_scope_audit.py and
+    // pinned by fixtures in scripts/lock_scope_audit_selftest.py.
     //
     // So the rule for anyone adding a consumer here: your callback runs with
     // cs_main HELD. Take your own lock if you must, but you may NOT hold it
-    // across a call that takes cs_main. The guard enforces that; review does not.
+    // across a call that takes cs_main — directly OR through a helper. The guard
+    // catches the direct spelling; the indirect one is on you and your reviewer.
     //
     // Residual, so the guarantee is not over-read. The guard matches a call through
     // ANY receiver now (`g_chainstate.`, `m_chainstate->`, a `CChainState&` bound to

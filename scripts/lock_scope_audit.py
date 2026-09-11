@@ -40,6 +40,18 @@ would otherwise have to infer them from a green line:
          the tree"; that was wrong, and the grep that produced it also counted
          comments. Corrected by measuring, which is the whole point of the
          paragraph above it.)
+     (c) F3 (external panel round 1): an accessor CALL split across lines -
+             CBlockIndex* t = g_chainstate
+                 .GetTip();
+         - is invisible, because matching is per line. Same for the census, so
+         the coverage number under-reports by the same amount.
+     (d) F3: `auto lk = std::lock_guard(m);` (CTAD via copy-init) is not matched;
+         LOCK expects the type to be followed by the VARIABLE name, not by `=`.
+         The generator's GUARD pattern has the same single-spelling fragility -
+         it recognises `<std::recursive_mutex> name(cs_main)` and nothing else,
+         so an accessor that took cs_main by any other spelling would never
+         enter the generated list at all.
+         [measured] neither (c) nor (d) occurs in production .cpp today.
      (b) A guard whose DECLARATION spans lines -
              std::lock_guard<std::recursive_mutex>
                  lock(cs_main);
@@ -119,6 +131,16 @@ ALLOWED = {
     # `scripts/check-tip-notify-drain.sh` is what actually holds that order.
     ('src/net/headers_manager.cpp', 'OnBlockActivated', 'GetBlockHeightByHash', 'cs_headers'): 1,
 
+    # F9 (external panel round 1), because these four entries' safety argument
+    # depends on it: the body also calls tip->GetAncestor(...), and
+    # CBlockIndex::GetAncestor takes NO lock - [measured] src/node/block_index.cpp
+    # contains no cs_main acquisition at all, only a comment mentioning it; the
+    # function is a plain pprev walk. So it adds no edge of its own and needs no
+    # entry here. What makes THESE two safe is stated at the definition of
+    # SettlePendingMinerWinsOnConnect: its only caller is a block-connect
+    # callback, which already holds cs_main (recursive), so no thread can supply
+    # the opposite order.
+    #
     # D-1 (external review of #197): keying on 'main' was only PARTLY the fix.
     # main() in the node files runs from its opening line to end of file, so every
     # lambda inside it shares the key - and a NEW chainstate call under this mutex
@@ -252,18 +274,48 @@ def scan(path, accessors):
             # unlock()/lock() on that variable moves all of them together.
             for mx in [m.strip() for m in lk.group(2).split(',') if m.strip()]:
                 held.append({'d': depth, 'var': lk.group(1), 'mx': mx, 'rel': False})
-        for h in held:
-            u = UNLOCK.search(line)
-            if u and h['var'] == u.group(1):
-                h['rel'] = True
-            r = RELOCK.search(line)
-            if r and h['var'] == r.group(1):
-                h['rel'] = False          # <-- the fix: a re-take is held again
-        c = call_re.search(line)
-        if c:
-            live = [h['mx'] for h in held if not h['rel'] and 'cs_main' not in h['mx']]
+        # F2(a) (external panel round 1, gpt6 HIGH): unlock/relock used to be
+        # applied to the WHOLE line before the accessor call was examined, so
+        #     g_chainstate.GetTip(); lk.unlock();
+        # was read as "released" even though the call happens while the mutex is
+        # still held - the exact direction that hides a site. Position within the
+        # line decides now: a release only counts if it appears BEFORE the call.
+        u = UNLOCK.search(line)
+        r = RELOCK.search(line)
+        u_at = u.start() if u else None
+        r_at = r.start() if r else None
+
+        # F2(c): this used to classify only the FIRST accessor on a line, while
+        # the census below counts every one with finditer - so a line with two
+        # accessor calls was half-audited and the two numbers disagreed by
+        # construction. Every call on the line is classified now.
+        for c in call_re.finditer(line):
+            c_at = c.start()
+            for h in held:
+                if u_at is not None and u_at < c_at and h['var'] == u.group(1):
+                    h['rel'] = True
+                if r_at is not None and r_at < c_at and h['var'] == r.group(1):
+                    h['rel'] = False      # a re-take before the call is held again
+            # F2(b): this exemption was a SUBSTRING test - `'cs_main' not in mx` -
+            # so any mutex whose NAME merely contains the text, such as
+            # `private_cs_main_mutex`, was silently treated as the global lock and
+            # its sites never reported. Match the identifier, optionally qualified
+            # (`CChainState::cs_main`), and nothing else.
+            live = [h['mx'] for h in held
+                    if not h['rel'] and h['mx'].split('::')[-1] != 'cs_main']
             if live:
                 out.append((i, func, c.group(2), sorted(set(live)), c.group(1)))
+
+        # Apply the line's release/re-take to the carried state REGARDLESS of
+        # position, so a line that only unlocks (no accessor call on it) still
+        # updates the held set for the lines that follow. The positional test
+        # above governs only whether THIS line's calls see it.
+        for h in held:
+            if u is not None and h['var'] == u.group(1):
+                h['rel'] = True
+            if r is not None and h['var'] == r.group(1):
+                h['rel'] = False
+
         prev_depth = depth
         depth += line.count('{') - line.count('}')
         # D-3 (external review of #197): `func` was never CLEARED, so anything at
@@ -295,7 +347,10 @@ def main(argv):
         if os.sep + 'test' in dirpath:
             continue
         for f in files:
-            if f.endswith('.cpp') and f != 'chain.cpp':
+            # F8 (external panel round 1): this excluded by BASENAME, so ANY file
+            # called chain.cpp anywhere in the tree was skipped - not merely the
+            # one whose accessors are being generated. Compare the path.
+            if f.endswith('.cpp') and os.path.join(dirpath, f) != chain:
                 targets.append(os.path.join(dirpath, f))
 
     total, counts, unattributed, receivers = 0, {}, [], {}
@@ -318,7 +373,7 @@ def main(argv):
     # M-1: state the POPULATION this auditor can see, not only what it flagged.
     # Before the receiver was widened this matched `g_chainstate.` alone, so the
     # "every site is classified" line below was true only of DIRECT calls on the
-    # global. [censused] 98 of 332 accessor calls in production .cpp files (27%)
+    # global. [censused] 98 of 332 accessor calls in production .cpp files (29.5%)
     # reach the chainstate through another receiver - 90 via `m_chainstate`, 8
     # via a plain `chainstate`. None of those 98 sits inside a private-mutex
     # scope, so the old verdict was accidentally right while its coverage claim
@@ -366,9 +421,28 @@ def main(argv):
     # reason. When the site goes away the claim is stale, and a stale entry is how
     # an allowlist silently starts authorising something else later. So walk the
     # ALLOWED side too and fail on any entry with no matching site.
+    #
+    # F1 (external panel round 1, gpt6 BLOCKER — and it was a real one): the first
+    # version of this walk demanded EVERY allowlist entry have a site under the
+    # scanned root, unconditionally. That is true of the repository and false of
+    # any other tree, so it broke the auditor's own fixtures: they build a
+    # throwaway src/consensus + src/probe, none of the five production files
+    # exist there, and all five entries reported "expected 1, found 0" — turning
+    # four NEGATIVE controls red and the self-test's exit into 1.
+    #
+    # The refinement is NOT a fixture-sniff and NOT a flag (either would be a
+    # hole the wrapper could inherit). It is a statement of what the check can
+    # actually know: an allowlist entry names a FILE, and an entry whose file is
+    # not present in the tree being scanned says nothing about that tree. Where
+    # the file IS present — which is every entry in the repository — the rule
+    # keeps its full force, so D-2 stays load-bearing exactly where it matters.
     for key, want in ALLOWED.items():
-        if want > 0 and key not in counts:
-            overcount.append((key, 0, want))
+        if want <= 0 or key in counts:
+            continue
+        entry_file = os.path.join(root, key[0].replace('/', os.sep))
+        if not os.path.isfile(entry_file):
+            continue        # not this tree's file; unknowable, not a violation
+        overcount.append((key, 0, want))
 
     if unclassified or overcount:
         print('')

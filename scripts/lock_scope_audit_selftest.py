@@ -92,7 +92,7 @@ void Probe1() {
 }
 ''', must_find=['g_chainstate.GetTip()', 'm_privateMutex'], expect_rc=1)
 
-case('R2 m_chainstate->  (81 such calls in production)', '''
+case('R2 m_chainstate->  (90 such calls in production)', '''
 void Probe2() {
     std::lock_guard<std::mutex> lk(m_privateMutex);
     CBlockIndex* t = m_chainstate->GetTip();
@@ -172,7 +172,11 @@ def header_case():
         io.open(os.path.join(tmp, 'src', 'consensus', 'chain.h'), 'w', encoding='utf-8').write(CHAIN_H_INLINE)
         io.open(os.path.join(tmp, 'src', 'probe', 'probe.cpp'), 'w', encoding='utf-8').write(PROBE_H)
         rc, out = run(tmp)
-        ok = ('InlineOnlyAccessor' in out) and ('m_privateMutex' in out) and rc == 1
+        # F9: NoLockHere is the CONTROL and must be asserted, not merely present -
+        # if the generator listed every method rather than every cs_main taker, H1
+        # would still pass on the first two conditions alone.
+        ok = (('InlineOnlyAccessor' in out) and ('m_privateMutex' in out)
+              and ('NoLockHere' not in out) and rc == 1)
         if not ok:
             FAILURES.append('H1: an inline chain.h cs_main taker was not treated as an accessor')
         print('  %-58s %s' % ('H1 inline accessor defined in chain.h is generated', 'ok' if ok else 'FAIL'))
@@ -227,6 +231,148 @@ void Probe11() {
     (void)h;
 }
 ''', must_find=['sites found: 0'], must_not_find=['PRIVATE-mutex scope'], expect_rc=0)
+
+
+print('SILENT ESCAPES (F2, external panel round 1) - each was invisible, and')
+print('each failed in the direction that reads as CLEAN:')
+
+# F2(a) order on one line: the release comes AFTER the call, so the call happens
+# while the mutex is still held. Processing the whole line first read it as
+# released and dropped the site.
+case('F2a unlock AFTER the call on the same line -> still a site', '''
+void ProbeF2a() {
+    std::unique_lock<std::mutex> lk(m_privateMutex);
+    CBlockIndex* t = g_chainstate.GetTip(); lk.unlock();
+    (void)t;
+}
+''', must_find=['m_privateMutex'], expect_rc=1)
+
+# ...and the mirror, so the fix is not just "always report": a release BEFORE
+# the call on the same line must still exempt it.
+case('F2a unlock BEFORE the call on the same line -> NOT a site', '''
+void ProbeF2a2() {
+    std::unique_lock<std::mutex> lk(m_privateMutex);
+    lk.unlock(); CBlockIndex* t = g_chainstate.GetTip();
+    (void)t;
+}
+''', must_find=['sites found: 0'], must_not_find=['PRIVATE-mutex scope'], expect_rc=0)
+
+# F2(b) the cs_main exemption was a SUBSTRING test, so a private mutex whose
+# name merely contains the text was treated as the global lock and never
+# reported.
+case('F2b a mutex NAMED private_cs_main_mutex is not cs_main', '''
+void ProbeF2b() {
+    std::lock_guard<std::mutex> lk(private_cs_main_mutex);
+    CBlockIndex* t = g_chainstate.GetTip();
+    (void)t;
+}
+''', must_find=['private_cs_main_mutex'], expect_rc=1)
+
+# ...control: the REAL cs_main must still be exempt, or the widening would turn
+# every correct call into a finding.
+case('F2b the real cs_main is still exempt', '''
+void ProbeF2b2() {
+    std::lock_guard<std::recursive_mutex> lk(cs_main);
+    CBlockIndex* t = g_chainstate.GetTip();
+    (void)t;
+}
+''', must_find=['sites found: 0'], must_not_find=['PRIVATE-mutex scope'], expect_rc=0)
+
+# F2(c) only the FIRST accessor on a line was classified, while the census
+# counted every one with finditer - so a two-call line was half-audited and the
+# two numbers disagreed by construction.
+case('F2c TWO accessor calls on one line -> both classified', '''
+void ProbeF2c() {
+    std::lock_guard<std::mutex> lk(m_privateMutex);
+    CBlockIndex* a = g_chainstate.GetTip(); CBlockIndex* b = g_chainstate.GetBlockIndex(uint256());
+    (void)a; (void)b;
+}
+''', must_find=['GetTip()', 'GetBlockIndex()'], expect_rc=1)
+
+print('ALLOWLIST WALK, BOTH DIRECTIONS (D-2 / F1) - the check that a classified')
+print('site still EXISTS, exercised as a fixture rather than by hand:')
+
+def walk_case(label, allowed, body, expect_rc, needle=None):
+    """Run the REAL auditor as a library with a synthetic allowlist.
+
+    Not a flag and not a root-sniff: the self-test imports the module and
+    substitutes ALLOWED, so production keeps exactly one allowlist and there is
+    nothing a wrapper could inherit to weaken the check.
+    """
+    import importlib.util
+    tmp = tempfile.mkdtemp(prefix='lsa_walk_')
+    try:
+        build(tmp, body)
+        spec = importlib.util.spec_from_file_location('lsa_under_test', AUDIT)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        mod.ALLOWED = allowed
+        import io as _io, contextlib
+        buf = _io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = mod.main(['lock_scope_audit.py', tmp])
+        out = buf.getvalue()
+        ok = (rc == expect_rc) and (needle is None or needle in out)
+        if not ok:
+            FAILURES.append('%s: exit %s (expected %s)%s' %
+                            (label, rc, expect_rc,
+                             '' if needle is None or needle in out else ' / missing %r' % needle))
+        print('  %-58s %s' % (label, 'ok' if ok else 'FAIL'))
+        if not ok:
+            for l in out.strip().split('\n')[:12]:
+                print('    ' + l)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+PROBE_SITE = '''
+void ProbeW() {
+    std::lock_guard<std::mutex> lk(m_privateMutex);
+    CBlockIndex* t = g_chainstate.GetTip();
+    (void)t;
+}
+'''
+
+# W1: the entry MATCHES a real site in this tree -> classified, exit 0.
+walk_case('W1 allowlist entry with a matching site -> OK',
+          {('src/probe/probe.cpp', 'ProbeW', 'GetTip', 'm_privateMutex'): 1},
+          PROBE_SITE, 0)
+
+# W2: the entry's FILE exists but the site does NOT -> the walk must FAIL.
+#     This is the D-2 regression encoded: before the ALLOWED-side walk existed,
+#     a vanished classified site left counts empty and the run exited 0.
+walk_case('W2 entry whose file exists but site is GONE -> FAIL',
+          {('src/probe/probe.cpp', 'NoSuchFunction', 'GetTip', 'm_privateMutex'): 1,
+           ('src/probe/probe.cpp', 'ProbeW', 'GetTip', 'm_privateMutex'): 1},
+          PROBE_SITE, 1, needle='expected 1')
+
+# W3: the entry names a file NOT PRESENT in this tree -> unknowable, not a
+#     violation. This is the F1 fix itself: without it the auditor's own
+#     fixtures turned four negative controls red.
+walk_case('W3 entry for a file absent from this tree -> not a violation',
+          {('src/net/headers_manager.cpp', 'OnBlockActivated', 'GetTip', 'cs_headers'): 1,
+           ('src/probe/probe.cpp', 'ProbeW', 'GetTip', 'm_privateMutex'): 1},
+          PROBE_SITE, 0)
+
+# W4 (D-1 encoded): an allowlist keyed on ONE function does not cover a site in
+#     a DIFFERENT function of the same file. Before the callback bodies were
+#     hoisted to named statics, every lambda in main() shared one key and a
+#     relocated site inherited its classification.
+TWO_FUNCS = '''
+void ProbeW() {
+    std::lock_guard<std::mutex> lk(m_privateMutex);
+    CBlockIndex* t = g_chainstate.GetTip();
+    (void)t;
+}
+
+void ProbeOther() {
+    std::lock_guard<std::mutex> lk(m_privateMutex);
+    CBlockIndex* t = g_chainstate.GetTip();
+    (void)t;
+}
+'''
+walk_case('W4 a site in a DIFFERENT function is not covered -> FAIL',
+          {('src/probe/probe.cpp', 'ProbeW', 'GetTip', 'm_privateMutex'): 1},
+          TWO_FUNCS, 1, needle='UNCLASSIFIED')
 
 print('')
 if FAILURES:

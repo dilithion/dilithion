@@ -1991,6 +1991,20 @@ std::optional<CBlockTemplate> BuildMiningTemplate(CBlockchainDB& blockchain, CWa
 // function gives the allowlist a key that means one specific body.
 //
 // This is the ONLY reason it is a named function; the behaviour is unchanged.
+// PRECONDITION (F5, external panel round 1): call this ONLY from a
+// block-connect callback, i.e. with cs_main ALREADY HELD by the caller.
+//
+// The lock-scope allowlist entries for the two g_chainstate calls below rest
+// entirely on that: they take g_pendingMinerWinsMutex and then reach cs_main,
+// which is one half of an AB-BA — safe ONLY because the sole caller already owns
+// cs_main (it is recursive), so no thread can supply the opposite order. Call
+// this from anywhere that does not hold cs_main and the tuples in
+// scripts/lock_scope_audit.py stop describing the truth while still matching.
+//
+// Also stated because the auditor cannot: RELOCATING this body, or adding
+// another chainstate call INSIDE it, keeps every allowlist key and therefore
+// passes BY DESIGN. The key names this function; it does not name these lines.
+// Interprocedural reachability is a review question, not a grep one.
 static void SettlePendingMinerWinsOnConnect(int height)
 {
     std::lock_guard<std::mutex> lock(g_pendingMinerWinsMutex);
