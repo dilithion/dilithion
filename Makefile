@@ -508,6 +508,31 @@ check-headers-manager-pointer:
 check-tip-notify-drain:
 	@bash scripts/check-tip-notify-drain.sh
 
+# DEFERRED-RECLAMATION GUARDS. Same rule as the two above: a guard nobody runs is
+# a file. Both are sub-second and run BEFORE the suites, because if a thread_local
+# grew a destructor or a participant started blocking online, the suites will
+# still be green and still be wrong.
+#
+# ⚠️ EACH RUNS ITS OWN SELF-TEST FIRST. A guard whose fixtures are not exercised
+# is a guard that can quietly stop discriminating -- both of these have failed
+# their own fixtures during development (the thread_local one accepted a NEGATED
+# static_assert; the participant one accepted a scope that had already closed),
+# and in both cases the fixtures caught it before the tree did. Running the
+# fixtures on every invocation is what keeps that true.
+check-thread-local-guard:
+	@bash scripts/check_thread_local_guard.sh --self-test
+	@bash scripts/check_thread_local_guard.sh
+
+check-participant-waits:
+	@bash scripts/check_participant_waits.sh --self-test
+	@bash scripts/check_participant_waits.sh
+
+# Pins the CALLER of the socket timeouts, which no unit test can reach without a
+# live server. See the script header for why a mutation arm was tried and discarded.
+check-http-socket-timeouts:
+	@bash scripts/check_http_socket_timeouts.sh --self-test
+	@bash scripts/check_http_socket_timeouts.sh
+
 # P2P-14/15 TSan lock-inversion gate — MANUAL, Linux-only, ~4 min.
 #
 # Deliberately NOT a prerequisite of tests-fast/tests-full, and that is stated
@@ -653,7 +678,7 @@ endif
 # `make dilithion-node` runs earlier in that job and drags libzmq in.
 $(TEST_SUITES_ALL): | libzmq
 
-.PHONY: tests tests-build tests-fast tests-full
+.PHONY: tests tests-build tests-fast tests-full check-thread-local-guard check-participant-waits check-http-socket-timeouts
 
 # A-010 review LOW (a8, 2026-09-08): scripts/census_test_mains.sh had ZERO
 # callers -- an orphaned script inside the change that registers orphaned
@@ -678,7 +703,7 @@ tests: tests-build
 # wired into the target CI actually runs because a guard with zero callers is
 # not a guard — it is a file. It runs FIRST: it is a sub-second grep, and if the
 # drain invariant is broken there is no point running the suites.
-tests-fast: check-tip-notify-drain check-headers-manager-pointer check-no-private-mutex-across-chainstate $(TEST_SUITES_FAST)
+tests-fast: check-tip-notify-drain check-headers-manager-pointer check-no-private-mutex-across-chainstate check-thread-local-guard check-participant-waits check-http-socket-timeouts $(TEST_SUITES_FAST)
 	@bash scripts/check_roster_completeness.sh
 	@bash scripts/test_run_with_hang_capture.sh
 	@bash scripts/test_run_test_suites_timeout.sh
@@ -686,7 +711,7 @@ tests-fast: check-tip-notify-drain check-headers-manager-pointer check-no-privat
 	@bash scripts/test_run_test_suites_args.sh
 	@bash scripts/run_test_suites.sh fast
 
-tests-full: check-tip-notify-drain check-headers-manager-pointer check-no-private-mutex-across-chainstate $(TEST_SUITES_FULL)
+tests-full: check-tip-notify-drain check-headers-manager-pointer check-no-private-mutex-across-chainstate check-thread-local-guard check-participant-waits check-http-socket-timeouts $(TEST_SUITES_FULL)
 	@bash scripts/run_test_suites.sh full
 
 phase1_test: $(CORE_OBJECTS) $(OBJ_DIR)/test/phase1_simple_test.o $(DILITHIUM_OBJECTS) $(CHIAVDF_OBJECTS)
@@ -897,10 +922,47 @@ chain_selector_tests: $(CORE_OBJECTS) $(OBJ_DIR)/test/chain_selector_tests.o $(D
 	@$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS) $(LIBS)
 	@echo "$(COLOR_GREEN)✓ chain_selector_tests built successfully$(COLOR_RESET)"
 
+# Measures graveyard peak occupancy and drain cost at the ingress ceiling, so the
+# design note can carry observations instead of arithmetic.
+graveyard_occupancy_bench: $(CORE_OBJECTS) $(OBJ_DIR)/tools/graveyard_occupancy_bench.o $(DILITHIUM_OBJECTS) $(CHIAVDF_OBJECTS)
+	@echo "$(COLOR_BLUE)[LINK]$(COLOR_RESET) $@"
+	@$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS) $(LIBS)
+	@echo "$(COLOR_GREEN)✓ graveyard_occupancy_bench built successfully$(COLOR_RESET)"
+
 evict_cost_bench: $(CORE_OBJECTS) $(OBJ_DIR)/tools/evict_cost_bench.o $(DILITHIUM_OBJECTS) $(CHIAVDF_OBJECTS)
 	@echo "$(COLOR_BLUE)[LINK]$(COLOR_RESET) $@"
 	@$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS) $(LIBS)
 	@echo "$(COLOR_GREEN)â evict_cost_bench built successfully$(COLOR_RESET)"
+
+# THE MEMORY-SAFETY VERDICT for deferred reclamation, and it is only a verdict
+# under -fsanitize=address. Two of its three arms MUST CRASH; scripts/asan_uaf_arms.sh
+# is the driver that enforces that, and a plain build of this target proves only that
+# the fixture reaches the free -- not that the memory is safe.
+# A PAIRED CONTROL WHOSE PASS IS A PROCESS ABORT: it opens an illegal nested
+# EpochOfflineScope and must die on the ConsensusInvariant. Run by
+# scripts/red_arms_pr198_r1_folds.sh as the positive control for the inverted F13 arm.
+epoch_nest_probe: $(CORE_OBJECTS) $(OBJ_DIR)/test/epoch_nest_probe.o $(DILITHIUM_OBJECTS) $(CHIAVDF_OBJECTS)
+	@echo "$(COLOR_BLUE)[LINK]$(COLOR_RESET) $@"
+	@$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS) $(LIBS)
+	@echo "$(COLOR_GREEN)✓ epoch_nest_probe built successfully$(COLOR_RESET)"
+
+blockindex_uaf_asan_arm: $(CORE_OBJECTS) $(OBJ_DIR)/test/blockindex_uaf_asan_arm.o $(DILITHIUM_OBJECTS) $(CHIAVDF_OBJECTS)
+	@echo "$(COLOR_BLUE)[LINK]$(COLOR_RESET) $@"
+	@$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS) $(LIBS)
+	@echo "$(COLOR_GREEN)✓ blockindex_uaf_asan_arm built successfully$(COLOR_RESET)"
+
+# The bound on an HTTP worker's ONLINE window (round-8 F48). Links the real
+# CHttpServer so the arm exercises the production ApplyClientSocketTimeouts rather
+# than a copy of it.
+http_socket_timeout_tests: $(CORE_OBJECTS) $(OBJ_DIR)/test/http_socket_timeout_tests.o $(DILITHIUM_OBJECTS) $(CHIAVDF_OBJECTS)
+	@echo "$(COLOR_BLUE)[LINK]$(COLOR_RESET) $@"
+	@$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS) $(LIBS)
+	@echo "$(COLOR_GREEN)✓ http_socket_timeout_tests built successfully$(COLOR_RESET)"
+
+deferred_reclamation_tests: $(CORE_OBJECTS) $(OBJ_DIR)/test/deferred_reclamation_tests.o $(DILITHIUM_OBJECTS) $(CHIAVDF_OBJECTS)
+	@echo "$(COLOR_BLUE)[LINK]$(COLOR_RESET) $@"
+	@$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS) $(LIBS)
+	@echo "$(COLOR_GREEN)✓ deferred_reclamation_tests built successfully$(COLOR_RESET)"
 
 leaf_index_invariant_tests: $(CORE_OBJECTS) $(OBJ_DIR)/test/leaf_index_invariant_tests.o $(DILITHIUM_OBJECTS) $(CHIAVDF_OBJECTS)
 	@echo "$(COLOR_BLUE)[LINK]$(COLOR_RESET) $@"

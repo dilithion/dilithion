@@ -7,7 +7,7 @@
 #
 # CChainState::GetTip() takes cs_main, reads pindexTip, and RELEASES cs_main
 # before returning. The CBlockIndex it points at is owned by mapBlockIndex and
-# can be destroyed by EvictLowestWorkNotOnBestChain at any moment afterwards.
+# can be destroyed by EvictLowestWorkLeafNotPinned at any moment afterwards.
 #
 # CHeadersManager used to call GetTip() and then walk the result
 # (pTip->GetAncestor(height)) while holding cs_headers and NOT cs_main — a
