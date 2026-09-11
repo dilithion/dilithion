@@ -2793,6 +2793,13 @@ static void Test_F1_AbortOnValidButWrongMnemonic() {
 // own mt19937_64. NOTHING HERE IS WALLET MATERIAL and nothing here is a secret:
 // re-running the probe reproduces the triple exactly.
 //
+// CAVEAT ON THAT REPRODUCIBILITY, so it is not read as stronger than it is: the
+// probe is NOT built by the Makefile (src/tools/* is not in any *_SOURCES list,
+// and it defines its own main()). Reproducing the triple is a MANUAL step using
+// the recipe in the probe's own header. Nothing re-derives these bytes on every
+// build, so what actually protects them is the four assertions below -- they are
+// the machine-checked half, and the probe is the provenance, not the guard.
+//
 // WHAT IT PINS:
 //   1. the fixture is well-formed  — the RIGHT key returns the phrase;
 //   2. THE PREMISE                 — the WRONG key is ACCEPTED, not rejected;

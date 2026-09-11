@@ -5952,11 +5952,18 @@ bool CWallet::MigrateToEncryptedSeedV7Unlocked(bool* persistedToDisk,
         // OFF unless DILITHION_LP7_DIAG is set, so nothing changes for any node
         // that does not ask for it.
         //
-        // It prints NO SECRET -- not the phrase, not the seed, not any key. Only
-        // which arm ran, whether it decrypted, whether the bytes are syntactically
-        // BIP39, their length and word count, and whether they verified. That is
-        // exactly enough to tell arm pre-emption apart from any other failure in a
-        // field log, and nothing more.
+        // It prints NO PHRASE, NO SEED AND NO KEY. Only which arm ran, whether it
+        // decrypted, whether the bytes are syntactically BIP39, their length and
+        // word count, and whether they verified -- enough to tell arm pre-emption
+        // apart from any other failure in a field log, and nothing more.
+        //
+        // ONE FIELD IS AN ORACLE, AND CALLING THIS "no secret" WOULD BE WRONG:
+        // verified_with_passphrase=1 CONFIRMS that the BIP39 passphrase the caller
+        // supplied was the correct one. It reveals no passphrase bytes, but it does
+        // answer a yes/no question about a secret, so anyone who can read the log
+        // learns that much. That is acceptable for an operator who deliberately
+        // enabled diagnostics on their own wallet; it is not "no secret", and the
+        // difference matters when someone decides where these logs may be sent.
         //
         // It reports PER ARM. The old single-line form could only ever observe one
         // arm, because a spurious arm-1 acceptance ended the attempt -- the very
@@ -5969,9 +5976,22 @@ bool CWallet::MigrateToEncryptedSeedV7Unlocked(bool* persistedToDisk,
 
         for (int arm = 1; arm <= 2 && !verified; ++arm) {
             std::vector<uint8_t> mnemonicPlain;
-            const bool decOk = (arm == 1) ? armObfuscation(mnemonicPlain)
-                                          : armMasterKey(mnemonicPlain);
-            const char* armName = (arm == 1) ? "1-obfuscation" : "2-masterkey";
+            bool decOk = false;
+            const char* armName = nullptr;
+            if (arm == 1) {
+                armName = "1-obfuscation";
+                decOk = armObfuscation(mnemonicPlain);
+            } else if (arm == 2) {
+                armName = "2-masterkey";
+                decOk = armMasterKey(mnemonicPlain);
+            } else {
+                // Unreachable at the current bound, and deliberately NOT a
+                // fall-through to the last arm. A ternary here would run
+                // armMasterKey for arm 3 and label it "2-masterkey" -- silently
+                // mislabelling a log is how the original defect stayed invisible
+                // for three releases. A new arm must add its own branch.
+                break;
+            }
             if (lp7diag) {
                 std::cerr << "[LP7DIAG] arm=" << armName
                           << " decOk=" << (decOk ? 1 : 0)
@@ -5990,15 +6010,25 @@ bool CWallet::MigrateToEncryptedSeedV7Unlocked(bool* persistedToDisk,
             bool usedPassphrase = false;
             const bool armVerified = phraseVerifies(candidate, usedPassphrase);
             if (lp7diag) {
-                size_t words = candidate.empty() ? 0 : 1;
+                const bool syntactic = CMnemonic::Validate(candidate);
+                size_t spaces = 0;
                 for (char ch : candidate) {
-                    if (ch == ' ') ++words;
+                    if (ch == ' ') ++spaces;
                 }
                 std::cerr << "[LP7DIAG] arm=" << armName
                           << " phrase_len=" << candidate.size()
-                          << " words=" << words
-                          << " bip39_syntactic=" << (CMnemonic::Validate(candidate) ? 1 : 0)
-                          << " verified=" << (armVerified ? 1 : 0)
+                          << " bip39_syntactic=" << (syntactic ? 1 : 0);
+                if (syntactic) {
+                    std::cerr << " words=" << (spaces + 1);
+                } else {
+                    // On a pre-empted arm these are raw wrong-key bytes, not a
+                    // phrase. Counting 0x20 bytes in ~190 bytes of binary garbage
+                    // yields about 8, which reads in a field log like a short but
+                    // plausible mnemonic and is nothing of the kind. Report the
+                    // byte count under a name that cannot be mistaken for one.
+                    std::cerr << " words=n/a space_bytes=" << spaces;
+                }
+                std::cerr << " verified=" << (armVerified ? 1 : 0)
                           << " verified_with_passphrase=" << (usedPassphrase ? 1 : 0)
                           << std::endl;
             }
@@ -6028,6 +6058,26 @@ bool CWallet::MigrateToEncryptedSeedV7Unlocked(bool* persistedToDisk,
             // migration (leave everything byte-identical) rather than risk a wallet
             // whose mnemonic becomes unreadable. Seed migration only proceeds when
             // the mnemonic can be carried forward.
+            //
+            // THIS IS NOT A PASSPHRASE PROBLEM, and until now it said nothing at
+            // all. Neither key produced any plaintext, which means a truncated or
+            // corrupt mnemonic record, a ciphertext that is not a multiple of the
+            // block size, or DecryptHDMasterKey failing -- none of which a BIP39
+            // passphrase can fix. The caller cannot yet tell this exit apart from
+            // "an arm decrypted but nothing verified" and so reports the generic
+            // passphrase-deferred state, which sends the operator after a
+            // passphrase that does not exist while a corrupt record goes
+            // unreported. Propagating the distinction to the caller is a separate
+            // change; saying it out loud is not, and the silence was the worse
+            // half.
+            std::cerr << "[Wallet] LP-7: v7 seed migration ABORTED - the mnemonic "
+                         "record could not be decrypted under EITHER the "
+                         "seed-derived obfuscation key or the wallet master key. "
+                         "This is not a BIP39-passphrase problem: no passphrase "
+                         "affects this step. The record is likely truncated or "
+                         "corrupt. The wallet was NOT modified and remains loadable; "
+                         "migration will be retried on the next unlock and will keep "
+                         "failing until the record is readable." << std::endl;
             rollback();
             return false;
         }
