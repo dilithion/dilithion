@@ -27,6 +27,7 @@
 #include <random>  // WALLET-007 FIX: For std::shuffle
 #include <cstring>
 #include <cstdlib>   // LP-7 diag: getenv (env-gated diagnostics)
+#include <functional>  // LP-7: RAII rollback guard
 #include <fstream>
 #include <iostream>
 #include <cstdio>   // For snprintf (thread-safe number formatting)
@@ -5850,6 +5851,46 @@ bool CWallet::MigrateToEncryptedSeedV7Unlocked(bool* persistedToDisk,
         mapCryptedKeys = snap_mapCryptedKeys;
     };
 
+    // EXCEPTION SAFETY (in-house read, HIGH). rollback() used to be invoked BY HAND
+    // on every early return, and there is no try/catch anywhere in this function --
+    // so an exception thrown in Steps 1 to 2c unwound straight past every call site.
+    // The RPC layer catches std::exception, so the process SURVIVES and carries on
+    // with in-memory state half-migrated while the on-disk file is still legacy, and
+    // the next ordinary operation that calls SaveUnlocked() persists that mixture.
+    //
+    // The worst case is Step 2c: it re-MACs the key map IN A LOOP while
+    // m_loadedFileVersion is still v6, so an exception mid-loop leaves some entries
+    // with v7-keyed MACs and some legacy. Those addresses then fail MAC verification
+    // on the next load. No key material is destroyed -- it is loss of ACCESS through
+    // MAC mismatch, recoverable by someone who understands the keying -- but it
+    // reaches a user as "my coins are gone", which is the same thing from where they
+    // are standing.
+    //
+    // So rollback is now an RAII guard rather than a call. Every exit restores by
+    // CONSTRUCTION: the documented early returns, the exception paths, and the early
+    // return someone adds next year without reading this comment. A third return
+    // code would not have done that, and it would have made the
+    // two-indistinguishable-exits problem into three -- today a caller cannot tell
+    // whether memory is trustworthy after a failure, because the exception exit is
+    // the one that did NOT restore.
+    //
+    // The destructor must not throw while unwinding: that calls std::terminate, and
+    // a failed restore is bad where terminating the node is worse.
+    struct RollbackGuard {
+        std::function<void()> restore;
+        bool armed = true;
+        void dismiss() { armed = false; }
+        ~RollbackGuard() {
+            if (!armed) return;
+            try {
+                restore();
+            } catch (...) {
+                // Deliberately swallowed -- see above.
+            }
+        }
+    } rollbackGuard{rollback};
+
+
     // --- Step 1: recover + re-encrypt the mnemonic under the master key ---
     // Legacy HD-first wallets stored the mnemonic under an obfuscation key derived
     // from the (plaintext) seed; EncryptWallet never re-encrypted it. We still hold
@@ -5968,7 +6009,23 @@ bool CWallet::MigrateToEncryptedSeedV7Unlocked(bool* persistedToDisk,
         // It reports PER ARM. The old single-line form could only ever observe one
         // arm, because a spurious arm-1 acceptance ended the attempt -- the very
         // defect being fixed made the instrument blind to it.
-        const bool lp7diag = (std::getenv("DILITHION_LP7_DIAG") != nullptr);
+        // GATE ON THE VALUE, NOT ON PRESENCE (in-house read, LOW -- and it is a
+        // PATTERN, not an instance: the same shape was found in a CI guard in an
+        // unrelated file the same day). `getenv(...) != nullptr` makes
+        // DILITHION_LP7_DIAG=0 turn the diagnostics ON, because every falsey value is
+        // still a present value. That matters more than usual here: the argument that
+        // the verified_with_passphrase oracle bit is acceptable rests on an operator
+        // DELIBERATELY enabling diagnostics, and a presence gate can be tripped by a
+        // parent process or a script that sets the variable to zero to turn it off.
+        //
+        // An environment variable read for presence is a boolean whose falsey values
+        // all mean true.
+        const bool lp7diag = [] {
+            const char* v = std::getenv("DILITHION_LP7_DIAG");
+            if (v == nullptr) return false;
+            const std::string s(v);
+            return s == "1" || s == "true" || s == "TRUE" || s == "yes" || s == "on";
+        }();
 
         bool anyArmDecrypted = false;
         bool verified = false;
@@ -6086,7 +6143,6 @@ bool CWallet::MigrateToEncryptedSeedV7Unlocked(bool* persistedToDisk,
                          "corrupt. The wallet was NOT modified and remains loadable; "
                          "migration will be retried on the next unlock and will keep "
                          "failing until the record is readable." << std::endl;
-            rollback();
             return false;
         }
 
@@ -6127,7 +6183,6 @@ bool CWallet::MigrateToEncryptedSeedV7Unlocked(bool* persistedToDisk,
                          "ciphertext was NOT modified; the wallet remains fully "
                          "loadable and usable. Migration will be retried on the next "
                          "unlock." << std::endl;
-            rollback();
             return false;
         }
 
@@ -6137,7 +6192,6 @@ bool CWallet::MigrateToEncryptedSeedV7Unlocked(bool* persistedToDisk,
             memory_cleanse(&mnemonicStr[0], mnemonicStr.size());
         }
         if (!reOk) {
-            rollback();
             return false;
         }
     }
@@ -6148,7 +6202,6 @@ bool CWallet::MigrateToEncryptedSeedV7Unlocked(bool* persistedToDisk,
     // case (a) needs this step.
     if (!seedAlreadyEncrypted) {
         if (!EncryptHDMasterKey()) {
-            rollback();
             return false;
         }
     }
@@ -6171,8 +6224,7 @@ bool CWallet::MigrateToEncryptedSeedV7Unlocked(bool* persistedToDisk,
             bool mikOk = EncryptMIKPrivKey();   // adds MAC under master key
             m_mik->privkey.clear();
             if (!mikOk) {
-                rollback();
-                return false;
+                    return false;
             }
         } else {
             // MIK plaintext unrecoverable — drop it (regenerated on next mining).
@@ -6206,20 +6258,17 @@ bool CWallet::MigrateToEncryptedSeedV7Unlocked(bool* persistedToDisk,
                 // Malformed entry — cannot re-MAC safely. Abort rather than write a
                 // v7 file with a per-address key that can't be authenticated.
                 memory_cleanse(mkVec.data(), mkVec.size());
-                rollback();
-                return false;
+                    return false;
             }
             CCrypter keyCrypter;
             if (!keyCrypter.SetKey(mkVec, ek.vchIV)) {
                 memory_cleanse(mkVec.data(), mkVec.size());
-                rollback();
-                return false;
+                    return false;
             }
             std::vector<uint8_t> newMAC;
             if (!ComputeRecordMAC(keyCrypter, ek.vchCryptedKey, newMAC)) {
                 memory_cleanse(mkVec.data(), mkVec.size());
-                rollback();
-                return false;
+                    return false;
             }
             ek.vchMAC = newMAC;
         }
@@ -6240,7 +6289,6 @@ bool CWallet::MigrateToEncryptedSeedV7Unlocked(bool* persistedToDisk,
         if (!SaveUnlocked()) {
             // The on-disk legacy file is still intact (temp file was discarded).
             // Roll back in-memory state to match it (including the loaded version).
-            rollback();
             return false;
         }
         // The migrated v7 (no-plaintext) file is now on disk — only NOW is it safe
@@ -6250,10 +6298,11 @@ bool CWallet::MigrateToEncryptedSeedV7Unlocked(bool* persistedToDisk,
         // Unreachable given the entry guard, but fail closed rather than report a
         // half-migrated success: roll back so in-memory state stays consistent with
         // the unchanged on-disk legacy file.
-        rollback();
         return false;
     }
 
+    // Step 3 persisted the v7 file. ONLY NOW is it safe not to restore.
+    rollbackGuard.dismiss();
     return true;
 }
 
