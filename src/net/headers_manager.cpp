@@ -2,6 +2,8 @@
 // Distributed under the MIT software license
 
 #include <net/headers_manager.h>
+
+#include <atomic>
 #include <net/net.h>
 #include <net/connman.h>
 #include <net/protocol.h>
@@ -119,7 +121,113 @@ CHeadersManager::CHeadersManager()
     // ships VDFHeaderProofChecker; DIL ships RandomXHeaderProofChecker.
     // The HeadersSyncState instances we construct below get a non-owning
     // pointer to this; lifetime: owned by manager, outlives all states.
-    if (Dilithion::g_chainParams && Dilithion::g_chainParams->IsDilV()) {
+    // ⚠️ WHAT THIS SITE USED TO SELECT ON, AND WHY THAT IS NOT THE ANSWER.
+    // It selected on IsDilV(). That was wrong: the comment fifteen lines below
+    // already diagnosed the identical hazard for the genesis-hash key --
+    // "Selecting on IsDilV() alone disagreed with it on TESTNET and REGTEST
+    // (both VDF-from-genesis but network != DILV) ... Route through the shared
+    // dispatcher" -- and that site was repaired while THIS one, two lines above
+    // it, was not, with the explanation sitting between them.
+    //
+    // WHAT IT BROKE: regtest is a VDF chain whose network is not DILV, so it was
+    // handed RandomXHeaderProofChecker, which calls
+    // CheckProofOfWork(header.GetHash(), nBits) on a VDF header. A VDF header's
+    // hash is not mined against a target, so honest regtest VDF headers failed
+    // their proof check.
+    //
+    // ⛔ AND THE OBVIOUS REPAIR -- "route through IsVdfFromGenesis() like the
+    // dispatcher below" -- IS ALSO WRONG. An earlier draft of this very commit
+    // did exactly that. The paragraph that said so has been REMOVED rather than
+    // left standing above its own correction: a superseded instruction carrying
+    // the same ⛔ marker as the rule that replaced it is worse than no comment,
+    // and leaving it here would have been this mission's own sibling defect in
+    // its comment form. The reasoning is preserved below, where it is correct.
+
+    // ⛔ MIRROR THE PRODUCER'S PREDICATE EXACTLY. NOT IsVdfFromGenesis().
+    //
+    // The VDF checker enforces nBits == genesisNBits, and that rule is only
+    // sound where the PRODUCER emits a constant. GetNextWorkRequired's constant
+    // branch is `IsDilV() || IsRegtest()` (pow.cpp:1142-1146) -- TESTNET IS NOT
+    // IN IT. Testnet has vdfActivationHeight = 0 and vdfExclusiveHeight = 0, so
+    // IsVdfFromGenesis() is TRUE for it, but it falls through to ASERT
+    // RETARGETING and its honest headers carry non-genesis nBits.
+    //
+    // Selecting on IsVdfFromGenesis() would therefore hand testnet a checker
+    // whose equality rule its own honest headers violate -- banning honest peers,
+    // the exact defect this class of guard exists to avoid. An earlier draft of
+    // this fix did precisely that; an external seat caught it.
+    //
+    // THE RULE: the checker's predicate must mirror the producer's, because the
+    // checker is asserting a property only the producer can guarantee. Two
+    // predicates verified separately against different things are not the same
+    // predicate.
+    //
+    // ⚠️ TESTNET IS LEFT ON THE RandomX CHECKER AND REMAINS BROKEN — knowingly.
+    // Its VDF headers fail CheckProofOfWork either way, so this change does not
+    // regress it; it declines to swap one breakage for a subtler one. Testnet
+    // headers-sync needs its own rule (equality does not apply under retargeting)
+    // and that is an activation prerequisite, tracked separately.
+    m_uses_vdf_proof_checker =
+        Dilithion::g_chainParams &&
+        (Dilithion::g_chainParams->IsDilV() || Dilithion::g_chainParams->IsRegtest());
+
+    // ⛔ THE TESTNET GAP, MADE MACHINE-ENFORCED INSTEAD OF SILENT.
+    //
+    // Testnet is VDF-from-genesis (vdfActivationHeight = 0, vdfExclusiveHeight
+    // = 0) but is NOT in the producer's constant branch, so NEITHER checker is
+    // correct for it: the VDF checker's nBits-equality rule is violated by its
+    // own honest, ASERT-retargeted headers, and the RandomX checker demands a
+    // hash under target from a header that was never mined against one.
+    //
+    // Selecting the lesser-wrong checker and saying so in a comment is what the
+    // previous draft did. A comment is not a guard — this mission has now had
+    // three claims-in-comments turn out to be stale — so the gap is recorded in
+    // a FLAG that the sync entry point refuses on. If someone arms the gate on
+    // testnet, they get a refusal naming the reason, not a peer-banning header
+    // sync that looks like it works.
+    //
+    // A-3 owns the real rule: a predicate that mirrors ASERT rather than
+    // asserting a constant. Until it exists, this network is unsupported and
+    // says so.
+    // ⛔ F2 — WHY THE REFUSAL IS SUFFICIENT, CENSUSED RATHER THAN ASSERTED.
+    //
+    // A seat's MEDIUM asked the fair question: this flag guards
+    // InitializeDoSProtectedSync, but the constructor above STILL BUILDS a
+    // RandomX checker for testnet. Does anything else reach a header proof check?
+    // Censused at a60fe10d, greps excluding src/test/:
+    //
+    //   (1) checker CONSTRUCTION — 2 sites, both the branch directly above:
+    //         headers_manager.cpp:197  make_unique<VDFHeaderProofChecker>
+    //         headers_manager.cpp:200  make_unique<RandomXHeaderProofChecker>
+    //       Nothing else in non-test code constructs either checker.
+    //
+    //   (2) CheckHeaderProof CALL sites — 2, both through m_proof_checker inside
+    //       HeadersSyncState:
+    //         headerssync.cpp:261, headerssync.cpp:312
+    //       So a proof check requires a HeadersSyncState to exist.
+    //
+    //   (3) A HeadersSyncState is created ONLY by InitializeDoSProtectedSync —
+    //       which is behind the refusal above.
+    //
+    //   (4) And that entry point has ZERO PRODUCTION CALLERS. Every non-test grep
+    //       hit for InitializeDoSProtectedSync / ProcessHeadersWithDoSProtection
+    //       is a COMMENT: chainparams.cpp:148-149, :172; headerssync.cpp:46;
+    //       headers_manager.cpp:61, :408. Not one is a call.
+    //
+    // So the testnet checker object the constructor builds is UNREACHABLE twice
+    // over: nothing creates the state that would use it, and if a future caller
+    // tries, the refusal stops it before the state exists. That is the whole
+    // argument, and each step is a grep someone can re-run at this sha rather
+    // than a claim to be taken on trust.
+    //
+    // ⚠️ IF (4) EVER STOPS BEING TRUE — i.e. A-3 wires a real caller — step (4)
+    // is gone and the refusal at that caller becomes the ONLY thing standing
+    // between testnet and a checker that rejects its own honest headers. Re-run
+    // this census then; do not inherit it.
+    m_proof_checker_supports_network =
+        Dilithion::g_chainParams != nullptr &&
+        !(Dilithion::g_chainParams->IsVdfFromGenesis() && !m_uses_vdf_proof_checker);
+    if (m_uses_vdf_proof_checker) {
         m_proof_checker =
             std::make_unique<::dilithion::net::port::VDFHeaderProofChecker>();
     } else {
@@ -858,6 +966,32 @@ bool CHeadersManager::ShouldUseDoSProtection(NodeId peer) const
 
 bool CHeadersManager::InitializeDoSProtectedSync(NodeId peer, const uint256& minimum_work)
 {
+    // Refuse before any state is created. See m_proof_checker_supports_network
+    // in the constructor: on a VDF-from-genesis network outside the producer's
+    // constant branch (testnet today) neither checker is correct, and starting a
+    // DoS-protected sync there would reject every honest header.
+    if (!m_proof_checker_supports_network) {
+        // ⚠️ LOG ONCE PER PROCESS, NOT PER CALL (seat LOW, F4). The REFUSAL stays
+        // per-call and unconditional — only the log is deduplicated. On an armed
+        // node every inbound peer would otherwise emit an identical WARN, turning a
+        // configuration fact that cannot change for the life of the process into
+        // per-peer log spam that buries whatever else is happening.
+        //
+        // atomic exchange rather than a plain bool: this becomes reachable from
+        // more than one thread once the gate is wired, and the cost of being
+        // correct here is one word.
+        static std::atomic<bool> already_logged{false};
+        if (!already_logged.exchange(true)) {
+            LogPrintf(NET, WARN,
+                "[HeadersManager] DoS-protected header sync REFUSED (logged once "
+                "per process; first refusal was peer=%d): no correct proof checker "
+                "exists for this network (VDF from genesis, but difficulty "
+                "retargets). A-3 owns the retargeting rule.\n",
+                static_cast<int>(peer));
+        }
+        return false;
+    }
+
     std::lock_guard<std::mutex> lock(cs_headers);
 
     // Don't reinitialize if already exists
