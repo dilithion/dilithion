@@ -4084,8 +4084,12 @@ bool CChainState::DisconnectTip(CBlockIndex* pindex, bool force_skip_utxo) {
     //   * a lock taken with a bare `m.lock()`, or behind a macro;
     //   * a conditional `unlock()`, which it reads as unconditional;
     //   * anything in a file it does not scan.
-    // The limits are enumerated at the head of scripts/lock_scope_audit.py and
-    // pinned by fixtures in scripts/lock_scope_audit_selftest.py.
+    // Those limits are enumerated at the head of scripts/lock_scope_audit.py.
+    // F13: they are DOCUMENTED, not pinned - no fixture exercises the split-line
+    // call, the conditional unlock, the bare m.lock() or the helper-reached call,
+    // because each is a case the matcher deliberately does not handle. The
+    // fixtures in lock_scope_audit_selftest.py pin what it DOES handle. Do not
+    // read "there are fixtures" as "these limits are covered".
     //
     // So the rule for anyone adding a consumer here: your callback runs with
     // cs_main HELD. Take your own lock if you must, but you may NOT hold it

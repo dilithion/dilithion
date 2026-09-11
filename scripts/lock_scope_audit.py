@@ -240,6 +240,25 @@ def cs_main_accessors(chain_cpp):
     return names
 
 
+def _innermost(held, m, at, before):
+    """The entries an unlock()/lock() on `m` actually names.
+
+    F11(b): ownership used to be matched on the variable NAME alone, so two
+    guards both called `lk` in nested scopes shared one entry and the inner
+    unlock released the outer. C++ resolves the identifier to its INNERMOST
+    binding, so pick the greatest scope depth among the matching entries and
+    move only those (a scoped_lock records one entry per mutex at the same
+    depth, and those must still move together).
+    """
+    if m is None or at is None or not (at < before):
+        return []
+    same = [h for h in held if h['var'] == m.group(1)]
+    if not same:
+        return []
+    deepest = max(h['d'] for h in same)
+    return [h for h in same if h['d'] == deepest]
+
+
 call_re_global = None   # set by main() once the accessor list exists
 
 def scan(path, accessors):
@@ -267,8 +286,12 @@ def scan(path, accessors):
         if m and depth == 0:
             func = m.group(1)
 
-        lk = LOCK.search(line)
-        if lk:
+        # F11(a) (external panel round 2): only the FIRST guard on a line was
+        # recorded. `std::lock_guard a(m1); std::lock_guard b(m2);` registered `a`
+        # and dropped `b` entirely - so unlocking `a` read as "nothing held" while
+        # `b` still owned its mutex, and a chainstate call after that reported
+        # CLEAN. Record every declaration on the line.
+        for lk in LOCK.finditer(line):
             # group(2) may hold SEVERAL mutexes (std::scoped_lock a(m1, m2)).
             # Record one entry per mutex under the same variable name, so an
             # unlock()/lock() on that variable moves all of them together.
@@ -291,11 +314,16 @@ def scan(path, accessors):
         # construction. Every call on the line is classified now.
         for c in call_re.finditer(line):
             c_at = c.start()
-            for h in held:
-                if u_at is not None and u_at < c_at and h['var'] == u.group(1):
-                    h['rel'] = True
-                if r_at is not None and r_at < c_at and h['var'] == r.group(1):
-                    h['rel'] = False      # a re-take before the call is held again
+            # F11(b): ownership was matched by variable TEXT alone, so two guards
+            # both called `lk` in nested scopes were the same entry - the inner
+            # unlock() marked the OUTER one released, and a call after the inner
+            # scope closed reported CLEAN while the outer mutex was still held.
+            # An unlock names the INNERMOST binding of that identifier, so resolve
+            # to the deepest matching entry instead of all of them.
+            for h in _innermost(held, u, u_at, c_at):
+                h['rel'] = True
+            for h in _innermost(held, r, r_at, c_at):
+                h['rel'] = False          # a re-take before the call is held again
             # F2(b): this exemption was a SUBSTRING test - `'cs_main' not in mx` -
             # so any mutex whose NAME merely contains the text, such as
             # `private_cs_main_mutex`, was silently treated as the global lock and
@@ -310,11 +338,10 @@ def scan(path, accessors):
         # position, so a line that only unlocks (no accessor call on it) still
         # updates the held set for the lines that follow. The positional test
         # above governs only whether THIS line's calls see it.
-        for h in held:
-            if u is not None and h['var'] == u.group(1):
-                h['rel'] = True
-            if r is not None and h['var'] == r.group(1):
-                h['rel'] = False
+        for h in _innermost(held, u, 0, 1):
+            h['rel'] = True
+        for h in _innermost(held, r, 0, 1):
+            h['rel'] = False
 
         prev_depth = depth
         depth += line.count('{') - line.count('}')
@@ -373,8 +400,20 @@ def main(argv):
     # M-1: state the POPULATION this auditor can see, not only what it flagged.
     # Before the receiver was widened this matched `g_chainstate.` alone, so the
     # "every site is classified" line below was true only of DIRECT calls on the
-    # global. [censused] 98 of 332 accessor calls in production .cpp files (29.5%)
-    # reach the chainstate through another receiver - 90 via `m_chainstate`, 8
+    # global.
+    #
+    # ⚠️ THE SNAPSHOT BELOW MOVES WITH main, AND HAS ALREADY BEEN STALE TWICE.
+    # It read 86/319 at the L-3 fold, 98/332 after it, and 108/344 after #198
+    # merged - each time because the accessor list or the tree grew underneath a
+    # number written into a comment. The LIVE figures are printed on every run by
+    # the block just below; treat those as authoritative and this as dated
+    # context. It is kept only because the RATIO is the point (roughly a third of
+    # accessor calls do not go through the global, so a g_chainstate-only matcher
+    # was never auditing what its output implied), and that survives the drift.
+    #
+    # [censused at main 0683b3f2] 108 of 344 accessor calls in production .cpp
+    # (31.4%) reach the chainstate through another receiver - 90 via
+    # `m_chainstate`, 10 via `cs`, 8
     # via a plain `chainstate`. None of those 98 sits inside a private-mutex
     # scope, so the old verdict was accidentally right while its coverage claim
     # was a quarter short. Printing the split lets the next reader see that

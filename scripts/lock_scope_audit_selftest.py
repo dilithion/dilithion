@@ -5,9 +5,13 @@ Why this exists. The auditor's two regexes were each too narrow, and neither
 narrowness was visible from its output:
 
   * M-1 - `call_re` matched only `g_chainstate.`, so a chainstate call through
-    any other receiver was invisible. [censused] 98 of 332 accessor calls in
-    production .cpp reach the chainstate as `m_chainstate->` (90) or a plain
-    `chainstate.` (8). None of them happened to sit under a private mutex, so
+    any other receiver was invisible. [censused at main 0683b3f2] 108 of 344
+    accessor calls in production .cpp reach the chainstate through some other
+    receiver - 90 `m_chainstate`, 10 `cs`, 8 `chainstate`. That count MOVES with
+    main (it has read 86/319, then 98/332, then this), so the auditor prints the
+    live figures on every run; the ratio is the durable part, and roughly a third
+    is enough to say a g_chainstate-only matcher was not auditing what its output
+    implied. None of them happened to sit under a private mutex, so
     widening the regex changed no verdict - which is exactly why the gap could
     have survived indefinitely. A regex that finds nothing new is
     indistinguishable from a regex that finds nothing, unless something proves
@@ -154,6 +158,18 @@ PROBE_H = (
     '    size_t n = g_chainstate.InlineOnlyAccessor();\n'
     '    (void)n;\n'
     '}\n'
+    '\n'
+    '// F12: the control must be EXERCISED, not merely defined. NoLockHere takes\n'
+    '// no cs_main, so calling it under a private mutex must produce NO site. If\n'
+    '// the generator listed every method rather than every cs_main taker, this\n'
+    '// call would be classified and this fixture fails. The previous assertion\n'
+    '// ("NoLockHere" not in out) was vacuous - the auditor prints a COUNT, not\n'
+    '// accessor names, and nothing ever called it.\n'
+    'void ProbeH2() {\n'
+    '    std::lock_guard<std::mutex> lk(m_otherPrivateMutex);\n'
+    '    int k = g_chainstate.NoLockHere();\n'
+    '    (void)k;\n'
+    '}\n'
 )
 
 def header_case():
@@ -172,11 +188,15 @@ def header_case():
         io.open(os.path.join(tmp, 'src', 'consensus', 'chain.h'), 'w', encoding='utf-8').write(CHAIN_H_INLINE)
         io.open(os.path.join(tmp, 'src', 'probe', 'probe.cpp'), 'w', encoding='utf-8').write(PROBE_H)
         rc, out = run(tmp)
-        # F9: NoLockHere is the CONTROL and must be asserted, not merely present -
-        # if the generator listed every method rather than every cs_main taker, H1
-        # would still pass on the first two conditions alone.
+        # F12: exactly ONE site - InlineOnlyAccessor under m_privateMutex.
+        # NoLockHere is now CALLED, under m_otherPrivateMutex, and must NOT be
+        # classified; if the generator listed every method rather than every
+        # cs_main taker, that call becomes a second site and this fails. The
+        # earlier form asserted `'NoLockHere' not in out`, which was vacuous:
+        # the auditor prints a COUNT, not accessor names, and nothing called it.
         ok = (('InlineOnlyAccessor' in out) and ('m_privateMutex' in out)
-              and ('NoLockHere' not in out) and rc == 1)
+              and ('m_otherPrivateMutex' not in out)
+              and ('sites found: 1' in out) and rc == 1)
         if not ok:
             FAILURES.append('H1: an inline chain.h cs_main taker was not treated as an accessor')
         print('  %-58s %s' % ('H1 inline accessor defined in chain.h is generated', 'ok' if ok else 'FAIL'))
@@ -288,6 +308,44 @@ void ProbeF2c() {
     (void)a; (void)b;
 }
 ''', must_find=['GetTip()', 'GetBlockIndex()'], expect_rc=1)
+
+print('OWNERSHIP (F11, external panel round 2) - two escapes INSIDE the advertised')
+print('direct-RAII scope, both reading as CLEAN:')
+
+# F11(a): only the FIRST guard on a line was recorded, so the second's mutex was
+# never in the held set and a call under it reported clean.
+case('F11a TWO guards on one line -> both recorded', '''
+void ProbeF11a() {
+    std::lock_guard<std::mutex> a(m_firstMutex); std::lock_guard<std::mutex> b(m_secondMutex);
+    CBlockIndex* t = g_chainstate.GetTip();
+    (void)t;
+}
+''', must_find=['m_firstMutex', 'm_secondMutex'], expect_rc=1)
+
+# ...and the sharper form: unlock the FIRST, call under the SECOND. Before the
+# fix the second was never recorded, so this read as "nothing held".
+case('F11a unlock the first, call under the second -> still a site', '''
+void ProbeF11a2() {
+    std::unique_lock<std::mutex> a(m_firstMutex); std::unique_lock<std::mutex> b(m_secondMutex);
+    a.unlock();
+    CBlockIndex* t = g_chainstate.GetTip();
+    (void)t;
+}
+''', must_find=['m_secondMutex'], expect_rc=1)
+
+# F11(b): ownership matched by variable TEXT, so an inner `lk` unlocking marked
+# the OUTER `lk` released and a call after the inner scope read as clean.
+case('F11b nested guards both named lk -> inner unlock frees only the inner', '''
+void ProbeF11b() {
+    std::unique_lock<std::mutex> lk(m_outerMutex);
+    {
+        std::unique_lock<std::mutex> lk(m_innerMutex);
+        lk.unlock();
+    }
+    CBlockIndex* t = g_chainstate.GetTip();
+    (void)t;
+}
+''', must_find=['m_outerMutex'], expect_rc=1)
 
 print('ALLOWLIST WALK, BOTH DIRECTIONS (D-2 / F1) - the check that a classified')
 print('site still EXISTS, exercised as a fixture rather than by hand:')

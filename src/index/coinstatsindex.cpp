@@ -530,6 +530,42 @@ bool CCoinStatsIndex::WriteBlock(const CBlock& block, int height, const uint256&
         // onto a stale m_running. If a third caller is ever added, or the
         // IsSynced() gate is removed, re-examine this: m_running is read AFTER
         // the window.
+        //
+        // [!] THE TEARDOWN PREMISE - F10, external panel round 2. This window
+        // also depends on something the whole-body lock_guard used to supply BY
+        // CONSTRUCTION, and which was written down nowhere until now.
+        //
+        // ~CCoinStatsIndex calls Stop(), then takes m_mutex, then m_db.reset().
+        // Stop() joins m_sync_thread ONLY and does not take m_mutex. So the
+        // destructor can acquire this mutex WHILE a callback-thread WriteBlock is
+        // sitting in one of these unlock windows, free m_db and destroy the
+        // object - and the callback thread then calls lock.lock() on a mutex
+        // inside a freed object. Under the old whole-body guard the destructor
+        // simply blocked until WriteBlock returned. That protection is gone, and
+        // this comment is where it has to be replaced.
+        //
+        // THE PREMISE: nothing may destroy this index while a block-connect
+        // callback can still fire. The callbacks are never unregistered (the only
+        // clear is in chain.cpp, outside the shutdown sequence), so quiescing the
+        // callback SOURCE is the only thing that holds it.
+        //
+        // [measured, dilithion-node.cpp] the index is reset at four sites:
+        //   :3552  before the callback is registered           - safe by order
+        //   :9258  normal shutdown, AFTER g_node_context.Shutdown() (:9220),
+        //          which stops the validation queue and connman - quiesced
+        //   :9324  catch (std::exception)                       - NOT QUIESCED
+        //   :9380  catch (...)                                  - NOT QUIESCED
+        // Both catch blocks were read line by line: neither calls Shutdown(),
+        // Stop(), connman or anything validation-related before the reset. So on
+        // an exception path the premise DOES NOT HOLD today. That is a
+        // shutdown-ordering gap which this change makes reachable; it is FILED,
+        // not silently patched here, and that is why this note names the exact
+        // sites instead of asserting "shutdown handles it".
+        //
+        // AND a post-retake `if (!m_db) return false;` must NOT stand in for this
+        // argument: re-checking m_db after the retake closes only the null-deref
+        // half. The freed-object half - locking a mutex that no longer exists -
+        // happens BEFORE any such check could run.
         lock.unlock();
         const std::vector<uint256> prev_hashes =
             g_chainstate.GetBlocksAtHeight(height - 1);

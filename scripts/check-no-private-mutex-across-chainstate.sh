@@ -44,6 +44,38 @@ if ! fixt=$("$PY" scripts/lock_scope_audit_selftest.py 2>&1); then
     exit 1
 fi
 
+# F14 (external panel round 2) — closes the residual left by F1's fix.
+#
+# The auditor skips an allowlist entry whose FILE is absent from the tree it is
+# scanning. That is correct there: an entry naming a file this tree does not
+# contain says nothing about this tree, and without it the auditor's own fixtures
+# (which build a throwaway src/consensus + src/probe) reported every production
+# entry as violated. But it has a residual: in the REPOSITORY, deleting a whole
+# file would silently retire its entries instead of failing.
+#
+# So the "every allowlisted path must exist" rule lives HERE, in the wrapper that
+# only ever runs against the repo root — never inside the auditor, where the
+# fixtures would hit it, and not behind a flag the wrapper could pass to weaken
+# anything. The paths are read from the module rather than grepped, so the check
+# cannot drift from the data it is checking.
+missing=$("$PY" - <<'PYEOF' 2>&1
+import importlib.util, os, sys
+spec = importlib.util.spec_from_file_location('lsa', 'scripts/lock_scope_audit.py')
+mod = importlib.util.module_from_spec(spec); spec.loader.exec_module(mod)
+bad = sorted({k[0] for k in mod.ALLOWED if not os.path.isfile(k[0])})
+print('\n'.join(bad))
+PYEOF
+)
+if [ -n "$missing" ]; then
+    echo "FAIL: an allowlist entry names a file that does not exist in this repository:"
+    printf '%s\n' "$missing" | sed 's/^/      /'
+    echo "      The auditor skips entries for files absent from the tree it scans, which"
+    echo "      is right for its fixtures and wrong for the repo: deleting a file would"
+    echo "      silently retire its classifications. Delete the ALLOWED entries in the"
+    echo "      same change that removed the file."
+    exit 1
+fi
+
 out=$("$PY" scripts/lock_scope_audit.py . 2>&1); rc=$?
 if [ "$rc" -eq 0 ]; then
     echo "PASS: no unclassified private mutex held across a chainstate call"

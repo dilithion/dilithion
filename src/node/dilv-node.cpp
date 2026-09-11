@@ -2011,10 +2011,16 @@ std::optional<CBlockTemplate> BuildMiningTemplate(CBlockchainDB& blockchain, CWa
 // this from anywhere that does not hold cs_main and the tuples in
 // scripts/lock_scope_audit.py stop describing the truth while still matching.
 //
-// Also stated because the auditor cannot: RELOCATING this body, or adding
-// another chainstate call INSIDE it, keeps every allowlist key and therefore
-// passes BY DESIGN. The key names this function; it does not name these lines.
-// Interprocedural reachability is a review question, not a grep one.
+// F13 - what passes BY DESIGN, stated correctly (the first version of this note
+// was wrong). Adding another chainstate call inside this body does NOT pass: an
+// extra call of an allowed shape exceeds its expected count and fails, and a
+// call of a different shape is unclassified and fails. What genuinely passes is
+//   (1) MOVING these lines around WITHIN this function - the tuple is unchanged;
+//   (2) adding a CALLER that violates the cs_main precondition above - the
+//       auditor sees a call site's lock scope, never its callers.
+// (2) is the one that matters, and it is why the precondition is stated here
+// rather than left implicit: interprocedural reachability is a review question,
+// not a grep one.
 static void SettlePendingMinerWinsOnConnect(int height)
 {
     std::lock_guard<std::mutex> lock(g_pendingMinerWinsMutex);
