@@ -127,6 +127,52 @@ log_says_bad_launch() {
 }
 
 # ---------------------------------------------------------------------------
+# report_tightening_input <census> <hash_est> <node_hash> — the census floor's
+# missing half, reported not consumed.
+#
+# The committed floor is derived from the CLAMP alone: hash workers are in [1,8],
+# so from a census C the fixed remainder is at least C-8 and no healthy node can
+# print below (C-8)+1. That needs no assumption, which is why it shipped. A
+# TIGHTER floor needs the remainder EXACTLY — how many of the census are hash
+# workers — so the node is asked directly and the answer compared with ours.
+#
+# ⚠️ COMPARE AGAINST THE CLAMPED ESTIMATE, NOT RAW `nproc`. The node caps the pool
+# at 8 (headers_manager.cpp:3621-3623). Comparing a 16-core runner's raw nproc
+# against the node's 8 makes agreement IMPOSSIBLE BY CONSTRUCTION, and the leg
+# would print "nproc and hardware_concurrency do not see the same machine" — a
+# confident diagnosis of a cause that did not occur, while the tightening could
+# never be licensed on a larger runner. The clamp is ours to apply too.
+#
+# ⚠️ IT IS A FUNCTION BECAUSE THE SELF-TEST EXITS LONG BEFORE THE REAL RUN REACHES
+# HERE. Inline, this block was unreachable by the harness — and the first version
+# of it died with `count: unbound variable` on its own SUCCESS path, passing 18/18
+# while the real leg aborted. That is the untestable-branch lesson this file
+# already carries, reproduced one block lower by the commit claiming to apply it.
+# ---------------------------------------------------------------------------
+report_tightening_input() {
+    local census_count="$1" hash_est="$2" node_hash="$3" fixed
+    if [ -z "$node_hash" ]; then
+        # ⚠️ "COULD NOT MEASURE" MUST NOT READ AS "MEASURED AND FINE".
+        echo "  ⚠️ tightening input UNAVAILABLE this run: the node printed no"
+        echo "     \"[HeadersManager] N hash workers started\" line. Either --verbose"
+        echo "     stopped reaching g_verbose or that text changed. The floor stays at"
+        echo "     its clamp-derived value; do NOT tighten from nproc alone."
+        return 0
+    fi
+    if [ "$node_hash" = "$hash_est" ]; then
+        fixed=$((census_count - node_hash))
+        echo "  node reports $node_hash hash workers; our clamped estimate agrees"
+        echo "  => fixed remainder $fixed, so a floor of $((fixed + 1)) is derivable on THIS evidence"
+        return 0
+    fi
+    echo "  ⚠️ DISAGREEMENT, AND THIS IS THE FINDING: we estimated $hash_est hash"
+    echo "     workers (nproc, clamped as the node clamps), the node reports"
+    echo "     $node_hash. hardware_concurrency and nproc do not see the same machine"
+    echo "     here, so ANY floor derived from nproc would be wrong. Keep the"
+    echo "     clamp-derived floor."
+}
+
+# ---------------------------------------------------------------------------
 # hash_workers_from_log <logfile> — how many hash workers did the NODE say it
 # started? Empty when the line is absent, which the caller must treat as
 # "could not measure", never as agreement.
@@ -300,7 +346,10 @@ if [ "${1:-}" = "--self-test" ]; then
 
     # (8) the tightening input's three outcomes. ⚠️ The third -- "could not
     #     measure" -- is the one that must never resemble the first.
-    printf '[HeadersManager] Starting 4 hash worker threads (Phase 2)...
+    # ⚠️ THE TWO NUMBERS MUST DIFFER. With "Starting 4" and "4 started" a parser
+    #    reading the WRONG line also returns 4 and this case passes anyway --
+    #    it was vacuous, and case 2 was silently carrying all the discrimination.
+    printf '[HeadersManager] Starting 7 hash worker threads (Phase 2)...
 [HeadersManager] 4 hash workers started
 ' > "$tmp/hw.log"
     got="$(hash_workers_from_log "$tmp/hw.log")"
@@ -316,11 +365,49 @@ if [ "${1:-}" = "--self-test" ]; then
     got="$(hash_workers_from_log "$tmp/hw3.log")"
     [ -z "$got" ] && echo "  PASS  an absent line yields EMPTY (could-not-measure)"         || { echo "  FAIL  absent line yielded '$got'"; fails=$((fails+1)); }
 
+    # (9) the tightening REPORT itself. ⚠️ None of this was reachable by the
+    #     harness when it was inline: it sat ~50 lines past the self-test's exit,
+    #     and its agreement branch aborted the real leg with an unbound `count`
+    #     while 18/18 stayed green. A case per branch, plus the abort that was.
+    out="$(report_tightening_input 24 4 4)"
+    case "$out" in
+      *"fixed remainder 20"*|*"floor of 21"*)
+        echo "  PASS  agreement reports the exact remainder and derivable floor" ;;
+      *) echo "  FAIL  agreement branch: $out"; fails=$((fails+1)) ;;
+    esac
+
+    # ⚠️ THE REGRESSION TEST FOR B1: the agreement branch must not die under set -u.
+    if ( set -u; report_tightening_input 24 4 4 >/dev/null 2>&1 ); then
+        echo "  PASS  agreement branch survives set -u (no unbound census count)"
+    else
+        echo "  FAIL  agreement branch aborts under set -u"; fails=$((fails+1))
+    fi
+
+    out="$(report_tightening_input 24 4 '')"
+    case "$out" in
+      *UNAVAILABLE*) echo "  PASS  no node line reports UNAVAILABLE, not agreement" ;;
+      *) echo "  FAIL  empty node_hash branch: $out"; fails=$((fails+1)) ;;
+    esac
+
+    # ⚠️ B2: on a >8-core runner the node CLAMPS to 8. Comparing raw nproc would
+    #    make agreement impossible and blame a cgroup quota that did not occur.
+    out="$(report_tightening_input 24 8 8)"
+    case "$out" in
+      *"agrees"*) echo "  PASS  16-core runner: clamped estimate 8 agrees with the node" ;;
+      *) echo "  FAIL  clamp comparison: $out"; fails=$((fails+1)) ;;
+    esac
+
+    out="$(report_tightening_input 24 4 6)"
+    case "$out" in
+      *DISAGREEMENT*) echo "  PASS  a genuine mismatch is reported as the finding" ;;
+      *) echo "  FAIL  disagreement branch: $out"; fails=$((fails+1)) ;;
+    esac
+
     echo
     if [ "$fails" -ne 0 ]; then
         echo "===== node startup gate SELF-TEST: FAIL ($fails) ====="; exit 1
     fi
-    echo "===== node startup gate SELF-TEST: PASS (18 cases) ====="
+    echo "===== node startup gate SELF-TEST: PASS (23 cases) ====="
     exit 0
 fi
 
@@ -484,44 +571,6 @@ case "$hash_est" in ''|*[!0-9]*) hash_est=4 ;; esac
 [ "$hash_est" -gt 8 ] 2>/dev/null && hash_est=8
 echo "  runner: ${cores} cores -> hash pool ~${hash_est} of the census (nproc)"
 
-# ---------------------------------------------------------------------------
-# ⚠️ THE TIGHTENING INPUT. The committed floor (17) is derived from the CLAMP
-# alone -- hash workers are in [1,8], so from a census C the fixed remainder is
-# at least C-8 and no healthy node can print below (C-8)+1. That needs no
-# assumption and is why it shipped.
-#
-# A TIGHTER floor needs the fixed remainder EXACTLY, which means knowing how many
-# of the census are hash workers. `nproc` is a guess at that: it is what the
-# RUNNER reports, not what the NODE sees. Under cgroup quotas or CPU affinity the
-# two can differ, and if the node ever sees MORE cores than nproc reports, a floor
-# derived from nproc is too high and FAILS ON A HEALTHY TREE -- the defect this
-# leg has produced three times.
-#
-# So the node is asked directly, and the two are compared. Agreement pins the
-# remainder and licenses the tighter floor; DISAGREEMENT IS THE FINDING, not
-# noise, and the floor stays where it is.
-# ---------------------------------------------------------------------------
-node_hash="$(hash_workers_from_log "$log")"
-if [ -z "$node_hash" ]; then
-    # ⚠️ "COULD NOT MEASURE" MUST NOT READ AS "MEASURED AND FINE". This is not a
-    # failure of the tree -- the leg still did its job -- but it must not look
-    # like the agreement case, or a silent format change would freeze the
-    # tightening forever while appearing to progress.
-    echo "  ⚠️ tightening input UNAVAILABLE this run: the node printed no"
-    echo "     \"[HeadersManager] N hash workers started\" line. Either --verbose"
-    echo "     stopped reaching g_verbose or that text changed. The floor stays at"
-    echo "     its clamp-derived value; do NOT tighten from nproc alone."
-elif [ "$node_hash" = "$cores" ]; then
-    fixed=$((count - node_hash))
-    echo "  node reports $node_hash hash workers; nproc agrees -> fixed remainder $fixed"
-    echo "  => a floor of $((fixed + 1)) is derivable on THIS evidence (committed floor: ${expect_min:-unset})"
-else
-    echo "  ⚠️ DISAGREEMENT, AND THIS IS THE FINDING: nproc says $cores, the node"
-    echo "     reports $node_hash hash workers. hardware_concurrency and nproc do not"
-    echo "     see the same machine here (cgroup quota or CPU affinity), so ANY floor"
-    echo "     derived from nproc would be wrong. Keep the clamp-derived floor."
-fi
-
 # ⚠️ A CENSUS OF ZERO WOULD PASS THE GATE AND PROVE NOTHING. The gate is satisfied
 # when every DECLARED participant has checkpointed -- and zero declared participants
 # satisfy it vacuously. Assert a plausible floor so a regression that stops
@@ -537,6 +586,11 @@ if [ "$count" -lt 5 ]; then
     echo "     a tree that stopped DECLARING threads would look exactly like this."
     echo "===== node startup gate: FAIL (census too small) ====="; exit 1
 fi
+
+# ⚠️ CALLED HERE, AFTER `count` EXISTS. The first version called it ~50 lines
+# earlier, where `count` was still unassigned: under `set -u` the AGREEMENT branch
+# -- the one this feature exists to produce -- aborted the leg outright.
+report_tightening_input "$count" "$hash_est" "$(hash_workers_from_log "$log")"
 
 # ---------------------------------------------------------------------------
 # PARTIAL LOSS. The floor above catches zero and near-zero; it does NOT catch a
