@@ -39,9 +39,14 @@
 #include <net/headers_manager.h>
 
 #include <core/chainparams.h>
+#include <consensus/pow.h>
+#include <node/block_index.h>
+#include <crypto/randomx_hash.h>
 
 #include <cstdlib>
+#include <cstring>
 #include <iostream>
+#include <string>
 
 namespace {
 
@@ -84,40 +89,152 @@ Support SupportUnder(const Dilithion::ChainParams& params)
     return {supported, init_ok};
 }
 
-// THE DISCRIMINATING PAIR. Every VDF-from-genesis network must select the VDF
-// checker; the RandomX chain must not. Testnet and regtest are the arms that
-// were RED before the fix — under IsDilV() both returned false.
-void test_vdf_chains_select_the_vdf_checker()
+// ============================================================================
+// ⛔ ASK THE PRODUCER. DO NOT COPY ITS TABLE.
+// ============================================================================
+//
+// The first version of this suite hardcoded the answer per network — "DilV yes,
+// regtest yes, testnet no, mainnet no". Two external seats caught it (grok HIGH,
+// gpt6 MEDIUM) and they were right: `grep -c GetNextWorkRequired` in this file
+// was ZERO. A suite that COPIES the producer's set cannot detect that set
+// CHANGING — which is the very two-predicate drift this PR exists to close,
+// reproduced inside the test written to close it. A fifth network, or a change to
+// pow.cpp:1142-1146 in either direction, stayed green unless someone remembered
+// to edit the table in lockstep.
+//
+// So the expected value is DERIVED by calling GetNextWorkRequired itself.
+
+// Every network, from the ENUM rather than a hand-kept list of factory calls. The
+// switch carries NO `default:`, so adding a fifth Network fails the BUILD here
+// instead of silently going uncovered.
+Dilithion::ChainParams ParamsFor(Dilithion::Network n)
 {
-    std::cout << "  test_vdf_chains_select_the_vdf_checker..." << std::flush;
-
-    // The two networks where the PRODUCER emits a constant, which is the only
-    // condition under which the checker's nBits-equality rule is sound.
-    Check("DilV selects the VDF checker",
-          SelectsVdfCheckerUnder(Dilithion::ChainParams::DilV()));
-    Check("REGTEST selects the VDF checker (RED under IsDilV alone)",
-          SelectsVdfCheckerUnder(Dilithion::ChainParams::Regtest()));
-
-    // ⛔ TESTNET MUST **NOT** SELECT IT, and this arm exists because an earlier
-    // draft of this fix got it wrong. Testnet is VDF-from-genesis
-    // (IsVdfFromGenesis() == true) but the producer's constant branch is
-    // `IsDilV() || IsRegtest()` (pow.cpp:1142-1146), so testnet RETARGETS via
-    // ASERT and its honest headers carry non-genesis nBits. Handing it the VDF
-    // checker would apply an equality rule its own honest headers violate.
-    Check("TESTNET does NOT select the VDF checker (its producer RETARGETS)",
-          !SelectsVdfCheckerUnder(Dilithion::ChainParams::Testnet()));
-
-    std::cout << " done" << std::endl;
+    switch (n) {
+        case Dilithion::MAINNET: return Dilithion::ChainParams::Mainnet();
+        case Dilithion::TESTNET: return Dilithion::ChainParams::Testnet();
+        case Dilithion::DILV:    return Dilithion::ChainParams::DilV();
+        case Dilithion::REGTEST: return Dilithion::ChainParams::Regtest();
+    }
+    std::cerr << "  FAIL unlisted Network value — add it to ParamsFor" << std::endl;
+    std::abort();
 }
 
-// THE OTHER HALF, without which "always pick VDF" would pass everything above.
-// DIL is a RandomX chain and must keep the RandomX checker.
-void test_randomx_chain_keeps_the_randomx_checker()
-{
-    std::cout << "  test_randomx_chain_keeps_the_randomx_checker..." << std::flush;
+const Dilithion::Network kAllNetworks[] = {
+    Dilithion::MAINNET, Dilithion::TESTNET, Dilithion::DILV, Dilithion::REGTEST,
+};
+static_assert(sizeof(kAllNetworks) / sizeof(kAllNetworks[0]) == 4,
+              "A Network was added or removed. List it above; ParamsFor's switch "
+              "will not compile until the new value is handled.");
 
-    Check("DIL mainnet does NOT select the VDF checker",
-          !SelectsVdfCheckerUnder(Dilithion::ChainParams::Mainnet()));
+const char* NameOf(Dilithion::Network n)
+{
+    switch (n) {
+        case Dilithion::MAINNET: return "MAINNET";
+        case Dilithion::TESTNET: return "TESTNET";
+        case Dilithion::DILV:    return "DILV";
+        case Dilithion::REGTEST: return "REGTEST";
+    }
+    return "?";
+}
+
+// A difficulty that is NOT any network's genesisNBits (mainnet 0x1e01fffe;
+// testnet/DilV/regtest 0x1d00ffff). It is a plausible real value, so nothing here
+// depends on it being unusual.
+constexpr uint32_t kSentinelNBits = 0x1b0404cb;
+
+// Does the PRODUCER emit a constant nBits on this network? MEASURED by calling it.
+//
+// HOW THIS DISCRIMINATES — read out of pow.cpp, not assumed:
+//   * the constant branch (`IsDilV() || IsRegtest()`, pow.cpp:1142-1146) returns
+//     genesisNBits WITHOUT dereferencing pindexLast at all;
+//   * every retargeting path needs an ASERT anchor via
+//     `pindexLast->GetAncestor(...)`, which is nullptr for a lone index, and the
+//     documented fallback is `return pindexLast->header.nBits` — our sentinel.
+// A synthetic index carrying kSentinelNBits therefore separates the two exactly.
+//
+// The height must clear the LARGEST activation threshold in the tree: testnet's
+// asertActivationHeight is 999999999 (chainparams.cpp:402). Below it the code
+// falls through to the LEGACY retarget, which would compute a third value and
+// make this probe meaningless — so the height is deliberately past it.
+//
+// ⚠️ A retargeting network prints "[ASERT…] CRITICAL: Cannot find anchor block"
+// on stderr here. That is the documented fallback being exercised on purpose; it
+// is not a failure.
+bool ProducerEmitsConstantNBits(const Dilithion::ChainParams& params, const char* name)
+{
+    Dilithion::ChainParams* saved = Dilithion::g_chainParams;
+    Dilithion::g_chainParams = new Dilithion::ChainParams(params);
+
+    CBlockIndex idx;
+    idx.pprev = nullptr;
+    idx.pnext = nullptr;
+    idx.pskip = nullptr;
+    idx.nHeight = 1500000000;          // clears every activation height in the tree
+    idx.header.nBits = kSentinelNBits;
+    idx.nBits = kSentinelNBits;
+
+    const uint32_t genesis = Dilithion::g_chainParams->genesisNBits;
+    const uint32_t got = GetNextWorkRequired(&idx, /*nBlockTime=*/0);
+
+    delete Dilithion::g_chainParams;
+    Dilithion::g_chainParams = saved;
+
+    // ⛔ FAIL LOUDLY RATHER THAN MIS-CLASSIFY. If the producer returns a THIRD
+    // value this function cannot tell constant from retargeting, and treating
+    // "not genesis" as "retargeting" would be a guess dressed as a measurement.
+    if (got != genesis && got != kSentinelNBits) {
+        std::cerr << "  FAIL " << name << ": GetNextWorkRequired returned 0x"
+                  << std::hex << got << " — neither genesisNBits (0x" << genesis
+                  << ") nor the sentinel (0x" << kSentinelNBits << std::dec
+                  << "). This probe can no longer classify the producer; fix the "
+                     "probe, do not reinterpret its result." << std::endl;
+        ++g_failures;
+    }
+    return got == genesis;
+}
+
+// THE ARM THAT REPLACED THE COPIED TABLE. For EVERY network: the checker the
+// manager builds must agree with what the PRODUCER actually does, and the gate's
+// refusal must be derived from that same bit.
+//
+// Nothing here names which networks are constant. If pow.cpp:1142-1146 gains or
+// loses a network, this arm follows it and the CHECKER is what goes red — which
+// is the drift the seats flagged and the drift this PR is about.
+void test_selection_and_refusal_match_the_producer_on_every_network()
+{
+    std::cout << "  test_selection_and_refusal_match_the_producer_on_every_network..." << std::flush;
+
+    int constant_producers = 0, retargeting_producers = 0, refused = 0;
+
+    for (Dilithion::Network n : kAllNetworks) {
+        const Dilithion::ChainParams params = ParamsFor(n);
+        const std::string name = NameOf(n);
+        const bool producer_constant = ProducerEmitsConstantNBits(params, name.c_str());
+        producer_constant ? ++constant_producers : ++retargeting_producers;
+
+        // (1) The checker must mirror the producer, not a table.
+        Check((name + ": VDF checker selected IFF the producer emits a constant").c_str(),
+              SelectsVdfCheckerUnder(params) == producer_constant);
+
+        // (2) The gate's refusal, derived from that same bit. A network that is
+        // VDF-from-genesis but whose producer RETARGETS has no correct checker and
+        // must be refused; every other network must be accepted.
+        const bool expect_supported = !(params.IsVdfFromGenesis() && !producer_constant);
+        const Support sup = SupportUnder(params);
+        Check((name + ": ProofCheckerSupportsNetwork matches the producer").c_str(),
+              sup.supported == expect_supported);
+        Check((name + ": the GATE accepts iff supported").c_str(),
+              sup.init_accepted == expect_supported);
+        if (!expect_supported) ++refused;
+    }
+
+    // NON-VACUITY. Without these the loop passes when every network answers the
+    // same way — which is what "always pick VDF", "never pick VDF" and "refuse
+    // everything" all look like from inside the loop.
+    Check("at least one network's producer emits a CONSTANT", constant_producers >= 1);
+    Check("at least one network's producer RETARGETS", retargeting_producers >= 1);
+    Check("at least one network is REFUSED (VDF-from-genesis yet retargeting)", refused >= 1);
+    Check("not every network is refused", refused < 4);
 
     std::cout << " done" << std::endl;
 }
@@ -188,11 +305,26 @@ void test_testnet_is_refused_rather_than_given_a_wrong_checker()
 
 int main()
 {
+    // ⚠️ RandomX MUST be initialised, and WITH THE PRODUCTION KEY. This suite
+    // constructs a CHeadersManager under MAINNET, whose path reaches
+    // GetGenesisHash(), which RECOMPUTES the RandomX genesis hash and compares it
+    // to the value pinned in chainparams.
+    //
+    // Both failure modes were measured here, and the second one is the useful one:
+    //   * no init at all           -> throws "RandomX VM not initialized";
+    //   * init with an ARBITRARY key -> the recompute mismatches the pin and
+    //     GetGenesisHash REFUSES TO RUN ("substituted consensus values"). That
+    //     guard is doing exactly its job — a test that invented its own key was
+    //     asking the node to validate against consensus values it had changed.
+    // So the key is the production one, the same string genesis_test.cpp:96 mines
+    // with. Light mode: one genesis hash does not justify full mode's ~2.5 GB.
+    const char* rx_key = "Dilithion-RandomX-v1";
+    randomx_init_for_hashing(rx_key, strlen(rx_key), 1 /* light mode */);
+
     std::cout << "proof_checker_selection_tests" << std::endl;
 
     test_the_two_predicates_really_disagree();
-    test_vdf_chains_select_the_vdf_checker();
-    test_randomx_chain_keeps_the_randomx_checker();
+    test_selection_and_refusal_match_the_producer_on_every_network();
     test_testnet_is_refused_rather_than_given_a_wrong_checker();
 
     if (g_failures != 0) {
