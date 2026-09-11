@@ -107,9 +107,10 @@ static uint32_t FileVersion(const std::string& path) {
 // Derive the master seed+chaincode the wallet stores from a mnemonic.
 static bool DeriveSeedChaincode(const std::string& mnemonic,
                                 std::vector<uint8_t>& seedOut,
-                                std::vector<uint8_t>& chaincodeOut) {
+                                std::vector<uint8_t>& chaincodeOut,
+                                const std::string& bip39Passphrase = "") {
     uint8_t bip39seed[64];
-    if (!CMnemonic::ToSeed(mnemonic, "", bip39seed)) return false;
+    if (!CMnemonic::ToSeed(mnemonic, bip39Passphrase, bip39seed)) return false;
     CHDExtendedKey master;
     DeriveMaster(bip39seed, master);
     memory_cleanse(bip39seed, 64);
@@ -293,7 +294,20 @@ static bool BuildLegacyV6Wallet(const std::string& path,
                                 // and the master-key FALLBACK arm (wallet.cpp ~5747)
                                 // recovers the plaintext — exercising the fallback arm's
                                 // path into the identity guard. Default false ⇒ Step-1.
-                                bool encryptMnemonicUnderMasterKey = false) {
+                                bool encryptMnemonicUnderMasterKey = false,
+                                // The wallet's seed is derived from the mnemonic AND
+                                // this passphrase, so MnemonicReDerivesSeed(m, "")
+                                // FAILS, the v7 migration DEFERS, and the wallet is
+                                // left in exactly the state the export branch under
+                                // test selects on: flag armed, mnemonic MAC empty,
+                                // file still v6. Default "" => today's behaviour.
+                                const std::string& bip39Passphrase = "",
+                                // Replace the mnemonic slot with a ciphertext
+                                // CONSTRUCTED so the obfuscation decrypt FAILS and the
+                                // MASTER-key decrypt spuriously ACCEPTS (AES-CBC +
+                                // PKCS#7 unpadding cleanly by chance, 0.3825%
+                                // measured). Requires the master-key variant.
+                                bool forceMasterKeySpuriousAcceptance = false) {
     // --- 1. Use a real CWallet to mint a consistent HD wallet, then read out the
     //        pieces we need (mnemonic, seed, chaincode, default address). ---
     std::string scratch = path + ".scratch";
@@ -315,12 +329,12 @@ static bool BuildLegacyV6Wallet(const std::string& path,
     std::remove(scratch.c_str());
 
     std::vector<uint8_t> seed, chaincode;
-    if (!DeriveSeedChaincode(mnemonic, seed, chaincode)) return false;
+    if (!DeriveSeedChaincode(mnemonic, seed, chaincode, bip39Passphrase)) return false;
 
     CHDExtendedKey master;
     {
         uint8_t bip39seed[64];
-        if (!CMnemonic::ToSeed(mnemonic, "", bip39seed)) return false;
+        if (!CMnemonic::ToSeed(mnemonic, bip39Passphrase, bip39seed)) return false;
         DeriveMaster(bip39seed, master);
         memory_cleanse(bip39seed, 64);
     }
@@ -371,6 +385,53 @@ static bool BuildLegacyV6Wallet(const std::string& path,
     std::vector<uint8_t> mnemonicBytes(mnSource.begin(), mnSource.end());
     std::vector<uint8_t> mnCipher;
     if (!mnCrypter.Encrypt(mnemonicBytes, mnCipher)) return false;
+
+    if (forceMasterKeySpuriousAcceptance) {
+        // CONSTRUCT the precondition rather than wait for it. We need a mnemonic
+        // slot on which:
+        //   (a) the OBFUSCATION decrypt FAILS      -- so criterion 1 falls through;
+        //   (b) the MASTER-key decrypt SUCCEEDS    -- yielding garbage, which only
+        //       criterion 2's Validate gate can then refuse.
+        // (a) is the overwhelmingly likely outcome for a ciphertext not produced with
+        // that key; (b) is the 0.3825% event, so this searches for it. Expected ~255
+        // tries, bounded ~780x that, and a MISS FAILS THE FIXTURE BUILD rather than
+        // quietly yielding an ordinary wallet that would make the test green while
+        // proving nothing.
+        if (!encryptMnemonicUnderMasterKey) return false;  // obfKey must BE the master key
+
+        std::vector<uint8_t> arm1Key(WALLET_CRYPTO_KEY_SIZE);
+        {
+            std::vector<uint8_t> hdSeed(master.seed, master.seed + 32);
+            DeriveEncryptionKey(hdSeed, "mnemonic", arm1Key);
+            memory_cleanse(hdSeed.data(), hdSeed.size());
+        }
+
+        const int kMaxSearch = 200000;
+        bool forced = false;
+        std::vector<uint8_t> candidateCt(mnCipher.size());
+        for (int attempt = 0; attempt < kMaxSearch && !forced; ++attempt) {
+            if (!GetStrongRandBytes(candidateCt.data(), candidateCt.size())) return false;
+
+            CCrypter obfProbe;
+            std::vector<uint8_t> obfOut;
+            const bool obfAccepts = obfProbe.SetKey(arm1Key, mnIV) &&
+                                    obfProbe.Decrypt(candidateCt, obfOut);
+            if (!obfOut.empty()) memory_cleanse(obfOut.data(), obfOut.size());
+            if (obfAccepts) continue;   // (a) must FAIL
+
+            CCrypter mkProbe;
+            std::vector<uint8_t> mkOut;
+            const bool mkAccepts = mkProbe.SetKey(obfKey, mnIV) &&
+                                   mkProbe.Decrypt(candidateCt, mkOut);
+            const bool notBip39 =
+                mkAccepts && !CMnemonic::Validate(std::string(mkOut.begin(), mkOut.end()));
+            if (!mkOut.empty()) memory_cleanse(mkOut.data(), mkOut.size());
+            if (notBip39) forced = true;   // (b)
+        }
+        memory_cleanse(arm1Key.data(), arm1Key.size());
+        if (!forced) return false;
+        mnCipher = candidateCt;
+    }
 
     // --- 4. Assemble the body (everything after the [Salt]). ---
     std::vector<uint8_t> hmacSalt(WALLET_FILE_SALT_SIZE);  // 32 bytes (NOT the 16-byte IV size)
@@ -2715,6 +2776,130 @@ static void Test_F1_AbortOnValidButWrongMnemonic() {
 //       byte-for-byte preserved at v6. Proves the identity guard catches a wrong
 //       phrase recovered through the fallback arm too (not only Step-1).
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// WALLET-EXPORTMNEMONIC-ARM-SELECTED-BY-A-FLAG — exportmnemonic picks its decrypt
+// arm by a FLAG and cannot fall through to the arm that would work.
+//
+// THE DEFECT. `CWallet::DecryptMnemonic` branches on
+// `m_migrationDeferredPassphrase && vchMnemonicMAC.empty()`, derives the
+// OBFUSCATION key, and returns false if that decrypt fails OR if the result is
+// not syntactically BIP39 — with no path to the master-key arm thirty lines
+// below. And the flag is NOT passphrase-specific: it is armed on
+// `mnMacLen == 0 && masterKey.IsValid()`, i.e. EVERY legacy v3–v6 encrypted HD
+// wallet, because legacy wallets never carried a mnemonic MAC.
+//
+// So for a wallet whose mnemonic sits under the MASTER key and which also uses a
+// BIP39 passphrase the operator has not supplied: migration correctly defers, the
+// flag stays armed, the MAC stays empty, the file stays v6 — and exportmnemonic
+// is PERMANENTLY false although the phrase is recoverable one arm down.
+//
+// It returns an ERROR, never a wrong phrase. The user cannot READ their backup
+// phrase; they are never handed garbage to write down. That is the line between an
+// availability defect on a backup path and a fund-loss defect.
+// ---------------------------------------------------------------------------
+static const char* kExportPP = "TREZOR";
+
+static void Test_ExportMnemonic_MasterKeyArmIsUnreachable() {
+    std::cout << COLOR_BLUE "\n[Test 2e-6] exportmnemonic: the master-key arm must be reachable\n" COLOR_RESET;
+
+    const std::string path = "export_masterkey_arm.dat";
+    const std::string pass = "ExportArm!2026";
+    std::remove(path.c_str());
+
+    LegacyV6Result legacy;
+    const bool built = BuildLegacyV6Wallet(path, pass, legacy,
+                                           /*mnemonicPlaintextOverride=*/"",
+                                           /*encryptMnemonicUnderMasterKey=*/true,
+                                           /*bip39Passphrase=*/kExportPP);
+    CHECK(built, "Built a legacy v6 wallet: mnemonic under the MASTER key, seed derived "
+                 "WITH a BIP39 passphrase");
+    if (!built) { std::remove(path.c_str()); return; }
+
+    CWallet w;
+    w.SetWalletFile(path);  // autosave on
+    CHECK(w.Load(path), "Loaded the legacy wallet");
+    CHECK(w.Unlock(pass), "Unlock succeeds (migration defers — no BIP39 passphrase supplied)");
+
+    // PRECONDITIONS, asserted rather than assumed. If any of these is false the
+    // export assertion below proves nothing about the branch under test.
+    CHECK(FileVersion(path) == WALLET_FILE_VERSION_6,
+          "PRECONDITION: file is still v6 (migration deferred, not committed)");
+    CHECK(w.MigrationDeferredForPassphrase(),
+          "PRECONDITION: m_migrationDeferredPassphrase is ARMED — the flag that selects "
+          "the obfuscation arm");
+
+    std::string exported;
+    const bool ok = w.ExportMnemonic(exported);
+
+    CHECK(ok, "LOAD-BEARING: exportmnemonic SUCCEEDS — the master-key arm is reached "
+              "after the obfuscation arm fails (pre-fix: permanently false)");
+    CHECK(exported == legacy.mnemonic,
+          "LOAD-BEARING: and it returns the CORRECT phrase, not a different one");
+
+    std::remove(path.c_str());
+}
+
+// ---------------------------------------------------------------------------
+// CRITERION 2 IS LOAD-BEARING — and this is the test that proves it.
+//
+// READ THIS BEFORE ASSUMING IT IS A RED-ON-MAIN ARM: IT IS NOT. It passes on main
+// (the obfuscation decrypt fails, export returns false) and it passes after the
+// complete fix (the master arm's Validate gate refuses the garbage). It fails on
+// exactly ONE tree: the one where criterion 1 was applied and criterion 2 was
+// forgotten — which is the tree a careless version of this fix would produce.
+//
+// WHY THAT TREE IS DANGEROUS. `VerifyRecordMAC` returns `!isV7` when the MAC is
+// empty, so on a v6 wallet an empty mnemonic MAC PASSES it — and the master-key
+// arm then assigns straight to the caller's output with no syntactic check at all.
+// Falling through without adding a gate therefore hands back garbage whenever the
+// master-key decrypt happens to unpad cleanly (0.3825%, measured), reopening the
+// shipped HIGH-1 guarantee that export refuses a tampered phrase.
+//
+// The fixture CONSTRUCTS that 0.3825% event rather than waiting for it, and fails
+// to build if it cannot — so this test can never pass vacuously.
+// ---------------------------------------------------------------------------
+static void Test_ExportMnemonic_FallThroughMustStillValidate() {
+    std::cout << COLOR_BLUE "\n[Test 2e-7] exportmnemonic: the fall-through must NOT hand back garbage\n" COLOR_RESET;
+
+    const std::string path = "export_fallthrough_garbage.dat";
+    const std::string pass = "ExportGarbage!2026";
+    std::remove(path.c_str());
+
+    LegacyV6Result legacy;
+    const bool built = BuildLegacyV6Wallet(path, pass, legacy,
+                                           /*mnemonicPlaintextOverride=*/"",
+                                           /*encryptMnemonicUnderMasterKey=*/true,
+                                           /*bip39Passphrase=*/kExportPP,
+                                           /*forceMasterKeySpuriousAcceptance=*/true);
+    CHECK(built,
+          "PRECONDITION: constructed a mnemonic slot where the OBFUSCATION decrypt FAILS "
+          "and the MASTER-key decrypt SPURIOUSLY ACCEPTS non-BIP39 garbage");
+    if (!built) { std::remove(path.c_str()); return; }
+
+    CWallet w;
+    w.SetWalletFile(path);
+    CHECK(w.Load(path), "Loaded the constructed wallet");
+    CHECK(w.Unlock(pass), "Unlock succeeds (migration defers — recovered bytes do not verify)");
+    CHECK(FileVersion(path) == WALLET_FILE_VERSION_6,
+          "PRECONDITION: file is still v6 — which is what makes the empty MAC PASS "
+          "VerifyRecordMAC and puts the unguarded assignment in reach");
+    CHECK(w.MigrationDeferredForPassphrase(),
+          "PRECONDITION: the arm-selecting flag is ARMED");
+
+    std::string exported;
+    const bool ok = w.ExportMnemonic(exported);
+
+    CHECK(!ok,
+          "LOAD-BEARING (criterion 2): export REFUSES — the fall-through reached the "
+          "master-key arm, which accepted garbage, and the Validate gate rejected it");
+    CHECK(exported.empty(),
+          "LOAD-BEARING: no garbage was written into the caller's output buffer");
+    CHECK(exported != legacy.mnemonic,
+          "Sanity: the real phrase was never recoverable from this constructed slot anyway");
+
+    std::remove(path.c_str());
+}
+
 static void Test_F1_MasterKeyFallbackArm() {
     std::cout << COLOR_BLUE "\n[Test 2e-3] F1 FOLD (LOW-3): master-key fallback decrypt arm reaches the identity guard\n" COLOR_RESET;
 
@@ -3394,6 +3579,8 @@ int main() {
     Test_Migration();
     Test_F1_AbortOnInvalidMnemonic();
     Test_F1_AbortOnValidButWrongMnemonic();          // MED-1: valid-but-wrong, migration path
+    Test_ExportMnemonic_MasterKeyArmIsUnreachable();   // arm selected by a flag, no fall-through
+    Test_ExportMnemonic_FallThroughMustStillValidate();  // the fall-through must still Validate
     Test_F1_MasterKeyFallbackArm();                  // LOW-3: master-key fallback decrypt arm
     Test_F1_ValidMnemonicStillMigrates();
     Test_NeedsSeedMigrationSurfaced();

@@ -6437,25 +6437,43 @@ bool CWallet::DecryptMnemonic(std::string& mnemonic) const {
             // Use the LIVE seed (via DecryptHDMasterKey) — in the deferred state the seed
             // is encrypted at rest, so hdMasterKey.seed is scrubbed; the obfuscation key
             // must be derived from the decrypted cache / ciphertext.
-            CHDExtendedKey live;
-            if (!DecryptHDMasterKey(live)) {
-                return false;
-            }
-            std::vector<uint8_t> obfKey(WALLET_CRYPTO_KEY_SIZE);
-            std::vector<uint8_t> hdSeed(live.seed, live.seed + 32);
-            DeriveEncryptionKey(hdSeed, "mnemonic", obfKey);
-            memory_cleanse(hdSeed.data(), hdSeed.size());
-            live.Wipe();
+            //
+            // CRITERION 1 (WALLET-EXPORTMNEMONIC-ARM-SELECTED-BY-A-FLAG): this arm is
+            // an ATTEMPT, not a commitment. Every way it can fail now FALLS THROUGH to
+            // the master-key arm below instead of returning false.
+            //
+            // It previously returned false on all three: the seed being unavailable,
+            // the decrypt failing, and the result not being BIP39. That stranded a real
+            // cohort -- the flag is armed on `mnMacLen == 0 && masterKey.IsValid()`,
+            // i.e. EVERY legacy v3-v6 encrypted HD wallet, not only passphrase ones, so
+            // a wallet whose mnemonic sits under the MASTER key and which also uses a
+            // BIP39 passphrase could never export its phrase at all, though the arm
+            // below would have recovered it.
+            //
+            // Behaviour is unchanged for every wallet this arm already serves: it is
+            // still tried FIRST, and a result that passes Validate still returns here
+            // without the master-key arm running.
+            bool obfArmProducedAPhrase = false;
+            std::string candidate;
 
-            CCrypter obfCrypter;
-            bool ok = obfCrypter.SetKey(obfKey, vchMnemonicIV) &&
-                      obfCrypter.Decrypt(vchEncryptedMnemonic, decrypted);
-            memory_cleanse(obfKey.data(), obfKey.size());
-            if (!ok) {
-                return false;
+            CHDExtendedKey live;
+            if (DecryptHDMasterKey(live)) {
+                std::vector<uint8_t> obfKey(WALLET_CRYPTO_KEY_SIZE);
+                std::vector<uint8_t> hdSeed(live.seed, live.seed + 32);
+                DeriveEncryptionKey(hdSeed, "mnemonic", obfKey);
+                memory_cleanse(hdSeed.data(), hdSeed.size());
+                live.Wipe();
+
+                CCrypter obfCrypter;
+                const bool ok = obfCrypter.SetKey(obfKey, vchMnemonicIV) &&
+                                obfCrypter.Decrypt(vchEncryptedMnemonic, decrypted);
+                memory_cleanse(obfKey.data(), obfKey.size());
+                if (ok) {
+                    candidate.assign(decrypted.begin(), decrypted.end());
+                    memory_cleanse(decrypted.data(), decrypted.size());
+                    obfArmProducedAPhrase = true;
+                }
             }
-            std::string candidate(decrypted.begin(), decrypted.end());
-            memory_cleanse(decrypted.data(), decrypted.size());
             // LP-7 (F1 round 4, red-team HIGH-1 / extreview BLOCKER): the deferred
             // obfuscation-key branch has NO per-record MAC (empty by construction in
             // this window), so a tampered/corrupt vchEncryptedMnemonic that happens to
@@ -6470,13 +6488,21 @@ bool CWallet::DecryptMnemonic(std::string& mnemonic) const {
             // empty-passphrase identity check would WRONGLY refuse legit passphrase-wallet
             // exports (the exact cohort round-3 fixed). Validate catches tamper/corruption
             // without needing the passphrase.
-            if (!CMnemonic::Validate(candidate)) {
-                memory_cleanse(candidate.data(), candidate.size());
-                return false;
+            if (obfArmProducedAPhrase) {
+                if (CMnemonic::Validate(candidate)) {
+                    mnemonic = candidate;
+                    memory_cleanse(&candidate[0], candidate.size());
+                    memory_cleanse(vMasterKeyVec.data(), vMasterKeyVec.size());
+                    return true;
+                }
+                // Decrypted, but not a phrase. Under criterion 1 that is no longer the
+                // end of the attempt -- fall through and let the master-key arm try,
+                // where the SAME syntactic gate applies (criterion 2, below).
+                if (!candidate.empty()) {
+                    memory_cleanse(&candidate[0], candidate.size());
+                }
             }
-            mnemonic = candidate;
-            memory_cleanse(candidate.data(), candidate.size());
-            return true;
+            // FALL THROUGH to the master-key arm.
         }
 
         // LP-7 (HIGH-2): authenticate-before-decrypt via the ONE centralized gate.
@@ -6491,6 +6517,39 @@ bool CWallet::DecryptMnemonic(std::string& mnemonic) const {
         if (!crypter.Decrypt(vchEncryptedMnemonic, decrypted)) {
             memory_cleanse(vMasterKeyVec.data(), vMasterKeyVec.size());
             return false;
+        }
+
+        // CRITERION 2, AND IT IS LOAD-BEARING RATHER THAN DEFENSIVE DECORATION.
+        //
+        // VerifyRecordMAC returns `!isV7` when the MAC is EMPTY, so on a v6 wallet an
+        // empty mnemonic MAC PASSES it and this decrypt is UNAUTHENTICATED. Without a
+        // syntactic gate, criterion 1's new fall-through would hand back whatever a
+        // wrong-key decrypt happened to unpad to -- AES-CBC + PKCS#7 accepts a wrong
+        // key whenever the trailing bytes form valid padding, measured at 0.3825% --
+        // and that would reopen the HIGH-1 guarantee that export refuses a tampered
+        // phrase. Test 2e-7 constructs exactly that event and fails without this gate.
+        //
+        // Gated on the record being UNAUTHENTICATED rather than on how we arrived
+        // here. An empty MAC is the condition that makes the bytes untrusted, and it is
+        // also true for a v6 wallet that reached this arm WITHOUT the deferred branch --
+        // a pre-existing case this therefore also covers. A record with a MAC has been
+        // verified by VerifyRecordMAC above and needs nothing further.
+        //
+        // Validate, NOT MnemonicReDerivesSeed("") -- a legitimate BIP39-passphrase
+        // wallet's real mnemonic does not re-derive the seed under an empty passphrase,
+        // and an identity check here would wrongly refuse exactly the cohort this whole
+        // change exists to serve.
+        if (vchMnemonicMAC.empty()) {
+            std::string unauthenticated(decrypted.begin(), decrypted.end());
+            const bool syntactic = CMnemonic::Validate(unauthenticated);
+            if (!unauthenticated.empty()) {
+                memory_cleanse(&unauthenticated[0], unauthenticated.size());
+            }
+            if (!syntactic) {
+                memory_cleanse(decrypted.data(), decrypted.size());
+                memory_cleanse(vMasterKeyVec.data(), vMasterKeyVec.size());
+                return false;
+            }
         }
 
         memory_cleanse(vMasterKeyVec.data(), vMasterKeyVec.size());
