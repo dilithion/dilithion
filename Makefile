@@ -520,6 +520,12 @@ check-participant-waits:
 	@bash scripts/check_participant_waits.sh --self-test
 	@bash scripts/check_participant_waits.sh
 
+# Pins the CALLER of the socket timeouts, which no unit test can reach without a
+# live server. See the script header for why a mutation arm was tried and discarded.
+check-http-socket-timeouts:
+	@bash scripts/check_http_socket_timeouts.sh --self-test
+	@bash scripts/check_http_socket_timeouts.sh
+
 # P2P-14/15 TSan lock-inversion gate — MANUAL, Linux-only, ~4 min.
 #
 # Deliberately NOT a prerequisite of tests-fast/tests-full, and that is stated
@@ -665,7 +671,7 @@ endif
 # `make dilithion-node` runs earlier in that job and drags libzmq in.
 $(TEST_SUITES_ALL): | libzmq
 
-.PHONY: tests tests-build tests-fast tests-full check-thread-local-guard check-participant-waits
+.PHONY: tests tests-build tests-fast tests-full check-thread-local-guard check-participant-waits check-http-socket-timeouts
 
 # A-010 review LOW (a8, 2026-09-08): scripts/census_test_mains.sh had ZERO
 # callers -- an orphaned script inside the change that registers orphaned
@@ -690,7 +696,7 @@ tests: tests-build
 # wired into the target CI actually runs because a guard with zero callers is
 # not a guard — it is a file. It runs FIRST: it is a sub-second grep, and if the
 # drain invariant is broken there is no point running the suites.
-tests-fast: check-tip-notify-drain check-headers-manager-pointer check-thread-local-guard check-participant-waits $(TEST_SUITES_FAST)
+tests-fast: check-tip-notify-drain check-headers-manager-pointer check-thread-local-guard check-participant-waits check-http-socket-timeouts $(TEST_SUITES_FAST)
 	@bash scripts/check_roster_completeness.sh
 	@bash scripts/test_run_with_hang_capture.sh
 	@bash scripts/test_run_test_suites_timeout.sh
@@ -698,7 +704,7 @@ tests-fast: check-tip-notify-drain check-headers-manager-pointer check-thread-lo
 	@bash scripts/test_run_test_suites_args.sh
 	@bash scripts/run_test_suites.sh fast
 
-tests-full: check-tip-notify-drain check-headers-manager-pointer check-thread-local-guard check-participant-waits $(TEST_SUITES_FULL)
+tests-full: check-tip-notify-drain check-headers-manager-pointer check-thread-local-guard check-participant-waits check-http-socket-timeouts $(TEST_SUITES_FULL)
 	@bash scripts/run_test_suites.sh full
 
 phase1_test: $(CORE_OBJECTS) $(OBJ_DIR)/test/phase1_simple_test.o $(DILITHIUM_OBJECTS) $(CHIAVDF_OBJECTS)

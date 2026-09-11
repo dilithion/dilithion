@@ -183,6 +183,23 @@ jobs:
         bash scripts/check_thread_local_guard.sh
         bash scripts/check_participant_waits.sh --self-test
         bash scripts/check_participant_waits.sh
+        bash scripts/check_http_socket_timeouts.sh --self-test
+        bash scripts/check_http_socket_timeouts.sh
+
+    - name: Graveyard drain-cost observation (report-only)
+      run: |
+        # ⚠️ REPORT-ONLY BY DESIGN, and the script header says why at length: a
+        # fixed millisecond gate on a shared runner would fire on noise (measured
+        # 3.4 / 10.7 / 3.6 ms across three identical local runs). What this leg
+        # buys is that F59's operating limit -- "the bench is the gate" -- is a
+        # thing that HAPPENS rather than a thing that was written down.
+        #
+        # DrainGraveyard is O(slots) and slots accrue per thread that ever
+        # participated, so at ~5,760 slots/day the 50 ms redesign threshold is six
+        # to eight weeks of continuous mining away. A number nobody looks at would
+        # decay exactly as fast as the quantity it describes.
+        make graveyard_occupancy_bench -j$(nproc)
+        bash scripts/run_graveyard_bench_ci.sh
 
     - name: Wallet-preservation guard regression
       run: |

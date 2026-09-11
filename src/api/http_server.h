@@ -256,13 +256,17 @@ public:
 
     /**
      * Apply SO_RCVTIMEO and SO_SNDTIMEO to an accepted client socket.
-     * Returns true if BOTH were accepted by the OS. Failure is non-fatal at the
-     * call site (an unbounded socket still works), but the arm asserts success so
-     * a silent regression to "no timeouts" is a RED rather than a shrug.
+     * Returns true if BOTH were accepted by the OS.
+     *
+     * ⚠️ FAILURE IS NOT SURVIVABLE FOR THAT CONNECTION (round-9 F56). This doc
+     * used to say failure was "non-fatal at the call site" -- true when AcceptThread
+     * discarded the result, and that discard is exactly what silently restored the
+     * unbounded pin on a socket whose send sites claim a 10 s bound. AcceptThread
+     * now REJECTS a socket that will not take the options, and
+     * scripts/check_http_socket_timeouts.sh fails if that rejection is removed.
      */
     static bool ApplyClientSocketTimeouts(SOCKET client_socket);
 
-private:
 private:
     /**
      * Accept thread main loop

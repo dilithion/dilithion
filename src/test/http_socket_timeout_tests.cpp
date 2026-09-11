@@ -131,6 +131,23 @@ int main()
         "value; change one and you must change the other)",
         CHttpServer::CLIENT_SOCKET_TIMEOUT_MS == 10000);
 
+    // ⚠️ THE WIRING IS NOT TESTABLE FROM HERE, AND I AM NOT GOING TO PRETEND IT IS
+    // (round-9 F56). Everything above tests ApplyClientSocketTimeouts in isolation:
+    // it stays green if AcceptThread stops calling it -- the "a test that calls the
+    // mechanism proves the mechanism, not that anything invokes it" failure this
+    // branch has already shipped twice (nothing called DrainGraveyard; nothing
+    // created the slot). Reaching AcceptThread needs a live server.
+    //
+    // My first attempt at closing that was a `chk(..., true)` saying the caller
+    // exists -- an assertion that cannot fail, i.e. the vacuous-assertion defect
+    // this PR keeps finding, written by me into the arm that exists to prevent its
+    // cousin. Deleted rather than softened.
+    //
+    // The caller is pinned instead by scripts/check_http_socket_timeouts.sh, a
+    // structural guard in the same family as check-tip-notify-drain: it asserts
+    // AcceptThread calls the helper AND rejects the socket when it fails. That can
+    // actually fail, which is the whole difference.
+
     closesocket(s);
 #ifdef _WIN32
     WSACleanup();

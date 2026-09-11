@@ -241,6 +241,39 @@ io.open(p,'w',encoding='utf-8',newline='').write(s)
 assert 'MUTANT F33' in io.open(p,encoding='utf-8').read()
 print('MUTATED')
 " "F33: an offline resolve RE-RECORDS the accusation, and COUNTS it (0 -> +1)"
+arm "F55 - the epoch stamp made PRE-increment (equality would then be a UAF)" "
+import io
+p='$CHAIN'; s=io.open(p,encoding='utf-8').read()
+old='m_globalEpoch.fetch_add(1, std::memory_order_acq_rel) + 1});'
+assert s.count(old)==1, ('anchor',s.count(old))
+s=s.replace(old,'m_globalEpoch.fetch_add(1, std::memory_order_acq_rel)});  /* MUTANT F55 */',1)
+io.open(p,'w',encoding='utf-8',newline='').write(s)
+assert 'MUTANT F55' in io.open(p,encoding='utf-8').read()
+print('MUTATED')
+" "gating: a drain frees nothing while this thread has not passed the epoch"
+# ⚠️ NO "F56-caller" ARM HERE, AND THE REASON IS WORTH MORE THAN THE ARM WOULD BE.
+# I wrote one: mutate AcceptThread to stop applying the socket timeouts, expect the
+# suite to die. It would have SURVIVED -- this harness builds and runs
+# deferred_reclamation_tests, which never touches CHttpServer, so the mutation is
+# invisible to the thing being measured. A mutant that survives because the harness
+# cannot observe it is not evidence of anything, and shipping it would have put a
+# green row in the table for a check that does not exist.
+# The caller is pinned by scripts/check_http_socket_timeouts.sh instead -- a
+# structural guard that reads the source, in the same family as
+# check-tip-notify-drain. See F56.
+
+# ⚠️ THIS ARM EXISTS BECAUSE TWO PANELS, NINE ROUNDS APART, CALLED THE SAME
+# CORRECT COMPARATOR A BLOCKER. Round 1 and round 9 both read
+# `unlinked_epoch <= safe_epoch` and asked: if fetch_add returned the PRE-increment
+# value, a thread that checkpointed BEFORE the unlink would compare EQUAL to the
+# stamp and the entry would be freed under it -- a use-after-free.
+#
+# They are right about the conditional. The `+ 1` is what makes it false: the stamp
+# is POST-increment, so a pre-unlink checkpoint is strictly less. That single
+# character is load-bearing, was carried only by prose, and prose is what both packs
+# omitted. Now the harness holds it: flip the stamp to pre-increment and the suite
+# must die.
+
 # ⚠️ WHY THIS ARM EXISTS AT ALL: A CLAMP WAS HIDING THE DEFECT. Both withdrawal
 # paths are `if (u.live > 0) --u.live;`. That guard is right -- it stops an
 # underflow to SIZE_MAX -- but it also means a MISSING increment produces no

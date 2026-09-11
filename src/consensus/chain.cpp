@@ -655,11 +655,25 @@ std::atomic<uint64_t>* MyEpochSlot()
         //   WHAT ACTUALLY TRIPS. DrainGraveyard is O(slots) per call, so the cost
         //     that matters is DRAIN LATENCY, not bytes. graveyard_occupancy_bench
         //     reports drain max/mean on every run.
-        //   THE TRIGGER, stated so it is a threshold and not a judgement call:
-        //     REDESIGN WHEN THE BENCH'S DRAIN MAX EXCEEDS 50 ms, which is the same
-        //     number the deque-vs-vector note above uses as its flip condition.
-        //     Measured today: 19.3 ms max at 500,000 entries with ~100,000 live
-        //     slots-worth of survivors, so there is roughly a 2.5x margin.
+        //   ⚠️ THE TRIGGER, AS A DATE AND NOT A MARGIN (round-9 F59). "2.5x margin"
+        //     is a snapshot, and a snapshot of a quantity that GROWS says nothing
+        //     about when it stops being true. Restated: at ~5,760 slots/day the
+        //     50 ms threshold arrives at roughly 250,000-300,000 slots, which is
+        //     **six to eight weeks of continuous mining**. Not "someday" -- inside
+        //     a release cycle.
+        //     (Measured today: 19.3 ms max at 500,000 entries with ~100,000 live
+        //     slots-worth of survivors. 50 ms is the same number the
+        //     deque-vs-vector note above uses as its flip condition.)
+        //
+        //   ⚠️ AND THE DECISION, because a trigger with no decision is a deferral
+        //     wearing a threshold's clothes. NOT building the free list now; the
+        //     operating limit is: **`graveyard_occupancy_bench` runs in CI and its
+        //     drain max is the gate**. Six to eight weeks is long enough that the
+        //     bench will observe the approach many times before it matters, and a
+        //     generation-stamped free list is a lifetime proof one level down --
+        //     the exact class of change this branch has spent nine rounds showing
+        //     is expensive to get right. It is built when the bench says so, not
+        //     when the arithmetic says it might.
         //   THE SHAPE OF THE FIX, if it trips: a generation-stamped free list --
         //     a retired slot is reusable once every thread has passed the epoch in
         //     which it retired, which is this file's own rule applied one level
@@ -1385,6 +1399,30 @@ size_t CChainState::DrainGraveyard()
     }
 
     // FREE WHEN EVERY THREAD HAS REACHED THE UNLINK EPOCH, NOT PASSED IT.
+    //
+    // ⚠️ THE PROOF THAT EQUALITY IS SAFE LIVES HERE, NOT IN A REVIEW THREAD. Two
+    // external panels (round 1 and round 9) independently called this comparator a
+    // BLOCKER — the same false positive, nine rounds apart — because the one fact
+    // that settles it was not at the site. It is now:
+    //
+    //     THE STAMP IS POST-INCREMENT.  `m_globalEpoch.fetch_add(1, acq_rel) + 1`
+    //     (this file, the evictor's push_back). So an entry unlinked when the
+    //     counter held N is stamped N+1.
+    //
+    //     A CHECKPOINT ONLY EVER *LOADS*.  `MyEpochSlot()->store(m_globalEpoch
+    //     .load(acquire))`. A thread that checkpointed before the unlink therefore
+    //     published at most N, which is STRICTLY LESS THAN the stamp N+1.
+    //
+    //     THE EVICTOR IS THE ONLY WRITER of the counter, one fetch_add per unlink,
+    //     under cs_main. Nothing else can advance it between the two.
+    //
+    // Therefore `slot == stamp` means the thread stood at a no-pointer boundary at
+    // or after the unlink, never before it: equality is EXACT, and `<` would simply
+    // retain every entry for one extra epoch with no safety gained. The review
+    // objection ("if fetch_add returned the PRE-increment value, equality would be a
+    // UAF") is correct in the abstract and is why the `+ 1` is load-bearing rather
+    // than cosmetic — so the mutation harness now flips it to pre-increment and the
+    // suite must die (arm "F55" in scripts/red_arms_pr198_r1_folds.sh).
     //
     // ⚠️ This was `>=` and that is an off-by-one in the one rule the whole mechanism
     // rests on. A thread's slot holds the epoch at which it last stood at a boundary

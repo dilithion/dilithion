@@ -6724,7 +6724,7 @@ load_genesis_block:  // Bug #29: Label for automatic retry after blockchain wipe
             ~MaintThreadJoiner() {
                 if (t.joinable()) {
                     g_node_state.running = false;  // break the maintenance loop
-                    // EPOCH-WAIT-EXEMPT: MAIN THREAD, SHUTDOWN -- the DilV twin of dilithion-node's maintenance-thread join
+                    // EPOCH-WAIT-EXEMPT: MAIN THREAD, SHUTDOWN -- the DilV twin. Same checkable bound: the maintenance thread ticks in 1 s steps re-testing the run flag, so this join returns within ~1 s of it clearing
                     t.join();
                 }
             }
@@ -7896,10 +7896,21 @@ load_genesis_block:  // Bug #29: Label for automatic retry after blockchain wipe
         // tip on nearly every iteration), so it declares and checkpoints here,
         // where startup is finished and it holds nothing.
         // ⚠️ ONE-SHOT ASSERTION: NOTHING ON THIS THREAD MAY HAVE CHECKPOINTED
-        // BEFORE HERE (round-8 F50). Sixteen sleeps above this line are exempted
-        // on exactly that ground -- "the main thread has published no epoch yet"
-        // -- and that is an assumption about control flow, which is the kind of
-        // thing that silently stops being true when someone adds a call above it.
+        // BEFORE HERE (round-8 F50, predicate spelled out per round-9 F58).
+        //
+        // THE PREDICATE: `IsEpochParticipant()` returns true once THIS THREAD has
+        // published an epoch -- i.e. once it holds a slot from a named checkpoint.
+        // Asserting its negation here says: control has reached the main loop's
+        // declaration point without this thread ever having checkpointed. It is
+        // written out because the last two review packs omitted the predicate and
+        // the seats could not evaluate the assertion from the excerpt.
+        //
+        // WHAT RESTS ON IT: the exemption markers on the sleeps that run ON THIS
+        // THREAD BEFORE ITS FIRST CHECKPOINT -- stated by thread, not by line
+        // number, because "sixteen sleeps above this line" counts by LOCATION and
+        // the thing that matters is which thread executes them. That is an
+        // assumption about control flow, and it stops being true silently when
+        // someone adds a checkpointing call above it.
         //
         // The exemption markers cannot check themselves; this can. If a future
         // change checkpoints the main thread earlier, every one of those sixteen
@@ -8718,7 +8729,7 @@ load_genesis_block:  // Bug #29: Label for automatic retry after blockchain wipe
         // Only join maintenance thread
         Dilithion::ShutdownProgress::Stage("p2p maintenance thread join");
         if (p2p_maint_thread.joinable()) {
-            // EPOCH-WAIT-EXEMPT: MAIN THREAD, SHUTDOWN SEQUENCE -- the DilV twin
+            // EPOCH-WAIT-EXEMPT: MAIN THREAD, SHUTDOWN SEQUENCE -- the DilV twin; bounded by the joined thread's 1 s tick against the run flag
             p2p_maint_thread.join();
         }
 

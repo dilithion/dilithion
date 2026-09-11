@@ -112,19 +112,43 @@ if [ "${1:-}" = "--self-test" ]; then
     # OK: an offline scope OUTSIDE an online window covers a call after it
     printf 'void f(){ g_chainstate.EpochCheckpoint("x");\n  { EpochOfflineScope o(&cs);\n    { EpochOnlineWindow w(&cs); }\n    cv.wait(lk); }\n}\n' > "$tmp/src/g6.cpp"
 
+    # ── round-9 F57: seven more ways, each its own fixture ───────────────────
+    # (a) BOTH scopes on ONE line, offline first — the online window wins
+    printf 'void f(){ g_chainstate.EpochCheckpoint("x");\n  { EpochOfflineScope o(&cs); { EpochOnlineWindow w(&cs); cv.wait(lk); } }\n}\n' > "$tmp/src/b11.cpp"
+    # (b) a COMPLETE one-line function must keep its checkpoint
+    printf 'void f(){ cs.EpochCheckpoint("x"); cv.wait(lk); }\n' > "$tmp/src/b12.cpp"
+    # (c) a preceding-line marker must not exempt the SECOND call on the line
+    printf 'void f(){ g_chainstate.EpochCheckpoint("x");\n  // EPOCH-WAIT-EXEMPT: only the first one was considered\n  cv.wait(a); cv.wait(b);\n}\n' > "$tmp/src/b13.cpp"
+    # (d) the marker-names-the-call test must be LITERAL, not a regex
+    printf 'void f(){ g_chainstate.EpochCheckpoint("x");\n  // EPOCH-WAIT-EXEMPT: this mentions joXn, not the real token\n  int filler = 0; (void)filler;\n  t.join();\n}\n' > "$tmp/src/b14.cpp"
+    # (e) arrow-form join
+    printf 'void f(){ g_chainstate.EpochCheckpoint("x");\n  p->join();\n}\n' > "$tmp/src/b15.cpp"
+
+    # OK: a qualified definition must still be NAMED, so its callees are reachable
+    printf 'void Cls::worker(){ g_chainstate.EpochCheckpoint("x");\n  { EpochOfflineScope o(&cs);\n    cv.wait(lk); }\n}\n' > "$tmp/src/g7.cpp"
+
     fails=0
-    for f in b1 b2 b3 b4 b5 b6 b7 b8 b9 b10; do
+    for f in b1 b2 b3 b4 b5 b6 b7 b8 b9 b10 b11 b12 b13 b14 b15; do
         if awk -f "$AWK_PROG" "$tmp/src/$f.cpp" 2>&1 | grep -q '^BAD'; then
             echo "  PASS  reject $f"
         else
             echo "  FAIL  reject $f: an ONLINE blocking call was not flagged"; fails=$((fails+1))
         fi
     done
-    for f in g1 g2 g4 g5 g6; do
-        if awk -f "$AWK_PROG" "$tmp/src/$f.cpp" 2>&1 | grep -qE '^(OK|EXEMPT)'; then
+    # ⚠️ THE POSITIVE CASES ASSERT THE *COMPLETE* RESULT (round-9 F57g). They used
+    # to pass if ANY line was OK/EXEMPT, so a fixture emitting one OK and one
+    # stray BAD or PARSE counted as accepted -- a guard self-test that tolerates
+    # the failure it is checking for. Now: at least one OK/EXEMPT, and ZERO
+    # BAD/PARSE.
+    for f in g1 g2 g4 g5 g6 g7; do
+        out="$(awk -f "$AWK_PROG" "$tmp/src/$f.cpp" 2>&1)"
+        if printf '%s\n' "$out" | grep -qE '^(OK|EXEMPT)' \
+           && ! printf '%s\n' "$out" | grep -qE '^(BAD|PARSE)'; then
             echo "  PASS  accept $f"
         else
-            echo "  FAIL  accept $f: a correctly handled call was flagged"; fails=$((fails+1))
+            echo "  FAIL  accept $f: expected only OK/EXEMPT, got:"
+            printf '%s\n' "$out" | sed 's/^/          /'
+            fails=$((fails+1))
         fi
     done
     if [ -z "$(awk -f "$AWK_PROG" "$tmp/src/g3.cpp" 2>&1)" ]; then
@@ -137,7 +161,7 @@ if [ "${1:-}" = "--self-test" ]; then
     if [ "$fails" -ne 0 ]; then
         echo "===== participant-wait guard SELF-TEST: FAIL ($fails) ====="; exit 1
     fi
-    echo "===== participant-wait guard SELF-TEST: PASS (10 rejected, 6 accepted) ====="
+    echo "===== participant-wait guard SELF-TEST: PASS (15 rejected, 7 accepted) ====="
     exit 0
 fi
 
@@ -175,10 +199,10 @@ echo "participant blocking calls: $ok scoped, $exempt exempt, $bad ONLINE, $pars
 # "4 markers" in another, "five sites by hand" in a commit message -- because each
 # counted a different population and none said which. The guard now states its own:
 echo "input set: src/**/*.{cpp,h}, EXCLUDING src/test/; within that, only files"
-echo "           containing EpochCheckpoint( ; within those, only the checkpointing"
-echo "           function and ONE HOP of its callees."
+echo "           containing EpochCheckpoint( ; within those, the checkpointing"
+echo "           function and TWO HOPS of its callees."
 echo "⚠️ NOT in the input set, and therefore NOT certified by this PASS:"
-echo "           * blocking calls two or more frames below a checkpointing function"
+echo "           * blocking calls THREE or more frames below a checkpointing function"
 echo "           * blocking calls in another translation unit"
 echo "           * src/test/ (tests are not a node)"
 echo "           * any participant file the parser could not read (reported as PARSE"

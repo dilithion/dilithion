@@ -298,7 +298,30 @@ void CHttpServer::AcceptThread() {
         // refuses the option still works, it is merely unbounded, and refusing
         // the connection would be a worse outcome than the pin. Mirrors the RPC
         // server's CID 1675178 handling.
-        (void)ApplyClientSocketTimeouts(client_socket);
+        // ⚠️ FAIL CLOSED: A SOCKET WITHOUT TIMEOUTS IS NOT ADMITTED (round-9 F56).
+        // This was `(void)ApplyClientSocketTimeouts(...)` -- the result discarded,
+        // the connection accepted regardless. A failed setsockopt therefore
+        // SILENTLY RESTORED the unbounded pin, on a socket whose send sites carry
+        // markers reading "BOUNDED AT 10 s BY SO_SNDTIMEO". That is the
+        // adjective-versus-value family in its FIFTH form on this branch: the
+        // value existed, was correct, and was not enforced.
+        //
+        // Rejecting costs one client its connection. Admitting costs a
+        // checkpointing worker an unbounded online window, on a socket the
+        // attacker chose. Once per occurrence, not per connection, so a
+        // systematically failing platform says so once instead of flooding.
+        if (!ApplyClientSocketTimeouts(client_socket)) {
+            static std::atomic<bool> s_warned{false};
+            if (!s_warned.exchange(true)) {
+                std::cerr << "[HttpServer] REFUSING connections: socket timeouts "
+                             "could not be set, and an untimed socket can pin a "
+                             "checkpointing worker for as long as a client likes. "
+                             "This message appears once." << std::endl;
+            }
+            shutdown(client_socket, SHUT_RDWR);
+            close(client_socket);
+            continue;
+        }
 
         // STRESS TEST FIX: Queue request for worker thread instead of blocking here
         // This prevents one slow request from blocking the accept loop
@@ -335,7 +358,20 @@ void CHttpServer::WorkerThread() {
         // after the request. The /metrics handler and the REST branch both
         // resolve a CBlockIndex* on THIS thread, so it is a participant; at the
         // loop top the previous request is finished and no new one is taken.
-        // Pin bound: one HTTP request.
+        //
+        // ⚠️ THE AGGREGATE BOUND, because "10 s per blocking call" is not by itself
+        // a bound on the connection (round-9 F56). It would not be if this server
+        // kept connections alive: N requests on one socket would be N x 10 s with
+        // one checkpoint at the start. It does not -- EVERY response carries
+        // `Connection: close` (verified: this file emits no keep-alive header at
+        // all), so a connection is exactly one request, and the worker returns HERE
+        // and re-checkpoints before taking another.
+        //
+        // So the ONLINE interval per connection is: one request's handling, whose
+        // blocking parts are each capped at 10 s by the socket timeouts set at
+        // accept. If keep-alive is ever added, THIS COMMENT IS THE THING THAT GOES
+        // STALE -- the fix then is a checkpoint between requests on the same
+        // socket, not a bigger timeout.
         // Wait for work from queue (blocks until item available or shutdown)
         bool got_work;
         {
@@ -831,6 +867,7 @@ void CHttpServer::SendResponse(SOCKET client_socket,
     // On Windows, SOCKET_ERROR is -1. On Unix, -1 indicates error and errno is set.
     size_t response_len = response_str.length();
 #ifdef _WIN32
+    // EPOCH-WAIT-EXEMPT: BOUNDED AT 10 s BY SO_SNDTIMEO, set at accept time and enforced by refusing sockets that will not take it. Same reasoning as the raw sends in HandleRequest: publishing "I hold nothing" here cannot be shown -- the handler that called SendResponse has already run its resolve -- and promising it falsely would UNPIN A HOLDER, the use-after-free direction, worse than a 10 s pin. ⚠️ These two were INVISIBLE to the guard until round 9: SendResponse is TWO hops from the checkpoint (WorkerThread -> HandleRequest -> SendResponse) and the guard only followed one.
     int bytes_sent = send(client_socket, response_str.c_str(), static_cast<int>(response_len), 0);
     if (bytes_sent == SOCKET_ERROR) {
         // Failed to send response - log error but continue (connection may be closed)
@@ -842,6 +879,7 @@ void CHttpServer::SendResponse(SOCKET client_socket,
                   << " of " << response_len << " bytes)" << std::endl;
     }
 #else
+    // EPOCH-WAIT-EXEMPT: BOUNDED AT 10 s BY SO_SNDTIMEO, set at accept time and enforced by refusing sockets that will not take it. Same reasoning as the raw sends in HandleRequest: publishing "I hold nothing" here cannot be shown -- the handler that called SendResponse has already run its resolve -- and promising it falsely would UNPIN A HOLDER, the use-after-free direction, worse than a 10 s pin. ⚠️ These two were INVISIBLE to the guard until round 9: SendResponse is TWO hops from the checkpoint (WorkerThread -> HandleRequest -> SendResponse) and the guard only followed one.
     ssize_t bytes_sent = send(client_socket, response_str.c_str(), response_len, MSG_NOSIGNAL);
     if (bytes_sent < 0) {
         // Failed to send response - log error but continue (connection may be closed)
