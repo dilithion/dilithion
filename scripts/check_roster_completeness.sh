@@ -28,10 +28,25 @@
 # a test object it is a test and belongs in the register. Tools (src/tools/) do
 # not match, which is why genesis_gen is correctly absent.
 #
-# EXEMPTIONS ARE EXPLICIT AND MUST CARRY A REASON. There are exactly two kinds:
-# a paired control whose whole job is to fail (batch_verifier_race_control), and
-# a target whose source no longer exists. Both are listed below with the reason
-# inline. An exemption without a reason is a hole with a nicer name.
+# EXEMPTIONS ARE EXPLICIT AND MUST CARRY A REASON. There are exactly THREE kinds:
+#
+#   1. a paired CONTROL whose whole job is to fail (batch_verifier_race_control);
+#   2. a target whose source no longer exists, or does not exist YET;
+#   3. a SANITIZER-ONLY harness, whose observable is the sanitizer's report rather
+#      than the exit code — p2p14_lock_inversion_tsan_tests,
+#      headerssync_disconnect_race_tsan, blockindex_uaf_asan_arm. Rostering one of
+#      these builds it WITHOUT the sanitizer, where it exits 0 having detected
+#      nothing, so the roster would print a green for a binary that cannot fail.
+#      A row of this kind MUST name the CI job and step that actually runs it.
+#
+# ⚠️ This header said "exactly two kinds" for as long as kind 3 has existed: the
+# two TSan rows landed under it and the sentence was never updated, so the next
+# reader would have read a correct row as a violation of the file's own rule. A fix
+# aimed at a site leaves siblings; when a fourth kind appears, this paragraph is
+# part of the change.
+#
+# All are listed below with the reason inline. An exemption without a reason is a
+# hole with a nicer name.
 # ============================================================================
 set -uo pipefail
 cd "$(dirname "${BASH_SOURCE[0]:-$0}")/.." || exit 2
@@ -57,6 +72,10 @@ exempt_reason() {
             echo "TSan-only by construction: it exists to make a lock-order inversion observable and is run via scripts/run_p2p14_lock_inversion_tsan.sh, not the roster. A non-TSan build of it proves nothing." ;;
         headerssync_disconnect_race_tsan)
             echo "TSan-only by construction, same class as p2p14_lock_inversion_tsan_tests: it drives ProcessHeadersWithDoSProtection against OnPeerDisconnected to make a use-after-free observable, and the OBSERVABLE IS THE SANITISER REPORT, not the exit code. Built and run by hand: 'make TSAN=1 headerssync_disconnect_race_tsan', then 'setarch \$(uname -m) -R ./headerssync_disconnect_race_tsan' (TSan aborts with a FATAL mapping error unless ASLR is off). A non-TSan build exits 0 while proving nothing, so rostering it would manufacture a green. Its own reachability guard exits 3 if neither edge was driven, so an unrun harness cannot read as a pass. RED/GREEN evidence: dilithion-strategy/missions/lp10-headerssync-wiring/EVIDENCE_A9_tsan_{red,green}.txt." ;;
+        blockindex_uaf_asan_arm)
+            echo "KIND 3, sanitizer-only, and with the sharpest form of that tell: TWO OF ITS THREE ARMS MUST CRASH. Rostering it live would build it WITHOUT -fsanitize=address, where both trap arms read stale bytes and exit 0 -- the roster would print a green for a binary that cannot detect anything. WHERE IT ACTUALLY RUNS, named so this is not 'run elsewhere' with no elsewhere: .github/workflows/ci.yml, job 'AddressSanitizer (Memory Safety)', step 'Deferred-reclamation ASan arms (2 of 3 MUST trap)', on every PR. Driver: scripts/asan_uaf_arms.sh, which refuses to report a verdict without the sanitizer and, with REQUIRE_ASAN=1 as that step sets it, HARD-FAILS instead of skipping. Verdict at 42a287cd (run 34426922897, job step 'Deferred-reclamation ASan arms (2 of 3 MUST trap)': success; the literal arm lines were captured at 4ae2798c, run 34424068632 job 102705495467): deferred exit 0 clean; immediate exit 1 heap-use-after-free; drained exit 1 heap-use-after-free; 'ASan arms: PASS (0 failed)'. Reproduce: CXX=clang++ CXXFLAGS='-fsanitize=address -fno-omit-frame-pointer -g -std=c++17' LDFLAGS=-fsanitize=address make blockindex_uaf_asan_arm && REQUIRE_ASAN=1 bash scripts/asan_uaf_arms.sh" ;;
+        epoch_nest_probe)
+            echo "KIND 1, a paired CONTROL whose PASS IS A PROCESS ABORT -- same class as batch_verifier_race_control. It opens an illegal nested EpochOfflineScope, which must fire a ConsensusInvariant; a suite cannot assert that, because catching the invariant is exactly what the invariant prevents, so the refusal is only observable from OUTSIDE the process. Run by scripts/red_arms_pr198_r1_folds.sh as the POSITIVE CONTROL for the inverted F13 mutation arm: the mutant shows the nest is accepted without the refusal, this shows it is rejected with it, and either half alone proves nothing. Rostering a binary whose correct behaviour is to die would file a working control as a defect." ;;
         *) echo "" ;;
     esac
 }

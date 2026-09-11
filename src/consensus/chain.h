@@ -12,6 +12,7 @@
 #include <set>                  // Phase 5: m_setBlockIndexCandidates
 #include <vector>
 #include <memory>
+#include <string>
 #include <mutex>
 #include <atomic>
 #include <chrono>
@@ -254,6 +255,281 @@ private:
     std::map<const CBlockIndex*, size_t> m_inDegree;
     std::set<CBlockIndex*, LeafWorkOrder> m_evictableLeaves;
 
+    // ========================================================================
+    // DEFERRED RECLAMATION — the graveyard.
+    //
+    // WHAT IT IS FOR. 62 call sites resolve a CBlockIndex* under cs_main and use
+    // it after the lock is released (census: scripts/census_blockindex_pointer_
+    // windows.py). Guarding all 62 is a fix aimed at consumers when the defect has
+    // ONE producer: eviction is the only runtime free. Eviction now UNLINKS
+    // immediately — out of mapBlockIndex, the leaf index, the in-degree map and
+    // the candidate set, so a by-hash re-resolve returns null exactly as today —
+    // and the MEMORY is released only at a point where no thread can still hold a
+    // pointer to it. Every one of those 62 windows then points at memory that
+    // stays valid for the duration of the call.
+    //
+    // ⚠️ THIS IS NOT SUFFICIENT ON ITS OWN, AND THE ORDER MATTERS.
+    //   * A grace period protects a pointer held by a THREAD.
+    //   * It does NOTHING for a pointer stored in the GRAPH: if an interior node X
+    //     is freed while a child C has C->pprev == X, deferring the free only
+    //     moves WHEN C->pprev dangles, because C->pprev is not transient.
+    // Leaf-only eviction (#129) is what makes an entry safe to free AT ALL; this
+    // makes the timing safe. Both are required and neither substitutes.
+    //
+    // WHY AN EPOCH AND NOT A TIMER. A wall-clock grace is an assumption about
+    // worst-case call duration, and the ProcessBlock path alone contains a LevelDB
+    // write — milliseconds, bounded above by nothing in this repo. A stalled VM, a
+    // slow disk or a debugger silently violates it and the failure is a
+    // use-after-free. An epoch bound is a proof: each participating thread bumps
+    // its counter at a point where it provably holds no CBlockIndex*, and an entry
+    // is freed only once EVERY registered thread has moved past the epoch in which
+    // it was unlinked. See docs/contracts/deferred-reclamation-quiescence-proof.md
+    // for the thread-by-thread table of those points.
+    struct GraveyardEntry {
+        std::unique_ptr<CBlockIndex> node;   // owned, unlinked, not yet freed
+        uint64_t unlinked_epoch;             // global epoch at unlink time
+    };
+    // ⚠️ A VECTOR, AND THE PANEL'S SUGGESTED deque WAS TRIED AND MEASURED SLOWER.
+    //
+    // The finding is asymptotically right: reclamation frees a PREFIX, and
+    // std::vector::erase(begin, cut) moves the surviving suffix down, so freeing a
+    // few entries under a large pinned suffix is O(G) rather than O(freed).
+    // std::deque erases a prefix in time linear in the erased count. So the change
+    // was made — and then measured, same fixture, same configuration (500,000-entry
+    // index, 10,400/s ingress, a 10 s slow participant so ~5,000 entries clear per
+    // call under a ~100,000-entry survivor set):
+    //
+    //     vector : drain max 19.3 ms, mean 1.0 ms
+    //     deque  : drain max 28.0 ms, mean 1.5 ms
+    //
+    // The deque is ~45% WORSE at the measured size, because a GraveyardEntry is 16
+    // bytes and moving a ~100,000-entry suffix is a bulk move of contiguous
+    // trivially-relocatable-in-practice data, while the deque pays chunked
+    // iteration and per-element destruction across segments. (The move is a
+    // sequence of unique_ptr moves, NOT a specified memmove -- the compiler is free
+    // to emit one and typically does, but the standard does not promise it.)
+    //
+    // ⚠️ THE TRIGGER IS A BUDGET, NOT A "MEMORY CEILING". An earlier version of
+    // this comment argued the asymptotics never win because the node runs out of
+    // RAM first; that is a hand-wave, not a bound. The supported workload is the
+    // one measured: ~10,400 evictions/s with a slowest participant of ~10 s, giving
+    // G in the 10^5 range. REVISIT THIS CHOICE IF EITHER of these is breached:
+    // a drain hold above ~50 ms under cs_main, or a graveyard above ~10^6 entries.
+    // Both are reported by graveyard_occupancy_bench on every run, so the trigger
+    // is observable rather than remembered.
+    //
+    // Reverted on the measurement, not on preference, and recorded here so the next
+    // reader does not re-derive the same "obviously a deque" conclusion from the
+    // asymptotics alone. IF a future change removes the memory ceiling on G — or if
+    // GraveyardEntry grows — this flips, and the fix is an offset-based head rather
+    // than a deque, which keeps the contiguous layout AND avoids the move.
+    std::vector<GraveyardEntry> m_graveyard;
+
+    // ⚠️ THIS COMMENT SAID "bumped by each participating thread at its call
+    // boundary" AND THAT WAS FALSE — an external seat caught it and it cost the
+    // panel a round, because the free rule only makes sense once you know who
+    // bumps. THE EVICTOR IS THE ONLY WRITER: it does one fetch_add per unlink,
+    // under cs_main, and stamps the graveyard entry with the POST-bump value.
+    // EpochCheckpoint only ever LOADS this counter and stores the value into the
+    // calling thread's own slot. That asymmetry is what makes equality-freeing
+    // correct: a thread that checkpointed at G and then resolved a still-linked
+    // pointer holds slot G, while that pointer's eventual unlink stamps G+1 or
+    // later, so `stamp <= min(slots)` can never free something a thread took
+    // after its last checkpoint.
+    std::atomic<uint64_t> m_globalEpoch{1};
+
+    // TEST-ONLY. When set, eviction frees the entry in place instead of parking it
+    // in the graveyard -- the behaviour this branch replaced. It exists so the
+    // ASan arms can put the defect and the fix in ONE binary with deferral as the
+    // only variable; production never sets it.
+    std::atomic<bool> m_immediateFreeForTest{false};
+
+    // Test-only: run the drain's exhaustive pprev scan, which is O(map) per freed
+    // entry and validates m_inDegree itself. Off in production, where the O(log n)
+    // in-degree check carries the same invariant.
+    std::atomic<bool> m_deepDrainInvariants{false};
+
+    // Next graveyard size at which "this is not draining" is reported. Doubles on
+    // each report, so a leak is visible early and a healthy node stays silent.
+    // Guarded by cs_main, like the graveyard itself.
+    size_t m_graveyardWarnAt{1024};
+
+public:
+    /**
+     * Bump this thread's epoch. Called at the boundary where the calling thread
+     * provably holds no CBlockIndex* — see the quiescence proof for which point
+     * that is per thread. Cheap: one relaxed atomic store into a thread-local.
+     */
+    void EpochCheckpoint(const char* name = nullptr);
+
+    /**
+     * Declare that a thread called `name` will participate — called by whoever
+     * spawns it. The declared set and the set that has actually checkpointed are
+     * compared by EpochRegistrationComplete() at startup, so a thread that is
+     * started and never checkpoints is named rather than merely missing from a
+     * count. Deliberately built by the spawning code instead of a static list: a
+     * static list cannot know whether the txindex thread was started on THIS run.
+     */
+    void DeclareEpochParticipant(const char* name, size_t count = 1);
+
+    /** How many participant THREADS have been declared by spawn sites this run. */
+    size_t DeclaredEpochParticipants() const;
+
+    /**
+     * Go OFFLINE before a blocking wait: publish "I hold no CBlockIndex* and I am
+     * not participating in the quiescent-state calculation until I say otherwise."
+     *
+     * ⚠️ CHECKPOINTING BEFORE THE WAIT IS NOT ENOUGH, and the design note claimed
+     * otherwise. A slot holding epoch E pins every entry unlinked after E for as
+     * long as the thread stays parked — an RPC server asleep in accept() for an
+     * hour pins an hour of evictions. Going offline removes the thread from the
+     * minimum entirely, exactly as an exited thread is removed.
+     *
+     * Pair it with EpochCheckpoint() on wake, BEFORE resolving anything. Prefer
+     * EpochOfflineScope, which cannot forget the second half.
+     */
+    /**
+     * Go OFFLINE before a blocking wait. Returns TRUE if the thread actually went
+     * offline; FALSE if it refused because the calling thread has no registered
+     * participant name -- an undeclared thread may be pinning at slot 0 with a live
+     * pointer, and publishing a promise for it would unpin a holder.
+     */
+    bool EpochQuiesce();
+
+    /**
+     * How many times a thread resolved a CBlockIndex* while OFFLINE. That is a
+     * mispaired quiesce/checkpoint; the resolve is made safe (it re-enters under
+     * cs_main before the pointer escapes) but counted, because a non-zero value
+     * means some wake path resolves before it re-enters.
+     */
+    static uint64_t OfflineResolveCount();
+
+    /**
+     * Has the CALLING thread declared itself (registered a participant name)? Only
+     * a declared thread may publish an epoch promise; an undeclared one may be
+     * pinning a pointer it resolved, so both scope types are inert on it.
+     */
+    static bool IsEpochParticipant();
+
+    /**
+     * Free graveyard entries that every participating thread has moved past.
+     * Safe to call from anywhere; takes cs_main. Returns the number freed.
+     */
+    size_t DrainGraveyard();
+
+    /** How many threads are participating RIGHT NOW — retired and offline slots
+     *  excluded. See the implementation for why the old name was wrong. */
+    size_t LiveEpochParticipants() const;
+
+    /** Total epoch slots ever created, retired ones included (diagnostics only). */
+    size_t EverRegisteredEpochSlots() const;
+
+    /**
+     * Is every participant accounted for? Fails if a DECLARED thread has never
+     * checkpointed (named in `why`), or if any thread has obtained a
+     * CBlockIndex* while never having checkpointed (observed, needs no list).
+     *
+     * A thread that never checkpoints pins the graveyard for the process
+     * lifetime -- safe, but an unbounded and SILENT leak, which is why this is
+     * asserted at startup rather than assumed. `why` carries the diagnostic.
+     */
+    bool EpochRegistrationComplete(std::string& why) const;
+
+    /**
+     * Poll EpochRegistrationComplete() until it passes or `timeout_ms` elapses.
+     * Called once at node startup after the last thread spawn. A failure means a
+     * declared thread never checkpointed, or a thread holds pointers without
+     * ever having checkpointed — either way the graveyard is pinned for the
+     * process lifetime, so the node refuses to run rather than leaking silently.
+     */
+    bool AwaitEpochRegistration(int timeout_ms, std::string& why);
+
+    /**
+     * TEST-ONLY: make eviction free the entry in place, as it did before deferred
+     * reclamation existed. The ASan arms use it to reproduce the use-after-free
+     * and the fix in one binary on one fixture (src/test/blockindex_uaf_asan_arm.cpp
+     * is the only caller). Never set in production.
+     */
+    void SetEvictionImmediateFreeForTest(bool on);
+
+    /**
+     * TEST-ONLY: re-enable the drain's exhaustive "no live entry names this as
+     * pprev" scan. O(map) per freed entry (~0.73 ms per entry at 50,000 entries),
+     * so production relies on the maintained in-degree map instead; the suites
+     * turn this on so the cheap check is corroborated by the expensive one.
+     */
+    void SetDeepDrainInvariantsForTest(bool on);
+
+    /**
+     * TEST-ONLY: turn on hold tracking, which makes EpochCheckpoint() and
+     * EpochQuiesce() ASSERT that the calling thread declares no live
+     * CBlockIndex*. Production cannot check this — the pointer is a raw pointer on
+     * someone's stack — so the no-pointer-across-a-boundary rule is a CONTRACT
+     * there and a checked property here. Declare holds with EpochPointerHold.
+     */
+    void SetEpochHoldTrackingForTest(bool on);
+
+    /**
+     * Adjust this thread's declared hold count. ⚠️ NOT FOR DIRECT USE — it is
+     * public only because EpochPointerHold is a free class, and a caller passing a
+     * negative delta by hand can drive the count below what it holds and defeat
+     * the boundary assertions. The implementation refuses a negative result; use
+     * EpochPointerHold, whose constructor and destructor are the only balanced
+     * pair.
+     */
+    static void NoteEpochPointerHeld(int delta);
+
+    /** Test-only: how many in-degree rows exist (live entries plus graveyard). */
+    size_t InDegreeRowsForTest() const {
+        std::lock_guard<std::recursive_mutex> lock(cs_main);
+        return m_inDegree.size();
+    }
+
+    /**
+     * How many threads have obtained a CBlockIndex* and have NEVER checkpointed.
+     *
+     * ⚠️ THIS IS THE DETECTOR THAT DOES NOT DEPEND ON A LIST BEING MAINTAINED.
+     * The participant count above is checked against a table, and the thread that
+     * leaks is added by someone who would also have forgotten the table row — so
+     * the count catches a wired thread that has not reached its checkpoint yet,
+     * and this catches the unwired thread that was never written down. It is
+     * recorded at the only place the hazard is visible without a list: the moment
+     * a raw pointer leaves cs_main. Cleared when the thread checkpoints, so
+     * resolving during startup before the first checkpoint is not counted.
+     *
+     * Non-zero means an unbounded, silent graveyard leak. `detail` names the
+     * count and the thread ids.
+     */
+    size_t UnregisteredResolverThreads(std::string& detail) const;
+
+    /** Test/diagnostic: how many entries are unlinked but not yet freed. */
+    size_t GraveyardSize() const {
+        std::lock_guard<std::recursive_mutex> lock(cs_main);
+        return m_graveyard.size();
+    }
+
+    /**
+     * Test/diagnostic: is THIS entry still awaiting reclamation?
+     *
+     * ⚠️ IDENTITY, BECAUSE A COUNT IS NOT AN IDENTITY (round-6 F32). Arms used to
+     * assert "the drain freed at least one entry", which an OLDER, UNRELATED entry
+     * left by an earlier arm can satisfy while the entry actually under test stays
+     * pinned. The aggregate is only sufficient if the graveyard is known to hold
+     * exactly one entry, and in a suite whose arms all evict, it is not.
+     *
+     * Compares by hash rather than by pointer on purpose: a freed entry's pointer
+     * is not a legal thing to compare, and re-using it as a key would be reading a
+     * dangling value to decide whether it dangles.
+     */
+    bool GraveyardContains(const uint256& hash) const {
+        std::lock_guard<std::recursive_mutex> lock(cs_main);
+        for (const auto& e : m_graveyard) {
+            if (e.node && e.node->GetBlockHash() == hash) return true;
+        }
+        return false;
+    }
+private:
+
     // Maintain the two structures above. Called only from AddBlockIndex and the
     // evictor's erase; both hold cs_main.
     void LeafIndexOnInsert(CBlockIndex* pnew);
@@ -433,14 +709,14 @@ private:
     //      OnBlockActivated, which takes cs_headers — so cs_main → cs_headers.
     //      The reverse edge, cs_headers → cs_main, exists on the header-processing
     //      path (ProcessHeaders holds cs_headers and reaches AddBlockIndex /
-    //      EvictLowestWorkNotOnBestChain, both of which take cs_main). TSan
+    //      EvictLowestWorkLeafNotPinned, both of which take cs_main). TSan
     //      CONSTRUCTS the resulting deadlock: docs/p2p14-lock-inversion/ —
     //      registered arm 2 lock-order-inversions, unregistered arm 0.
     //
     //   2. POINTER LIFETIME. Handing a raw CBlockIndex* to a callback that runs
     //      after the lock is released is a use-after-free waiting to happen:
     //      CBlockIndex objects ARE destroyed at runtime (mapBlockIndex.erase in
-    //      EvictLowestWorkNotOnBestChain), and the headers thread itself drives
+    //      EvictLowestWorkLeafNotPinned), and the headers thread itself drives
     //      that eviction. Eviction spares the active chain, so the tip is safe
     //      only until a reorg makes it non-active.
     //
@@ -792,7 +1068,7 @@ public:
      *
      * ⚠️ RELEASED POINTER. This takes cs_main, reads pindexTip, and RELEASES
      * cs_main before returning. The CBlockIndex it points at is owned by
-     * mapBlockIndex and can be destroyed by EvictLowestWorkNotOnBestChain the
+     * mapBlockIndex and can be destroyed by EvictLowestWorkLeafNotPinned the
      * moment this returns. Dereferencing the result — including a
      * GetAncestor/pprev walk — with cs_main NOT held is a use-after-free
      * (register P2P-16). Use GetAncestorHashes() when you need chain data
@@ -1675,6 +1951,131 @@ private:
     private:
         CChainState& m_chainstate;
     };
+};
+
+
+/**
+ * RAII for the offline/online protocol: quiesce on entry, re-enter on exit.
+ *
+ *     {
+ *         EpochOfflineScope offline(&chainstate);   // NO NAME — see below
+ *         m_queueCV.wait(lock, pred);          // parked, pinning nothing
+ *     }                                        // re-entered BEFORE any resolve
+ *
+ * ⚠️ THIS EXAMPLE USED TO PASS A NAME, AND THE NAMED FORM IS GONE FOR A REASON: it
+ * made `waitfornewblock` over a websocket abort the node. A handler cannot know
+ * which thread is running it, so it must not assert one. Names are registered once
+ * per thread at its own loop-top checkpoint; scopes act on whatever the calling
+ * thread already is. A stale example in the header that DEFINES the primitive is
+ * the worst place for this, because it is what the next caller copies.
+ *
+ * The destructor runs on every path out of the block, including an exception and
+ * an early `break`, which is the reason this is a scope object and not two calls:
+ * a wake path that forgot to re-enter would resolve pointers while unpinned, and
+ * that is the one hazard the offline state introduces.
+ */
+/**
+ * Declares that the calling thread is holding a resolved CBlockIndex* for the
+ * lifetime of this object. Inert unless SetEpochHoldTrackingForTest is on, in which
+ * case crossing an epoch boundary (checkpoint or quiesce) while one is alive fires
+ * the invariant instead of publishing a false claim.
+ *
+ * ⚠️ THIS IS TEST-TIME ENFORCEMENT OF A PRODUCTION CONTRACT, NOT THE CONTRACT
+ * ITSELF. Production has no way to know a raw pointer is still live on a caller's
+ * stack; the rule "hold no CBlockIndex* across a checkpoint, a quiesce, or the exit
+ * of an EpochOfflineScope" is enforced by review and by this, not by the type
+ * system.
+ */
+class EpochPointerHold
+{
+public:
+    EpochPointerHold() { CChainState::NoteEpochPointerHeld(+1); }
+    ~EpochPointerHold() { CChainState::NoteEpochPointerHeld(-1); }
+    EpochPointerHold(const EpochPointerHold&) = delete;
+    EpochPointerHold& operator=(const EpochPointerHold&) = delete;
+};
+
+/**
+ * The inverse of EpochOfflineScope: a brief ONLINE window inside a long offline
+ * wait. Checkpoint on entry, quiesce on exit.
+ *
+ * It exists for one shape — a blocking wait whose PREDICATE resolves. The long-poll
+ * wait-* RPCs park for up to 300 s and re-evaluate a predicate on each notification;
+ * that predicate calls GetTip() and immediately copies out {hash, height}. Going
+ * offline for the whole wait would make every predicate evaluation a
+ * resolve-while-offline; staying online for the whole wait pins every eviction for
+ * up to five minutes. The predicate is the only part that holds anything, so the
+ * predicate is the part that goes online.
+ */
+class EpochOnlineWindow
+{
+public:
+    explicit EpochOnlineWindow(CChainState* cs) : m_cs(cs)
+    {
+        // Nameless: it re-enters the CALLING THREAD, whatever that thread is
+        // registered as. See EpochOfflineScope for why a NAME here was a remotely
+        // reachable abort.
+        //
+        // ⚠️ AND INERT ON AN UNNAMED THREAD, for the same reason the offline scope
+        // is. This constructor used to call EpochCheckpoint() unconditionally, so on
+        // an undeclared thread it advanced the epoch and cleared the accusation —
+        // unpinning a possible slot-0 holder, which is precisely what the offline
+        // scope's own comment says must never happen. Two comments a dozen lines
+        // apart, one of them not implemented. The gate now lives in
+        // EpochCheckpoint itself, so both scopes inherit it; m_online records
+        // whether it took effect so the destructor does not quiesce a thread that
+        // never went online.
+        if (m_cs) {
+            m_cs->EpochCheckpoint();
+            m_online = m_cs->IsEpochParticipant();
+        }
+    }
+    ~EpochOnlineWindow() { if (m_online) m_cs->EpochQuiesce(); }
+
+    EpochOnlineWindow(const EpochOnlineWindow&) = delete;
+    EpochOnlineWindow& operator=(const EpochOnlineWindow&) = delete;
+
+private:
+    CChainState* m_cs;
+    bool m_online{false};
+};
+
+class EpochOfflineScope
+{
+public:
+    // Takes a POINTER and no-ops on null: several call sites hold the chainstate
+    // as an optional pointer (rpc/server.cpp), and a nullable site must not be the
+    // reason a wait goes unwrapped.
+    // ⚠️ NAMELESS, AND THE NAME IT USED TO TAKE WAS A REMOTE DENIAL OF SERVICE.
+    //
+    // A name is chosen per SITE; a slot belongs to a THREAD. The three wait-* RPC
+    // handlers opened scopes hard-named "rpc-worker" -- but a handler runs on
+    // whichever thread dispatched it, and the WebSocket server thread dispatches the
+    // entire RPC table (websocket.cpp's SetMessageCallback -> ExecuteRPC) while
+    // registered as "websocket-server". The one-thread-one-name check then fired
+    // ConsensusInvariant(false), so A WEBSOCKET CLIENT CALLING waitfornewblock
+    // ABORTED THE NODE -- introduced by the very check meant to catch a wiring
+    // mistake, and reachable by anyone who can open a websocket.
+    //
+    // The fix is not a softer check. A HANDLER CANNOT KNOW ITS THREAD, so it must
+    // not assert one: names are established once, by each thread, at its own
+    // loop-top checkpoint, and scopes act on whatever the calling thread already is.
+    explicit EpochOfflineScope(CChainState* cs) : m_cs(cs)
+    {
+        // Inert when the thread is unregistered. EpochQuiesce refuses to publish a
+        // promise nobody declared, and this scope must not then "re-enter" it: a
+        // nameless checkpoint would publish the current epoch and UNPIN a thread
+        // that may be holding a pointer at slot 0.
+        m_active = (m_cs != nullptr) && m_cs->EpochQuiesce();
+    }
+    ~EpochOfflineScope() { if (m_active) m_cs->EpochCheckpoint(); }
+
+    EpochOfflineScope(const EpochOfflineScope&) = delete;
+    EpochOfflineScope& operator=(const EpochOfflineScope&) = delete;
+
+private:
+    CChainState* m_cs;
+    bool m_active{false};
 };
 
 #endif // DILITHION_CONSENSUS_CHAIN_H

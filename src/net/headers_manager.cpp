@@ -3644,6 +3644,19 @@ bool CHeadersManager::StartValidationThread()
         if (g_verbose.load(std::memory_order_relaxed))
             std::cout << "[HeadersManager] Header processor thread started" << std::endl;
 
+        // ⚠️ DECLARED AFTER THE SPAWNS SUCCEED, NOT BEFORE THEM. A declaration made
+        // before a std::thread constructor that then THROWS leaves a name nobody will
+        // ever answer for, and the startup census refuses to start the node over a
+        // thread that does not exist — a false positive that bricks a node. Declaring
+        // after the spawn is safe in the other direction: a thread that checkpoints
+        // before its declaration lands is simply already in the registered set, and
+        // the census only ever asks for declared-minus-registered.
+        // The hash-worker pool declares its size: one worker's checkpoint must not
+        // stand in for its siblings (the registry counts threads, not names).
+        g_chainstate.DeclareEpochParticipant("headers-validation",
+                                             m_hash_workers.size());
+        g_chainstate.DeclareEpochParticipant("headers-processor");
+
         return true;
     } catch (const std::exception& e) {
         m_validation_running.store(false);
@@ -3774,19 +3787,51 @@ void CHeadersManager::ValidationWorkerThread()
     while (m_validation_running.load()) {
         // Check if paused for fork recovery - wait until unpaused
         if (m_processing_paused.load()) {
+            // ⚠️ THE PAUSE PATH PINNED ONLINE FOR AS LONG AS THE PAUSE LASTED,
+            // and "never the duration of a wait" was false here. A fork recovery can
+            // hold this pause open indefinitely; the loop then spins 10 ms at a time
+            // with this thread's epoch frozen at its last checkpoint, pinning every
+            // entry unlinked meanwhile. It holds nothing in this branch -- it has not
+            // dequeued anything -- so it should not be in the calculation at all.
+            // Scoped to the sleep, so the next iteration re-enters before it can
+            // dequeue.
+            //
+            // (Round-4 panel named ONE of these. There are TWO, in
+            // ValidationWorkerThread and HeaderProcessorThread, with identical
+            // bodies -- the sibling was found by grepping the shape rather than
+            // fixing the line that was reported.)
+            EpochOfflineScope offline(&g_chainstate);
             std::this_thread::sleep_for(std::chrono::milliseconds(10));
             continue;
         }
 
         PendingValidation pending;
 
+        // DEFERRED-RECLAMATION CHECKPOINT — before the wait, not after the work.
+        // At the loop top this thread has finished the previous unit and started
+        // no new one, so it holds no CBlockIndex*. Publishing here means a thread
+        // that then sleeps (idle node, empty queue) pins NOTHING while it sleeps;
+        // the pin is one unit of work, never the duration of a wait.
+        g_chainstate.EpochCheckpoint("headers-validation");
+
         // Wait for work
         {
             std::unique_lock<std::mutex> lock(m_validation_mutex);
 
-            m_validation_cv.wait(lock, [this] {
-                return !m_validation_running.load() || !m_validation_queue.empty() || m_processing_paused.load();
-            });
+            {
+                // OFFLINE FOR THE DURATION OF THE WAIT. Checkpointing before the wait
+                // publishes an epoch that then FREEZES while this thread is parked, pinning
+                // every entry unlinked afterwards -- a server asleep in accept() for an hour
+                // pins an hour of evictions, which is what made the design note's "parked
+                // threads pin nothing" false. Going offline removes this thread from the
+                // quiescent-state calculation entirely, exactly as an exited thread is
+                // removed; the scope re-enters on EVERY exit path, before anything is
+                // resolved.
+                EpochOfflineScope offline(&g_chainstate);
+                m_validation_cv.wait(lock, [this] {
+                    return !m_validation_running.load() || !m_validation_queue.empty() || m_processing_paused.load();
+                });
+            }
 
             if (!m_validation_running.load()) {
                 break;
@@ -3879,8 +3924,29 @@ void CHeadersManager::HeaderProcessorThread()
         std::cout << "[HeadersManager] Header processor thread started" << std::endl;
 
     while (m_processor_running.load()) {
+        // DEFERRED-RECLAMATION CHECKPOINT — before the wait, not after the work.
+        // At the loop top this thread has finished the previous unit and started
+        // no new one, so it holds no CBlockIndex*. Publishing here means a thread
+        // that then sleeps (idle node, empty queue) pins NOTHING while it sleeps;
+        // the pin is one unit of work, never the duration of a wait.
+        g_chainstate.EpochCheckpoint("headers-processor");
+
         // Check if paused for fork recovery - wait until unpaused
         if (m_processing_paused.load()) {
+            // ⚠️ THE PAUSE PATH PINNED ONLINE FOR AS LONG AS THE PAUSE LASTED,
+            // and "never the duration of a wait" was false here. A fork recovery can
+            // hold this pause open indefinitely; the loop then spins 10 ms at a time
+            // with this thread's epoch frozen at its last checkpoint, pinning every
+            // entry unlinked meanwhile. It holds nothing in this branch -- it has not
+            // dequeued anything -- so it should not be in the calculation at all.
+            // Scoped to the sleep, so the next iteration re-enters before it can
+            // dequeue.
+            //
+            // (Round-4 panel named ONE of these. There are TWO, in
+            // ValidationWorkerThread and HeaderProcessorThread, with identical
+            // bodies -- the sibling was found by grepping the shape rather than
+            // fixing the line that was reported.)
+            EpochOfflineScope offline(&g_chainstate);
             std::this_thread::sleep_for(std::chrono::milliseconds(10));
             continue;
         }
@@ -3891,9 +3957,35 @@ void CHeadersManager::HeaderProcessorThread()
         {
             std::unique_lock<std::mutex> lock(m_raw_queue_mutex);
 
-            m_raw_queue_cv.wait(lock, [this] {
-                return !m_processor_running.load() || !m_raw_header_queue.empty() || m_processing_paused.load();
-            });
+            // ⚠️ AN IDLE PROCESSOR PINNED THE WHOLE GRAVEYARD (round-7 F45). The
+            // PAUSE path a few lines above goes offline across its sleep; this
+            // wait -- the one a HEALTHY, IDLE node sits in essentially all the
+            // time -- did not. So a node with no headers arriving kept this
+            // thread's epoch frozen at its last loop-top checkpoint, and
+            // DrainGraveyard's minimum froze with it: nothing unlinked during the
+            // idle period could ever be freed. That is the exact shape of the
+            // parked-participant defect the round-1 panel found in the RPC server
+            // (47.60 MB and climbing over 15 s), reached by a different door, and
+            // the proof's own wiring table disclosed the gap with a "—" rather
+            // than closing it.
+            //
+            // ⚠️ POINTER-FREE IS NOT PIN-FREE. This thread holds nothing here --
+            // it has not dequeued anything yet -- and that is precisely why the
+            // old reasoning felt safe and was wrong: a thread pins by its
+            // PUBLISHED EPOCH, not by holding a pointer.
+            //
+            // No inverse-scope subtlety: this predicate reads two atomics and a
+            // queue emptiness flag, and resolves no CBlockIndex*, so the plain
+            // offline scope is correct here (compare the wait-* RPC handlers,
+            // whose predicates DO resolve and therefore need EpochOnlineWindow).
+            // The scope is braced to the WAIT, not to the enclosing block, so the
+            // thread is back online before it can dequeue anything.
+            {
+                EpochOfflineScope offline(&g_chainstate);
+                m_raw_queue_cv.wait(lock, [this] {
+                    return !m_processor_running.load() || !m_raw_header_queue.empty() || m_processing_paused.load();
+                });
+            }
 
             if (!m_processor_running.load()) {
                 break;
