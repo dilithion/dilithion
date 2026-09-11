@@ -5856,58 +5856,135 @@ bool CWallet::MigrateToEncryptedSeedV7Unlocked(bool* persistedToDisk,
     // re-encrypt under the master key (which also attaches a MAC).
     if (!vchEncryptedMnemonic.empty()) {
         std::vector<uint8_t> ivVec(vchMnemonicIV.begin(), vchMnemonicIV.end());
-        std::vector<uint8_t> mnemonicPlain;
-        bool decOk = false;
 
-        // Primary case (legacy HD-first wallet): mnemonic under the obfuscation key
-        // derived from the seed. F1 round 3: use the LIVE seed via DecryptHDMasterKey,
-        // NOT hdMasterKey.seed directly — in the defer-and-preserve (seed-already-
-        // encrypted) state that slot is scrubbed and the seed lives in the cache /
-        // ciphertext. DecryptHDMasterKey returns the right value in both states.
-        {
+        // LP-7 (WALLET-LP7-MIGRATION-NEVER-COMPLETES): TRY EACH ARM UNTIL ONE
+        // VERIFIES, not until one DECRYPTS.
+        //
+        // The previous shape gated the second arm on the first arm's DECRYPT
+        // failing:
+        //     decOk = <obfuscation-key decrypt>
+        //     if (!decOk) { decOk = <master-key decrypt>; }
+        //     if (!decOk) { rollback(); return false; }
+        //     verified = MnemonicReDerivesSeed(...)
+        //     if (!verified) { DEFER }            // <-- no path back to arm 2
+        //
+        // For a legacy wallet whose mnemonic sits under the MASTER key, arm 1 runs
+        // with the WRONG key, and AES-CBC + PKCS#7 accepts a wrong-key block
+        // whenever the trailing bytes happen to form valid padding. Measured
+        // against the real CCrypter::Decrypt: 765 / 200,000 = 0.3825% (strict-PKCS#7
+        // prediction 0.3922%, so the decrypt is strict and there is no laxer path).
+        // When that happens decOk is true holding GARBAGE, arm 2 never runs, the
+        // identity guard correctly rejects, and migration defers. Key, IV and
+        // ciphertext are all fixed for a given wallet, so it recurs on EVERY future
+        // unlock: that wallet can NEVER migrate, and its seed stays unencrypted at
+        // rest -- the exact condition LP-7 exists to close -- while the log promises
+        // a retry that cannot succeed. About 1 in 260 legacy master-key-mnemonic
+        // wallets on v4.5.0 / v4.5.1 / v4.5.2.
+        //
+        // The guard is NOT at fault and is not touched: a stage-B probe over 5,000
+        // fresh mnemonics found derivation stable and injective (0 mismatches).
+        // Rejecting garbage is the guard doing its job; the defect is that a
+        // rejection had nowhere to go.
+        //
+        // So each arm now runs decrypt-THEN-verify, and a failed verification falls
+        // through to the next arm instead of ending the attempt. Behaviour is
+        // unchanged for every wallet that migrates today: arm 1 is still tried
+        // first, and when its output verifies the loop stops before arm 2 runs, by
+        // the same path and with no extra work.
+        auto armObfuscation = [&](std::vector<uint8_t>& out) -> bool {
+            // Primary case (legacy HD-first wallet): mnemonic under the obfuscation
+            // key derived from the seed. Use the LIVE seed via DecryptHDMasterKey,
+            // NOT hdMasterKey.seed directly -- in the defer-and-preserve
+            // (seed-already-encrypted) state that slot is scrubbed and the seed
+            // lives in the cache / ciphertext. DecryptHDMasterKey is right in both.
             CHDExtendedKey live;
-            if (DecryptHDMasterKey(live)) {
-                std::vector<uint8_t> obfKey(WALLET_CRYPTO_KEY_SIZE);
-                std::vector<uint8_t> hdSeed(live.seed, live.seed + 32);
-                DeriveEncryptionKey(hdSeed, "mnemonic", obfKey);
-                memory_cleanse(hdSeed.data(), hdSeed.size());
-                live.Wipe();
-
-                CCrypter obfCrypter;
-                decOk = obfCrypter.SetKey(obfKey, ivVec) &&
-                        obfCrypter.Decrypt(vchEncryptedMnemonic, mnemonicPlain);
-                memory_cleanse(obfKey.data(), obfKey.size());
+            if (!DecryptHDMasterKey(live)) {
+                return false;
             }
-        }
+            std::vector<uint8_t> obfKey(WALLET_CRYPTO_KEY_SIZE);
+            std::vector<uint8_t> hdSeed(live.seed, live.seed + 32);
+            DeriveEncryptionKey(hdSeed, "mnemonic", obfKey);
+            memory_cleanse(hdSeed.data(), hdSeed.size());
+            live.Wipe();
 
-        // Fallback: a legacy wallet whose mnemonic was encrypted under the master
-        // key directly (no MAC). Try the master key if the obfuscation key failed.
-        if (!decOk) {
+            CCrypter obfCrypter;
+            const bool ok = obfCrypter.SetKey(obfKey, ivVec) &&
+                            obfCrypter.Decrypt(vchEncryptedMnemonic, out);
+            memory_cleanse(obfKey.data(), obfKey.size());
+            return ok;
+        };
+
+        auto armMasterKey = [&](std::vector<uint8_t>& out) -> bool {
+            // Fallback: a legacy wallet whose mnemonic was encrypted under the
+            // master key directly (no MAC).
             std::vector<uint8_t> mkVec(vMasterKey.data_ptr(),
                                        vMasterKey.data_ptr() + vMasterKey.size());
             CCrypter mkCrypter;
-            mnemonicPlain.clear();
-            decOk = mkCrypter.SetKey(mkVec, ivVec) &&
-                    mkCrypter.Decrypt(vchEncryptedMnemonic, mnemonicPlain);
+            const bool ok = mkCrypter.SetKey(mkVec, ivVec) &&
+                            mkCrypter.Decrypt(vchEncryptedMnemonic, out);
             memory_cleanse(mkVec.data(), mkVec.size());
+            return ok;
+        };
+
+        // The identity check, unchanged in substance and in order: the empty
+        // passphrase FIRST (the common cohort), then -- only if that fails AND the
+        // caller supplied a non-empty BIP39 passphrase -- retry WITH it, so a
+        // legitimate passphrase wallet can complete migration. Still fail-closed: a
+        // wrong or absent passphrase leaves this false on every arm, and the
+        // ABORT-AND-PRESERVE path below runs exactly as before.
+        auto phraseVerifies = [&](const std::string& phrase) -> bool {
+            if (MnemonicReDerivesSeed(phrase, "")) {
+                return true;
+            }
+            if (!bip39Passphrase.empty() &&
+                MnemonicReDerivesSeed(phrase, bip39Passphrase)) {
+                return true;
+            }
+            return false;
+        };
+
+        bool anyArmDecrypted = false;
+        bool verified = false;
+        std::string mnemonicStr;
+
+        for (int arm = 1; arm <= 2 && !verified; ++arm) {
+            std::vector<uint8_t> mnemonicPlain;
+            const bool decOk = (arm == 1) ? armObfuscation(mnemonicPlain)
+                                          : armMasterKey(mnemonicPlain);
+            if (!decOk) {
+                memory_cleanse(mnemonicPlain.data(), mnemonicPlain.size());
+                continue;
+            }
+            anyArmDecrypted = true;
+
+            std::string candidate(mnemonicPlain.begin(), mnemonicPlain.end());
+            memory_cleanse(mnemonicPlain.data(), mnemonicPlain.size());
+
+            if (phraseVerifies(candidate)) {
+                mnemonicStr = candidate;
+                verified = true;
+            }
+            // Cleanse the candidate on BOTH outcomes. The fall-through is a new exit
+            // that did not exist before, and it is the one that would otherwise
+            // leave a rejected phrase -- or a verified one, now copied into
+            // mnemonicStr -- sitting in a dead local.
+            if (!candidate.empty()) {
+                memory_cleanse(&candidate[0], candidate.size());
+            }
         }
 
-        if (!decOk) {
+        if (!anyArmDecrypted) {
             // Could not recover the mnemonic plaintext under either key. Abort
             // migration (leave everything byte-identical) rather than risk a wallet
             // whose mnemonic becomes unreadable. Seed migration only proceeds when
             // the mnemonic can be carried forward.
-            memory_cleanse(mnemonicPlain.data(), mnemonicPlain.size());
             rollback();
             return false;
         }
 
-        std::string mnemonicStr(mnemonicPlain.begin(), mnemonicPlain.end());
-        memory_cleanse(mnemonicPlain.data(), mnemonicPlain.size());
-
         // LP-7 (F1, BLOCKER + fold MED-1): a successful Decrypt() only proves PKCS#7
-        // padding was well-formed — NOT that the recovered bytes are a real seed
-        // phrase, and CMnemonic::Validate only proves SYNTACTIC BIP39 — NOT that the
+        // padding was well-formed -- NOT that the recovered bytes are a real seed
+        // phrase, and CMnemonic::Validate only proves SYNTACTIC BIP39 -- NOT that the
         // phrase is THIS wallet's seed. Under a wrong-key edge case / partial
         // corruption / format confusion the decrypt can yield a DIFFERENT but
         // syntactically-valid BIP39 string. Re-encrypting that as the authoritative
@@ -5915,28 +5992,16 @@ bool CWallet::MigrateToEncryptedSeedV7Unlocked(bool* persistedToDisk,
         // ciphertext => PERMANENT seed loss (the live wallet keeps spending via the
         // in-memory seed, but a later restore-from-phrase yields the WRONG seed).
         //
-        // So positively confirm IDENTITY, not just syntax: re-derive the master seed
-        // from the recovered mnemonic and compare it byte-for-byte to the wallet's
-        // authoritative in-memory hdMasterKey.seed (MnemonicReDerivesSeed, which folds
-        // in the CMnemonic::Validate structural gate). Only on an EXACT match do we
-        // re-encrypt and discard the original. On ANY mismatch — garbage that passed
-        // Validate, OR a legitimate but non-re-derivable BIP39-passphrase wallet —
+        // So identity is confirmed POSITIVELY above, per arm, before any arm is
+        // allowed to win. Only on an EXACT match do we re-encrypt and discard the
+        // original. When NO arm produces a verifying phrase -- garbage that passed
+        // Validate, OR a legitimate but non-re-derivable BIP39-passphrase wallet --
         // ABORT migration loudly: do NOT call EncryptMnemonic (which would overwrite
         // vchEncryptedMnemonic/IV/MAC), roll back to the pre-migration snapshot so the
         // original ciphertext is preserved byte-for-byte, and leave the wallet in its
         // prior valid state. The migration safely defers and re-arms on the next
-        // unlock. INVARIANT (absolute): the original seed ciphertext is NEVER discarded
-        // unless the recovered phrase PROVABLY derives this wallet's seed.
-        //
-        // F1 round 3: try the empty passphrase FIRST (the common cohort, behaviour
-        // unchanged), then — only if that fails AND the caller supplied a non-empty
-        // BIP39 passphrase — retry the identity check WITH that passphrase so a
-        // legitimate passphrase wallet can complete migration. Still fail-closed: a
-        // wrong/absent passphrase leaves verified==false → ABORT-AND-PRESERVE.
-        bool verified = MnemonicReDerivesSeed(mnemonicStr, "");
-        if (!verified && !bip39Passphrase.empty()) {
-            verified = MnemonicReDerivesSeed(mnemonicStr, bip39Passphrase);
-        }
+        // unlock. INVARIANT (absolute): the original seed ciphertext is NEVER
+        // discarded unless the recovered phrase PROVABLY derives this wallet's seed.
         if (!verified) {
             // LOW-5: &mnemonicStr[0] on an empty string is UB; guard the cleanse.
             if (!mnemonicStr.empty()) {
