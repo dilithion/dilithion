@@ -18,6 +18,7 @@
 #include <consensus/chain_work.h>     // Phase 3 shared helper
 #include <consensus/pow.h>            // CheckProofOfWork
 #include <primitives/block.h>         // CBlockHeader
+#include <core/chainparams.h>         // g_chainParams->genesisNBits (VDF nBits equality)
 
 namespace dilithion::net::port {
 
@@ -68,6 +69,60 @@ public:
         if (!header.IsVDFBlock()) return false;        // wrong chain type
         if (header.vdfProofHash.IsNull()) return false;
         if (header.vdfOutput.IsNull()) return false;
+
+        // LP-10 A-2 / blocker 4 — nBits SANITY, added because its absence was a
+        // complete break of the header-sync work gate on DilV.
+        //
+        // MEASURED: this function used to examine only the version flag and two
+        // non-null fields, all peer-chosen, and never looked at nBits. Compose
+        // that with ComputeChainWork saturating to MAX on a zero MANTISSA
+        // (chain_work.h:44-47) and ONE fabricated header -- VDF version, two
+        // arbitrary non-null VDF fields, nBits = 0x1e000000 -- was worth maximum
+        // chain work and satisfied DilV's MEASURED nMinimumChainWork by itself:
+        // "sufficient work demonstrated at HEIGHT 1". The same single header with
+        // honest nBits did NOT open the gate, so the saturation was the cause.
+        //
+        // DIL was never exposed to this, and the reason is worth stating because
+        // it is not reassuring: RandomXHeaderProofChecker calls CheckProofOfWork,
+        // which rejects a zero TARGET (pow.cpp:139-149). The protection was an
+        // incidental consequence of that check, not a design decision, and it is
+        // one refactor away from being lost. So the guard belongs HERE too, at the
+        // chain-specific seam, not only in the caller.
+        //
+        // Note ChainWorkContribution below feeds the same nBits into
+        // ComputeChainWork, so a checker that validates the proof but not the
+        // work input is only half a checker.
+        //
+        // ⛔ A ZERO-MANTISSA TEST CLOSES ONE VALUE, NOT THE CLASS. That was the
+        // first version of this guard and it was insufficient — measured:
+        //
+        //   nBits        mantissa   chain work            opens DilV's gate?
+        //   0x1e000000   0          2^256-1 (saturated)   YES  <- mantissa test blocks
+        //   0x01000001   1          1.15e77               YES  <- mantissa test PASSES
+        //   0x1c000001   1          7.92e28               YES  <- mantissa test PASSES
+        //   0x1d00ffff   65535      4.72e21               no   (honest DilV)
+        //
+        // A tiny MANTISSA gives near-maximal work without being zero, so one
+        // fabricated header still opened the gate. Third instance in this mission
+        // of fixing the instance and describing it as the class.
+        //
+        // THE CLASS-CLOSING RULE: on a VDF chain the honest nBits is a CONSTANT,
+        // so require exact equality rather than policing a range.
+        //   * pow.cpp:1143-1145 — GetNextWorkRequired returns genesisNBits
+        //     unconditionally for IsDilV() and IsRegtest(). The producer emits
+        //     exactly this value, so no honest block can fail the test.
+        //   * chainparams.cpp (DilV) — "DilV nBits is 0x1d00ffff on ALL 255,028
+        //     canonical blocks measured; difficulty has NEVER retargeted".
+        //   * VDF selection is lowest-output-wins, not hash-under-target, so nBits
+        //     is vestigial here and has no reason to vary.
+        //
+        // FAIL CLOSED on absent chainparams. A `g_chainParams ? … : <default>`
+        // here would be the fail-OPEN shape that #189 shipped once already and
+        // that two external seats caught: a missing parameter must not become a
+        // permissive verdict on a work-accounting input.
+        if (Dilithion::g_chainParams == nullptr) return false;
+        if (header.nBits != Dilithion::g_chainParams->genesisNBits) return false;
+
         // Full VDF verification deferred to CheckVDFProof at ConnectBlock —
         // the proof bytes aren't in the header layout.
         return true;
