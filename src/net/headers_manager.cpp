@@ -2,6 +2,8 @@
 // Distributed under the MIT software license
 
 #include <net/headers_manager.h>
+
+#include <atomic>
 #include <net/net.h>
 #include <net/connman.h>
 #include <net/protocol.h>
@@ -863,11 +865,24 @@ bool CHeadersManager::InitializeDoSProtectedSync(NodeId peer, const uint256& min
     // constant branch (testnet today) neither checker is correct, and starting a
     // DoS-protected sync there would reject every honest header.
     if (!m_proof_checker_supports_network) {
-        LogPrintf(NET, WARN,
-            "[HeadersManager] DoS-protected header sync REFUSED for peer=%d: "
-            "no correct proof checker exists for this network (VDF from genesis, "
-            "but difficulty retargets). A-3 owns the retargeting rule.\n",
-            static_cast<int>(peer));
+        // ⚠️ LOG ONCE PER PROCESS, NOT PER CALL (seat LOW, F4). The REFUSAL stays
+        // per-call and unconditional — only the log is deduplicated. On an armed
+        // node every inbound peer would otherwise emit an identical WARN, turning a
+        // configuration fact that cannot change for the life of the process into
+        // per-peer log spam that buries whatever else is happening.
+        //
+        // atomic exchange rather than a plain bool: this becomes reachable from
+        // more than one thread once the gate is wired, and the cost of being
+        // correct here is one word.
+        static std::atomic<bool> already_logged{false};
+        if (!already_logged.exchange(true)) {
+            LogPrintf(NET, WARN,
+                "[HeadersManager] DoS-protected header sync REFUSED (logged once "
+                "per process; first refusal was peer=%d): no correct proof checker "
+                "exists for this network (VDF from genesis, but difficulty "
+                "retargets). A-3 owns the retargeting rule.\n",
+                static_cast<int>(peer));
+        }
         return false;
     }
 
