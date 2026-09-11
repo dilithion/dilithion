@@ -245,6 +245,20 @@ void test_presync_short_batch_ends_the_sync()
     // flag nobody acts on is the shape this whole finding is about.
     REQUIRE(o.state == HeadersSyncState::State::FINAL);
 
+    // ⛔ AND success == TRUE, which this test did not pin until #196 round 2 asked
+    // for it. It is the observable whose MEANING changed under D-1: a PRESYNC abort
+    // returns success = true, because the batch's headers were valid and there is
+    // simply nothing further to do. That is not a detail — it is why the
+    // gate-arming suite had to stop reading the manager's bool and read the PHASE
+    // instead (the bool now says "true" on both promotion and termination).
+    //
+    // Leaving it unpinned meant the one arm that documents the convention did not
+    // assert it, so a regression flipping it to false would have reddened only the
+    // callers that happen to depend on it — and the immediate caller treats
+    // !success as compare-and-erase, so the failure would present as a vanished
+    // peer session rather than as a wrong flag.
+    REQUIRE(o.success);
+
     std::cout << " OK" << std::endl;
 }
 

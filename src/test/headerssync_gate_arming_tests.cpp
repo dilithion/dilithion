@@ -27,6 +27,11 @@
 #include <net/headers_manager.h>
 
 #include <consensus/chain_work.h>
+// For Consensus::MAX_HEADERS_RESULTS. Included EXPLICITLY rather than relied on
+// transitively through headers_manager.h: the full-batch arm below is defined by
+// that constant, and a test that names a protocol limit should not depend on
+// another header's include list to see it.
+#include <consensus/params.h>
 #include <core/chainparams.h>
 #include <node/genesis.h>
 #include <primitives/block.h>
@@ -148,6 +153,91 @@ std::optional<HeadersSyncState::State> PresyncPhase(const uint256& threshold)
     return mgr.GetHeadersSyncPhase(peer);
 }
 
+// Build `n` VDF headers, each linked to the previous, all satisfying the checker.
+// Shares the single-header recipe above deliberately: if that recipe ever stops
+// being accepted, both the promotion arms and the termination arms fail together
+// rather than one silently measuring nothing.
+std::vector<CBlockHeader> ChainOfVdfHeaders(const uint256& start, size_t n)
+{
+    std::vector<CBlockHeader> out;
+    out.reserve(n);
+    uint256 prev = start;
+    for (size_t i = 0; i < n; ++i) {
+        CBlockHeader h;
+        h.nVersion      = CBlockHeader::VDF_VERSION;
+        h.nBits         = Dilithion::g_chainParams->genesisNBits;
+        h.nTime         = 1700000000 + static_cast<uint32_t>(i);
+        h.nNonce        = 0;
+        h.hashPrevBlock = prev;
+        for (int b = 0; b < 32; ++b) h.vdfProofHash.data[b] = static_cast<uint8_t>(0x42 + (i & 0x0f));
+        for (int b = 0; b < 32; ++b) h.vdfOutput.data[b]    = static_cast<uint8_t>(0x37 + (i & 0x0f));
+        prev = h.GetHash();
+        out.push_back(h);
+    }
+    return out;
+}
+
+// Drive the manager with a batch of `n` real VDF headers at a threshold the peer
+// cannot reach, and report the resulting phase.
+std::optional<HeadersSyncState::State> PhaseAfterBatchOf(const uint256& threshold, size_t n)
+{
+    CHeadersManager mgr(threshold);
+    const NodeId peer = 11;
+
+    if (!mgr.InitializeDoSProtectedSync(peer, mgr.GetMinimumChainWork())) {
+        std::cerr << "\n  FAIL InitializeDoSProtectedSync refused to start\n";
+        std::abort();
+    }
+    REQUIRE(mgr.GetHeadersSyncPhase(peer) == HeadersSyncState::State::PRESYNC);
+
+    uint256 start = mgr.GetBestHeaderHash();
+    if (start.IsNull()) start = Genesis::GetGenesisHash();
+
+    mgr.ProcessHeadersWithDoSProtection(peer, ChainOfVdfHeaders(start, n));
+    return mgr.GetHeadersSyncPhase(peer);
+}
+
+// ⛔ THE BEHAVIOURAL TERMINATION ARM, which until now did not exist.
+//
+// `scripts/check-headers-termination-signal.sh` stood in for this, and said so:
+// a manager-level header test was BLOCKED because the manager selected its proof
+// checker on IsDilV(), so regtest got RandomXHeaderProofChecker and every
+// synthesisable header was rejected before the termination signal was consulted
+// (measured then: n=3 and n=2000 both `ret=0 after=NONE(erased)`, identical).
+//
+// **That blocker is GONE.** #201 merged as main `8d8b9b8e` and routes regtest to
+// the VDF checker. The guard script's own comment named this arm as the thing to
+// write when that landed — so writing it is finishing the job, not adding scope,
+// and it removes a comment that would otherwise have gone on describing an
+// obstacle that no longer exists.
+//
+// THE PAIR ISOLATES THE SIGNAL, not the promotion: both arms run at a threshold
+// the peer cannot reach, so neither can be explained by promotion. Only the
+// batch's FULLNESS differs.
+void test_manager_short_batch_terminates_and_full_batch_continues()
+{
+    std::cout << "  test_manager_short_batch_terminates_and_full_batch_continues..." << std::flush;
+    using namespace dilithion::consensus;
+
+    uint256 unreachable = GenesisWork();
+    for (int i = 0; i < 5000; ++i)
+        unreachable = AddChainWork(unreachable, ComputeChainWork(0x1d00ffff));
+
+    // ARM A — a NON-full batch says the peer's chain has ended (Core
+    // headerssync.cpp:91). The sync aborts, the manager compare-and-erases the
+    // FINAL state on the way out, so no phase remains.
+    REQUIRE(!PhaseAfterBatchOf(unreachable, 1).has_value());
+
+    // ARM B — a batch of exactly MAX_HEADERS_RESULTS means more is coming. No
+    // abort, and the peer is still in PRESYNC: below the threshold but not done.
+    // ⛔ This is the arm the structural guard could not express, and the one that
+    // fails if `full_headers_available` ever goes back to a hardcoded `true`.
+    REQUIRE(PhaseAfterBatchOf(unreachable, Consensus::MAX_HEADERS_RESULTS)
+            == HeadersSyncState::State::PRESYNC);
+
+    std::cout << " OK" << std::endl;
+}
+
 // THE DISCRIMINATING PAIR, restored. Same code path, same peer, same single real
 // header — ONLY the threshold differs. If both arms landed the same way the suite
 // would certify nothing, which is what the SKIP block said out loud for the two
@@ -207,11 +297,19 @@ void test_zero_threshold_makes_rejection_impossible()
 
 int main()
 {
-    Dilithion::g_chainParams = new Dilithion::ChainParams(Dilithion::ChainParams::Regtest());
+    // CHeadersManager reads chainparams during construction, so the manager-level
+    // arms cannot run without it. Static, not `new`: the storage outlives every
+    // test and a leak here would be noise in any sanitizer run. Both sibling
+    // suites in this PR use this idiom; this one was the last `new` and #196
+    // round 2 asked why it differed. No reason — it was written first.
+    static Dilithion::ChainParams s_regtest = Dilithion::ChainParams::Regtest();
+    Dilithion::g_chainParams = &s_regtest;
+
     std::cout << "headerssync_gate_arming_tests" << std::endl;
     test_threshold_is_injectable_and_observable();
     test_below_threshold_is_rejected_and_at_threshold_is_accepted();
     test_zero_threshold_makes_rejection_impossible();
+    test_manager_short_batch_terminates_and_full_batch_continues();
     std::cout << "headerssync_gate_arming_tests: ALL PASS" << std::endl;
     return 0;
 }

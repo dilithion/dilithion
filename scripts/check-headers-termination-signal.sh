@@ -28,14 +28,28 @@
 # manager-level header test on regtest dies at the same wall — which is exactly
 # why the existing gate-arming suite drives the manager with an EMPTY vector.
 #
-# So a behavioural arm here is BLOCKED ON THE CHECKER-SELECTION FIX (the branch
-# fix/lp10-vdf-checker-selection, which routes regtest to the VDF checker whose
-# rule fabricated headers can satisfy). When that lands, replace this guard with
-# the real arm: short batch -> phase FINAL, MAX_HEADERS_RESULTS batch -> phase
-# PRESYNC, via CHeadersManager::GetHeadersSyncPhase.
+# ⛔ THAT BLOCKER IS GONE, AND THIS COMMENT SAID OTHERWISE FOR ONE ROUND TOO LONG.
+# fix/lp10-vdf-checker-selection MERGED as main 8d8b9b8e and routes regtest to the
+# VDF checker, so the wall described above no longer exists. The arm this comment
+# promised is now WRITTEN, not pending:
 #
-# Until then this is a structural property with a structural check, stated as
-# such rather than dressed up as coverage.
+#   src/test/headerssync_gate_arming_tests.cpp
+#     test_manager_short_batch_terminates_and_full_batch_continues
+#       batch of 1    -> abort, state erased, GetHeadersSyncPhase == nullopt
+#       batch of 2000 -> no abort, GetHeadersSyncPhase == PRESYNC
+#     both at a threshold the peer cannot reach, so neither arm can be explained
+#     by promotion -- only the batch's FULLNESS differs.
+#
+#   Mutation-verified: reverting the caller's full_headers_available to a constant
+#   `true` makes that arm FAIL on its own (isolated run, exit 3), then restored
+#   from an out-of-tree baseline, sha256-matched, rebuilt, green.
+#
+# THIS GUARD STAYS ANYWAY, and the reason is not sentiment. The arm proves the
+# behaviour of the code as written; the guard proves the SHAPE -- that exactly one
+# production caller exists and that it derives the flag rather than passing a
+# constant. A future second caller passing `true` would leave the arm green, since
+# the arm drives the caller that behaves. Different questions, both worth asking.
+# What has changed is that this file is no longer a stand-in for missing coverage.
 #
 # Exit 0 = invariant holds. Exit 1 = it does not. Exit 2 = the guard could not run.
 
