@@ -35,9 +35,39 @@
 #     still resolve SEED-ATTESTATION paths from the chainparams default.** It is
 #     safe HERE only because an ephemeral runner's default directory does not
 #     exist and holds nothing. It is NOT safe on a developer box — so the local
-#     override was REMOVED rather than left as a footgun. A container counts as CI.
-#   * `--generate-seed-key` is NEVER passed, so no key can be minted.
+#     override was REMOVED rather than left as a footgun, and so was the container
+#     check (see `in_ci()`): a devcontainer takes no deliberate act to be inside.
+#   * `--generate-seed-key` is NEVER passed. `--relay-only` sets the seed-capable
+#     path (gated on `relay_only || public_api`), so the attestation loader runs
+#     and resolves against `g_chainParams->dataDir`; with no key file and no
+#     permission to mint, it takes the documented benign non-fatal path and the
+#     node boots non-attesting. Measured on a live host, on the HARDER case — a
+#     protected directory that EXISTS and is full: it printed FATAL, refused to
+#     mint, wrote nothing (mtime identical to the nanosecond), and the node kept
+#     running and reached the gate. A runner's directory does not exist at all.
+#   * ⚠️ THE CONVERSE, STATED BECAUSE IT IS LOAD-BEARING: **this leg must never
+#     run anywhere a real default datadir exists.** It is a live exerciser of the
+#     open HIGH's arming condition — fine on an ephemeral runner, unacceptable
+#     anywhere else. That is why `in_ci()` below is strict and has no override.
 #   * MAINNET datadir only. Testnet's default directory is the protected one.
+#
+# ⚠️ EVERY GATE BETWEEN PROCESS START AND THE LINE THIS LEG WAITS FOR. This list
+# exists because the leg twice mistook a gate it had not anticipated for an epoch
+# wiring defect. A gate added to the node WITHOUT a case added below is then a
+# visible omission in a file that already fails closed, rather than a surprise in
+# CI six weeks later — the lesson carried by the artifact instead of by whoever
+# remembers it.
+#   1. argument parsing            — an unknown flag ends in `Unknown option:`
+#   2. wallet setup (`:5521`)      — refuses a non-TTY launch with no wallet;
+#                                    passed here by `--relay-only`
+#   3. seed-attestation load       — benign non-fatal without a key (above)
+#   4. peer handshake settle       — ~10 s, bounded, inside the timeout
+#   5. RandomX FULL-mode dataset   — behind `config.start_mining`; NOT on this
+#                                    path, because `--mine` is never passed. If
+#                                    that ever changes, the 120 s budget does not
+#                                    survive it.
+#   6. AwaitEpochRegistration      — THE TARGET. Everything above is a way to
+#                                    never arrive.
 #
 # Self-test: scripts/ci_node_startup_gate.sh --self-test
 #   Drives the wait/timeout/kill logic against a FAKE node that prints scripted output,
@@ -48,6 +78,14 @@ set -u
 GATE_LINE='declared epoch participants have checkpointed'
 REFUSE_LINE='REFUSING TO START'
 TIMEOUT_S="${DIL_STARTUP_GATE_TIMEOUT:-120}"
+
+# The launch arguments, defined ONCE so the self-test can assert on the REAL
+# thing rather than on a description of it. The first gate-5 case grepped this
+# file for "--mine" and matched the COMMENTS saying --mine is never passed -- a
+# check that failed on a healthy tree, in the file whose subject is checks that
+# fail on healthy trees. Caught by running it.
+# (--datadir is appended at launch: it is a temp dir created at runtime.)
+NODE_ARGS="--port=18555 --rpcport=18556 --connect=127.0.0.1:1 --relay-only"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
@@ -69,23 +107,6 @@ watch_for_gate() {
 }
 
 # ---------------------------------------------------------------------------
-# in_ci — are we on a CI runner?
-#
-# ⚠️ `[ -n "$CI" ]` IS THE WRONG TEST, AND IT INVERTS ON THE ONE VALUE PEOPLE
-# TYPE DELIBERATELY. `CI=false` is non-empty, so an emptiness test reads the
-# string that MEANS "not CI" as "yes, CI" and launches a node on a developer
-# box. That is not a nit here: the Actions runners are plain VMs with no
-# `/.dockerenv`, so this predicate — not the docker check — is what actually
-# decides, and what it holds back is a real node launch on a machine whose
-# chainparams-default datadir holds wallet and seed material (the open
-# `--datadir` attestation HIGH). The guard was weaker than the warning in this
-# file's own header.
-#
-# `GITHUB_ACTIONS` is set to "true" by Actions itself and by nothing else, so it
-# is the primary. `CI` is still honoured — many runners set only that — but a
-# FALSEY value is taken to mean what it says.
-# ---------------------------------------------------------------------------
-# ---------------------------------------------------------------------------
 # log_says_bad_launch <logfile> — did the NODE refuse because THIS SCRIPT started
 # it wrongly? Every entry here was a real CI failure that pointed at innocent
 # code, not a hypothetical:
@@ -100,8 +121,40 @@ log_says_bad_launch() {
     return 1
 }
 
+# ---------------------------------------------------------------------------
+# in_ci — are we on a CI runner?
+#
+# ⚠️ `[ -n "$CI" ]` IS THE WRONG TEST, AND IT INVERTS ON THE ONE VALUE PEOPLE
+# TYPE DELIBERATELY. `CI=false` is non-empty, so an emptiness test reads the
+# string that MEANS "not CI" as "yes, CI" and launches a node on a developer
+# box. That is not a nit here: the Actions runners are plain VMs, and this is now
+# the ONLY predicate — there is no container fallback behind it (see below) — so
+# what it holds back is a real node launch on a machine whose
+# chainparams-default datadir holds wallet and seed material (the open
+# `--datadir` attestation HIGH). The guard was weaker than the warning in this
+# file's own header.
+#
+# `GITHUB_ACTIONS` is set to "true" by Actions itself and by nothing else, so it
+# is the primary. `CI` is still honoured — many runners set only that — but a
+# FALSEY value is taken to mean what it says.
+# ---------------------------------------------------------------------------
+#
+# ⚠️ THERE IS DELIBERATELY NO `/.dockerenv` BRANCH, AND THERE USED TO BE.
+# It returned 0 on the container marker ALONE, before CI or GITHUB_ACTIONS were
+# consulted. Once the env override was removed and --relay-only became required,
+# that branch was the whole guard for anyone in a devcontainer or a
+# `docker run -v ~:/root`: the leg would have launched a relay-only node against
+# a REAL $HOME/.dilithion holding wallet and seed material — the exact directory
+# the open HIGH is about. **The tightening closed the door that required a
+# deliberate act and left open the one that requires none**: an env var takes
+# intent, being inside a container takes none. Every real CI system sets CI or
+# GITHUB_ACTIONS, so nothing legitimate is lost.
+#
+# ⚠️ AND NOTE WHICH BRANCH IT WAS: the only one the self-test could not exercise,
+# because a test can unset variables but cannot create /.dockerenv. The untestable
+# branch is the one that was wrong. When a predicate has a branch the harness
+# cannot reach, look THERE first.
 in_ci() {
-    [ -f /.dockerenv ] && return 0
     case "${GITHUB_ACTIONS:-}" in [Tt][Rr][Uu][Ee]|1) return 0 ;; esac
     case "${CI:-}" in
         ''|[Ff][Aa][Ll][Ss][Ee]|0|[Nn][Oo]|[Oo][Ff][Ff]) return 1 ;;
@@ -188,11 +241,50 @@ if [ "${1:-}" = "--self-test" ]; then
         echo "  PASS  a real abort is NOT excused as a bad launch"
     fi
 
+    # (7) ONE CASE PER GATE IN THE HEADER'S ENUMERATION. A gate added to the node
+    #     without a case here is meant to be a visible omission; that only works
+    #     if the listed ones are actually exercised.
+    #
+    # ⚠️ GATE 3 IS THE DANGEROUS ONE AND IT IS WHY THIS BLOCK EXISTS. The
+    #    seed-attestation loader prints **FATAL** when it finds no key and is not
+    #    permitted to mint -- and the node KEEPS RUNNING and reaches the gate
+    #    (measured on a live host). A leg that treated "FATAL" as death would fail
+    #    on a healthy tree, which is this file's recurring sin. It must not.
+    ( sleep 1
+      echo "[SeedAttestation] FATAL: no attestation key and minting not permitted" >> "$tmp/g3.log"
+      echo "[Chain] deferred reclamation: all 28 $GATE_LINE" >> "$tmp/g3.log" ) &
+    faker=$!; : > "$tmp/g3.log"
+    watch_for_gate "$tmp/g3.log" "$faker"; rc=$?
+    wait "$faker" 2>/dev/null
+    [ "$rc" -eq 0 ] && echo "  PASS  gate 3: a FATAL attestation line does NOT abort the leg" \
+        || { echo "  FAIL  gate 3: FATAL misread as death (rc=$rc)"; fails=$((fails+1)); }
+
+    # GATE 4: the ~10 s handshake settle is a WARN the node walks past.
+    ( sleep 1
+      echo "  [WARN] No handshakes completed after 10s (peers will auto-reconnect)" >> "$tmp/g4.log"
+      echo "[Chain] deferred reclamation: all 28 $GATE_LINE" >> "$tmp/g4.log" ) &
+    faker=$!; : > "$tmp/g4.log"
+    watch_for_gate "$tmp/g4.log" "$faker"; rc=$?
+    wait "$faker" 2>/dev/null
+    [ "$rc" -eq 0 ] && echo "  PASS  gate 4: a handshake WARN does not stop the leg" \
+        || { echo "  FAIL  gate 4: handshake WARN misread (rc=$rc)"; fails=$((fails+1)); }
+
+    # GATE 5: RandomX FULL-mode init is behind --mine and must NOT be on this
+    # path. Asserted against the script's own launch line rather than prose,
+    # because a future edit that adds --mine would blow the 120 s budget.
+    case "$NODE_ARGS" in
+      *--mine*)
+        echo "  FAIL  gate 5: NODE_ARGS passes --mine; the RandomX dataset wait"
+        echo "        will exceed the launch timeout budget"; fails=$((fails+1)) ;;
+      *)
+        echo "  PASS  gate 5: --mine is not in NODE_ARGS, so no RandomX dataset wait" ;;
+    esac
+
     echo
     if [ "$fails" -ne 0 ]; then
         echo "===== node startup gate SELF-TEST: FAIL ($fails) ====="; exit 1
     fi
-    echo "===== node startup gate SELF-TEST: PASS (12 cases) ====="
+    echo "===== node startup gate SELF-TEST: PASS (15 cases) ====="
     exit 0
 fi
 
@@ -205,16 +297,17 @@ cd "$ROOT" || exit 2
 # `DIL_STARTUP_GATE_ALLOW_LOCAL=1` was removed when the leg was forced to pass
 # --relay-only (see the launch below): that flag arms the seed-attestation path
 # the open HIGH is about, and an env var is far too cheap a key for a door that
-# now leads somewhere real. A container still counts as CI via /.dockerenv, so a
-# developer who wants to run this locally can, in a clean container -- which is
-# the same isolation CI has, rather than a promise to be careful.
+# now leads somewhere real. The container marker was removed from in_ci() for the
+# opposite reason: being inside a devcontainer takes no intent at all, and with a
+# mounted home it points at the very directory the HIGH is about.
 if ! in_ci; then
     echo "===== node startup gate: REFUSED TO RUN ====="
     echo "  This launches a real node WITH --relay-only, which arms the open"
     echo "  --datadir attestation-path HIGH: a node given --datadir can still"
     echo "  resolve seed-attestation paths from the chainparams default, and on a"
     echo "  developer box that is a REAL directory holding wallet and seed material."
-    echo "  There is deliberately no env override. Run it in a container or in CI."
+    echo "  There is deliberately no override and no container escape hatch:"
+    echo "  CI=true or GITHUB_ACTIONS=true, on a host with no real datadir."
     exit 2
 fi
 
@@ -269,7 +362,7 @@ echo "launching a node with an isolated datadir (no --relay-only, no seed-key ge
 # the parser. So the node can NEVER reach the thing this leg measures without it.
 #
 # What makes it safe HERE and nowhere else: this runs ONLY on an ephemeral CI
-# runner (or a container), where the chainparams default directory does not exist
+# runner, where the chainparams default directory does not exist
 # and holds nothing to leak or destroy. The local-override escape hatch has been
 # REMOVED rather than left as a footgun -- on a developer box that default is a
 # real directory with wallet and seed material, and with --relay-only now required
@@ -279,9 +372,8 @@ echo "launching a node with an isolated datadir (no --relay-only, no seed-key ge
 # ⚠️ AND IT CHANGES WHAT THE CENSUS COUNTS: a relay-only node declares the
 # participants a relay-only node has. The baseline must be measured from THIS
 # configuration, and is not comparable to a mining node's.
-"$NODE" --datadir="$workdir/data" --port=18555 --rpcport=18556 \
-        --connect=127.0.0.1:1 --relay-only \
-        > "$log" 2>&1 &
+# shellcheck disable=SC2086  # deliberate word-splitting of NODE_ARGS
+"$NODE" --datadir="$workdir/data" $NODE_ARGS > "$log" 2>&1 &
 node_pid=$!
 
 watch_for_gate "$log" "$node_pid"; rc=$?
@@ -379,7 +471,11 @@ fi
 # it is a FLOOR rather than an equality so extra cores can only ever add.
 # ---------------------------------------------------------------------------
 baseline_file="$ROOT/scripts/epoch_participant_census.baseline"
-expect_min="${DIL_STARTUP_GATE_MIN:-$(cat "$baseline_file" 2>/dev/null | tr -dc '0-9')}"
+# ⚠️ READ THE FIRST NUMERIC LINE, NOT EVERY DIGIT IN THE FILE. An earlier version
+# used `tr -dc '0-9'`, which would have spliced the digits out of the recorded
+# invocation (ports 18555/18556) into a nonsense floor the moment the file gained
+# the configuration line below.
+expect_min="${DIL_STARTUP_GATE_MIN:-$(grep -m1 -oE '^[0-9]+' "$baseline_file" 2>/dev/null)}"
 if [ -n "$expect_min" ]; then
     if [ "$count" -lt "$expect_min" ]; then
         echo "  ⚠️ CENSUS DROPPED: $count declared, baseline floor $expect_min."
@@ -396,9 +492,20 @@ else
     # ⚠️ SOFT, AND SAYS SO. A number I cannot measure on this box is a number I
     # will not invent: the baseline is seeded from a real run, not from reading.
     echo "  ⚠️ NO BASELINE RECORDED -- partial-loss detection is NOT active."
-    echo "     This run observed $count. To arm it, commit that number (minus any"
-    echo "     slack you want for smaller runners) as:"
-    echo "       echo $count > scripts/epoch_participant_census.baseline"
+    echo "     This run observed $count."
+    # ⚠️ THE BASELINE RECORDS ITS CONFIGURATION, NOT JUST ITS NUMBER. A relay-only
+    # node declares the participants a relay-only node has; the same integer taken
+    # from a mining node would mean something else entirely, and a baseline that
+    # quietly means something else is worse than no baseline. So the file carries
+    # the invocation that produced it.
+    echo "     To arm it, commit the count WITH the configuration that produced it:"
+    echo "       {"
+    echo "         echo \"# measured $(date -u +%Y-%m-%d) on a CI runner\""
+    echo "         echo \"# invocation: dilithion-node --datadir=<tmp> $NODE_ARGS\""
+    echo "         echo \"# hash workers = hardware_concurrency, so smaller runners"
+    echo "         echo \"#   legitimately report FEWER; this is a FLOOR, not an equality.\""
+    echo "         echo $count"
+    echo "       } > scripts/epoch_participant_census.baseline"
 fi
 
 echo "  the startup assertion did not fire and $count participants checkpointed"
