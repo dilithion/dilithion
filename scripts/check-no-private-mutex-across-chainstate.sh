@@ -47,7 +47,10 @@ fi
 out=$("$PY" scripts/lock_scope_audit.py . 2>&1); rc=$?
 if [ "$rc" -eq 0 ]; then
     echo "PASS: no unclassified private mutex held across a chainstate call"
-    printf '%s\n' "$out" | grep -E 'accessors generated|files scanned|^OK:' | sed 's/^/  /'
+    # D-4: the receiver split is the line that shows COVERAGE, and this filter was
+    # dropping it - so a CI log showed a green tick but not the number saying how
+    # much the auditor can actually see. Print it through.
+    printf '%s\n' "$out" | grep -E 'accessors generated|files scanned|accessor CALLS|non-global receivers|^OK:' | sed 's/^/  /'
     exit 0
 fi
 echo "FAIL: the lock-scope audit reported an unclassified or extra site (rc=$rc)."

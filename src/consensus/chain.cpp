@@ -2814,9 +2814,13 @@ bool CChainState::DisconnectTip(CBlockIndex* pindex, bool force_skip_utxo) {
     // cs_main HELD. Take your own lock if you must, but you may NOT hold it
     // across a call that takes cs_main. The guard enforces that; review does not.
     //
-    // Residual, so the guarantee is not over-read: the guard matches direct
-    // g_chainstate. calls. A consumer that reaches cs_main INDIRECTLY, through
-    // another object, is not caught.
+    // Residual, so the guarantee is not over-read. The guard matches a call through
+    // ANY receiver now (`g_chainstate.`, `m_chainstate->`, a `CChainState&` bound to
+    // some other name) - [censused] 332 accessor calls in production .cpp, 234 on the
+    // global and 98 through another receiver. What it still cannot see: a call reached
+    // through a HELPER this file invokes, a macro-wrapped lock, a conditional
+    // `unlock()`, or a lock taken with a bare `m.lock()`. Those limits are listed at
+    // the head of scripts/lock_scope_audit.py rather than implied here.
     for (size_t i = 0; i < m_blockDisconnectCallbacks.size(); ++i) {
         try {
             m_blockDisconnectCallbacks[i](block, disconnectHeight, disconnectHash);

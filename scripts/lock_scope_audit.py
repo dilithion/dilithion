@@ -26,6 +26,33 @@ would otherwise have to infer them from a green line:
    a same-named method on an unrelated class can be over-reported. Over-reporting
    is loud and gets classified; under-reporting is what the widening fixed.
 
+4. D-8 (#197 fold read): two more spellings escape SILENTLY, and they are listed
+   here rather than left to be rediscovered.
+     (a) A lock ACQUIRED by a bare call - `m_mutex.lock();` with no RAII guard -
+         is not seen at all. `.lock()` is recognised only as a RE-take on a
+         variable this auditor already knows about, so a mutex first acquired
+         that way never enters the held set and a chainstate call under it
+         reports CLEAN.
+         [measured] TWO such sites exist: registration_manager.cpp:498 and :550,
+         both `stateMutex_.lock();`. Neither is a live miss - that file makes ZERO
+         chainstate accessor calls, so there is nothing for the auditor to have
+         missed there. (An earlier version of this note claimed "no instance in
+         the tree"; that was wrong, and the grep that produced it also counted
+         comments. Corrected by measuring, which is the whole point of the
+         paragraph above it.)
+     (b) A guard whose DECLARATION spans lines -
+             std::lock_guard<std::recursive_mutex>
+                 lock(cs_main);
+         - does not match, because LOCK is applied per line. Same consequence.
+         [measured] ZERO instances in production .cpp.
+   Both are under-reporting, i.e. the direction that reads as success. They are
+   left unhandled deliberately: handling them means either joining lines (which
+   would break the per-line reporting this guard's output depends on) or tracking
+   bare lock/unlock pairs across scopes, which is the half-a-parser this file has
+   twice refused to become. Stated, measured as absent, and revisited if either
+   spelling appears - the accessor COUNT printed on every run is the tripwire for
+   the tree changing underneath that claim.
+
 Review fixes folded (COORD reader on 732eb9e8):
   * `.lock()` now RE-MARKS a released lock as held. The first version only ever
     set released=True on `.unlock()` and never cleared it, so a chainstate call
@@ -92,6 +119,13 @@ ALLOWED = {
     # `scripts/check-tip-notify-drain.sh` is what actually holds that order.
     ('src/net/headers_manager.cpp', 'OnBlockActivated', 'GetBlockHeightByHash', 'cs_headers'): 1,
 
+    # D-1 (external review of #197): keying on 'main' was only PARTLY the fix.
+    # main() in the node files runs from its opening line to end of file, so every
+    # lambda inside it shares the key - and a NEW chainstate call under this mutex
+    # in a DIFFERENT lambda would inherit this classification and pass silently.
+    # The four callback bodies are hoisted to named statics
+    # (SettlePendingMinerWinsOnConnect) so each entry names one specific body.
+    #
     # M-3: these were keyed on '?' - the attribution placeholder - which is
     # location-agnostic: it means "one unattributed site of this shape SOMEWHERE
     # in this file", so deleting the classified site and adding a different one
@@ -104,10 +138,10 @@ ALLOWED = {
     # ALREADY owns cs_main - the only holder that reaches the chainstate is itself
     # inside a block-connect callback, where cs_main is held and recursive. No
     # thread can supply the opposite order.
-    ('src/node/dilithion-node.cpp', 'main', 'GetTip', 'g_pendingMinerWinsMutex'): 1,
-    ('src/node/dilithion-node.cpp', 'main', 'GetBlockIndex', 'g_pendingMinerWinsMutex'): 1,
-    ('src/node/dilv-node.cpp', 'main', 'GetTip', 'g_pendingMinerWinsMutex'): 1,
-    ('src/node/dilv-node.cpp', 'main', 'GetBlockIndex', 'g_pendingMinerWinsMutex'): 1,
+    ('src/node/dilithion-node.cpp', 'SettlePendingMinerWinsOnConnect', 'GetTip', 'g_pendingMinerWinsMutex'): 1,
+    ('src/node/dilithion-node.cpp', 'SettlePendingMinerWinsOnConnect', 'GetBlockIndex', 'g_pendingMinerWinsMutex'): 1,
+    ('src/node/dilv-node.cpp', 'SettlePendingMinerWinsOnConnect', 'GetTip', 'g_pendingMinerWinsMutex'): 1,
+    ('src/node/dilv-node.cpp', 'SettlePendingMinerWinsOnConnect', 'GetBlockIndex', 'g_pendingMinerWinsMutex'): 1,
 }
 
 
@@ -210,6 +244,7 @@ def scan(path, accessors):
         m = FUNC.match(raw)
         if m and depth == 0:
             func = m.group(1)
+
         lk = LOCK.search(line)
         if lk:
             # group(2) may hold SEVERAL mutexes (std::scoped_lock a(m1, m2)).
@@ -229,7 +264,16 @@ def scan(path, accessors):
             live = [h['mx'] for h in held if not h['rel'] and 'cs_main' not in h['mx']]
             if live:
                 out.append((i, func, c.group(2), sorted(set(live)), c.group(1)))
+        prev_depth = depth
         depth += line.count('{') - line.count('}')
+        # D-3 (external review of #197): `func` was never CLEARED, so anything at
+        # namespace scope AFTER a function closed - a lambda initialising a global,
+        # say - inherited that function's name. A mis-key is quieter than a refusal:
+        # it can match an ALLOWED entry written for a different body. Clear at the
+        # CLOSE of the body, not merely at depth 0, because a signature whose brace
+        # sits on the next line is still at depth 0 and must keep its name.
+        if prev_depth > 0 and depth <= 0:
+            func = '?'
         held = [h for h in held if h['d'] <= depth]
     return out
 
@@ -254,7 +298,7 @@ def main(argv):
             if f.endswith('.cpp') and f != 'chain.cpp':
                 targets.append(os.path.join(dirpath, f))
 
-    total, counts, unattributed = 0, {}, []
+    total, counts, unattributed, receivers = 0, {}, [], {}
     for t in sorted(targets):
         f = scan(t, acc)
         if f:
@@ -266,6 +310,7 @@ def main(argv):
                 for mx in mxs:
                     k = (rel, fn, call, mx)
                     counts[k] = counts.get(k, 0) + 1
+                    receivers[k] = recv      # D-5: report the ACTUAL receiver
                     if fn == '?':
                         unattributed.append((rel, ln, call, mx))
     print(f"\nfiles scanned: {len(targets)}   sites found: {total}")
@@ -273,9 +318,9 @@ def main(argv):
     # M-1: state the POPULATION this auditor can see, not only what it flagged.
     # Before the receiver was widened this matched `g_chainstate.` alone, so the
     # "every site is classified" line below was true only of DIRECT calls on the
-    # global. [censused] 86 of 319 accessor calls in production .cpp files (27%)
-    # reach the chainstate through another receiver - 81 via `m_chainstate`, 5
-    # via a plain `chainstate`. None of those 86 sits inside a private-mutex
+    # global. [censused] 98 of 332 accessor calls in production .cpp files (27%)
+    # reach the chainstate through another receiver - 90 via `m_chainstate`, 8
+    # via a plain `chainstate`. None of those 98 sits inside a private-mutex
     # scope, so the old verdict was accidentally right while its coverage claim
     # was a quarter short. Printing the split lets the next reader see that
     # difference instead of inferring it.
@@ -308,13 +353,28 @@ def main(argv):
     unclassified, overcount = [], []
     for key, got in counts.items():
         want = ALLOWED.get(key, 0)
-        if want == 0:   unclassified.append((key, got))
-        elif got > want: overcount.append((key, got, want))
+        if want == 0:     unclassified.append((key, got))
+        elif got != want: overcount.append((key, got, want))
+
+    # D-2 (#197 fold read), and the first fix for it was COSMETIC. Changing the
+    # comparison from `got > want` to `got != want` is not enough on its own,
+    # because this loop iterates over the sites that were FOUND - a classified
+    # site that DISAPPEARS is simply absent from `counts`, so `got` is never 0 and
+    # nothing is compared. Measured: deleting a classified call still exited 0.
+    #
+    # An allowlist entry is a claim that a site EXISTS and is safe for a stated
+    # reason. When the site goes away the claim is stale, and a stale entry is how
+    # an allowlist silently starts authorising something else later. So walk the
+    # ALLOWED side too and fail on any entry with no matching site.
+    for key, want in ALLOWED.items():
+        if want > 0 and key not in counts:
+            overcount.append((key, 0, want))
 
     if unclassified or overcount:
         print('')
         for (f, fn, call, mx), got in unclassified:
-            print(f'FAIL: UNCLASSIFIED - {f} :: {fn} holds {mx} across g_chainstate.{call}()  x{got}')
+            recv = receivers.get((f, fn, call, mx), '<receiver>')
+            print(f'FAIL: UNCLASSIFIED - {f} :: {fn} holds {mx} across {recv}.{call}()  x{got}')
             print( '      One half of an AB-BA with the cs_main -> <private mutex> edge the block')
             print( '      connect/disconnect callbacks create (P2P-17). Fix with unique_lock +')
             print( '      unlock() across the call, as CCoinStatsIndex::WriteBlock, its Init(),')
@@ -322,7 +382,14 @@ def main(argv):
             print( '      **with the argument**.')
         for (f, fn, call, mx), got, want in overcount:
             print(f'FAIL: {f} has {got} sites of shape ({fn}/{call}/{mx}), expected {want}.')
-            print( '      An EXTRA site of an allowed shape is still a new site - classify it.')
+            if got > want:
+                print( '      An EXTRA site of an allowed shape is still a new site - classify it.')
+            else:
+                print( '      FEWER sites than the allowlist claims. An ALLOWED entry asserts a site')
+                print( '      EXISTS and is safe for a stated reason; with the site gone the entry is')
+                print( '      stale, and a stale entry is how an allowlist quietly starts authorising')
+                print( '      a DIFFERENT site later. Delete the entry in the same change that')
+                print( '      removed the call.')
         return 1
 
     print('OK: every site is classified (tuple + exact count)')

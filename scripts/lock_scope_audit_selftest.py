@@ -5,9 +5,9 @@ Why this exists. The auditor's two regexes were each too narrow, and neither
 narrowness was visible from its output:
 
   * M-1 - `call_re` matched only `g_chainstate.`, so a chainstate call through
-    any other receiver was invisible. [censused] 86 of 319 accessor calls in
-    production .cpp reach the chainstate as `m_chainstate->` (81) or a plain
-    `chainstate.` (5). None of them happened to sit under a private mutex, so
+    any other receiver was invisible. [censused] 98 of 332 accessor calls in
+    production .cpp reach the chainstate as `m_chainstate->` (90) or a plain
+    `chainstate.` (8). None of them happened to sit under a private mutex, so
     widening the regex changed no verdict - which is exactly why the gap could
     have survived indefinitely. A regex that finds nothing new is
     indistinguishable from a regex that finds nothing, unless something proves

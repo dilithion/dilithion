@@ -2042,6 +2042,49 @@ std::optional<CBlockTemplate> BuildMiningTemplate(CBlockchainDB& blockchain, CWa
     return CBlockTemplate(block, hashTarget, nHeight, version);
 }
 
+// D-1 (external review of #197): this body used to be an anonymous lambda
+// inside main(). The lock-scope auditor keys its allowlist on (file, function,
+// call, mutex), and main() here runs from its opening line to end of file, so
+// EVERY lambda inside main() shares the key "main" - a NEW chainstate call
+// under g_pendingMinerWinsMutex in a different lambda (a miner-thread one, say)
+// would inherit this entry's classification and pass silently. Naming the
+// function gives the allowlist a key that means one specific body.
+//
+// This is the ONLY reason it is a named function; the behaviour is unchanged.
+static void SettlePendingMinerWinsOnConnect(int height)
+{
+    std::lock_guard<std::mutex> lock(g_pendingMinerWinsMutex);
+    auto it = g_pendingMinerWins.begin();
+    while (it != g_pendingMinerWins.end()) {
+        if (it->height >= height) { ++it; continue; }  // not yet settled
+
+        CBlockIndex* tip    = g_chainstate.GetTip();
+        CBlockIndex* ourIdx = g_chainstate.GetBlockIndex(it->blockHash);
+        bool isCanonical = false;
+        if (ourIdx && tip) {
+            CBlockIndex* ancestor = tip->GetAncestor(it->height);
+            isCanonical = (ancestor == ourIdx);
+        }
+
+        if (isCanonical) {
+            std::cout << std::endl
+                      << "======================================" << std::endl
+                      << "  BLOCK CONFIRMED!" << std::endl
+                      << "  Height: " << it->height << std::endl
+                      << "======================================" << std::endl;
+        } else {
+            std::cout << std::endl
+                      << "======================================" << std::endl
+                      << "  BLOCK NOT SELECTED" << std::endl
+                      << "  Another miner's block won at height "
+                      << it->height << "." << std::endl
+                      << "  This is normal - better luck next block!" << std::endl
+                      << "======================================" << std::endl;
+        }
+        it = g_pendingMinerWins.erase(it);
+    }
+}
+
 int main(int argc, char* argv[]) {
     // FIRST local in main, so it is the LAST thing destroyed on the way out.
     // This node starts RandomX FULL-mode init in a background thread on any host
@@ -6186,38 +6229,10 @@ load_genesis_block:  // Bug #29: Label for automatic retry after blockchain wipe
         // ancestor of the new tip at its height (a reorg displaced it), we fire
         // BLOCK ORPHANED instead.
         // =========================================================================
-        g_chainstate.RegisterBlockConnectCallback([](const CBlock& /*block*/, int height, const uint256& /*hash*/) {
-            std::lock_guard<std::mutex> lock(g_pendingMinerWinsMutex);
-            auto it = g_pendingMinerWins.begin();
-            while (it != g_pendingMinerWins.end()) {
-                if (it->height >= height) { ++it; continue; }  // not yet settled
-
-                CBlockIndex* tip    = g_chainstate.GetTip();
-                CBlockIndex* ourIdx = g_chainstate.GetBlockIndex(it->blockHash);
-                bool isCanonical = false;
-                if (ourIdx && tip) {
-                    CBlockIndex* ancestor = tip->GetAncestor(it->height);
-                    isCanonical = (ancestor == ourIdx);
-                }
-
-                if (isCanonical) {
-                    std::cout << std::endl
-                              << "======================================" << std::endl
-                              << "  BLOCK CONFIRMED!" << std::endl
-                              << "  Height: " << it->height << std::endl
-                              << "======================================" << std::endl;
-                } else {
-                    std::cout << std::endl
-                              << "======================================" << std::endl
-                              << "  BLOCK NOT SELECTED" << std::endl
-                              << "  Another miner's block won at height "
-                              << it->height << "." << std::endl
-                              << "  This is normal - better luck next block!" << std::endl
-                              << "======================================" << std::endl;
-                }
-                it = g_pendingMinerWins.erase(it);
-            }
-        });
+        g_chainstate.RegisterBlockConnectCallback(
+            [](const CBlock& /*block*/, int height, const uint256& /*hash*/) {
+                SettlePendingMinerWinsOnConnect(height);
+            });
         std::cout << "  [OK] Deferred mining-outcome callback registered" << std::endl;
 
         // Digital DNA: Behavioral profile + trust scoring block hook
