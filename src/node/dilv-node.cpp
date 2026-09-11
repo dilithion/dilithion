@@ -127,6 +127,7 @@
 #include <util/shutdown_progress.h>
 #include <cstring>
 #include <cassert>
+#include <util/assert.h>   // ConsensusInvariant (round-8 F50 startup assertion)
 #include <thread>
 #include <chrono>
 #include <atomic>
@@ -2321,7 +2322,7 @@ int main(int argc, char* argv[]) {
             std::cout << "\nWindows shutdown signal received, cleaning up..." << std::endl;
             SignalHandler(SIGINT);
             // Give the shutdown logic a few seconds to flush databases
-            // EPOCH-WAIT-EXEMPT: startup banner countdown, long before the main loop publishes an epoch
+            // EPOCH-WAIT-EXEMPT: ⚠️ WINDOWS CONSOLE CONTROL HANDLER THREAD, at SHUTDOWN -- NOT the main thread and NOT startup. This runs when the console window closes, on a thread the OS creates for the handler, to give the shutdown path time to flush LevelDB. That thread never checkpoints and publishes no epoch, so it pins nothing. (Round-8 F50: this was labelled "startup banner countdown" because it SITS NEAR the banner code -- an exemption reason must name the THREAD THAT EXECUTES IT, not the code it is printed next to.)
             std::this_thread::sleep_for(std::chrono::seconds(3));
             return TRUE;
         }
@@ -6723,6 +6724,7 @@ load_genesis_block:  // Bug #29: Label for automatic retry after blockchain wipe
             ~MaintThreadJoiner() {
                 if (t.joinable()) {
                     g_node_state.running = false;  // break the maintenance loop
+                    // EPOCH-WAIT-EXEMPT: MAIN THREAD, SHUTDOWN -- the DilV twin of dilithion-node's maintenance-thread join
                     t.join();
                 }
             }
@@ -7075,21 +7077,21 @@ load_genesis_block:  // Bug #29: Label for automatic retry after blockchain wipe
                     // joiner where it is declared); an uninterruptible 30s sleep
                     // would add up to 30s to every exit, error returns included.
                     for (int maint_tick = 0; maint_tick < 30 && g_node_state.running; ++maint_tick) {
-                        // EPOCH-WAIT-EXEMPT: startup: staged service bring-up, before the main loop's first checkpoint
+                        // EPOCH-WAIT-EXEMPT: ⚠️ P2P-MAINTENANCE THREAD, a long-lived concurrent thread that runs AFTER start -- NOT the main thread and NOT before any checkpoint. It sleeps 30 x 1 s between maintenance cycles. It never calls EpochCheckpoint and resolves no CBlockIndex*, so it publishes no epoch and pins nothing; the 1 s stepping exists so a join at exit is prompt. (Round-8 F50: was labelled "before the main loop's first checkpoint", which described where the code SITS, not which thread runs it.)
                         std::this_thread::sleep_for(std::chrono::seconds(1));
                     }
                 } catch (const std::system_error& e) {
                     std::cerr << "[P2P-Maint] System error in maintenance loop: " << e.what()
                               << " (code: " << e.code() << ")" << std::endl;
-                    // EPOCH-WAIT-EXEMPT: startup: staged service bring-up, before the main loop's first checkpoint
+                    // EPOCH-WAIT-EXEMPT: ⚠️ P2P-MAINTENANCE THREAD, a long-lived concurrent thread that runs AFTER start -- NOT the main thread and NOT before any checkpoint. It sleeps 30 x 1 s between maintenance cycles. It never calls EpochCheckpoint and resolves no CBlockIndex*, so it publishes no epoch and pins nothing; the 1 s stepping exists so a join at exit is prompt. (Round-8 F50: was labelled "before the main loop's first checkpoint", which described where the code SITS, not which thread runs it.)
                     std::this_thread::sleep_for(std::chrono::seconds(5));
                 } catch (const std::exception& e) {
                     std::cerr << "[P2P-Maint] Exception in maintenance loop: " << e.what() << std::endl;
-                    // EPOCH-WAIT-EXEMPT: startup: staged service bring-up, before the main loop's first checkpoint
+                    // EPOCH-WAIT-EXEMPT: ⚠️ P2P-MAINTENANCE THREAD, a long-lived concurrent thread that runs AFTER start -- NOT the main thread and NOT before any checkpoint. It sleeps 30 x 1 s between maintenance cycles. It never calls EpochCheckpoint and resolves no CBlockIndex*, so it publishes no epoch and pins nothing; the 1 s stepping exists so a join at exit is prompt. (Round-8 F50: was labelled "before the main loop's first checkpoint", which described where the code SITS, not which thread runs it.)
                     std::this_thread::sleep_for(std::chrono::seconds(5));
                 } catch (...) {
                     std::cerr << "[P2P-Maint] Unknown exception in maintenance loop" << std::endl;
-                    // EPOCH-WAIT-EXEMPT: startup: staged service bring-up, before the main loop's first checkpoint
+                    // EPOCH-WAIT-EXEMPT: ⚠️ P2P-MAINTENANCE THREAD, a long-lived concurrent thread that runs AFTER start -- NOT the main thread and NOT before any checkpoint. It sleeps 30 x 1 s between maintenance cycles. It never calls EpochCheckpoint and resolves no CBlockIndex*, so it publishes no epoch and pins nothing; the 1 s stepping exists so a join at exit is prompt. (Round-8 F50: was labelled "before the main loop's first checkpoint", which described where the code SITS, not which thread runs it.)
                     std::this_thread::sleep_for(std::chrono::seconds(5));
                 }
                 }
@@ -7893,6 +7895,18 @@ load_genesis_block:  // Bug #29: Label for automatic retry after blockchain wipe
         // This main thread is itself a participant (the loop below resolves the
         // tip on nearly every iteration), so it declares and checkpoints here,
         // where startup is finished and it holds nothing.
+        // ⚠️ ONE-SHOT ASSERTION: NOTHING ON THIS THREAD MAY HAVE CHECKPOINTED
+        // BEFORE HERE (round-8 F50). Sixteen sleeps above this line are exempted
+        // on exactly that ground -- "the main thread has published no epoch yet"
+        // -- and that is an assumption about control flow, which is the kind of
+        // thing that silently stops being true when someone adds a call above it.
+        //
+        // The exemption markers cannot check themselves; this can. If a future
+        // change checkpoints the main thread earlier, every one of those sixteen
+        // exemptions becomes a false reason beside a live pin -- the precise
+        // failure this round's triage found five of. Cheap: one atomic load, once,
+        // at startup.
+        ConsensusInvariant(!g_chainstate.IsEpochParticipant());
         g_chainstate.DeclareEpochParticipant("node-main-loop");
         g_chainstate.EpochCheckpoint("node-main-loop");
         {
@@ -7982,8 +7996,14 @@ load_genesis_block:  // Bug #29: Label for automatic retry after blockchain wipe
             // ⚠️ FOUND BY scripts/check_participant_waits.sh ON ITS FIRST RUN,
             // not by review: it is the same shape as F45 and F46 and it survived
             // both of those rounds because a one-second sleep does not look like
-            // a defect next to a two-minute one. Duration is not the thing that
-            // makes a pin matter; DUTY CYCLE is, and this one is ~100%.
+            // a defect next to a two-minute one.
+            //
+            // ⚠️ PRECISELY WHAT IT COSTS (round-8 LOW): the loop re-checkpoints
+            // every iteration, so this is BOUNDED LAG -- the reclamation floor
+            // trails the true epoch by about a second, permanently -- and NOT
+            // indefinite accumulation. It never stops reclamation; it keeps it a
+            // second behind, forever. Worth fixing; not the unbounded freeze a
+            // parked thread causes. The scope stays, the claim is corrected.
             {
                 EpochOfflineScope offline(&g_chainstate);
                 std::this_thread::sleep_for(std::chrono::seconds(1));
@@ -8698,6 +8718,7 @@ load_genesis_block:  // Bug #29: Label for automatic retry after blockchain wipe
         // Only join maintenance thread
         Dilithion::ShutdownProgress::Stage("p2p maintenance thread join");
         if (p2p_maint_thread.joinable()) {
+            // EPOCH-WAIT-EXEMPT: MAIN THREAD, SHUTDOWN SEQUENCE -- the DilV twin
             p2p_maint_thread.join();
         }
 

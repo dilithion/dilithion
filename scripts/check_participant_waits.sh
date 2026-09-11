@@ -89,15 +89,38 @@ if [ "${1:-}" = "--self-test" ]; then
     # OK: NOT a participant — no checkpoint, so not in scope at all
     printf 'void f(){ cv.wait(lk); }\n' > "$tmp/src/g3.cpp"
 
+    # ── round-8 F49: six ways to satisfy the guard WITHOUT the property ──────
+    # (a) a marker three lines up exempts a call added into the window later
+    printf 'void f(){ g_chainstate.EpochCheckpoint("x");\n  // EPOCH-WAIT-EXEMPT: an older reason, about a different call\n  int filler = 0; (void)filler;\n  cv.wait(lk);\n}\n' > "$tmp/src/b4.cpp"
+    # (b) braceless: the scope dies at the semicolon, the next call is NOT covered
+    printf 'void f(){ g_chainstate.EpochCheckpoint("x");\n  if (x) EpochOfflineScope o(&cs);\n  cv.wait(lk);\n}\n' > "$tmp/src/b5.cpp"
+    # (c) an ONLINE WINDOW is not an offline scope -- its body is ONLINE
+    printf 'void f(){ g_chainstate.EpochCheckpoint("x");\n  { EpochOnlineWindow w(&cs);\n    cv.wait(lk); }\n}\n' > "$tmp/src/b6.cpp"
+    # (d) an online window NESTED in an offline scope masks it
+    printf 'void f(){ g_chainstate.EpochCheckpoint("x");\n  { EpochOfflineScope o(&cs);\n    { EpochOnlineWindow w(&cs);\n      cv.wait(lk); } }\n}\n' > "$tmp/src/b7.cpp"
+    # (e) only the FIRST call on a line was checked; the second hid
+    printf 'void f(){ g_chainstate.EpochCheckpoint("x");\n  { EpochOfflineScope o(&cs); cv.wait(lk); } cv.wait(lk2);\n}\n' > "$tmp/src/b8.cpp"
+    # (f) taxonomy: join() on the node main is a blocking call too
+    printf 'void f(){ g_chainstate.EpochCheckpoint("x");\n  t.join();\n}\n' > "$tmp/src/b9.cpp"
+    # (f) taxonomy: arrow-form wait
+    printf 'void f(){ g_chainstate.EpochCheckpoint("x");\n  p->wait(lk);\n}\n' > "$tmp/src/b10.cpp"
+
+    # OK: the marker on the IMMEDIATELY preceding line still works
+    printf 'void f(){ g_chainstate.EpochCheckpoint("x");\n  // EPOCH-WAIT-EXEMPT: shutdown only\n  cv.wait(lk);\n}\n' > "$tmp/src/g4.cpp"
+    # OK: a marker further up that NAMES the call it excuses
+    printf 'void f(){ g_chainstate.EpochCheckpoint("x");\n  // EPOCH-WAIT-EXEMPT: the join below is shutdown-only\n  int filler = 0; (void)filler;\n  t.join();\n}\n' > "$tmp/src/g5.cpp"
+    # OK: an offline scope OUTSIDE an online window covers a call after it
+    printf 'void f(){ g_chainstate.EpochCheckpoint("x");\n  { EpochOfflineScope o(&cs);\n    { EpochOnlineWindow w(&cs); }\n    cv.wait(lk); }\n}\n' > "$tmp/src/g6.cpp"
+
     fails=0
-    for f in b1 b2 b3; do
+    for f in b1 b2 b3 b4 b5 b6 b7 b8 b9 b10; do
         if awk -f "$AWK_PROG" "$tmp/src/$f.cpp" 2>&1 | grep -q '^BAD'; then
             echo "  PASS  reject $f"
         else
             echo "  FAIL  reject $f: an ONLINE blocking call was not flagged"; fails=$((fails+1))
         fi
     done
-    for f in g1 g2; do
+    for f in g1 g2 g4 g5 g6; do
         if awk -f "$AWK_PROG" "$tmp/src/$f.cpp" 2>&1 | grep -qE '^(OK|EXEMPT)'; then
             echo "  PASS  accept $f"
         else
@@ -114,7 +137,7 @@ if [ "${1:-}" = "--self-test" ]; then
     if [ "$fails" -ne 0 ]; then
         echo "===== participant-wait guard SELF-TEST: FAIL ($fails) ====="; exit 1
     fi
-    echo "===== participant-wait guard SELF-TEST: PASS (3 rejected, 3 accepted) ====="
+    echo "===== participant-wait guard SELF-TEST: PASS (10 rejected, 6 accepted) ====="
     exit 0
 fi
 
@@ -147,6 +170,19 @@ echo "participant blocking calls: $ok scoped, $exempt exempt, $bad ONLINE, $pars
 
 # ⚠️ The population is PRINTED, not just counted. A guard whose scan silently
 # narrows reports a smaller clean number and looks better while checking less.
+# ⚠️ THE INPUT SET IS PRINTED, AND SO IS WHAT IS NOT IN IT (round-8 F51). The send
+# accounting did not reconcile across three artifacts -- "18 sends" in one comment,
+# "4 markers" in another, "five sites by hand" in a commit message -- because each
+# counted a different population and none said which. The guard now states its own:
+echo "input set: src/**/*.{cpp,h}, EXCLUDING src/test/; within that, only files"
+echo "           containing EpochCheckpoint( ; within those, only the checkpointing"
+echo "           function and ONE HOP of its callees."
+echo "⚠️ NOT in the input set, and therefore NOT certified by this PASS:"
+echo "           * blocking calls two or more frames below a checkpointing function"
+echo "           * blocking calls in another translation unit"
+echo "           * src/test/ (tests are not a node)"
+echo "           * any participant file the parser could not read (reported as PARSE"
+echo "             above; there are $parse of those)"
 echo "participant files scanned:"
 printf '%s\n' "$verdicts" | awk '{print "        " $2}' | sort -u
 

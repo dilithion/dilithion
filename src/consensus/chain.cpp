@@ -641,8 +641,32 @@ std::atomic<uint64_t>* MyEpochSlot()
         // template update, this grows for the life of the process at one word
         // plus one vector entry per thread ever seen -- not per thread alive.
         //
-        // ACCEPTED, with the cost stated rather than hidden behind a wrong bound:
-        // 8 bytes plus a pointer per historical participant. Reuse would need a
+        // ⚠️ ACCEPTED WITH A BUDGET, NOT JUST A COST (round-8 F54). "It grows" is
+        // not a decision; a decision names the rate, the ceiling and what trips a
+        // redesign:
+        //   RATE. Slots accrue per thread that ever participated. The restarting
+        //     populations are the miners (StopMining/StartMining on every template
+        //     update, so ~1 worker-set per block) and the index sync loops (once
+        //     each). At a 60 s target spacing and 4 mining workers that is ~5,760
+        //     slots/day, ~2.1M/year.
+        //   CEILING. Each slot is 8 bytes of atomic plus one pointer in
+        //     Registry().slots: ~16 bytes all-in, so ~92 KB/day, ~34 MB/year of
+        //     continuous mining. Memory is not the constraint.
+        //   WHAT ACTUALLY TRIPS. DrainGraveyard is O(slots) per call, so the cost
+        //     that matters is DRAIN LATENCY, not bytes. graveyard_occupancy_bench
+        //     reports drain max/mean on every run.
+        //   THE TRIGGER, stated so it is a threshold and not a judgement call:
+        //     REDESIGN WHEN THE BENCH'S DRAIN MAX EXCEEDS 50 ms, which is the same
+        //     number the deque-vs-vector note above uses as its flip condition.
+        //     Measured today: 19.3 ms max at 500,000 entries with ~100,000 live
+        //     slots-worth of survivors, so there is roughly a 2.5x margin.
+        //   THE SHAPE OF THE FIX, if it trips: a generation-stamped free list --
+        //     a retired slot is reusable once every thread has passed the epoch in
+        //     which it retired, which is this file's own rule applied one level
+        //     down. Not built, because 2.5x is not a reason to build it.
+        //
+        // The bare cost, for the record: 8 bytes plus a pointer per historical
+        // participant. Reuse would need a
         // free-list whose safety is the very lifetime problem this file exists to
         // solve -- a retired slot cannot be recycled until every thread that
         // might read it has passed an epoch, which is the same proof obligation

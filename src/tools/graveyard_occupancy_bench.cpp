@@ -285,10 +285,14 @@ int main(int argc, char** argv)
     if (parked.joinable()) {
         { std::lock_guard<std::mutex> lk(park_m); park_release = true; }
         park_cv.notify_all();
+        // EPOCH-WAIT-EXEMPT: BENCH DRIVER THREAD, teardown. This is the instrument joining the parked participant it deliberately created to MEASURE what a park costs
         parked.join();
     }
+    // EPOCH-WAIT-EXEMPT: BENCH DRIVER THREAD, teardown -- joining a deliberately-parked worker
     slow.join();
+    // EPOCH-WAIT-EXEMPT: BENCH DRIVER THREAD, teardown -- joining a deliberately-parked worker
     fast.join();
+    // EPOCH-WAIT-EXEMPT: BENCH DRIVER THREAD, teardown -- joining a deliberately-parked worker
     drainer.join();
 
     const long rss_after = CurrentRssKb();

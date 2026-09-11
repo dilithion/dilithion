@@ -160,6 +160,30 @@ jobs:
       run: |
         make genesis_gen -j$(nproc)
 
+    - name: Deferred-reclamation structural guards
+      run: |
+        # ⚠️ THESE HELD ONLY ON ONE DEVELOPER'S MACHINE UNTIL NOW (round-8 F52).
+        # Both guards are sh + awk with no build dependency, so Linux runs them
+        # exactly as MSYS2 does -- and the PROPERTIES they hold are toolchain
+        # independent even though the DEFECT that motivated them is Windows-only:
+        #   * thread_local guard: every thread_local trivially destructible with a
+        #     positive static_assert on its own type, checked against an explicit
+        #     inventory. Motivated by MinGW emutls freeing TLS before the C++
+        #     destructors run; the RULE is worth holding everywhere.
+        #   * participant-wait guard: no epoch participant may block while ONLINE.
+        #     Five instances of that were found by hand on this branch before the
+        #     guard existed, and it found two more on its first run.
+        #
+        # EACH RUNS ITS OWN SELF-TEST FIRST, and that is not ceremony: both guards
+        # have failed their own fixtures during development, both times in the
+        # FALSE-OK direction (a NEGATED static_assert accepted; a scope that had
+        # already closed accepted). A guard whose fixtures are never exercised can
+        # stop discriminating without anyone noticing.
+        bash scripts/check_thread_local_guard.sh --self-test
+        bash scripts/check_thread_local_guard.sh
+        bash scripts/check_participant_waits.sh --self-test
+        bash scripts/check_participant_waits.sh
+
     - name: Wallet-preservation guard regression
       run: |
         # An unreadable wallet.dat must never be overwritten by the
