@@ -23,18 +23,21 @@
 # than letting "the node started" imply more.
 #
 # ⚠️ SAFETY, AND IT IS NOT INCIDENTAL:
-#   * `--datadir` is an ISOLATED TEMP DIR, removed on exit. **There is a live HIGH
-#     (2026-09-11) that a node given `--datadir=` can still resolve SEED-ATTESTATION
-#     paths from the chainparams default** — and on a developer box that default is a
-#     real, protected directory. That path is armed by `--relay-only`, which this
-#     script therefore NEVER passes.
-#   * `--generate-seed-key` is NEVER passed. It is forbidden on hosts with protected
-#     data and has no business in a startup check.
+#   * `--datadir` is an ISOLATED TEMP DIR, removed on exit.
+#   * ⚠️ `--relay-only` IS PASSED, and an earlier version of this header promised
+#     the opposite. It has to be: the WALLET GATE SITS BEFORE THE STARTUP GATE
+#     (`dilithion-node.cpp:5521` refuses a non-TTY launch with no wallet and names
+#     only two ways past it — `--relay-only` or an interactive terminal; there is
+#     no third flag in the parser). Without it the node can never reach the thing
+#     this leg measures. CI run 34573246685 failed all four matrix jobs on exactly
+#     that, and is why this file no longer claims otherwise.
+#   * **That flag arms the live HIGH (2026-09-11): a node given `--datadir=` can
+#     still resolve SEED-ATTESTATION paths from the chainparams default.** It is
+#     safe HERE only because an ephemeral runner's default directory does not
+#     exist and holds nothing. It is NOT safe on a developer box — so the local
+#     override was REMOVED rather than left as a footgun. A container counts as CI.
+#   * `--generate-seed-key` is NEVER passed, so no key can be minted.
 #   * MAINNET datadir only. Testnet's default directory is the protected one.
-#   * ⚠️ THIS IS A CI SCRIPT. It is safe on an ephemeral Linux runner with no
-#     pre-existing node data. Running it on a developer machine is NOT recommended
-#     while that HIGH is open, and `DIL_STARTUP_GATE_ALLOW_LOCAL=1` must be set to do
-#     it at all — a deliberate step, not a default.
 #
 # Self-test: scripts/ci_node_startup_gate.sh --self-test
 #   Drives the wait/timeout/kill logic against a FAKE node that prints scripted output,
@@ -82,6 +85,21 @@ watch_for_gate() {
 # is the primary. `CI` is still honoured — many runners set only that — but a
 # FALSEY value is taken to mean what it says.
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# log_says_bad_launch <logfile> — did the NODE refuse because THIS SCRIPT started
+# it wrongly? Every entry here was a real CI failure that pointed at innocent
+# code, not a hypothetical:
+#   * the wallet/TTY gate (CI run 34573246685, all four matrix jobs);
+#   * an unknown flag (`--noconnect`, caught before it shipped).
+# Keeping them in one testable predicate is the point: the enumeration grew twice
+# because each time I only taught the script the failure I had just hit.
+# ---------------------------------------------------------------------------
+log_says_bad_launch() {
+    grep -qF "Wallet setup requires an interactive terminal" "$1" 2>/dev/null && return 0
+    grep -q  "Unknown option:" "$1" 2>/dev/null && return 0
+    return 1
+}
+
 in_ci() {
     [ -f /.dockerenv ] && return 0
     case "${GITHUB_ACTIONS:-}" in [Tt][Rr][Uu][Ee]|1) return 0 ;; esac
@@ -146,11 +164,35 @@ if [ "${1:-}" = "--self-test" ]; then
     check_ci "CI=true is CI"                0 "CI=true"
     check_ci "GITHUB_ACTIONS=true is CI"    0 "GITHUB_ACTIONS=true"
 
+    # (6) ⚠️ THE DISCRIMINATION THAT COST FOUR MATRIX JOBS. A node that exits
+    #     before the gate is either the assertion firing or this script starting
+    #     it wrongly. The leg used to assert the first and was wrong; these cases
+    #     pin the difference so it cannot regress to a single story again.
+    printf 'ERROR: Wallet setup requires an interactive terminal.\nstdin is not a TTY\n' > "$tmp/w.log"
+    log_says_bad_launch "$tmp/w.log" \
+        && echo "  PASS  wallet/TTY exit reads as a BAD LAUNCH, not a wiring defect" \
+        || { echo "  FAIL  wallet/TTY exit misread as a wiring defect"; fails=$((fails+1)); }
+
+    printf 'Unknown option: --noconnect\n' > "$tmp/u.log"
+    log_says_bad_launch "$tmp/u.log" \
+        && echo "  PASS  unknown flag reads as a BAD LAUNCH" \
+        || { echo "  FAIL  unknown flag misread"; fails=$((fails+1)); }
+
+    # ⚠️ AND THE CONVERSE, WHICH IS THE ONE THAT MATTERS: a real abort must NOT be
+    #    excused as a bad launch, or this predicate becomes a way to lose the
+    #    defect the whole leg exists to catch.
+    printf '[Chain] deferred reclamation: assertion failed\nAborted (core dumped)\n' > "$tmp/x.log"
+    if log_says_bad_launch "$tmp/x.log"; then
+        echo "  FAIL  a real abort was excused as a bad launch"; fails=$((fails+1))
+    else
+        echo "  PASS  a real abort is NOT excused as a bad launch"
+    fi
+
     echo
     if [ "$fails" -ne 0 ]; then
         echo "===== node startup gate SELF-TEST: FAIL ($fails) ====="; exit 1
     fi
-    echo "===== node startup gate SELF-TEST: PASS (9 cases) ====="
+    echo "===== node startup gate SELF-TEST: PASS (12 cases) ====="
     exit 0
 fi
 
@@ -159,13 +201,20 @@ fi
 # ---------------------------------------------------------------------------
 cd "$ROOT" || exit 2
 
-if ! in_ci && [ "${DIL_STARTUP_GATE_ALLOW_LOCAL:-}" != "1" ]; then
+# ⚠️ NO LOCAL OVERRIDE, BY DESIGN, AND THIS USED TO HAVE ONE.
+# `DIL_STARTUP_GATE_ALLOW_LOCAL=1` was removed when the leg was forced to pass
+# --relay-only (see the launch below): that flag arms the seed-attestation path
+# the open HIGH is about, and an env var is far too cheap a key for a door that
+# now leads somewhere real. A container still counts as CI via /.dockerenv, so a
+# developer who wants to run this locally can, in a clean container -- which is
+# the same isolation CI has, rather than a promise to be careful.
+if ! in_ci; then
     echo "===== node startup gate: REFUSED TO RUN ====="
-    echo "  This launches a real node. On a developer machine that is not safe while"
-    echo "  the --datadir attestation-path HIGH is open: a node given --datadir can"
-    echo "  still resolve seed-attestation paths from the chainparams default, which"
-    echo "  on a developer box is a REAL directory holding wallet and seed material."
-    echo "  Set DIL_STARTUP_GATE_ALLOW_LOCAL=1 only if you know this box has none."
+    echo "  This launches a real node WITH --relay-only, which arms the open"
+    echo "  --datadir attestation-path HIGH: a node given --datadir can still"
+    echo "  resolve seed-attestation paths from the chainparams default, and on a"
+    echo "  developer box that is a REAL directory holding wallet and seed material."
+    echo "  There is deliberately no env override. Run it in a container or in CI."
     exit 2
 fi
 
@@ -209,8 +258,29 @@ echo "launching a node with an isolated datadir (no --relay-only, no seed-key ge
 # rejecting a real wiring defect. Verified against the real parser instead of
 # assumed: the flags that exist are `--datadir=`, `--port=`, `--rpcport=`,
 # `--connect=`. `--connect=` also disables DNS seeds, which is what was wanted.
+# ⚠️ --relay-only IS PASSED, REVERSING WHAT THIS SCRIPT ORIGINALLY PROMISED, AND
+# THE REVERSAL IS DELIBERATE. The first version refused it because --relay-only is
+# the flag that ARMS the open HIGH (a node given --datadir can still resolve
+# SEED-ATTESTATION paths from the chainparams default). CI run 34573246685 then
+# failed on all four matrix jobs for a reason that makes the refusal impossible to
+# keep: the WALLET GATE SITS BEFORE THE STARTUP GATE. dilithion-node.cpp:5521
+# refuses a non-TTY launch that has no wallet, naming exactly two ways past it --
+# --relay-only, or an interactive terminal. There is no third flag; I enumerated
+# the parser. So the node can NEVER reach the thing this leg measures without it.
+#
+# What makes it safe HERE and nowhere else: this runs ONLY on an ephemeral CI
+# runner (or a container), where the chainparams default directory does not exist
+# and holds nothing to leak or destroy. The local-override escape hatch has been
+# REMOVED rather than left as a footgun -- on a developer box that default is a
+# real directory with wallet and seed material, and with --relay-only now required
+# the old override would have armed precisely the path the HIGH is about.
+# --generate-seed-key is still NEVER passed, so no key can be minted.
+#
+# ⚠️ AND IT CHANGES WHAT THE CENSUS COUNTS: a relay-only node declares the
+# participants a relay-only node has. The baseline must be measured from THIS
+# configuration, and is not comparable to a mining node's.
 "$NODE" --datadir="$workdir/data" --port=18555 --rpcport=18556 \
-        --connect=127.0.0.1:1 \
+        --connect=127.0.0.1:1 --relay-only \
         > "$log" 2>&1 &
 node_pid=$!
 
@@ -237,11 +307,36 @@ case "$rc" in
      echo "     That is the gate working -- and it means this tree has a wiring bug."
      grep -F "$REFUSE_LINE" "$log" | head -3 | sed 's/^/       /'
      echo "===== node startup gate: FAIL (node refused) ====="; exit 1 ;;
-  2) echo "  ⚠️ THE NODE DIED BEFORE REACHING THE GATE. If the one-shot"
-     echo "     ConsensusInvariant(!IsEpochParticipant()) fired, it aborts here --"
-     echo "     which is exactly the case this leg exists to make visible."
+  2) # ⚠️ TWO VERY DIFFERENT THINGS REACH THIS BRANCH, AND THE FIRST DRAFT NAMED
+     # ONLY ONE OF THEM. A node that exits before the gate is EITHER the
+     # assertion firing (the defect this leg exists to expose) OR this script
+     # starting the node wrongly (the leg being broken). The old text asserted
+     # the first -- "which is exactly the case this leg exists to make visible"
+     # -- and CI run 34573246685 proved how expensive that is: the node had
+     # exited because it wanted a TTY to create a wallet, and the leg pointed
+     # four matrix jobs' worth of readers straight at the epoch code.
+     #
+     # Enumerating known instrument failures one at a time is what produced that
+     # bug twice (first `--noconnect`, then the wallet gate). So the DEFAULT
+     # reading here is now skeptical, and the known ones are named on top of it.
+     if log_says_bad_launch "$log"; then
+         echo "  ⚠️ THE NODE WANTED A TTY TO CREATE A WALLET. That is a MISCONFIGURED"
+         echo "     LAUNCH -- a bug in this leg -- NOT an epoch wiring defect. The"
+         echo "     wallet gate sits BEFORE the startup gate, so the node can never"
+         echo "     reach the thing this leg measures without a wallet or --relay-only."
+         echo "===== node startup gate: FAIL (bad launch in this script) ====="; exit 2
+     fi
+     echo "  ⚠️ THE NODE EXITED BEFORE REACHING THE GATE. THIS IS AMBIGUOUS and must"
+     echo "     not be read as a wiring defect until the tail below is checked:"
+     echo "       (a) the one-shot ConsensusInvariant(!IsEpochParticipant()) fired"
+     echo "           -- an abort, and the case this leg exists to expose; or"
+     echo "       (b) the node refused to START for a reason of its own (config,"
+     echo "           wallet, ports, datadir) -- in which case THIS SCRIPT is what"
+     echo "           is broken and the epoch code is innocent."
+     echo "     An abort leaves a signal/assert line; a refusal leaves an ERROR and"
+     echo "     a clean shutdown sequence. Read which one this is BEFORE debugging."
      tail -20 "$log" | sed 's/^/       /'
-     echo "===== node startup gate: FAIL (node died) ====="; exit 1 ;;
+     echo "===== node startup gate: FAIL (node exited early -- see above) ====="; exit 1 ;;
   3) echo "  ⚠️ TIMED OUT after ${TIMEOUT_S}s without reaching the gate."
      tail -20 "$log" | sed 's/^/       /'
      echo "===== node startup gate: FAIL (timeout) ====="; exit 1 ;;
