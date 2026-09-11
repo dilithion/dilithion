@@ -66,6 +66,32 @@ watch_for_gate() {
 }
 
 # ---------------------------------------------------------------------------
+# in_ci — are we on a CI runner?
+#
+# ⚠️ `[ -n "$CI" ]` IS THE WRONG TEST, AND IT INVERTS ON THE ONE VALUE PEOPLE
+# TYPE DELIBERATELY. `CI=false` is non-empty, so an emptiness test reads the
+# string that MEANS "not CI" as "yes, CI" and launches a node on a developer
+# box. That is not a nit here: the Actions runners are plain VMs with no
+# `/.dockerenv`, so this predicate — not the docker check — is what actually
+# decides, and what it holds back is a real node launch on a machine whose
+# chainparams-default datadir holds wallet and seed material (the open
+# `--datadir` attestation HIGH). The guard was weaker than the warning in this
+# file's own header.
+#
+# `GITHUB_ACTIONS` is set to "true" by Actions itself and by nothing else, so it
+# is the primary. `CI` is still honoured — many runners set only that — but a
+# FALSEY value is taken to mean what it says.
+# ---------------------------------------------------------------------------
+in_ci() {
+    [ -f /.dockerenv ] && return 0
+    case "${GITHUB_ACTIONS:-}" in [Tt][Rr][Uu][Ee]|1) return 0 ;; esac
+    case "${CI:-}" in
+        ''|[Ff][Aa][Ll][Ss][Ee]|0|[Nn][Oo]|[Oo][Ff][Ff]) return 1 ;;
+        *) return 0 ;;
+    esac
+}
+
+# ---------------------------------------------------------------------------
 # --self-test: the wait logic, without a node
 # ---------------------------------------------------------------------------
 if [ "${1:-}" = "--self-test" ]; then
@@ -100,11 +126,31 @@ if [ "${1:-}" = "--self-test" ]; then
     kill "$faker" 2>/dev/null; wait "$faker" 2>/dev/null
     [ "$rc" -eq 3 ] && echo "  PASS  a node that never reaches the gate times out" || { echo "  FAIL  no timeout (rc=$rc)"; fails=$((fails+1)); }
 
+    # (5) the CI predicate. ⚠️ THE POINT OF THESE CASES IS `CI=false`: the
+    #     previous emptiness test ran the node on exactly that input, which is
+    #     the value someone sets to say "I am NOT in CI". A guard that inverts on
+    #     its most deliberate input is worse than no guard, because the header
+    #     promises it holds.
+    check_ci() {  # <label> <expected 0|1> <env assignments...>
+        local label="$1" want="$2"; shift 2
+        ( unset CI GITHUB_ACTIONS; [ -n "$1" ] && export "$@"; in_ci ) ; local got=$?
+        if [ "$got" -eq "$want" ]; then
+            echo "  PASS  in_ci: $label"
+        else
+            echo "  FAIL  in_ci: $label (want $want, got $got)"; fails=$((fails+1))
+        fi
+    }
+    check_ci "CI=false must NOT read as CI" 1 "CI=false"
+    check_ci "CI=0 must NOT read as CI"     1 "CI=0"
+    check_ci "CI unset is not CI"           1 ""
+    check_ci "CI=true is CI"                0 "CI=true"
+    check_ci "GITHUB_ACTIONS=true is CI"    0 "GITHUB_ACTIONS=true"
+
     echo
     if [ "$fails" -ne 0 ]; then
         echo "===== node startup gate SELF-TEST: FAIL ($fails) ====="; exit 1
     fi
-    echo "===== node startup gate SELF-TEST: PASS (4 cases) ====="
+    echo "===== node startup gate SELF-TEST: PASS (9 cases) ====="
     exit 0
 fi
 
@@ -113,7 +159,7 @@ fi
 # ---------------------------------------------------------------------------
 cd "$ROOT" || exit 2
 
-if [ ! -f /.dockerenv ] && [ -z "${CI:-}" ] && [ "${DIL_STARTUP_GATE_ALLOW_LOCAL:-}" != "1" ]; then
+if ! in_ci && [ "${DIL_STARTUP_GATE_ALLOW_LOCAL:-}" != "1" ]; then
     echo "===== node startup gate: REFUSED TO RUN ====="
     echo "  This launches a real node. On a developer machine that is not safe while"
     echo "  the --datadir attestation-path HIGH is open: a node given --datadir can"
@@ -139,6 +185,15 @@ cleanup() {
             kill -0 "$node_pid" 2>/dev/null || break
             sleep 1
         done
+        # ⚠️ THE `kill -9` IS SAFE **HERE AND ONLY HERE**, AND THE REASON IS THE
+        # DATADIR, NOT THE TIMEOUT. This node owns an isolated temp directory
+        # created seconds ago and deleted on the next line: there is no
+        # persistent state to corrupt, so losing the clean-shutdown path costs
+        # nothing. Against a REAL node that is false — OPS-6 requires SIGTERM
+        # and a wait, because SIGKILL during a flush can leave a chainstate that
+        # must be rebuilt (a sibling session came within one command of doing
+        # exactly that to 11 GB this morning). **Do not lift this pattern into
+        # any script that points at a real datadir.**
         kill -9 "$node_pid" 2>/dev/null
     fi
     rm -rf "$workdir"
@@ -209,6 +264,46 @@ if [ "$count" -lt 5 ]; then
     echo "  ⚠️ only $count declared participants. The gate passed, but vacuously:"
     echo "     a tree that stopped DECLARING threads would look exactly like this."
     echo "===== node startup gate: FAIL (census too small) ====="; exit 1
+fi
+
+# ---------------------------------------------------------------------------
+# PARTIAL LOSS. The floor above catches zero and near-zero; it does NOT catch a
+# tree that drops SOME declarations, which is the more plausible regression and
+# the one sixteen EPOCH-WAIT-EXEMPT markers rest on.
+#
+# ⚠️ AND YET AN EXACT EXPECTED COUNT WOULD BE A CHECK THAT FAILS ON A HEALTHY
+# TREE. The census total is CORE-COUNT DEPENDENT: headers_manager.cpp:3617 sets
+# `m_hash_worker_count = std::thread::hardware_concurrency()` and that pool
+# declares with its own size, so a 2-core runner and a 16-core runner report
+# different, equally correct totals. Pinning the number I happen to observe
+# would redden this leg on the next runner with a different shape — the precise
+# failure mode this script's own header was written about. The RPC pool (8) and
+# the block-worker pool (1) are fixed; the hash-worker pool is not.
+#
+# So the drop check is keyed to a MEASURED baseline, not a read-derived one, and
+# it is a FLOOR rather than an equality so extra cores can only ever add.
+# ---------------------------------------------------------------------------
+baseline_file="$ROOT/scripts/epoch_participant_census.baseline"
+expect_min="${DIL_STARTUP_GATE_MIN:-$(cat "$baseline_file" 2>/dev/null | tr -dc '0-9')}"
+if [ -n "$expect_min" ]; then
+    if [ "$count" -lt "$expect_min" ]; then
+        echo "  ⚠️ CENSUS DROPPED: $count declared, baseline floor $expect_min."
+        echo "     Some participants stopped being DECLARED. The gate still passed"
+        echo "     -- it only asks that declared threads checkpoint -- so this is"
+        echo "     the check that catches it. Either a declaration was lost, or"
+        echo "     this runner has fewer cores than the one that set the baseline"
+        echo "     (hash workers = hardware_concurrency); confirm which before"
+        echo "     lowering $baseline_file."
+        echo "===== node startup gate: FAIL (census below baseline) ====="; exit 1
+    fi
+    echo "  census $count >= baseline floor $expect_min"
+else
+    # ⚠️ SOFT, AND SAYS SO. A number I cannot measure on this box is a number I
+    # will not invent: the baseline is seeded from a real run, not from reading.
+    echo "  ⚠️ NO BASELINE RECORDED -- partial-loss detection is NOT active."
+    echo "     This run observed $count. To arm it, commit that number (minus any"
+    echo "     slack you want for smaller runners) as:"
+    echo "       echo $count > scripts/epoch_participant_census.baseline"
 fi
 
 echo "  the startup assertion did not fire and $count participants checkpointed"
