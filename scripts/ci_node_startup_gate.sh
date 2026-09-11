@@ -85,7 +85,12 @@ TIMEOUT_S="${DIL_STARTUP_GATE_TIMEOUT:-120}"
 # check that failed on a healthy tree, in the file whose subject is checks that
 # fail on healthy trees. Caught by running it.
 # (--datadir is appended at launch: it is a temp dir created at runtime.)
-NODE_ARGS="--port=18555 --rpcport=18556 --connect=127.0.0.1:1 --relay-only"
+# ⚠️ --verbose EARNS ITS PLACE: it is what makes the node print its OWN hash-worker
+# count ("[HeadersManager] N hash workers started", gated on g_verbose, which
+# dilithion-node.cpp:2228 stores from config.verbose). That number is the missing
+# half of the census floor -- see the tightening block after the baseline check.
+# Verified against the parser at dilithion-node.cpp:783, not written from memory.
+NODE_ARGS="--port=18555 --rpcport=18556 --connect=127.0.0.1:1 --relay-only --verbose"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
@@ -119,6 +124,19 @@ log_says_bad_launch() {
     grep -qF "Wallet setup requires an interactive terminal" "$1" 2>/dev/null && return 0
     grep -q  "Unknown option:" "$1" 2>/dev/null && return 0
     return 1
+}
+
+# ---------------------------------------------------------------------------
+# hash_workers_from_log <logfile> — how many hash workers did the NODE say it
+# started? Empty when the line is absent, which the caller must treat as
+# "could not measure", never as agreement.
+#
+# ⚠️ IT IS A FUNCTION SO THE SELF-TEST CAN REACH IT. The one branch of in_ci()
+# the harness could not exercise was the branch that turned out to be wrong; the
+# rule earned there is applied here rather than re-learned.
+# ---------------------------------------------------------------------------
+hash_workers_from_log() {
+    grep -oE '\[HeadersManager\] [0-9]+ hash workers started' "$1" 2>/dev/null         | head -1 | grep -oE '[0-9]+' | head -1
 }
 
 # ---------------------------------------------------------------------------
@@ -280,11 +298,29 @@ if [ "${1:-}" = "--self-test" ]; then
         echo "  PASS  gate 5: --mine is not in NODE_ARGS, so no RandomX dataset wait" ;;
     esac
 
+    # (8) the tightening input's three outcomes. ⚠️ The third -- "could not
+    #     measure" -- is the one that must never resemble the first.
+    printf '[HeadersManager] Starting 4 hash worker threads (Phase 2)...
+[HeadersManager] 4 hash workers started
+' > "$tmp/hw.log"
+    got="$(hash_workers_from_log "$tmp/hw.log")"
+    [ "$got" = "4" ] && echo "  PASS  hash-worker count read from the node's own line"         || { echo "  FAIL  hash-worker parse got '$got', want 4"; fails=$((fails+1)); }
+
+    # the "Starting N ... threads" line must NOT be mistaken for the started line
+    printf '[HeadersManager] Starting 7 hash worker threads (Phase 2)...
+' > "$tmp/hw2.log"
+    got="$(hash_workers_from_log "$tmp/hw2.log")"
+    [ -z "$got" ] && echo "  PASS  the 'Starting' line alone is not read as a count"         || { echo "  FAIL  'Starting' line misread as '$got'"; fails=$((fails+1)); }
+
+    : > "$tmp/hw3.log"
+    got="$(hash_workers_from_log "$tmp/hw3.log")"
+    [ -z "$got" ] && echo "  PASS  an absent line yields EMPTY (could-not-measure)"         || { echo "  FAIL  absent line yielded '$got'"; fails=$((fails+1)); }
+
     echo
     if [ "$fails" -ne 0 ]; then
         echo "===== node startup gate SELF-TEST: FAIL ($fails) ====="; exit 1
     fi
-    echo "===== node startup gate SELF-TEST: PASS (15 cases) ====="
+    echo "===== node startup gate SELF-TEST: PASS (18 cases) ====="
     exit 0
 fi
 
@@ -446,7 +482,45 @@ cores="$(nproc 2>/dev/null || echo '?')"
 hash_est="$cores"
 case "$hash_est" in ''|*[!0-9]*) hash_est=4 ;; esac
 [ "$hash_est" -gt 8 ] 2>/dev/null && hash_est=8
-echo "  runner: ${cores} cores -> hash pool ~${hash_est} of the census"
+echo "  runner: ${cores} cores -> hash pool ~${hash_est} of the census (nproc)"
+
+# ---------------------------------------------------------------------------
+# ⚠️ THE TIGHTENING INPUT. The committed floor (17) is derived from the CLAMP
+# alone -- hash workers are in [1,8], so from a census C the fixed remainder is
+# at least C-8 and no healthy node can print below (C-8)+1. That needs no
+# assumption and is why it shipped.
+#
+# A TIGHTER floor needs the fixed remainder EXACTLY, which means knowing how many
+# of the census are hash workers. `nproc` is a guess at that: it is what the
+# RUNNER reports, not what the NODE sees. Under cgroup quotas or CPU affinity the
+# two can differ, and if the node ever sees MORE cores than nproc reports, a floor
+# derived from nproc is too high and FAILS ON A HEALTHY TREE -- the defect this
+# leg has produced three times.
+#
+# So the node is asked directly, and the two are compared. Agreement pins the
+# remainder and licenses the tighter floor; DISAGREEMENT IS THE FINDING, not
+# noise, and the floor stays where it is.
+# ---------------------------------------------------------------------------
+node_hash="$(hash_workers_from_log "$log")"
+if [ -z "$node_hash" ]; then
+    # ⚠️ "COULD NOT MEASURE" MUST NOT READ AS "MEASURED AND FINE". This is not a
+    # failure of the tree -- the leg still did its job -- but it must not look
+    # like the agreement case, or a silent format change would freeze the
+    # tightening forever while appearing to progress.
+    echo "  ⚠️ tightening input UNAVAILABLE this run: the node printed no"
+    echo "     \"[HeadersManager] N hash workers started\" line. Either --verbose"
+    echo "     stopped reaching g_verbose or that text changed. The floor stays at"
+    echo "     its clamp-derived value; do NOT tighten from nproc alone."
+elif [ "$node_hash" = "$cores" ]; then
+    fixed=$((count - node_hash))
+    echo "  node reports $node_hash hash workers; nproc agrees -> fixed remainder $fixed"
+    echo "  => a floor of $((fixed + 1)) is derivable on THIS evidence (committed floor: ${expect_min:-unset})"
+else
+    echo "  ⚠️ DISAGREEMENT, AND THIS IS THE FINDING: nproc says $cores, the node"
+    echo "     reports $node_hash hash workers. hardware_concurrency and nproc do not"
+    echo "     see the same machine here (cgroup quota or CPU affinity), so ANY floor"
+    echo "     derived from nproc would be wrong. Keep the clamp-derived floor."
+fi
 
 # ⚠️ A CENSUS OF ZERO WOULD PASS THE GATE AND PROVE NOTHING. The gate is satisfied
 # when every DECLARED participant has checkpointed -- and zero declared participants
