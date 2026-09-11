@@ -6028,6 +6028,14 @@ bool CWallet::MigrateToEncryptedSeedV7Unlocked(bool* persistedToDisk,
                     // byte count under a name that cannot be mistaken for one.
                     std::cerr << " words=n/a space_bytes=" << spaces;
                 }
+                // ORACLE BIT, AT THE FIELD THAT CARRIES IT: verified_with_passphrase=1
+                // emits no passphrase bytes, but it CONFIRMS the BIP39 passphrase the
+                // caller supplied was the correct one. Producing it on an operator's
+                // own wallet is fine; that is a different question from whether the
+                // resulting log may be SENT anywhere -- attached to a bug report,
+                // shipped to a log aggregator, pasted into a channel. Anyone deciding
+                // where these logs go needs this line, which is why it is here and not
+                // only in the block comment above.
                 std::cerr << " verified=" << (armVerified ? 1 : 0)
                           << " verified_with_passphrase=" << (usedPassphrase ? 1 : 0)
                           << std::endl;
