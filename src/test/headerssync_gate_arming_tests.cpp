@@ -32,6 +32,7 @@
 #include <primitives/block.h>
 
 #include <iostream>
+#include <optional>
 #include <vector>
 
 namespace {
@@ -88,125 +89,129 @@ void test_threshold_is_injectable_and_observable()
     std::cout << " OK" << std::endl;
 }
 
-// Drive the REAL DoS-protected entry points with a given threshold and report
-// whether the peer's sync state survived (promoted) or was finalised+erased.
-// Empty headers is the branch that evaluates the work comparison.
-bool PeerSurvivesPresync(const uint256& threshold)
+// Drive the REAL DoS-protected entry points with a given threshold and report the
+// peer's resulting sync PHASE.
+//
+// ⛔ RE-DERIVED after #201 merged (main 8d8b9b8e), and BOTH halves of the old arm
+// had to change — this is not the same test with a new header.
+//
+// 1. THE STIMULUS. It used to send an EMPTY vector, because that was the only way
+//    this port evaluated the work comparison. LP-10 F5/D-2 removed the invented
+//    empty-batch transition (Core refuses an empty batch, headerssync.cpp:74), so
+//    the batch is now ONE REAL VDF HEADER linked to the manager's chain start.
+//    That is only possible because #201 routes REGTEST to VDFHeaderProofChecker:
+//    under the old IsDilV() selection regtest got the RandomX checker and every
+//    synthesisable header failed its proof check — measured then as
+//    `n=3 ... ret=0 after=NONE(erased)` and `n=2000 ... ret=0`, identical, which is
+//    exactly why this suite used an empty vector and why these two arms were
+//    SKIPPED OUT LOUD rather than deleted.
+//
+// 2. THE OBSERVABLE. It used to be ProcessHeadersWithDoSProtection's return value.
+//    That no longer discriminates: F5/D-1 makes a PRESYNC abort return
+//    success = TRUE (the batch's headers were valid; there is simply nothing more to
+//    do), so the manager returns true whether the peer promoted or was terminated.
+//    An arm reading the bool would now PASS IN BOTH DIRECTIONS. The observable is
+//    the phase — GetHeadersSyncPhase, added in #196 for precisely this reason:
+//      promoted        -> REDOWNLOAD (state retained)
+//      below threshold -> the abort finalises, and the manager compare-and-erases a
+//                         FINAL state on the way out (headers_manager.cpp), so the
+//                         phase reads as nullopt/absent.
+std::optional<HeadersSyncState::State> PresyncPhase(const uint256& threshold)
 {
     CHeadersManager mgr(threshold);
     const NodeId peer = 7;
 
-    // Arming path, exercised end to end: the observable value is what gets
-    // passed in, exactly as a §3 wiring call site should do.
     if (!mgr.InitializeDoSProtectedSync(peer, mgr.GetMinimumChainWork())) {
         std::cerr << "\n  FAIL InitializeDoSProtectedSync refused to start\n";
         std::abort();
     }
+    // Sanity: the session must begin in PRESYNC, or the arm below is measuring
+    // something other than a phase TRANSITION.
+    REQUIRE(mgr.GetHeadersSyncPhase(peer) == HeadersSyncState::State::PRESYNC);
 
-    // THE OBSERVABLE is this function's own return value, not a debug print and
-    // not a second Initialize call. On a PRESYNC work failure ProcessNextHeaders
-    // reports !success, the manager erases the peer's state and returns FALSE
-    // (headers_manager.cpp, the `if (!result.success)` arm); on promotion to
-    // REDOWNLOAD it returns TRUE.
-    //
-    // (An earlier version of this probe asked whether a SECOND
-    // InitializeDoSProtectedSync was refused. That was wrong twice over: the
-    // function returns true — not false — when a state already exists, and a
-    // rejected peer's state is erased, so a fresh Initialize would also succeed.
-    // The probe could not have distinguished the two cases at all.)
-    const std::vector<CBlockHeader> no_more_headers;
-    return mgr.ProcessHeadersWithDoSProtection(peer, no_more_headers);
+    uint256 start = mgr.GetBestHeaderHash();
+    if (start.IsNull()) start = Genesis::GetGenesisHash();
+
+    // A VDF header the checker accepts: VDF version, both VDF fields non-null, and
+    // nBits EQUAL to genesisNBits — that equality is the rule #201 made sound on
+    // regtest by mirroring the producer's constant branch.
+    CBlockHeader h;
+    h.nVersion      = CBlockHeader::VDF_VERSION;
+    h.nBits         = Dilithion::g_chainParams->genesisNBits;
+    h.nTime         = 1700000000;
+    h.nNonce        = 0;
+    h.hashPrevBlock = start;
+    for (int i = 0; i < 32; ++i) h.vdfProofHash.data[i] = 0x42;
+    for (int i = 0; i < 32; ++i) h.vdfOutput.data[i]    = 0x37;
+
+    mgr.ProcessHeadersWithDoSProtection(peer, std::vector<CBlockHeader>{h});
+    return mgr.GetHeadersSyncPhase(peer);
 }
 
-// THE DISCRIMINATING PAIR. Same code path, same peer, same empty-headers
-// message -- only the threshold differs. Both arms are required: if they landed
-// the same way the suite would certify nothing.
+// THE DISCRIMINATING PAIR, restored. Same code path, same peer, same single real
+// header — ONLY the threshold differs. If both arms landed the same way the suite
+// would certify nothing, which is what the SKIP block said out loud for the two
+// rounds it stood.
 void test_below_threshold_is_rejected_and_at_threshold_is_accepted()
 {
     std::cout << "  test_below_threshold_is_rejected_and_at_threshold_is_accepted..." << std::flush;
     using namespace dilithion::consensus;
 
-    // ARM A — ACCEPT. Threshold equals the work our chain start already has, so
-    // the seeded accumulator satisfies it and the peer is promoted.
-    REQUIRE(PeerSurvivesPresync(GenesisWork()) == true);
+    // ARM A — ACCEPT. ⚠️ THE THRESHOLD IS **TWO** BLOCKS' WORK, NOT ONE, AND THE
+    // REASON IS A REAL INTERACTION BETWEEN TWO GUARDS IN THIS BRANCH — measured,
+    // not guessed: with a one-block threshold this arm FAILED with
+    //   "PRESYNC: single-header work reaches the minimum-chain-work gate on its own"
+    // which is F3's single-header work bound doing exactly its job. That bound
+    // refuses any header whose OWN work REACHES nMinimumChainWork, and the old arm
+    // set the threshold to precisely one genesis block's work — so one honest
+    // genesis-difficulty header hit it.
+    //
+    // This is the activation prerequisite F3 documented, demonstrated rather than
+    // dodged: nMinimumChainWork MUST exceed one block's work at the hardest
+    // difficulty. A test that satisfied the gate by setting the threshold to a
+    // single block's work was encoding a configuration the bound forbids.
+    //
+    // The arithmetic, from the manager: InitializeDoSProtectedSync seeds
+    // chainStartWork = ComputeChainWork(genesisNBits) = one block's work, so after
+    // one header the accumulator is 2x. With the threshold at 2x: the header's own
+    // work (1x) is BELOW it, so the bound passes; the accumulator (2x) REACHES it,
+    // so PRESYNC promotes. Both guards are satisfied for the right reasons.
+    uint256 two_blocks = GenesisWork();
+    two_blocks = AddChainWork(two_blocks, GenesisWork());
+    REQUIRE(PresyncPhase(two_blocks) == HeadersSyncState::State::REDOWNLOAD);
 
-    // ARM B — REJECT. A threshold far above anything this peer demonstrated.
-    // This arm is only possible BECAUSE the gate can be armed; at the regtest
-    // default of zero it could not exist.
+    // ARM B — REJECT. A threshold far above anything this peer demonstrated: no
+    // promotion, and a non-full batch means the peer's chain has ended (Core
+    // headerssync.cpp:91), so the sync aborts and the manager erases the session.
     uint256 unreachable = GenesisWork();
     for (int i = 0; i < 5000; ++i)
         unreachable = AddChainWork(unreachable, ComputeChainWork(0x1d00ffff));
-    REQUIRE(PeerSurvivesPresync(unreachable) == false);
+    REQUIRE(!PresyncPhase(unreachable).has_value());
 
     std::cout << " OK" << std::endl;
 }
 
 // The vacuity check itself, asserted rather than assumed: at threshold ZERO the
-// reject arm is IMPOSSIBLE. This is the finding encoded as a test, so that
+// reject arm is IMPOSSIBLE. This is the original finding encoded as a test, so that
 // anyone who later "simplifies" the arming mechanism away sees why it existed.
 void test_zero_threshold_makes_rejection_impossible()
 {
     std::cout << "  test_zero_threshold_makes_rejection_impossible..." << std::flush;
     uint256 zero;
-    REQUIRE(PeerSurvivesPresync(zero) == true);
+    REQUIRE(PresyncPhase(zero) == HeadersSyncState::State::REDOWNLOAD);
     std::cout << " OK" << std::endl;
 }
 
 }  // namespace
 
 
-// ============================================================================
-// ⛔ TWO ARMS ARE SKIPPED, AND THE SKIP IS PRINTED RATHER THAN THE ARMS DELETED
-// ============================================================================
-//
-// LP-10 F5/D-2 removed the empty-batch transition (Core refuses an empty batch
-// outright, headerssync.cpp:74). PeerSurvivesPresync drove the manager with an
-// EMPTY vector — the only way it could, and here is why, MEASURED by probe:
-//
-//     n=3     init=1  before=PRESYNC  ret=0  after=NONE(erased)
-//     n=2000  init=1  before=PRESYNC  ret=0  after=NONE(erased)
-//
-// A real batch of ANY size is rejected identically, because CHeadersManager
-// selects its proof checker on IsDilV(), so REGTEST is handed
-// RandomXHeaderProofChecker and every synthesisable header fails its proof check
-// before the work comparison is reached. So these two arms cannot be re-derived
-// on this branch at all.
-//
-// PR #201 (fix/lp10-vdf-checker-selection) routes regtest to the VDF checker,
-// whose rule a fabricated header CAN satisfy. When it merges, delete this block
-// and re-derive the two arms with a real single-header batch and
-// full_headers_available = false, exactly as
-// headerssync_accumulator_seeding_tests::RunPresyncDecision now does.
-//
-// THEY ARE SKIPPED OUT LOUD, NOT REMOVED. A deleted arm is invisible; a printed
-// SKIP is a standing statement of what this suite is NOT covering today. The
-// property itself — seed vs threshold decides promotion — IS still covered, at
-// the state-machine level, by headerssync_accumulator_seeding_tests' A/B pair.
-// What is not covered until #201 lands is the MANAGER-LEVEL wiring of it.
-void print_skipped_arms()
-{
-    std::cout << "  SKIPPED (blocked on PR #201, regtest gets the RandomX checker):"
-              << std::endl
-              << "    - test_below_threshold_is_rejected_and_at_threshold_is_accepted"
-              << std::endl
-              << "    - test_zero_threshold_makes_rejection_impossible"
-              << std::endl
-              << "    property still covered at state-machine level by "
-                 "headerssync_accumulator_seeding_tests"
-              << std::endl;
-}
-
 int main()
 {
     Dilithion::g_chainParams = new Dilithion::ChainParams(Dilithion::ChainParams::Regtest());
     std::cout << "headerssync_gate_arming_tests" << std::endl;
     test_threshold_is_injectable_and_observable();
-    print_skipped_arms();
-    // NOT "ALL PASS". Two arms are skipped (see print_skipped_arms), and a green
-    // summary line over a skip is the false signal this mission keeps hitting —
-    // a reader scanning roster output would take it for full coverage. The count
-    // is stated instead, so restoring the arms also restores the wording.
-    std::cout << "headerssync_gate_arming_tests: 1 PASS, 2 SKIPPED (blocked on PR #201)"
-              << std::endl;
+    test_below_threshold_is_rejected_and_at_threshold_is_accepted();
+    test_zero_threshold_makes_rejection_impossible();
+    std::cout << "headerssync_gate_arming_tests: ALL PASS" << std::endl;
     return 0;
 }
