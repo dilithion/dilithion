@@ -189,6 +189,41 @@ CHeadersManager::CHeadersManager()
     // A-3 owns the real rule: a predicate that mirrors ASERT rather than
     // asserting a constant. Until it exists, this network is unsupported and
     // says so.
+    // ⛔ F2 — WHY THE REFUSAL IS SUFFICIENT, CENSUSED RATHER THAN ASSERTED.
+    //
+    // A seat's MEDIUM asked the fair question: this flag guards
+    // InitializeDoSProtectedSync, but the constructor above STILL BUILDS a
+    // RandomX checker for testnet. Does anything else reach a header proof check?
+    // Censused at a60fe10d, greps excluding src/test/:
+    //
+    //   (1) checker CONSTRUCTION — 2 sites, both the branch directly above:
+    //         headers_manager.cpp:197  make_unique<VDFHeaderProofChecker>
+    //         headers_manager.cpp:200  make_unique<RandomXHeaderProofChecker>
+    //       Nothing else in non-test code constructs either checker.
+    //
+    //   (2) CheckHeaderProof CALL sites — 2, both through m_proof_checker inside
+    //       HeadersSyncState:
+    //         headerssync.cpp:261, headerssync.cpp:312
+    //       So a proof check requires a HeadersSyncState to exist.
+    //
+    //   (3) A HeadersSyncState is created ONLY by InitializeDoSProtectedSync —
+    //       which is behind the refusal above.
+    //
+    //   (4) And that entry point has ZERO PRODUCTION CALLERS. Every non-test grep
+    //       hit for InitializeDoSProtectedSync / ProcessHeadersWithDoSProtection
+    //       is a COMMENT: chainparams.cpp:148-149, :172; headerssync.cpp:46;
+    //       headers_manager.cpp:61, :408. Not one is a call.
+    //
+    // So the testnet checker object the constructor builds is UNREACHABLE twice
+    // over: nothing creates the state that would use it, and if a future caller
+    // tries, the refusal stops it before the state exists. That is the whole
+    // argument, and each step is a grep someone can re-run at this sha rather
+    // than a claim to be taken on trust.
+    //
+    // ⚠️ IF (4) EVER STOPS BEING TRUE — i.e. A-3 wires a real caller — step (4)
+    // is gone and the refusal at that caller becomes the ONLY thing standing
+    // between testnet and a checker that rejects its own honest headers. Re-run
+    // this census then; do not inherit it.
     m_proof_checker_supports_network =
         Dilithion::g_chainParams != nullptr &&
         !(Dilithion::g_chainParams->IsVdfFromGenesis() && !m_uses_vdf_proof_checker);
