@@ -26,6 +26,7 @@
 #include <algorithm>
 #include <random>  // WALLET-007 FIX: For std::shuffle
 #include <cstring>
+#include <cstdlib>   // LP-7 diag: getenv (env-gated diagnostics)
 #include <fstream>
 #include <iostream>
 #include <cstdio>   // For snprintf (thread-safe number formatting)
@@ -5932,16 +5933,35 @@ bool CWallet::MigrateToEncryptedSeedV7Unlocked(bool* persistedToDisk,
         // legitimate passphrase wallet can complete migration. Still fail-closed: a
         // wrong or absent passphrase leaves this false on every arm, and the
         // ABORT-AND-PRESERVE path below runs exactly as before.
-        auto phraseVerifies = [&](const std::string& phrase) -> bool {
+        auto phraseVerifies = [&](const std::string& phrase,
+                                  bool& usedPassphrase) -> bool {
+            usedPassphrase = false;
             if (MnemonicReDerivesSeed(phrase, "")) {
                 return true;
             }
             if (!bip39Passphrase.empty() &&
                 MnemonicReDerivesSeed(phrase, bip39Passphrase)) {
+                usedPassphrase = true;
                 return true;
             }
             return false;
         };
+
+        // LP-7 RESIDUAL MEASUREMENT FACILITY (contract aa61181, approved by Will
+        // 2026-09-11; kept permanently rather than deleted after the measurement).
+        // OFF unless DILITHION_LP7_DIAG is set, so nothing changes for any node
+        // that does not ask for it.
+        //
+        // It prints NO SECRET -- not the phrase, not the seed, not any key. Only
+        // which arm ran, whether it decrypted, whether the bytes are syntactically
+        // BIP39, their length and word count, and whether they verified. That is
+        // exactly enough to tell arm pre-emption apart from any other failure in a
+        // field log, and nothing more.
+        //
+        // It reports PER ARM. The old single-line form could only ever observe one
+        // arm, because a spurious arm-1 acceptance ended the attempt -- the very
+        // defect being fixed made the instrument blind to it.
+        const bool lp7diag = (std::getenv("DILITHION_LP7_DIAG") != nullptr);
 
         bool anyArmDecrypted = false;
         bool verified = false;
@@ -5951,6 +5971,13 @@ bool CWallet::MigrateToEncryptedSeedV7Unlocked(bool* persistedToDisk,
             std::vector<uint8_t> mnemonicPlain;
             const bool decOk = (arm == 1) ? armObfuscation(mnemonicPlain)
                                           : armMasterKey(mnemonicPlain);
+            const char* armName = (arm == 1) ? "1-obfuscation" : "2-masterkey";
+            if (lp7diag) {
+                std::cerr << "[LP7DIAG] arm=" << armName
+                          << " decOk=" << (decOk ? 1 : 0)
+                          << " recovered_len=" << mnemonicPlain.size()
+                          << std::endl;
+            }
             if (!decOk) {
                 memory_cleanse(mnemonicPlain.data(), mnemonicPlain.size());
                 continue;
@@ -5960,7 +5987,22 @@ bool CWallet::MigrateToEncryptedSeedV7Unlocked(bool* persistedToDisk,
             std::string candidate(mnemonicPlain.begin(), mnemonicPlain.end());
             memory_cleanse(mnemonicPlain.data(), mnemonicPlain.size());
 
-            if (phraseVerifies(candidate)) {
+            bool usedPassphrase = false;
+            const bool armVerified = phraseVerifies(candidate, usedPassphrase);
+            if (lp7diag) {
+                size_t words = candidate.empty() ? 0 : 1;
+                for (char ch : candidate) {
+                    if (ch == ' ') ++words;
+                }
+                std::cerr << "[LP7DIAG] arm=" << armName
+                          << " phrase_len=" << candidate.size()
+                          << " words=" << words
+                          << " bip39_syntactic=" << (CMnemonic::Validate(candidate) ? 1 : 0)
+                          << " verified=" << (armVerified ? 1 : 0)
+                          << " verified_with_passphrase=" << (usedPassphrase ? 1 : 0)
+                          << std::endl;
+            }
+            if (armVerified) {
                 mnemonicStr = candidate;
                 verified = true;
             }
@@ -5971,6 +6013,14 @@ bool CWallet::MigrateToEncryptedSeedV7Unlocked(bool* persistedToDisk,
             if (!candidate.empty()) {
                 memory_cleanse(&candidate[0], candidate.size());
             }
+        }
+
+        if (lp7diag) {
+            std::cerr << "[LP7DIAG] outcome="
+                      << (verified ? "verified"
+                                   : (anyArmDecrypted ? "decrypted-but-none-verified"
+                                                      : "no-arm-decrypted"))
+                      << std::endl;
         }
 
         if (!anyArmDecrypted) {
