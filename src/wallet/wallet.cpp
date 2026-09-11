@@ -364,14 +364,30 @@ bool CWallet::HasKey(const CDilithiumAddress& address) const {
 bool CWallet::VerifyRecordMAC(CCrypter& crypter,
                              const std::vector<uint8_t>& ciphertext,
                              const std::vector<uint8_t>& mac) const {
-    const bool isV7 = (m_loadedFileVersion >= WALLET_FILE_VERSION_7);
+    // PREDICATE DRIFT, FOUND BY ALL THREE ROUND-2 SEATS -- and the header had
+    // already warned about this exact failure: LegacyRecordKeying() is labelled
+    // "Single source of truth for that predicate -- it has drifted/bitten twice."
+    // This was the third.
+    //
+    // This function used to derive its own version test, `m_loadedFileVersion >= 7`,
+    // which DISAGREES with LegacyRecordKeying() at exactly one value: ZERO.
+    //   LegacyRecordKeying() = (version != 0 && version < 7) -> at 0: NOT legacy => v7 keying
+    //   the old local isV7   = (version >= 7)                -> at 0: not v7    => LEGACY
+    // A freshly-created in-memory wallet (version 0) was therefore KEYED as v7 but
+    // AUTHENTICATED as legacy, so an empty MAC passed here and the caller went on to
+    // decrypt an unauthenticated secret.
+    //
+    // The fix is to ASK the single source of truth rather than re-derive it. Two
+    // predicates each verified independently against something are not thereby the
+    // same predicate; the only way to know is to diff the SETS, which is what the
+    // seats did and what re-deriving will always eventually defeat.
 
     if (mac.empty()) {
-        // v7: an empty MAC is a corrupt/stripped record — refuse to decrypt the
-        // secret unauthenticated. pre-v7: this is the genuine legacy record that
-        // never carried a MAC — allow the (unauthenticated) legacy decrypt so the
-        // wallet loads and can be migrated to v7.
-        return !isV7;
+        // Only a GENUINE legacy record may carry no MAC: it is the one that never
+        // had one, and it must still load so it can be migrated to v7. A v7 record
+        // with an empty MAC is corrupt or stripped, and a version-0 (freshly
+        // created, v7-keyed) record has no business lacking one either.
+        return LegacyRecordKeying();
     }
 
     // MAC present — verify it BEFORE the caller decrypts, with the keying that
@@ -6399,6 +6415,20 @@ bool CWallet::EncryptMnemonic(const std::string& mnemonic) {
 }
 
 bool CWallet::DecryptMnemonic(std::string& mnemonic) const {
+    // THE REFUSAL PATH MUST NOT LEAVE A STALE VALUE IN THE CALLER'S BUFFER (round-2
+    // seat finding). Every false return below left `mnemonic` untouched, so a caller
+    // reusing a non-empty string kept whatever was already in it and could read a
+    // refusal as a success. It never wrote GARBAGE there -- but "we did not write"
+    // and "the buffer is safe to read" are different claims.
+    //
+    // Cleared HERE, once, rather than at each of the eight false returns: every exit
+    // is then safe by construction, including the one someone adds later without
+    // reading this. Same reasoning as the RAII rollback guard in the migration --
+    // a property enforced at one structural point beats eight correct call sites.
+    //
+    // The success paths assign to `mnemonic` immediately before returning true, so
+    // clearing up front costs them nothing.
+    mnemonic.clear();
     // Assumes caller holds cs_wallet lock
 
     if (vchEncryptedMnemonic.empty()) {
@@ -6521,13 +6551,23 @@ bool CWallet::DecryptMnemonic(std::string& mnemonic) const {
 
         // CRITERION 2, AND IT IS LOAD-BEARING RATHER THAN DEFENSIVE DECORATION.
         //
-        // VerifyRecordMAC returns `!isV7` when the MAC is EMPTY, so on a v6 wallet an
-        // empty mnemonic MAC PASSES it and this decrypt is UNAUTHENTICATED. Without a
-        // syntactic gate, criterion 1's new fall-through would hand back whatever a
-        // wrong-key decrypt happened to unpad to -- AES-CBC + PKCS#7 accepts a wrong
-        // key whenever the trailing bytes form valid padding, measured at 0.3825% --
-        // and that would reopen the HIGH-1 guarantee that export refuses a tampered
-        // phrase. Test 2e-7 constructs exactly that event and fails without this gate.
+        // VerifyRecordMAC ALLOWS an empty MAC on a genuine legacy record (it must, or
+        // a v6 wallet could never load to be migrated), so on such a wallet this
+        // decrypt is UNAUTHENTICATED. Without a syntactic gate, criterion 1's new
+        // fall-through would hand back whatever a wrong-key decrypt happened to unpad
+        // to -- AES-CBC + PKCS#7 accepts a wrong key whenever the trailing bytes form
+        // valid padding, measured at 0.3825% -- and that would reopen the HIGH-1
+        // guarantee that export refuses a tampered phrase. Test 2e-7 constructs
+        // exactly that event and fails without this gate.
+        //
+        // THIS GATE TURNED OUT TO COVER MORE THAN I CLAIMED FOR IT. Round 2 found
+        // that VerifyRecordMAC's own version predicate disagreed with
+        // LegacyRecordKeying() at version 0, so a freshly-created wallet was keyed v7
+        // but authenticated as legacy and its empty MAC passed. That predicate is now
+        // fixed at the source (see VerifyRecordMAC), but note the ordering: this gate
+        // was already closing that hole, because it keys on the record being
+        // unauthenticated rather than on any version test at all. A guard that does
+        // not re-derive a predicate cannot drift with it.
         //
         // Gated on the record being UNAUTHENTICATED rather than on how we arrived
         // here. An empty MAC is the condition that makes the bytes untrusted, and it is

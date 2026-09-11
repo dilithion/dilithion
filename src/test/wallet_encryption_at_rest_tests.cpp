@@ -2886,14 +2886,25 @@ static void Test_ExportMnemonic_FallThroughMustStillValidate() {
     CHECK(w.MigrationDeferredForPassphrase(),
           "PRECONDITION: the arm-selecting flag is ARMED");
 
-    std::string exported;
+    // SENTINEL. The previous version of this assertion was VACUOUS: it handed in a
+    // buffer that started empty and then checked the buffer was empty, which is true
+    // whether or not the refusal touches it. A refusal that leaves a caller's
+    // pre-existing value in place is indistinguishable from success to any caller
+    // that reuses its string, so the only version of this check that can FAIL is one
+    // that pre-fills something the refusal must remove.
+    const std::string kSentinel = "SENTINEL-if-you-can-read-me-the-refusal-did-not-clear-the-buffer";
+    std::string exported = kSentinel;
     const bool ok = w.ExportMnemonic(exported);
 
     CHECK(!ok,
           "LOAD-BEARING (criterion 2): export REFUSES — the fall-through reached the "
           "master-key arm, which accepted garbage, and the Validate gate rejected it");
+    CHECK(exported != kSentinel,
+          "LOAD-BEARING: the refusal CLEARED the caller's buffer — the sentinel is gone "
+          "(the previous assertion could not have caught this: it checked an empty "
+          "buffer was empty)");
     CHECK(exported.empty(),
-          "LOAD-BEARING: no garbage was written into the caller's output buffer");
+          "LOAD-BEARING: and no garbage was written into the caller's output buffer");
     CHECK(exported != legacy.mnemonic,
           "Sanity: the real phrase was never recoverable from this constructed slot anyway");
 
