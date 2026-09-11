@@ -99,14 +99,28 @@ Support SupportUnder(const Dilithion::ChainParams& params)
 // was ZERO. A suite that COPIES the producer's set cannot detect that set
 // CHANGING — which is the very two-predicate drift this PR exists to close,
 // reproduced inside the test written to close it. A fifth network, or a change to
-// pow.cpp:1142-1146 in either direction, stayed green unless someone remembered
+// pow.cpp's constant branch in either direction (:1142-1146 at 763c5a06), stayed green unless someone remembered
 // to edit the table in lockstep.
 //
 // So the expected value is DERIVED by calling GetNextWorkRequired itself.
 
-// Every network, from the ENUM rather than a hand-kept list of factory calls. The
-// switch carries NO `default:`, so adding a fifth Network fails the BUILD here
-// instead of silently going uncovered.
+// Every network, from the ENUM rather than a hand-kept list of factory calls.
+//
+// ⚠️ WHAT THIS ACTUALLY ENFORCES — CORRECTED, because the first version of this
+// comment said "adding a fifth Network fails the BUILD" and that is FALSE. Kimi's
+// round-2 LOW caught it and the measurement is one grep: there is NO `-Werror`
+// anywhere in the Makefile, so `-Wswitch` on the default-less switch below
+// produces a WARNING, not an error. Precisely:
+//   * `ParamsFor`'s switch has no `default:`, so a new enumerator WARNS under
+//     -Wall/-Wextra — visible in build output, not fatal;
+//   * `kAllNetworks` is HAND-KEPT, and its static_assert pins only its OWN size
+//     (4), not the enum's cardinality — the enum has no count sentinel to bind to;
+//   * `ParamsFor` aborts if an unlisted value ever reaches it, which is a
+//     backstop for a value already in the roster, not prevention.
+// RESIDUAL, stated rather than implied: a fifth Network still needs a human to add
+// it here. Nothing in C++17 forces that without a sentinel in the production enum,
+// which is out of scope for this PR. Overstating the guarantee was worse than the
+// gap, because it invited the next reader to skip the check.
 Dilithion::ChainParams ParamsFor(Dilithion::Network n)
 {
     switch (n) {
@@ -145,7 +159,7 @@ constexpr uint32_t kSentinelNBits = 0x1b0404cb;
 // Does the PRODUCER emit a constant nBits on this network? MEASURED by calling it.
 //
 // HOW THIS DISCRIMINATES — read out of pow.cpp, not assumed:
-//   * the constant branch (`IsDilV() || IsRegtest()`, pow.cpp:1142-1146) returns
+//   * the constant branch (`IsDilV() || IsRegtest()` — pow.cpp:1142-1146 as re-verified at 763c5a06; grep the condition, not the line) returns
 //     genesisNBits WITHOUT dereferencing pindexLast at all;
 //   * every retargeting path needs an ASERT anchor via
 //     `pindexLast->GetAncestor(...)`, which is nullptr for a lone index, and the
@@ -153,7 +167,7 @@ constexpr uint32_t kSentinelNBits = 0x1b0404cb;
 // A synthetic index carrying kSentinelNBits therefore separates the two exactly.
 //
 // The height must clear the LARGEST activation threshold in the tree: testnet's
-// asertActivationHeight is 999999999 (chainparams.cpp:402). Below it the code
+// asertActivationHeight is 999999999 (chainparams.cpp:402, re-verified at 763c5a06). Below it the code
 // falls through to the LEGACY retarget, which would compute a third value and
 // make this probe meaningless — so the height is deliberately past it.
 //
