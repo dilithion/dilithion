@@ -500,6 +500,27 @@ public:
      */
     void OnPeerDisconnected(NodeId peer);
 
+    //! Which proof checker this manager selected for the configured chain.
+    //!
+    //! Reports the DECISION, not the object, so it stays meaningful if the
+    //! concrete checker types ever change. Exists because the selection was
+    //! cross-wired — it keyed on IsDilV(), which is false on testnet and regtest
+    //! even though both are VDF-from-genesis — and a defect nothing can observe
+    //! is a defect nothing can regression-test. The alternative was asserting on
+    //! a proxy, which would not have caught the original bug either.
+    bool UsesVdfProofChecker() const { return m_uses_vdf_proof_checker; }
+
+    /**
+     * @brief False when NO correct proof checker exists for this network.
+     *
+     * True for DIL (RandomX) and for the VDF chains whose producer emits a
+     * constant nBits (DilV, regtest). FALSE for a VDF-from-genesis network that
+     * RETARGETS — testnet today — where the VDF checker's equality rule and the
+     * RandomX checker's hash-under-target rule are both wrong.
+     * InitializeDoSProtectedSync refuses when this is false.
+     */
+    bool ProofCheckerSupportsNetwork() const { return m_proof_checker_supports_network; }
+
     /**
      * @brief Check if we should fetch headers from this peer
      *
@@ -933,11 +954,26 @@ private:
     // Bug #46 Fix: Minimum chain work for DoS protection
     uint256 nMinimumChainWork;              ///< Reject chains below this work threshold
 
-    // Phase 3: chain-agnostic proof checker. Owned here; non-owning
-    // pointer passed to each HeadersSyncState. Picked at construction time
-    // based on g_chainParams (RandomXHeaderProofChecker for DIL,
-    // VDFHeaderProofChecker for DilV).
+    // Phase 3: chain-agnostic proof checker. Owned here; non-owning pointer
+    // passed to each HeadersSyncState. Picked at construction time.
+    //
+    // ⚠️ NOT "VDFHeaderProofChecker for DilV" — that was this comment until
+    // 2026-09-11 and it named the defect, not the rule. The selection MIRRORS THE
+    // PRODUCER: the VDF checker is chosen exactly where GetNextWorkRequired emits
+    // a CONSTANT nBits, i.e. its branch `IsDilV() || IsRegtest()`
+    // (pow.cpp:1142-1146). Regtest is a VDF chain whose network is not DILV, so
+    // the old DilV-only wording left it on the RandomX checker, which demands a
+    // hash under target from a header never mined against one.
+    //
+    // Do not "simplify" this to IsVdfFromGenesis(): testnet satisfies that and
+    // RETARGETS, so the VDF checker's nBits-equality rule would reject its own
+    // honest headers. See m_proof_checker_supports_network — such a network is
+    // refused outright rather than handed either checker.
     std::unique_ptr<::dilithion::net::IHeaderProofChecker> m_proof_checker;
+
+    //! Records which branch the constructor's checker selection took.
+    bool m_uses_vdf_proof_checker{false};
+    bool m_proof_checker_supports_network{false};
 
     // Bug #150 Fix: Best chain cache for fork-safe height lookups
     mutable std::map<int, uint256> m_bestChainCache;  ///< Height -> Hash on best chain
