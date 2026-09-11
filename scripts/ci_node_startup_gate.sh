@@ -437,6 +437,17 @@ esac
 census="$(grep -F "$GATE_LINE" "$log" | head -1)"
 echo "  $census"
 
+# ⚠️ REPORT THE RUNNER SHAPE BESIDE THE COUNT, because the count depends on it.
+# The hash-worker pool is sized from hardware_concurrency (headers_manager.cpp:3617)
+# but CLAMPED: 4 if detection fails, and CAPPED AT 8. So the census varies only
+# within a BOUNDED band -- every runner with 8 or more cores reports the same
+# total -- which is what makes a floor provable rather than guessed.
+cores="$(nproc 2>/dev/null || echo '?')"
+hash_est="$cores"
+case "$hash_est" in ''|*[!0-9]*) hash_est=4 ;; esac
+[ "$hash_est" -gt 8 ] 2>/dev/null && hash_est=8
+echo "  runner: ${cores} cores -> hash pool ~${hash_est} of the census"
+
 # ⚠️ A CENSUS OF ZERO WOULD PASS THE GATE AND PROVE NOTHING. The gate is satisfied
 # when every DECLARED participant has checkpointed -- and zero declared participants
 # satisfy it vacuously. Assert a plausible floor so a regression that stops
@@ -461,8 +472,15 @@ fi
 # ⚠️ AND YET AN EXACT EXPECTED COUNT WOULD BE A CHECK THAT FAILS ON A HEALTHY
 # TREE. The census total is CORE-COUNT DEPENDENT: headers_manager.cpp:3617 sets
 # `m_hash_worker_count = std::thread::hardware_concurrency()` and that pool
-# declares with its own size, so a 2-core runner and a 16-core runner report
-# different, equally correct totals. Pinning the number I happen to observe
+# declares with its own size, so runners of different shapes report different,
+# equally correct totals.
+#
+# ⚠️ BUT THE VARIATION IS BOUNDED, and I first stated this as though it were not.
+# :3618-3623 CLAMPS that count -- 4 if detection fails, and CAPPED AT 8 -- so
+# hash workers live in [1,8] and every runner with 8+ cores reports the SAME
+# total. That bound is what makes a floor PROVABLE instead of guessed: from an
+# observed census C the fixed remainder is at least C-8, so the smallest census a
+# healthy node can print on ANY runner is (C-8)+1. Pinning the number I happen to observe
 # would redden this leg on the next runner with a different shape — the precise
 # failure mode this script's own header was written about. The RPC pool (8) and
 # the block-worker pool (1) are fixed; the hash-worker pool is not.
@@ -483,7 +501,7 @@ if [ -n "$expect_min" ]; then
         echo "     -- it only asks that declared threads checkpoint -- so this is"
         echo "     the check that catches it. Either a declaration was lost, or"
         echo "     this runner has fewer cores than the one that set the baseline"
-        echo "     (hash workers = hardware_concurrency); confirm which before"
+        echo "     (hash workers = hardware_concurrency, clamped to [1,8]); check"
         echo "     lowering $baseline_file."
         echo "===== node startup gate: FAIL (census below baseline) ====="; exit 1
     fi
