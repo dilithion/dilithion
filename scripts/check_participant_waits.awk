@@ -27,9 +27,18 @@
 # thread held nothing at the wait. A thread pins by its PUBLISHED EPOCH, not by
 # holding a pointer -- which is exactly why this needs a machine and not a reviewer.
 #
-# A participant file is one containing `EpochCheckpoint(`. Within it, every
-# blocking call must be inside an `EpochOfflineScope` (or an `EpochOnlineWindow`,
-# whose destructor quiesces), or carry an exclusion on the line before:
+# A participant file is one containing `EpochCheckpoint(`. Within it -- in the
+# checkpointing function and TWO HOPS of its callees -- every blocking call must be
+# inside an `EpochOfflineScope`, or carry an exclusion on the line before.
+#
+# ⚠️ AN `EpochOnlineWindow` DOES NOT COVER ANYTHING. Its BODY IS ONLINE; it is the
+# inverse scope, for a wait whose PREDICATE resolves. An earlier version of this
+# header said its destructor quiesces and implied its body was covered -- it does
+# and it is not, and a wait inside one (even nested in an offline scope) is ONLINE.
+# Modelled that way since round 8; the header said otherwise until round 10 (F65).
+# A checkpoint inside an offline scope ends the cover for the same reason.
+#
+# The exclusion form:
 #
 #     // EPOCH-WAIT-EXEMPT: <reason this thread cannot pin here>
 #
@@ -95,15 +104,26 @@ function strip(s,   out, i, n, c, c2, state, prev, delim, endtok, at, at2, k, ru
 # CHttpServer::SendResponse declares four parameters across four lines, so the line
 # above its opening brace is `const std::string& body) {` -- no name in sight. The
 # block was therefore unnamed, could never be matched as a one-hop callee, and the
-# TWELVE sends inside it were invisible to this guard. Join back far enough to find
-# the declarator.
-function sigwindow(cl, i, ln,   w, k) {
+# send funnel inside it was invisible to this guard -- the funnel that TWELVE
+# `SendResponse(...)` call sites route through, and which is itself TWO textual
+# `send()` calls, one per platform branch. ("twelve" counts call sites, "two"
+# counts blocking calls; round-10 F65 asked for that reconciled rather than left
+# as two numbers for the same thing.) Join back far enough to find the declarator.
+# ⚠️ THE WINDOW STOPS AT THE OPENING BRACE (round-10 F63). It used to hand the
+# WHOLE opening line to the namer, which takes the LAST `identifier(` in it — so
+# `void Bridge() { Leaf(); }` was named **Leaf**, and a one-liner
+# `void g(){ cv.wait(lk); }` was named **wait**. Neither produced a PARSE: the block
+# got a plausible wrong name, was never matched as a callee, and the hop edge was
+# lost SILENTLY. A wrong name is worse than no name, because no name is reported.
+function sigwindow(cl, i, ln,   w, k, head) {
+    head = ln
+    sub(/\{.*$/, "", head)        # signature only; the body cannot name the function
     w = ""
     for (k = (i > 6 ? i - 6 : 1); k < i; k++) w = w " " cl[k]
-    return w " " ln
+    return w " " head
 }
 
-function finish(   code, ncl, cl, raw, nraw, i, j, ln, call, call_col, scope_col, depth, k, ch, exempt, fstart, hascp, nfn, f, g, nm, body, fname_line, nsc, ncall, ci, rest, base, covered, first_stmt, nsd, si, sd_rest, sd_base, nm_rest, hascp_line, hasblock, h, HOPS) {
+function finish(   code, ncl, cl, raw, nraw, i, j, ln, call, call_col, scope_col, depth, k, ch, exempt, fstart, hascp, nfn, f, g, nm, body, fname_line, nsc, ncall, ci, rest, base, covered, first_stmt, nsd, si, sd_rest, sd_base, nm_rest, hascp_line, hasblock, h, HOPS, same_tok, q) {
     if (src == "") return
     code = strip(src)
     if (code == "") { print "PARSE " fname " 0 unterminated comment, string or raw-string literal"; reset(); return }
@@ -126,13 +146,21 @@ function finish(   code, ncl, cl, raw, nraw, i, j, ln, call, call_col, scope_col
     #                     checkpoint is in WorkerThread and HandleRequest merely
     #                     RUNS ON that thread. The pin belongs to the THREAD; the
     #                     blocking call can be any number of frames down.
-    #   * by THREAD BODY + ONE HOP -> what this does.
+    #   * by THREAD BODY + ONE HOP -> caught HandleRequest, and still missed
+    #                     SendResponse (TWO hops; twelve of that file's eighteen
+    #                     send call sites). Found because the population did NOT
+    #                     move when the namer was fixed.
+    #   * by THREAD BODY + TWO HOPS -> what this does.
     #
-    # ⚠️ ONE HOP IS A STATED LIMIT, NOT A CLAIM OF COMPLETENESS. A blocking call
-    # two frames below a checkpointing function, or in another translation unit,
-    # is NOT seen. Closing that needs a real call graph, which is not an awk job;
-    # what it must not do is let the PASS line imply a coverage it does not have,
-    # so the driver prints the depth with the result.
+    # ⚠️ TWO HOPS IS A STATED LIMIT, NOT A CLAIM OF COMPLETENESS (corrected in
+    # round-10 F65 -- this paragraph still said ONE HOP while the walk below did
+    # two, which is the documentation decay this branch keeps finding, here in the
+    # guard written to stop the code version of it). A blocking call THREE frames
+    # below a checkpointing function, one in another translation unit, or one
+    # reached through a callback / std::function / function pointer, is NOT seen.
+    # Closing that needs a real call graph, which is not an awk job; what it must
+    # not do is let PASS imply coverage it does not have, so the driver prints the
+    # depth and the exclusions beside the result.
     depth = 0; fstart = 0; hascp = 0; nfn = 0
     for (i = 1; i <= ncl; i++) {
         ln = cl[i]
@@ -199,7 +227,12 @@ function finish(   code, ncl, cl, raw, nraw, i, j, ln, call, call_col, scope_col
         if (!fn_unnamed[f] || fn_cp[f]) continue
         hasblock = 0
         for (j = fn_start[f]; j <= fn_end[f]; j++)
-            if (cl[j] ~ /(\.|->)(wait|wait_for|wait_until|join)[ 	]*\(|this_thread::sleep_(for|until)[ 	]*\(|(^|[^A-Za-z0-9_])(accept|recv|send|select|poll)[ 	]*\(/) hasblock = 1
+            # ⚠️ THIS LIST MUST TRACK THE REAL TAXONOMY BELOW (round-10 F65). It
+            # is the probe that decides whether an unnamed block is worth
+            # reporting, and it was missing Sleep/WaitForSingleObject/epoll_wait/
+            # SSL* -- so an unnamed block whose only blocking call was one of those
+            # was silently judged harmless.
+            if (cl[j] ~ /(\.|->)(wait|wait_for|wait_until|join)[ 	]*\(|this_thread::sleep_(for|until)[ 	]*\(|(^|[^A-Za-z0-9_])(accept|recv|send|select|poll|epoll_wait|SSLRead|SSLWrite|WaitForSingleObject|WaitForMultipleObjects|Sleep)[ 	]*\(/) hasblock = 1
         if (hasblock)
             print "PARSE " fname " " fn_start[f] " a block containing a blocking call could not be NAMED, so it can never be matched as a one-hop callee -- its calls are invisible to this guard"
     }
@@ -210,9 +243,11 @@ function finish(   code, ncl, cl, raw, nraw, i, j, ln, call, call_col, scope_col
 
     # step 2: TWO HOPS, and the second was earned rather than chosen (round-9).
     # One hop covered `WorkerThread -> HandleRequest`. It did NOT cover
-    # `WorkerThread -> HandleRequest -> SendResponse`, and SendResponse holds TWELVE
-    # of http_server's eighteen `send()` calls -- so a dozen blocking calls on a
-    # participant thread sat outside the population while the guard printed PASS.
+    # `WorkerThread -> HandleRequest -> SendResponse`. SendResponse is the send
+    # FUNNEL that twelve `SendResponse(...)` call sites route through, and it holds
+    # TWO textual `send()` calls (one per platform branch) -- so the blocking calls
+    # for every one of those twelve sites sat outside the population while the
+    # guard printed PASS.
     #
     # That is the concrete answer to "can a two-hop case matter in this tree?": YES,
     # and it surfaced by widening the signature window far enough to NAME
@@ -273,6 +308,14 @@ function finish(   code, ncl, cl, raw, nraw, i, j, ln, call, call_col, scope_col
 # the two inside SendResponse were invisible until the guard reached TWO hops.
     #      `SSLWrite`, and the Win32 forms. Widened; what is still missing is named
     #      in the header rather than left to be discovered.
+#
+# ⚠️ WHAT THIS GUARD CANNOT SEE, so a PASS cannot be read as more than it means
+# (round-10 F65): a call THREE or more hops away (HOPS = 2); a callee in another
+# translation unit; ⚠️ ANY call reached through a CALLBACK, std::function or
+# function pointer -- an injected callable cannot be resolved by name, which is why
+# vdf_miner's three injected callbacks carry a written must-not-block contract at
+# the injection site INSTEAD of guard coverage; and any blocking primitive outside
+# the taxonomy below.
     #
     # The tell for (b) and (c) is the same one this file has hit twice before: a
     # FALSE OK is the dangerous direction, and only a fixture finds it.
@@ -287,6 +330,16 @@ function finish(   code, ncl, cl, raw, nraw, i, j, ln, call, call_col, scope_col
                 else if (ch == "}") { depth--; while (nsc > 0 && sc_depth[nsc] > depth) nsc-- }
             }
             continue
+        }
+
+        # ⚠️ A CHECKPOINT INSIDE AN OFFLINE SCOPE RE-ENTERS **ONLINE** (round-10
+        # F64a). EpochCheckpoint publishes the current epoch; it is the opposite of
+        # quiescing. The scope object is still alive, so the stack kept reporting
+        # OK for every blocking call after it — a false OK on a thread that is
+        # demonstrably online. Model it: a checkpoint inside a scope kills the
+        # innermost offline cover, exactly as an online window does.
+        if (ln ~ /EpochCheckpoint[ 	]*\(/ && nsc > 0 && sc_online[nsc] == 0) {
+            sc_online[nsc] = 1
         }
 
         # Positions of every blocking call on this line, and of a scope decl.
@@ -339,11 +392,28 @@ function finish(   code, ncl, cl, raw, nraw, i, j, ln, call, call_col, scope_col
                 # `raw[j] ~ call_tx[ci]` treated the call token as a pattern, so
                 # `cv.wait` "named" `cvXwait` -- `.` matching any character. index()
                 # is a substring test and cannot do that.
+                # ⚠️ THE NAMED FALLBACK IS A SUBSTRING SEARCH, AND A SUBSTRING
+                # CANNOT COUNT (round-10 F64b). A marker reading "only the first
+                # wait is exempt" contains `wait`, so it exempted BOTH calls in
+                # `cv.wait(a); cv.wait(b);` -- the guard did the opposite of what
+                # the marker said. There is no honest way to make a substring mean
+                # "one of these two", so the named fallback is REFUSED when the line
+                # carries more than one call of that token: split the line, or mark
+                # the line immediately above the one you mean. Fail-closed, and
+                # reported rather than silent.
                 exempt = 0
-                if (ci == 1 && raw[i-1] ~ /EPOCH-WAIT-EXEMPT:[ \t]*[^ \t]/) exempt = 1
+                if (ci == 1 && raw[i-1] ~ /EPOCH-WAIT-EXEMPT:[ 	]*[^ 	]/) exempt = 1
                 else {
-                    for (j = i - 1; j >= 1 && j >= i - 3; j--)
-                        if (raw[j] ~ /EPOCH-WAIT-EXEMPT:/ && index(raw[j], call_tx[ci]) > 0) exempt = 1
+                    same_tok = 0
+                    for (q = 1; q <= ncall; q++) if (call_tx[q] == call_tx[ci]) same_tok++
+                    for (j = i - 1; j >= 1 && j >= i - 3; j--) {
+                        if (raw[j] !~ /EPOCH-WAIT-EXEMPT:/) continue
+                        if (index(raw[j], call_tx[ci]) == 0) continue
+                        if (same_tok > 1)
+                            print "PARSE " fname " " i " a named exemption cannot select between " same_tok " `" call_tx[ci] "` calls on one line -- put each on its own line, or mark the line immediately above the one you mean"
+                        else
+                            exempt = 1
+                    }
                 }
                 # covered only if the INNERMOST scope is an OFFLINE one (c)+(d)
                 covered = (nsc > 0 && sc_online[nsc] == 0)

@@ -666,14 +666,27 @@ std::atomic<uint64_t>* MyEpochSlot()
         //     deque-vs-vector note above uses as its flip condition.)
         //
         //   ⚠️ AND THE DECISION, because a trigger with no decision is a deferral
-        //     wearing a threshold's clothes. NOT building the free list now; the
-        //     operating limit is: **`graveyard_occupancy_bench` runs in CI and its
-        //     drain max is the gate**. Six to eight weeks is long enough that the
-        //     bench will observe the approach many times before it matters, and a
-        //     generation-stamped free list is a lifetime proof one level down --
-        //     the exact class of change this branch has spent nine rounds showing
-        //     is expensive to get right. It is built when the bench says so, not
-        //     when the arithmetic says it might.
+        //     wearing a threshold's clothes. NOT building the free list now.
+        //
+        //     ⚠️ AND THE MECHANISM IS NOT "THE BENCH IS THE GATE" -- that claim was
+        //     wrong in two ways, both caught in round 10 (F66):
+        //       * the CI leg is REPORT-ONLY, deliberately: three identical local
+        //         runs measured 3.4 / 10.7 / 3.6 ms, a 3.1x spread, so a fixed
+        //         millisecond gate on a shared runner would fire on noise;
+        //       * and a fresh bench PROCESS never inherits a node's accumulated
+        //         slots. The bench builds its own population from scratch, so it
+        //         measures the SHAPE of the cost, never the value a long-running
+        //         node has reached. It cannot observe the thing that grows.
+        //
+        //     THE REAL MECHANISM, stated so it has an owner and a reader: the
+        //     growth is visible from a LIVE NODE, not from the bench --
+        //     `LiveEpochParticipants()` and the periodic census both report slot
+        //     counts, and `DrainGraveyard`'s cost is a function of that number. A
+        //     node that has been mining for weeks is the only instrument that can
+        //     say whether 250,000 slots has arrived. The bench's CI number is a
+        //     REGRESSION signal on the per-slot cost (did a change make each slot
+        //     more expensive?), which is a different and smaller question.
+        //     Recorded as a follow-up rather than pretended to be solved here.
         //   THE SHAPE OF THE FIX, if it trips: a generation-stamped free list --
         //     a retired slot is reusable once every thread has passed the epoch in
         //     which it retired, which is this file's own rule applied one level

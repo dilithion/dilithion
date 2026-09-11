@@ -74,12 +74,43 @@ check_file() {   # $1 = path to an http_server.cpp to check; echoes failures
         fails=1
     fi
 
+    # ⚠️ RECOGNITION IS NOT REJECTION (round-10 F62). Checking only that
+    # `if (!Apply...)` appears passes an EMPTY branch and a LOG-ONLY branch --
+    # both recognise the failure and then admit the socket anyway, which is
+    # exactly the defect F56 fixed. Pin what the branch DOES.
     if ! printf '%s\n' "$accept_body" | grep -qE 'if[ \t]*\([ \t]*![ \t]*ApplyClientSocketTimeouts'; then
-        echo "  FAIL: AcceptThread does not REJECT a socket whose timeouts could not"
-        echo "        be set. Discarding that result (\`(void)Apply...\`) silently"
-        echo "        restores the unbounded pin: the value exists, is correct, and"
-        echo "        is not enforced."
+        echo "  FAIL: AcceptThread does not test the result of"
+        echo "        ApplyClientSocketTimeouts. Discarding it silently restores the"
+        echo "        unbounded pin: the value exists, is correct, is not enforced."
         fails=1
+    else
+        # ⚠️ BRACE DEPTH, NOT "the next line that looks like a closing brace".
+        # The real branch contains a nested `if (!s_warned.exchange(true)) { ... }`
+        # for the once-per-process log, and a pattern-based extractor stopped at
+        # THAT brace -- truncating the branch before the close/continue and
+        # reporting a CORRECT tree as broken. The guard being naive about the very
+        # construct it checks is F62 one level down.
+        branch="$(printf '%s\n' "$accept_body" | awk '
+            /if[ \t]*\([ \t]*![ \t]*ApplyClientSocketTimeouts/ { f = 1 }
+            f {
+                print
+                n = gsub(/\{/, "{"); m = gsub(/\}/, "}")
+                d += n - m
+                if (started && d <= 0) exit
+                if (n > 0) started = 1
+            }')"
+        if ! printf '%s\n' "$branch" | grep -qE '(^|[^A-Za-z0-9_])close[ \t]*\('; then
+            echo "  FAIL: the failure branch does not CLOSE the socket. Recognising the"
+            echo "        failure and admitting the connection anyway is the same"
+            echo "        unbounded pin with a log line in front of it."
+            fails=1
+        fi
+        if ! printf '%s\n' "$branch" | grep -qE '(^|[^A-Za-z0-9_])(continue|return)[ \t]*;'; then
+            echo "  FAIL: the failure branch does not stop processing this socket, so"
+            echo "        control falls through to the enqueue -- the socket is closed"
+            echo "        AND handed to a worker."
+            fails=1
+        fi
     fi
 
     return $fails
@@ -95,10 +126,17 @@ if [ "${1:-}" = "--self-test" ]; then
     printf 'void CHttpServer::AcceptThread() {\n  while (1) {\n    SOCKET s = accept(a,b,c);\n    (void)ApplyClientSocketTimeouts(s);\n    queue(s);\n  }\n}\n' > "$tmp/b2.cpp"
     # NEGATIVE: only a COMMENT mentions it — the reason comments are stripped
     printf 'void CHttpServer::AcceptThread() {\n  while (1) {\n    SOCKET s = accept(a,b,c);\n    // ApplyClientSocketTimeouts(s); if (!ApplyClientSocketTimeouts(s)) {}\n    queue(s);\n  }\n}\n' > "$tmp/b3.cpp"
+    # NEGATIVE (F62): recognised, then admitted anyway -- an EMPTY branch
+    printf 'void CHttpServer::AcceptThread() {\n  while (1) {\n    SOCKET s = accept(a,b,c);\n    if (!ApplyClientSocketTimeouts(s)) {\n    }\n    queue(s);\n  }\n}\n' > "$tmp/b4.cpp"
+    # NEGATIVE (F62): recognised and LOGGED, then admitted anyway
+    printf 'void CHttpServer::AcceptThread() {\n  while (1) {\n    SOCKET s = accept(a,b,c);\n    if (!ApplyClientSocketTimeouts(s)) {\n      std::cerr << "oh dear" << std::endl;\n    }\n    queue(s);\n  }\n}\n' > "$tmp/b5.cpp"
+    # NEGATIVE (F62): closed, but control FALLS THROUGH to the enqueue
+    printf 'void CHttpServer::AcceptThread() {\n  while (1) {\n    SOCKET s = accept(a,b,c);\n    if (!ApplyClientSocketTimeouts(s)) {\n      close(s);\n    }\n    queue(s);\n  }\n}\n' > "$tmp/b6.cpp"
+
     # POSITIVE: the real shape
     printf 'void CHttpServer::AcceptThread() {\n  while (1) {\n    SOCKET s = accept(a,b,c);\n    if (!ApplyClientSocketTimeouts(s)) {\n      close(s);\n      continue;\n    }\n    queue(s);\n  }\n}\n' > "$tmp/g1.cpp"
 
-    for f in b1 b2 b3; do
+    for f in b1 b2 b3 b4 b5 b6; do
         if check_file "$tmp/$f.cpp" >/dev/null 2>&1; then
             echo "  FAIL  reject $f: an unwired/unenforced AcceptThread was accepted"
             fails=$((fails+1))
@@ -118,7 +156,7 @@ if [ "${1:-}" = "--self-test" ]; then
     if [ "$fails" -ne 0 ]; then
         echo "===== http socket-timeout wiring SELF-TEST: FAIL ($fails) ====="; exit 1
     fi
-    echo "===== http socket-timeout wiring SELF-TEST: PASS (3 rejected, 1 accepted) ====="
+    echo "===== http socket-timeout wiring SELF-TEST: PASS (6 rejected, 1 accepted) ====="
     exit 0
 fi
 

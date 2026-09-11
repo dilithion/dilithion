@@ -125,10 +125,24 @@ if [ "${1:-}" = "--self-test" ]; then
     printf 'void f(){ g_chainstate.EpochCheckpoint("x");\n  p->join();\n}\n' > "$tmp/src/b15.cpp"
 
     # OK: a qualified definition must still be NAMED, so its callees are reachable
-    printf 'void Cls::worker(){ g_chainstate.EpochCheckpoint("x");\n  { EpochOfflineScope o(&cs);\n    cv.wait(lk); }\n}\n' > "$tmp/src/g7.cpp"
+    printf 'void Cls::helper(){ { EpochOfflineScope o(&cs); cv.wait(lk); } }\nvoid Cls::worker(){ g_chainstate.EpochCheckpoint("x"); Cls::helper(); }\n' > "$tmp/src/g7.cpp"
+
+    # ── round-10 F63/F64 ─────────────────────────────────────────────────────
+    # (F64a) a CHECKPOINT INSIDE an offline scope re-enters ONLINE
+    printf 'void f(){ g_chainstate.EpochCheckpoint("x");\n  { EpochOfflineScope o(&cs);\n    g_chainstate.EpochCheckpoint("x");\n    cv.wait(lk); }\n}\n' > "$tmp/src/b16.cpp"
+    # (F64b) one marker cannot select between two calls of the same token
+    printf 'void f(){ g_chainstate.EpochCheckpoint("x");\n  // EPOCH-WAIT-EXEMPT: only the first wait is exempt\n  int filler = 0; (void)filler;\n  cv.wait(a); cv.wait(b);\n}\n' > "$tmp/src/b17.cpp"
+    # (F63) a one-line function must not be NAMED after the call in its body
+    #       (`void g(){ cv.wait(lk); }` was named `wait`), and the wait is still ONLINE
+    printf 'void g(){ g_chainstate.EpochCheckpoint("x"); cv.wait(lk); }\n' > "$tmp/src/b18.cpp"
+
+    # (F63) a GENUINE one-hop edge: the callee must be reached and flagged
+    printf 'void Leaf(){ cv.wait(lk); }\nvoid Bridge(){ g_chainstate.EpochCheckpoint("x"); Leaf(); }\n' > "$tmp/src/b19.cpp"
+    # (F63) a GENUINE two-hop edge: Mid is one hop, Leaf2 is two
+    printf 'void Leaf2(){ cv.wait(lk); }\nvoid Mid(){ Leaf2(); }\nvoid Top(){ g_chainstate.EpochCheckpoint("x"); Mid(); }\n' > "$tmp/src/b20.cpp"
 
     fails=0
-    for f in b1 b2 b3 b4 b5 b6 b7 b8 b9 b10 b11 b12 b13 b14 b15; do
+    for f in b1 b2 b3 b4 b5 b6 b7 b8 b9 b10 b11 b12 b13 b14 b15 b16 b17 b18 b19 b20; do
         if awk -f "$AWK_PROG" "$tmp/src/$f.cpp" 2>&1 | grep -q '^BAD'; then
             echo "  PASS  reject $f"
         else
@@ -161,7 +175,7 @@ if [ "${1:-}" = "--self-test" ]; then
     if [ "$fails" -ne 0 ]; then
         echo "===== participant-wait guard SELF-TEST: FAIL ($fails) ====="; exit 1
     fi
-    echo "===== participant-wait guard SELF-TEST: PASS (15 rejected, 7 accepted) ====="
+    echo "===== participant-wait guard SELF-TEST: PASS (20 rejected, 7 accepted) ====="
     exit 0
 fi
 

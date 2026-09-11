@@ -294,10 +294,6 @@ void CHttpServer::AcceptThread() {
         // send; the write funnel is still fe's and is what would remove the
         // window rather than bound it.
         //
-        // Failure is non-critical and deliberately not fatal: a socket that
-        // refuses the option still works, it is merely unbounded, and refusing
-        // the connection would be a worse outcome than the pin. Mirrors the RPC
-        // server's CID 1675178 handling.
         // ⚠️ FAIL CLOSED: A SOCKET WITHOUT TIMEOUTS IS NOT ADMITTED (round-9 F56).
         // This was `(void)ApplyClientSocketTimeouts(...)` -- the result discarded,
         // the connection accepted regardless. A failed setsockopt therefore
