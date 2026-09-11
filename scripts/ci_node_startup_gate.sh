@@ -488,6 +488,15 @@ if [ -n "$expect_min" ]; then
         echo "===== node startup gate: FAIL (census below baseline) ====="; exit 1
     fi
     echo "  census $count >= baseline floor $expect_min"
+elif [ -f "$baseline_file" ]; then
+    # ⚠️ A FILE THAT EXISTS BUT DOES NOT PARSE IS NOT THE SAME AS NO FILE, and
+    # reading it as "no baseline" would silently disarm a check somebody thought
+    # they had armed -- the quietest way for this leg to stop discriminating.
+    echo "  ⚠️ $baseline_file EXISTS BUT NO COUNT COULD BE READ FROM IT."
+    echo "     The file must carry the count on a line of its own (comments may"
+    echo "     precede it). Refusing to treat an unreadable baseline as an absent"
+    echo "     one: someone armed this and it is not armed."
+    echo "===== node startup gate: FAIL (unparsable baseline) ====="; exit 2
 else
     # ⚠️ SOFT, AND SAYS SO. A number I cannot measure on this box is a number I
     # will not invent: the baseline is seeded from a real run, not from reading.
