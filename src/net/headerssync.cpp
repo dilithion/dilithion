@@ -99,8 +99,25 @@ bool SingleHeaderWorkIsWithinBound(uint32_t nBits, const uint256& minimum_requir
     if (bound_is_zero) return true;
 
     const uint256 single = ::dilithion::consensus::ComputeChainWork(nBits);
-    // >= and not >: a single header that exactly meets the minimum satisfies the
-    // gate on its own, which is the thing being prevented.
+    // ⚠️ READ THE SENSE CAREFULLY — BOTH SENSES ARE SPELLED OUT BECAUSE THIS
+    // COMMENT ONCE LED A REVIEWER TO A FALSE HIGH.
+    //
+    // The function is named for what it RETURNS, not for what it rejects:
+    //   returns TRUE  <=> single-header work is BELOW the minimum   (within bound, fine)
+    //   returns FALSE <=> single-header work REACHES the minimum    (the hazard)
+    // and every caller rejects on the NEGATION: `if (!SingleHeaderWorkIsWithinBound(...))`.
+    //
+    // `>=` and not `>` inside the negation, because a header that EXACTLY meets the
+    // minimum satisfies the gate on its own — which is the thing being prevented, so
+    // it must land on the FALSE side.
+    //
+    // The previous comment stated only the rejection half ("a single header that
+    // exactly meets the minimum satisfies the gate on its own") directly above a
+    // `return !...`, and an external seat reading carefully mapped that sentence onto
+    // the return value and raised a HIGH for an inverted bound. The guard was correct;
+    // the COMMENT was ambiguous. A comment that leads a careful reviewer to invent a
+    // blocker is a defect in the comment, and the proof that it was ambiguous is that
+    // it happened.
     return !::dilithion::consensus::ChainWorkGreaterOrEqual(single, minimum_required_work);
 }
 

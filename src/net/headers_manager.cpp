@@ -236,8 +236,28 @@ CHeadersManager::CHeadersManager()
     //          exist. (Independently censused by COORD, same conclusion.)
     //
     //   (4) CALLS to either entry point, definitions and comments excluded:
-    //         git grep -nE "(InitializeDoSProtectedSync|ProcessHeadersWithDoSProtection)\s*\("     //             -- src ':!src/test' | grep -vE ":[[:space:]]*//|bool CHeadersManager::|bool "
-    //       -> ZERO. Every remaining non-test hit is a comment or a declaration.
+    //         git grep -nE "(InitializeDoSProtectedSync|ProcessHeadersWithDoSProtection)\s*\("     //             -- src ':!src/test'     //           | grep -vE ":[0-9]+:[[:space:]]*//"     //           | grep -vE ":[0-9]+:bool CHeadersManager::"     //           | grep -vE "\.h:[0-9]+:"
+    //       -> ZERO code hits. Every remaining non-test hit is a comment or a
+    //          declaration.
+    //
+    //       ⛔ THE FILTER'S FIRST VERSION COULD HIDE THE THING IT COUNTS, and two
+    //       seats found it independently. It excluded any line containing `bool `,
+    //       so a REAL call site written `bool ok = mgr.InitializeDoSProtectedSync(...)`
+    //       would have been filtered out and the ZERO would still have printed.
+    //       Measured on a fixture carrying exactly that line: the old filter kept
+    //       1 of 2 real calls; this one keeps 2 of 2, drops the comment-only line,
+    //       and drops both definitions and the header declaration — and still
+    //       returns ZERO on the tree, so the claim survives the stricter filter.
+    //
+    //       The repair is the shape, not the spelling: exclude COMMENT-ONLY lines
+    //       (anchored `:<lineno>:` then whitespace then `//`), never any line that
+    //       merely CONTAINS a comment or a type name.
+    //
+    //       SECOND instance of one class in this block — the first was a pattern
+    //       that matched only its own comment text. Both are checks whose success
+    //       condition can be satisfied by something other than the claim being
+    //       true. **Hostile-reading your own evidence commands is a separate step
+    //       from writing them**, and in this block it has now paid twice.
     //
     // So the testnet checker object the constructor builds is UNREACHABLE twice
     // over: nothing creates the state that would use it, and if a future caller
