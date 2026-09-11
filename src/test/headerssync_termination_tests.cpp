@@ -164,6 +164,35 @@ Outcome PresyncBatch(bool full_headers_available)
 }
 
 
+// A threshold the 3-header batch CROSSES, but that no SINGLE header reaches.
+//
+// Both halves matter. Too low and SingleHeaderWorkIsWithinBound rejects the first
+// header outright (the F3 guard: one header may not reach the gate alone), so the
+// batch never gets to promote and the arm would be measuring that guard instead.
+// Too high and it never promotes, and the arm silently becomes a duplicate of the
+// existing short-batch scenario. 2x a single header's work sits between the two.
+uint256 PromotableThreshold()
+{
+    const uint256 one = ComputeChainWork(0x1d00ffff);
+    return AddChainWork(one, one);
+}
+
+// PRESYNC with a threshold the batch CAN cross. Identical to PresyncBatch above in
+// every other respect, so any difference in outcome is attributable to the
+// promotion and to nothing else.
+Outcome PresyncBatchThatPromotes(bool full_headers_available)
+{
+    HeadersSyncParams params;
+    AlwaysValidChecker checker;
+    HeadersSyncState state(/*peer_id=*/1, params, ChainStartHash(),
+                           /*chain_start_height=*/0,
+                           /*chain_start_work=*/uint256(), PromotableThreshold(),
+                           &checker);
+
+    auto r = state.ProcessNextHeaders(LinkedChain(3), full_headers_available);
+    return {r.success, r.request_more, state.GetState()};
+}
+
 // Promote to REDOWNLOAD through the REAL two-phase flow, then deliver one
 // phase-2 batch with the given signal.
 //
@@ -266,6 +295,51 @@ void test_presync_short_batch_ends_the_sync()
 // ============================================================================
 // REDOWNLOAD — Core headerssync.cpp:123 / :127
 // ============================================================================
+
+// ⛔ THE ONE COMBINATION THE SUITE NEVER EXERCISED: SHORT **AND** PROMOTING.
+//
+// `request_more = full_headers_available || just_promoted`. The four existing
+// scenarios pin the FIRST disjunct in both directions and in both phases, and none
+// pins the second, because none is a short batch that also crosses the threshold.
+// Delete `|| just_promoted` and every one of them stays green. An in-house read
+// found that after four external rounds did not.
+//
+// ⚠️ THE PRESYNC-SHORT SCENARIO IS THE PROOF THE GAP IS REAL rather than
+// theoretical: it asserts request_more == FALSE, which can only hold because that
+// batch does NOT promote. If it did, `just_promoted` would force it true.
+//
+// WHY THIS ARM, not a severity argument: the single case where IGNORING the
+// termination signal is the CORRECT behaviour is the worst place in this file to
+// leave unpinned, because the whole change is about a signal that was computed and
+// then not acted on.
+//
+// ⚠️ MEASURED CONSEQUENCE OF THE REGRESSION, and it is worse than "we stop asking".
+// `if (!result.request_more) { ... Finalize(); }` runs immediately below. So without
+// the disjunct a peer that HAS crossed the threshold is finalised on the spot — the
+// promotion is undone, and the manager then compare-and-erases the session. The peer
+// is not merely left un-asked; its sync is destroyed one line after it succeeded.
+// That is why the assertions below are ordered property-first: under the mutation
+// BOTH fail, and the first one to fire should name the thing that actually broke.
+//
+// Core v28.0 headerssync.cpp:86 — a full message means more may be coming, AND SO
+// DOES having just switched to REDOWNLOAD, which needs the chain re-requested from
+// the beginning.
+void test_short_batch_that_promotes_still_asks_for_more()
+{
+    std::cout << "  test_short_batch_that_promotes_still_asks_for_more..." << std::flush;
+
+    const Outcome o = PresyncBatchThatPromotes(/*full_headers_available=*/false);
+
+    // THE PROPERTY: short batch, but promoted — so we must still ask.
+    REQUIRE(o.request_more);
+
+    // NON-VACUITY: the promotion must actually have happened, or this is just the
+    // existing short-batch case passing for the wrong reason.
+    REQUIRE(o.state == HeadersSyncState::State::REDOWNLOAD);
+    REQUIRE(o.success);
+
+    std::cout << " OK" << std::endl;
+}
 
 void test_redownload_full_batch_keeps_asking()
 {
@@ -433,6 +507,7 @@ int main()
     std::cout << "\n=== LP-10 F5 / D-1: headers-sync termination signal ===\n" << std::endl;
     test_presync_full_batch_keeps_asking();
     test_presync_short_batch_ends_the_sync();
+    test_short_batch_that_promotes_still_asks_for_more();
     test_redownload_full_batch_keeps_asking();
     test_redownload_short_batch_gives_up_but_keeps_its_headers();
     test_an_empty_batch_is_refused_and_changes_nothing();
