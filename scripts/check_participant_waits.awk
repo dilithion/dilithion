@@ -36,7 +36,7 @@
 # An exemption REQUIRES a reason. The point is not to allow opting out; it is to
 # force the argument to be written where the next reader will find it.
 
-function reset() { src = ""; delete inbody }
+function reset() { src = ""; delete inbody; delete fn_start; delete fn_end; delete fn_cp; delete fn_name }
 
 FNR == 1 && NR > 1 { finish() }
 FNR == 1 { reset(); fname = FILENAME }
@@ -91,7 +91,7 @@ function strip(s,   out, i, n, c, c2, state, prev, delim, endtok, at, at2, k, ru
     return out
 }
 
-function finish(   code, ncl, cl, raw, nraw, i, j, ln, call, call_col, scope_col, scopedepth, depth, k, ch, exempt, fstart, hascp) {
+function finish(   code, ncl, cl, raw, nraw, i, j, ln, call, call_col, scope_col, scopedepth, depth, k, ch, exempt, fstart, hascp, nfn, f, g, nm, body, fname_line) {
     if (src == "") return
     code = strip(src)
     if (code == "") { print "PARSE " fname " 0 unterminated comment, string or raw-string literal"; reset(); return }
@@ -102,36 +102,69 @@ function finish(   code, ncl, cl, raw, nraw, i, j, ln, call, call_col, scope_col
     ncl  = split(code, cl,  "\n")
     nraw = split(src,  raw, "\n")
 
-    # ⚠️ THE UNIT IS THE FUNCTION THAT CHECKPOINTS, NOT THE FILE (round-8 F47).
-    # Scoping by FILE reported 50 findings, nearly all of them blocking calls on
-    # threads that are NOT participants but happen to live in a file that has one
-    # -- startup/shutdown sleeps in dilithion-node.cpp, the bench's driver threads.
-    # A guard that reports 50 things nobody will action is a guard that gets
-    # switched off; precision is what makes it ENFORCEABLE rather than advisory.
-    # The defect is "a thread that HAS PUBLISHED an epoch then blocks", so the unit
-    # is the thread body: a top-level function containing an EpochCheckpoint( call.
-    depth = 0; fstart = 0; hascp = 0
+    # ⚠️ THE UNIT IS THE THREAD BODY AND WHAT IT CALLS, NOT THE FILE AND NOT ONE
+    # FUNCTION (round-8 F47 triage). Three versions of this, each wrong in a
+    # different direction, and the third was found by ADDING a check rather than
+    # by reading:
+    #   * by FILE      -> 50 findings, nearly all on threads that are not
+    #                     participants but share a file with one. A guard nobody
+    #                     will action is a guard that gets switched off.
+    #   * by FUNCTION  -> 27 findings, all real candidates -- but it could not see
+    #                     `send()` in CHttpServer::HandleRequest, because the
+    #                     checkpoint is in WorkerThread and HandleRequest merely
+    #                     RUNS ON that thread. The pin belongs to the THREAD; the
+    #                     blocking call can be any number of frames down.
+    #   * by THREAD BODY + ONE HOP -> what this does.
+    #
+    # ⚠️ ONE HOP IS A STATED LIMIT, NOT A CLAIM OF COMPLETENESS. A blocking call
+    # two frames below a checkpointing function, or in another translation unit,
+    # is NOT seen. Closing that needs a real call graph, which is not an awk job;
+    # what it must not do is let the PASS line imply a coverage it does not have,
+    # so the driver prints the depth with the result.
+    depth = 0; fstart = 0; hascp = 0; nfn = 0
     for (i = 1; i <= ncl; i++) {
         ln = cl[i]
         for (k = 1; k <= length(ln); k++) {
             ch = substr(ln, k, 1)
-            if (ch == "{") { if (depth == 0) { fstart = i; hascp = 0 } depth++ }
+            if (ch == "{") { if (depth == 0) { fstart = i; hascp = 0; fname_line = (i > 1 ? cl[i-1] " " ln : ln) } depth++ }
             else if (ch == "}") {
                 depth--
                 if (depth == 0 && fstart > 0) {
-                    if (hascp) for (j = fstart; j <= i; j++) inbody[j] = 1
+                    nfn++
+                    fn_start[nfn] = fstart; fn_end[nfn] = i; fn_cp[nfn] = hascp
+                    # the declarator name: last identifier before the '(' of the
+                    # signature, taken from the line that opened the body (or the
+                    # one above it, for a brace on its own line)
+                    fn_name[nfn] = ""
+                    if (match(fname_line, /[A-Za-z_][A-Za-z0-9_]*[ \t]*\(/)) {
+                        nm = substr(fname_line, RSTART, RLENGTH)
+                        sub(/[ \t]*\($/, "", nm)
+                        fn_name[nfn] = nm
+                    }
                     fstart = 0; hascp = 0
                 }
             }
         }
-        # AFTER the brace walk: a checkpoint on the SAME LINE as the opening
-        # brace of its own function must still count. Testing it before the walk
-        # read depth as 0 and missed exactly that shape -- caught by the
-        # fixtures, which is the second time in this file they have earned their
-        # keep.
         if (fstart > 0 && ln ~ /EpochCheckpoint[ \t]*\(/) hascp = 1
     }
 
+    # step 1: the checkpointing functions themselves
+    for (f = 1; f <= nfn; f++)
+        if (fn_cp[f]) for (j = fn_start[f]; j <= fn_end[f]; j++) inbody[j] = 1
+
+    # step 2: ONE HOP -- any function in this file whose name is called from a
+    # checkpointing function's body
+    for (f = 1; f <= nfn; f++) {
+        if (!fn_cp[f]) continue
+        body = ""
+        for (j = fn_start[f]; j <= fn_end[f]; j++) body = body " " cl[j]
+        for (g = 1; g <= nfn; g++) {
+            if (fn_cp[g] || fn_name[g] == "") continue
+            if (body ~ ("(^|[^A-Za-z0-9_])" fn_name[g] "[ \t]*\\(")) {
+                for (j = fn_start[g]; j <= fn_end[g]; j++) inbody[j] = 1
+            }
+        }
+    }
 
     # ⚠️ BRACE DEPTH, NOT A LINE WINDOW. The heuristic that FOUND F46 was "is there
     # an EpochOfflineScope within 25 lines above" -- good enough to find
@@ -160,6 +193,7 @@ function finish(   code, ncl, cl, raw, nraw, i, j, ln, call, call_col, scope_col
         else if (match(ln, /(^|[^A-Za-z0-9_])accept[ 	]*\(/))         { call = "accept";    call_col = RSTART }
         else if (match(ln, /(^|[^A-Za-z0-9_])recv[ 	]*\(/))           { call = "recv";      call_col = RSTART }
         else if (match(ln, /(^|[^A-Za-z0-9_])select[ 	]*\(/))         { call = "select";    call_col = RSTART }
+        else if (match(ln, /(^|[^A-Za-z0-9_])send[ 	]*\(/))           { call = "send";      call_col = RSTART }
         else if (match(ln, /(^|[^A-Za-z0-9_])poll[ 	]*\(/))           { call = "poll";      call_col = RSTART }
 
         for (k = 1; k <= length(ln) + 1; k++) {

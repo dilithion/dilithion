@@ -513,8 +513,10 @@ void CHttpServer::HandleRequest(SOCKET client_socket) {
         response << "\r\n";
         std::string response_str = response.str();
 #ifdef _WIN32
+        // EPOCH-WAIT-EXEMPT: a send publishes "I hold nothing", and at this site that CANNOT be shown -- the handler above has already run its resolve, so whether a CBlockIndex* is still live is a per-handler fact. Promising without the proof would UNPIN A HOLDER: the use-after-free direction, strictly worse than the bounded pin it removes. Waits for the write funnel, which gives one place to establish the property once.
         send(client_socket, response_str.c_str(), static_cast<int>(response_str.size()), 0);
 #else
+        // EPOCH-WAIT-EXEMPT: a send publishes "I hold nothing", and at this site that CANNOT be shown -- the handler above has already run its resolve, so whether a CBlockIndex* is still live is a per-handler fact. Promising without the proof would UNPIN A HOLDER: the use-after-free direction, strictly worse than the bounded pin it removes. Waits for the write funnel, which gives one place to establish the property once.
         send(client_socket, response_str.c_str(), response_str.size(), 0);
 #endif
         return;
@@ -600,8 +602,10 @@ void CHttpServer::HandleRequest(SOCKET client_socket) {
 
                 // Send raw response (handler builds complete HTTP response)
 #ifdef _WIN32
+                // EPOCH-WAIT-EXEMPT: a send publishes "I hold nothing", and at this site that CANNOT be shown -- the handler above has already run its resolve, so whether a CBlockIndex* is still live is a per-handler fact. Promising without the proof would UNPIN A HOLDER: the use-after-free direction, strictly worse than the bounded pin it removes. Waits for the write funnel, which gives one place to establish the property once.
                 send(client_socket, response.c_str(), static_cast<int>(response.size()), 0);
 #else
+                // EPOCH-WAIT-EXEMPT: a send publishes "I hold nothing", and at this site that CANNOT be shown -- the handler above has already run its resolve, so whether a CBlockIndex* is still live is a per-handler fact. Promising without the proof would UNPIN A HOLDER: the use-after-free direction, strictly worse than the bounded pin it removes. Waits for the write funnel, which gives one place to establish the property once.
                 send(client_socket, response.c_str(), response.size(), 0);
 #endif
             } catch (const std::exception& e) {

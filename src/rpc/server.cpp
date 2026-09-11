@@ -1018,6 +1018,23 @@ void CRPCServer::HandleClient(int clientSocket) {
     
     // Phase 3: Helper lambda for reading (works with both plain and SSL sockets)
     auto socket_read = [this, ssl](int socket_fd, void* buffer, int size) -> int {
+        // OFFLINE ACROSS THE READ (round-8 F47, found by the guard's one-hop pass).
+        // This is the RPC server's ONE read funnel and it blocks for as long as the
+        // client takes to send its request, so a slow or stalled client held an
+        // rpc-worker ONLINE for the whole of it.
+        //
+        // The WRITE side of this server was funnelled and wired rounds ago; the read
+        // side was not, and nothing looked -- the write side being done made the pair
+        // feel finished. That is the same "a fix aimed at a site leaves siblings"
+        // shape, with the sibling being the opposite direction of the same funnel.
+        //
+        // Safe here: this reads REQUEST bytes, before dispatch, so no handler has
+        // resolved anything yet -- the same argument as http_server's recv.
+        //
+        // The scope covers BOTH branches deliberately: SSLRead blocks exactly as
+        // recv does, and scoping only the plain branch would leave every TLS client
+        // pinning.
+        EpochOfflineScope offline(m_chainstate);
         if (ssl && m_ssl_wrapper) {
             return m_ssl_wrapper->SSLRead(ssl, buffer, size);
         } else {

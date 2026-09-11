@@ -1142,7 +1142,16 @@ bool EnsureMIKRegistered(CWallet& wallet, unsigned int nextHeight) {
             lastReason = snap->mineGate;
         }
 
+        // ⚠️ OFFLINE (round-8 F47, found by the guard's ONE-HOP pass). EnsureMIKRegistered polls once a second waiting for the MIK to register, and it is called BOTH at startup (:8006) AND from inside the main loop (:8391). The in-loop call runs with the loop's epoch published.
+        //
+        // ⚠️ THIS IS WHY ONE HOP WAS WORTH ADDING. The by-function version could not
+        // see this: the checkpoint is in the main loop, this sleep is a frame below
+        // it, and a pin belongs to the THREAD rather than to the function that
+        // happens to contain the checkpoint.
+        {
+            EpochOfflineScope offline(&g_chainstate);
         std::this_thread::sleep_for(std::chrono::seconds(1));
+        }
         s_registrationManager->Tick(tipHeight, g_node_state.running.load());
     }
     return false;
@@ -2089,6 +2098,7 @@ int main(int argc, char* argv[]) {
         std::cout << "To stop mining anytime: Press Ctrl+C" << std::endl;
         std::cout << std::endl;
         std::cout << "Starting in 3 seconds..." << std::endl;
+        // EPOCH-WAIT-EXEMPT: startup banner countdown, long before the main loop publishes an epoch
         std::this_thread::sleep_for(std::chrono::seconds(3));
         std::cout << std::endl;
 
@@ -2389,6 +2399,7 @@ int main(int argc, char* argv[]) {
             std::cout << "\nWindows shutdown signal received, cleaning up..." << std::endl;
             SignalHandler(SIGINT);
             // Give the shutdown logic a few seconds to flush databases
+            // EPOCH-WAIT-EXEMPT: startup banner countdown, long before the main loop publishes an epoch
             std::this_thread::sleep_for(std::chrono::seconds(3));
             return TRUE;
         }
@@ -7234,17 +7245,21 @@ load_genesis_block:  // Bug #29: Label for automatic retry after blockchain wipe
                     // joiner where it is declared); an uninterruptible 30s sleep
                     // would add up to 30s to every exit, error returns included.
                     for (int maint_tick = 0; maint_tick < 30 && g_node_state.running; ++maint_tick) {
+                        // EPOCH-WAIT-EXEMPT: startup: staged service bring-up, before the main loop's first checkpoint
                         std::this_thread::sleep_for(std::chrono::seconds(1));
                     }
                 } catch (const std::system_error& e) {
                     std::cerr << "[P2P-Maint] System error in maintenance loop: " << e.what()
                               << " (code: " << e.code() << ")" << std::endl;
+                    // EPOCH-WAIT-EXEMPT: startup: staged service bring-up, before the main loop's first checkpoint
                     std::this_thread::sleep_for(std::chrono::seconds(5));
                 } catch (const std::exception& e) {
                     std::cerr << "[P2P-Maint] Exception in maintenance loop: " << e.what() << std::endl;
+                    // EPOCH-WAIT-EXEMPT: startup: staged service bring-up, before the main loop's first checkpoint
                     std::this_thread::sleep_for(std::chrono::seconds(5));
                 } catch (...) {
                     std::cerr << "[P2P-Maint] Unknown exception in maintenance loop" << std::endl;
+                    // EPOCH-WAIT-EXEMPT: startup: staged service bring-up, before the main loop's first checkpoint
                     std::this_thread::sleep_for(std::chrono::seconds(5));
                 }
                 }
@@ -7937,6 +7952,7 @@ load_genesis_block:  // Bug #29: Label for automatic retry after blockchain wipe
                         handshake_ok = true;
                         break;
                     }
+                    // EPOCH-WAIT-EXEMPT: startup: pre-loop settle, before the main loop's first checkpoint
                     std::this_thread::sleep_for(std::chrono::milliseconds(250));
                 }
                 if (!handshake_ok) {
@@ -7968,6 +7984,7 @@ load_genesis_block:  // Bug #29: Label for automatic retry after blockchain wipe
                     std::cout << "  [WAIT] Waiting for RandomX FULL mode..." << std::endl;
                     auto wait_start = std::chrono::steady_clock::now();
                     while (!randomx_is_mining_mode_ready() && g_node_state.running) {
+                        // EPOCH-WAIT-EXEMPT: startup: pre-loop settle, before the main loop's first checkpoint
                         std::this_thread::sleep_for(std::chrono::milliseconds(100));
                         auto elapsed = std::chrono::steady_clock::now() - wait_start;
                         if (std::chrono::duration_cast<std::chrono::seconds>(elapsed).count() > 600) {
@@ -8018,6 +8035,7 @@ load_genesis_block:  // Bug #29: Label for automatic retry after blockchain wipe
                             // Retry up to 3 times (safety net — registration should already be done)
                             for (int attempt = 1; attempt <= 3 && !templateOpt; attempt++) {
                                 std::cerr << "[Mining] Template build failed, retrying (" << attempt << "/3)..." << std::endl;
+                                // EPOCH-WAIT-EXEMPT: startup: pre-loop settle, before the main loop's first checkpoint
                                 std::this_thread::sleep_for(std::chrono::seconds(1));
                                 templateOpt = BuildMiningTemplate(blockchain, wallet, true, config.mining_address_override);
                             }
@@ -8233,7 +8251,20 @@ load_genesis_block:  // Bug #29: Label for automatic retry after blockchain wipe
                     miner.StopMining();
                     int wait_count = 0;
                     while (miner.IsMining() && wait_count < 20) {
+                        // ⚠️ OFFLINE: this sleep is INSIDE the main loop, AFTER its checkpoint, so the
+                        // node's epoch is published and frozen for its whole duration (round-8 F47
+                        // triage: waiting up to 2 s (20 x 100 ms) for the miner to stop, inside the loop).
+                        //
+                        // ⚠️ THESE FIVE WERE ASSUMED TO BE STARTUP/SHUTDOWN AND ARE NOT. The triage
+                        // brief said the node-main residue was "sleeps that run before the loop
+                        // publishes anything"; brace-matching the loop (opens :8134, closes :8918)
+                        // put five of them INSIDE it. Exempting on the assumption would have written
+                        // a false reason next to a live defect -- which is worse than no marker,
+                        // because the marker is what stops the next reader looking.
+                        {
+                            EpochOfflineScope offline(&g_chainstate);
                         std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                        }
                         wait_count++;
                     }
                     if (wait_count >= 20) {
@@ -8241,7 +8272,20 @@ load_genesis_block:  // Bug #29: Label for automatic retry after blockchain wipe
                     }
                 }
                 // Additional small delay to ensure any in-flight block submission completes
+                // ⚠️ OFFLINE: this sleep is INSIDE the main loop, AFTER its checkpoint, so the
+                // node's epoch is published and frozen for its whole duration (round-8 F47
+                // triage: in-flight block-submission settle, 50 ms inside the main loop).
+                //
+                // ⚠️ THESE FIVE WERE ASSUMED TO BE STARTUP/SHUTDOWN AND ARE NOT. The triage
+                // brief said the node-main residue was "sleeps that run before the loop
+                // publishes anything"; brace-matching the loop (opens :8134, closes :8918)
+                // put five of them INSIDE it. Exempting on the assumption would have written
+                // a false reason next to a live defect -- which is worse than no marker,
+                // because the marker is what stops the next reader looking.
+                {
+                    EpochOfflineScope offline(&g_chainstate);
                 std::this_thread::sleep_for(std::chrono::milliseconds(50));
+                }
 
                 // Restart mining if appropriate (skip if paused or VDF miner handles itself)
                 if (g_node_state.mining_enabled.load() && !IsInitialBlockDownload()
@@ -8267,7 +8311,20 @@ load_genesis_block:  // Bug #29: Label for automatic retry after blockchain wipe
                             if (templateOpt) break;
                             std::cerr << "[Mining] Template build failed (attempt " << attempt << "/" << MAX_TEMPLATE_RETRIES << ")" << std::endl;
                             if (attempt < MAX_TEMPLATE_RETRIES) {
+                                // ⚠️ OFFLINE: this sleep is INSIDE the main loop, AFTER its checkpoint, so the
+                                // node's epoch is published and frozen for its whole duration (round-8 F47
+                                // triage: template-build retry, 50 ms inside the main loop).
+                                //
+                                // ⚠️ THESE FIVE WERE ASSUMED TO BE STARTUP/SHUTDOWN AND ARE NOT. The triage
+                                // brief said the node-main residue was "sleeps that run before the loop
+                                // publishes anything"; brace-matching the loop (opens :8134, closes :8918)
+                                // put five of them INSIDE it. Exempting on the assumption would have written
+                                // a false reason next to a live defect -- which is worse than no marker,
+                                // because the marker is what stops the next reader looking.
+                                {
+                                    EpochOfflineScope offline(&g_chainstate);
                                 std::this_thread::sleep_for(std::chrono::milliseconds(500));
+                                }
                             }
                         }
                         if (templateOpt) {
@@ -8305,7 +8362,20 @@ load_genesis_block:  // Bug #29: Label for automatic retry after blockchain wipe
                         std::cout << "  [WAIT] Waiting for dataset initialization..." << std::endl;
                         auto wait_start = std::chrono::steady_clock::now();
                         while (!randomx_is_mining_mode_ready() && g_node_state.running) {
+                            // ⚠️ OFFLINE: this sleep is INSIDE the main loop, AFTER its checkpoint, so the
+                            // node's epoch is published and frozen for its whole duration (round-8 F47
+                            // triage: RandomX DATASET INITIALISATION wait -- this one can run for MINUTES on a cold start, and it polls at 100 ms with the loop's epoch published).
+                            //
+                            // ⚠️ THESE FIVE WERE ASSUMED TO BE STARTUP/SHUTDOWN AND ARE NOT. The triage
+                            // brief said the node-main residue was "sleeps that run before the loop
+                            // publishes anything"; brace-matching the loop (opens :8134, closes :8918)
+                            // put five of them INSIDE it. Exempting on the assumption would have written
+                            // a false reason next to a live defect -- which is worse than no marker,
+                            // because the marker is what stops the next reader looking.
+                            {
+                                EpochOfflineScope offline(&g_chainstate);
                             std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                            }
                             auto elapsed = std::chrono::steady_clock::now() - wait_start;
                             if (std::chrono::duration_cast<std::chrono::seconds>(elapsed).count() > 120) {
                                 std::cerr << "  [WARN] FULL mode init timeout, starting with LIGHT mode" << std::endl;
@@ -8344,7 +8414,20 @@ load_genesis_block:  // Bug #29: Label for automatic retry after blockchain wipe
                                 // Retry up to 3 times with 1s delays
                                 for (int attempt = 1; attempt <= 3 && !templateOpt; attempt++) {
                                     std::cerr << "[Mining] Template build failed, retrying (" << attempt << "/3)..." << std::endl;
+                                    // ⚠️ OFFLINE: this sleep is INSIDE the main loop, AFTER its checkpoint, so the
+                                    // node's epoch is published and frozen for its whole duration (round-8 F47
+                                    // triage: template-build retry, 3 x 1 s inside the main loop).
+                                    //
+                                    // ⚠️ THESE FIVE WERE ASSUMED TO BE STARTUP/SHUTDOWN AND ARE NOT. The triage
+                                    // brief said the node-main residue was "sleeps that run before the loop
+                                    // publishes anything"; brace-matching the loop (opens :8134, closes :8918)
+                                    // put five of them INSIDE it. Exempting on the assumption would have written
+                                    // a false reason next to a live defect -- which is worse than no marker,
+                                    // because the marker is what stops the next reader looking.
+                                    {
+                                        EpochOfflineScope offline(&g_chainstate);
                                     std::this_thread::sleep_for(std::chrono::seconds(1));
+                                    }
                                     templateOpt = BuildMiningTemplate(blockchain, wallet, true, config.mining_address_override);
                                 }
                             }

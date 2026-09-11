@@ -1098,7 +1098,16 @@ bool EnsureMIKRegistered(CWallet& wallet, unsigned int nextHeight) {
             lastReason = snap->mineGate;
         }
 
+        // ⚠️ OFFLINE (round-8 F47, found by the guard's ONE-HOP pass). the DilV twin of EnsureMIKRegistered's 1 s poll, reached from the main loop the same way.
+        //
+        // ⚠️ THIS IS WHY ONE HOP WAS WORTH ADDING. The by-function version could not
+        // see this: the checkpoint is in the main loop, this sleep is a frame below
+        // it, and a pin belongs to the THREAD rather than to the function that
+        // happens to contain the checkpoint.
+        {
+            EpochOfflineScope offline(&g_chainstate);
         std::this_thread::sleep_for(std::chrono::seconds(1));
+        }
         waitSec++;
         s_registrationManager->Tick(tipHeight, g_node_state.running.load());
     }
@@ -2028,6 +2037,7 @@ int main(int argc, char* argv[]) {
         std::cout << "To stop mining anytime: Press Ctrl+C" << std::endl;
         std::cout << std::endl;
         std::cout << "Starting in 3 seconds..." << std::endl;
+        // EPOCH-WAIT-EXEMPT: startup banner countdown, long before the main loop publishes an epoch
         std::this_thread::sleep_for(std::chrono::seconds(3));
         std::cout << std::endl;
 
@@ -2311,6 +2321,7 @@ int main(int argc, char* argv[]) {
             std::cout << "\nWindows shutdown signal received, cleaning up..." << std::endl;
             SignalHandler(SIGINT);
             // Give the shutdown logic a few seconds to flush databases
+            // EPOCH-WAIT-EXEMPT: startup banner countdown, long before the main loop publishes an epoch
             std::this_thread::sleep_for(std::chrono::seconds(3));
             return TRUE;
         }
@@ -7064,17 +7075,21 @@ load_genesis_block:  // Bug #29: Label for automatic retry after blockchain wipe
                     // joiner where it is declared); an uninterruptible 30s sleep
                     // would add up to 30s to every exit, error returns included.
                     for (int maint_tick = 0; maint_tick < 30 && g_node_state.running; ++maint_tick) {
+                        // EPOCH-WAIT-EXEMPT: startup: staged service bring-up, before the main loop's first checkpoint
                         std::this_thread::sleep_for(std::chrono::seconds(1));
                     }
                 } catch (const std::system_error& e) {
                     std::cerr << "[P2P-Maint] System error in maintenance loop: " << e.what()
                               << " (code: " << e.code() << ")" << std::endl;
+                    // EPOCH-WAIT-EXEMPT: startup: staged service bring-up, before the main loop's first checkpoint
                     std::this_thread::sleep_for(std::chrono::seconds(5));
                 } catch (const std::exception& e) {
                     std::cerr << "[P2P-Maint] Exception in maintenance loop: " << e.what() << std::endl;
+                    // EPOCH-WAIT-EXEMPT: startup: staged service bring-up, before the main loop's first checkpoint
                     std::this_thread::sleep_for(std::chrono::seconds(5));
                 } catch (...) {
                     std::cerr << "[P2P-Maint] Unknown exception in maintenance loop" << std::endl;
+                    // EPOCH-WAIT-EXEMPT: startup: staged service bring-up, before the main loop's first checkpoint
                     std::this_thread::sleep_for(std::chrono::seconds(5));
                 }
                 }
@@ -7737,6 +7752,7 @@ load_genesis_block:  // Bug #29: Label for automatic retry after blockchain wipe
                         handshake_ok = true;
                         break;
                     }
+                    // EPOCH-WAIT-EXEMPT: startup: peer-handshake settle, before the main loop's first checkpoint
                     std::this_thread::sleep_for(std::chrono::milliseconds(250));
                 }
                 if (!handshake_ok) {

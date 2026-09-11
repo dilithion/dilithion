@@ -501,6 +501,25 @@ check-headers-manager-pointer:
 check-tip-notify-drain:
 	@bash scripts/check-tip-notify-drain.sh
 
+# DEFERRED-RECLAMATION GUARDS. Same rule as the two above: a guard nobody runs is
+# a file. Both are sub-second and run BEFORE the suites, because if a thread_local
+# grew a destructor or a participant started blocking online, the suites will
+# still be green and still be wrong.
+#
+# ⚠️ EACH RUNS ITS OWN SELF-TEST FIRST. A guard whose fixtures are not exercised
+# is a guard that can quietly stop discriminating -- both of these have failed
+# their own fixtures during development (the thread_local one accepted a NEGATED
+# static_assert; the participant one accepted a scope that had already closed),
+# and in both cases the fixtures caught it before the tree did. Running the
+# fixtures on every invocation is what keeps that true.
+check-thread-local-guard:
+	@bash scripts/check_thread_local_guard.sh --self-test
+	@bash scripts/check_thread_local_guard.sh
+
+check-participant-waits:
+	@bash scripts/check_participant_waits.sh --self-test
+	@bash scripts/check_participant_waits.sh
+
 # P2P-14/15 TSan lock-inversion gate — MANUAL, Linux-only, ~4 min.
 #
 # Deliberately NOT a prerequisite of tests-fast/tests-full, and that is stated
@@ -646,7 +665,7 @@ endif
 # `make dilithion-node` runs earlier in that job and drags libzmq in.
 $(TEST_SUITES_ALL): | libzmq
 
-.PHONY: tests tests-build tests-fast tests-full
+.PHONY: tests tests-build tests-fast tests-full check-thread-local-guard check-participant-waits
 
 # A-010 review LOW (a8, 2026-09-08): scripts/census_test_mains.sh had ZERO
 # callers -- an orphaned script inside the change that registers orphaned
@@ -671,7 +690,7 @@ tests: tests-build
 # wired into the target CI actually runs because a guard with zero callers is
 # not a guard — it is a file. It runs FIRST: it is a sub-second grep, and if the
 # drain invariant is broken there is no point running the suites.
-tests-fast: check-tip-notify-drain check-headers-manager-pointer $(TEST_SUITES_FAST)
+tests-fast: check-tip-notify-drain check-headers-manager-pointer check-thread-local-guard check-participant-waits $(TEST_SUITES_FAST)
 	@bash scripts/check_roster_completeness.sh
 	@bash scripts/test_run_with_hang_capture.sh
 	@bash scripts/test_run_test_suites_timeout.sh
@@ -679,7 +698,7 @@ tests-fast: check-tip-notify-drain check-headers-manager-pointer $(TEST_SUITES_F
 	@bash scripts/test_run_test_suites_args.sh
 	@bash scripts/run_test_suites.sh fast
 
-tests-full: check-tip-notify-drain check-headers-manager-pointer $(TEST_SUITES_FULL)
+tests-full: check-tip-notify-drain check-headers-manager-pointer check-thread-local-guard check-participant-waits $(TEST_SUITES_FULL)
 	@bash scripts/run_test_suites.sh full
 
 phase1_test: $(CORE_OBJECTS) $(OBJ_DIR)/test/phase1_simple_test.o $(DILITHIUM_OBJECTS) $(CHIAVDF_OBJECTS)

@@ -178,6 +178,7 @@ int main(int argc, char** argv)
         while (!stop.load()) {
             cs.EpochCheckpoint("bench-slow");
             checkpoints.fetch_add(1);
+            // EPOCH-WAIT-EXEMPT: THE INSTRUMENT'S PURPOSE: this bench exists to MEASURE what a parked participant costs, so its threads park online deliberately
             std::this_thread::sleep_for(std::chrono::milliseconds(checkpoint_ms));
         }
     });
@@ -185,6 +186,7 @@ int main(int argc, char** argv)
         while (!stop.load()) {
             cs.EpochCheckpoint("bench-fast");
             checkpoints.fetch_add(1);
+            // EPOCH-WAIT-EXEMPT: THE INSTRUMENT'S PURPOSE: deliberate park, see the file header
             std::this_thread::sleep_for(
                 std::chrono::milliseconds(std::max(1, checkpoint_ms / 10)));
         }
@@ -209,10 +211,12 @@ int main(int argc, char** argv)
                 // THE DEFECT: an epoch published and then frozen for the whole park.
                 park_ready = true;
                 park_cv.notify_all();
+                // EPOCH-WAIT-EXEMPT: THE INSTRUMENT'S PURPOSE: deliberate park, see the file header
                 park_cv.wait(lk, [&] { return park_release; });
             }
         });
         std::unique_lock<std::mutex> lk(park_m);
+        // EPOCH-WAIT-EXEMPT: THE INSTRUMENT'S PURPOSE: deliberate park, see the file header
         park_cv.wait(lk, [&] { return park_ready; });
         std::cout << "  parked participant    : mode " << parked_mode
                   << (parked_mode == 2 ? " (OFFLINE — the fix)"
@@ -243,6 +247,7 @@ int main(int argc, char** argv)
             drain_calls.fetch_add(1);
             drain_ms_total.store(drain_ms_total.load() + ms);
             if (ms > drain_ms_max.load()) drain_ms_max.store(ms);
+            // EPOCH-WAIT-EXEMPT: THE INSTRUMENT'S PURPOSE: deliberate park, see the file header
             std::this_thread::sleep_for(std::chrono::milliseconds(drain_ms));
         }
     });
@@ -261,6 +266,7 @@ int main(int argc, char** argv)
             const double now_ms = MsSince(t_start);
             if (now_ms < due_ms) {
                 const int nap = static_cast<int>(due_ms - now_ms);
+                // EPOCH-WAIT-EXEMPT: THE INSTRUMENT'S PURPOSE: deliberate park, see the file header
                 if (nap >= 1) std::this_thread::sleep_for(std::chrono::milliseconds(nap));
             }
         }
