@@ -1127,6 +1127,11 @@ minimum_chain_work_kat_tests: $(CORE_OBJECTS) $(OBJ_DIR)/test/minimum_chain_work
 	@$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS) $(LIBS)
 	@echo "$(COLOR_GREEN)✓ minimum_chain_work_kat_tests built successfully$(COLOR_RESET)"
 
+proof_checker_selection_tests: $(CORE_OBJECTS) $(OBJ_DIR)/test/proof_checker_selection_tests.o $(DILITHIUM_OBJECTS) $(CHIAVDF_OBJECTS)
+	@echo "$(COLOR_BLUE)[LINK]$(COLOR_RESET) $@"
+	@$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS) $(LIBS)
+	@echo "$(COLOR_GREEN)✓ proof_checker_selection_tests built successfully$(COLOR_RESET)"
+
 regtest_chainparams_smoke: $(CORE_OBJECTS) $(OBJ_DIR)/test/regtest_chainparams_smoke.o $(DILITHIUM_OBJECTS) $(CHIAVDF_OBJECTS)
 	@echo "$(COLOR_BLUE)[LINK]$(COLOR_RESET) $@"
 	@$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS) $(LIBS)
