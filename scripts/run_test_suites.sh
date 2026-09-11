@@ -269,6 +269,7 @@ fast|peer_scorer_tests|180||
 fast|peer_scorer_banman_integration_tests|180||
 fast|header_proof_checker_tests|180||
 fast|chain_selector_tests|180||
+fast|http_socket_timeout_tests|60||
 fast|deferred_reclamation_tests|180||
 fast|leaf_index_invariant_tests|180||
 fast|queue_parent_pin_publication_tests|180||

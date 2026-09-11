@@ -938,6 +938,14 @@ blockindex_uaf_asan_arm: $(CORE_OBJECTS) $(OBJ_DIR)/test/blockindex_uaf_asan_arm
 	@$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS) $(LIBS)
 	@echo "$(COLOR_GREEN)✓ blockindex_uaf_asan_arm built successfully$(COLOR_RESET)"
 
+# The bound on an HTTP worker's ONLINE window (round-8 F48). Links the real
+# CHttpServer so the arm exercises the production ApplyClientSocketTimeouts rather
+# than a copy of it.
+http_socket_timeout_tests: $(CORE_OBJECTS) $(OBJ_DIR)/test/http_socket_timeout_tests.o $(DILITHIUM_OBJECTS) $(CHIAVDF_OBJECTS)
+	@echo "$(COLOR_BLUE)[LINK]$(COLOR_RESET) $@"
+	@$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS) $(LIBS)
+	@echo "$(COLOR_GREEN)✓ http_socket_timeout_tests built successfully$(COLOR_RESET)"
+
 deferred_reclamation_tests: $(CORE_OBJECTS) $(OBJ_DIR)/test/deferred_reclamation_tests.o $(DILITHIUM_OBJECTS) $(CHIAVDF_OBJECTS)
 	@echo "$(COLOR_BLUE)[LINK]$(COLOR_RESET) $@"
 	@$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS) $(LIBS)

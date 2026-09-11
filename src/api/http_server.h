@@ -240,6 +240,29 @@ public:
      */
     int GetPort() const { return m_port; }
 
+public:
+
+    // ⚠️ THE BOUND ON A WORKER'S ONLINE WINDOW, AS A VALUE AND AS A FUNCTION
+    // (round-8 F48). The 18 unfunnelled sends in HandleRequest run with the
+    // worker ONLINE, and until this existed nothing bounded them: a client that
+    // stops reading parked a checkpointing thread for as long as it liked. The
+    // exemption markers on those sends quote this number.
+    //
+    // It is a named function rather than two inline setsockopt calls so an arm
+    // can exercise the PRODUCTION path instead of a copy of it -- a test that
+    // re-implements the thing it checks proves only that the author can write it
+    // twice.
+    static constexpr int CLIENT_SOCKET_TIMEOUT_MS = 10000;   // 10 s, both ways
+
+    /**
+     * Apply SO_RCVTIMEO and SO_SNDTIMEO to an accepted client socket.
+     * Returns true if BOTH were accepted by the OS. Failure is non-fatal at the
+     * call site (an unbounded socket still works), but the arm asserts success so
+     * a silent regression to "no timeouts" is a RED rather than a shrug.
+     */
+    static bool ApplyClientSocketTimeouts(SOCKET client_socket);
+
+private:
 private:
     /**
      * Accept thread main loop
