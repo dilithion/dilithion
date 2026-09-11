@@ -5,6 +5,7 @@
 // See: docs/developer/LIBEVENT-NETWORKING-PORT-PLAN.md
 
 #include <net/connman.h>
+#include <type_traits>   // static_assert on thread_local destructibility
 #include <net/netaddress.h>
 #include <net/peers.h>
 #include <net/net.h>
@@ -14,6 +15,11 @@
 #include <net/serialize.h>
 #include <net/banman.h>  // For MisbehaviorType
 #include <core/chainparams.h>  // Phase 4: per-chain outbound class targets
+#include <consensus/chain.h>    // g_chainstate: deferred-reclamation epoch checkpoints
+
+// Defined in src/core/globals.cpp; declared per-TU, matching the idiom in
+// headers_manager.cpp / block_processing.cpp / tx_index.cpp.
+extern CChainState g_chainstate;
 #include <util/time.h>
 #include <util/logging.h>
 #include <util/strencodings.h>  // For strprintf
@@ -239,6 +245,33 @@ bool CConnman::Start(CPeerManager& peer_mgr, CNetMessageProcessor& msg_proc, con
         }
         return false;
     }
+
+    // These three P2P threads reach block_processing and therefore resolve
+    // CBlockIndex*; ThreadSocketHandler and ThreadOpenConnections are NOT declared
+    // because they move bytes and addresses and never touch mapBlockIndex — and if
+    // that ever changes, the resolve-time detector in chain.cpp names them without
+    // anyone updating this list.
+    // ⚠️ DECLARED AFTER THE SPAWNS SUCCEED, NOT BEFORE THEM. A declaration made
+    // before a std::thread constructor that then THROWS leaves a name nobody will
+    // ever answer for, and the startup census refuses to start the node over a
+    // thread that does not exist — a false positive that bricks a node. Declaring
+    // after the spawn is safe in the other direction: a thread that checkpoints
+    // before its declaration lands is simply already in the registered set, and
+    // the census only ever asks for declared-minus-registered.
+    // These two are declared here, AFTER every spawn in this function has
+    // succeeded — the same rule as the pool below. Their threads were created
+    // earlier in Start(), but a declaration is a promise about a RUNNING thread,
+    // and until the last spawn succeeds this function can still return false and
+    // join them all.
+    g_chainstate.DeclareEpochParticipant("p2p-msg-handler");
+    g_chainstate.DeclareEpochParticipant("p2p-headers-worker");
+    // ⚠️ DECLARED WITH A COUNT, BECAUSE THIS IS A POOL. The registry used to
+    // hold a SET OF NAMES, so one worker reaching its first checkpoint
+    // satisfied the census for every sibling: fifteen of sixteen could have
+    // been wired wrong and the gate would still have passed.
+    g_chainstate.DeclareEpochParticipant("p2p-blocks-worker",
+                                        m_blocks_worker_threads.size());
+
 
     LogPrintf(NET, INFO, "[CConnman] Started successfully (with async headers + %d parallel block workers)\n", NUM_BLOCK_WORKERS);
     return true;
@@ -738,6 +771,15 @@ void CConnman::ThreadMessageHandler() {
     LogPrintf(NET, INFO, "[CConnman] ThreadMessageHandler started (async dispatch mode)\n");
 
     while (!flagInterruptMsgProc.load()) {
+        // DEFERRED-RECLAMATION CHECKPOINT — the loop top, which for THIS thread is
+        // the every-iteration point: its wait sits at the BOTTOM and is skipped
+        // entirely while fMoreWork is true, so a checkpoint there would never fire
+        // during IBD. Here the batch is not yet collected and nothing is resolved.
+        // Gap between checkpoints: one batch (<=500 messages) plus at most the
+        // 100ms bottom wait. Control messages are processed INLINE on this thread
+        // (getheaders/getdata/inv), and those resolve block indices.
+        g_chainstate.EpochCheckpoint("p2p-msg-handler");
+
         bool fMoreWork = false;
 
         // IBD Redesign Phase 1: Collect messages and route by type
@@ -855,9 +897,20 @@ void CConnman::ThreadMessageHandler() {
         // Wait for more work
         if (!fMoreWork && !flagInterruptMsgProc.load()) {
             std::unique_lock<std::mutex> lock(mutexMsgProc);
-            condMsgProc.wait_for(lock, std::chrono::milliseconds(100), [this] {
-                return fMsgProcWake.load() || flagInterruptMsgProc.load();
-            });
+            {
+                // OFFLINE FOR THE DURATION OF THE WAIT. Checkpointing before the wait
+                // publishes an epoch that then FREEZES while this thread is parked, pinning
+                // every entry unlinked afterwards -- a server asleep in accept() for an hour
+                // pins an hour of evictions, which is what made the design note's "parked
+                // threads pin nothing" false. Going offline removes this thread from the
+                // quiescent-state calculation entirely, exactly as an exited thread is
+                // removed; the scope re-enters on EVERY exit path, before anything is
+                // resolved.
+                EpochOfflineScope offline(&g_chainstate);
+                condMsgProc.wait_for(lock, std::chrono::milliseconds(100), [this] {
+                    return fMsgProcWake.load() || flagInterruptMsgProc.load();
+                });
+            }
             fMsgProcWake.store(false);
         }
     }
@@ -916,12 +969,30 @@ void CConnman::HeadersWorkerThread() {
     while (!flagInterruptMsgProc.load()) {
         QueuedMessage msg;
 
+        // DEFERRED-RECLAMATION CHECKPOINT — before the wait, not after the work.
+        // At the loop top this thread has finished the previous unit and taken no
+        // new one, so it holds no CBlockIndex*. ProcessQueuedMessage below reaches
+        // block_processing, which resolves index pointers, so this thread IS a
+        // participant: without this it would pin the graveyard for the whole run.
+        g_chainstate.EpochCheckpoint("p2p-headers-worker");
+
         // Wait for work
         {
             std::unique_lock<std::mutex> lock(m_headers_queue_mutex);
-            m_headers_cv.wait(lock, [this] {
-                return !m_headers_queue.empty() || flagInterruptMsgProc.load();
-            });
+            {
+                // OFFLINE FOR THE DURATION OF THE WAIT. Checkpointing before the wait
+                // publishes an epoch that then FREEZES while this thread is parked, pinning
+                // every entry unlinked afterwards -- a server asleep in accept() for an hour
+                // pins an hour of evictions, which is what made the design note's "parked
+                // threads pin nothing" false. Going offline removes this thread from the
+                // quiescent-state calculation entirely, exactly as an exited thread is
+                // removed; the scope re-enters on EVERY exit path, before anything is
+                // resolved.
+                EpochOfflineScope offline(&g_chainstate);
+                m_headers_cv.wait(lock, [this] {
+                    return !m_headers_queue.empty() || flagInterruptMsgProc.load();
+                });
+            }
 
             if (flagInterruptMsgProc.load()) {
                 break;
@@ -959,12 +1030,30 @@ void CConnman::BlocksWorkerThread() {
     while (!flagInterruptMsgProc.load()) {
         QueuedMessage msg;
 
+        // DEFERRED-RECLAMATION CHECKPOINT — before the wait, not after the work.
+        // At the loop top this thread has finished the previous unit and taken no
+        // new one, so it holds no CBlockIndex*. ProcessQueuedMessage below reaches
+        // block_processing, which resolves index pointers, so this thread IS a
+        // participant: without this it would pin the graveyard for the whole run.
+        g_chainstate.EpochCheckpoint("p2p-blocks-worker");
+
         // Wait for work
         {
             std::unique_lock<std::mutex> lock(m_blocks_queue_mutex);
-            m_blocks_cv.wait(lock, [this] {
-                return !m_blocks_queue.empty() || flagInterruptMsgProc.load();
-            });
+            {
+                // OFFLINE FOR THE DURATION OF THE WAIT. Checkpointing before the wait
+                // publishes an epoch that then FREEZES while this thread is parked, pinning
+                // every entry unlinked afterwards -- a server asleep in accept() for an hour
+                // pins an hour of evictions, which is what made the design note's "parked
+                // threads pin nothing" false. Going offline removes this thread from the
+                // quiescent-state calculation entirely, exactly as an exited thread is
+                // removed; the scope re-enters on EVERY exit path, before anything is
+                // resolved.
+                EpochOfflineScope offline(&g_chainstate);
+                m_blocks_cv.wait(lock, [this] {
+                    return !m_blocks_queue.empty() || flagInterruptMsgProc.load();
+                });
+            }
 
             if (flagInterruptMsgProc.load()) {
                 break;
@@ -2005,8 +2094,42 @@ void CConnman::InactivityCheck() {
 
                 if (should_ping && m_msg_processor) {
                     // Generate random nonce for ping (CWE-676 fix: use std::random_device instead of rand())
-                    static thread_local std::random_device rd;
-                    uint64_t nonce = (static_cast<uint64_t>(rd()) << 32) | rd();
+                    //
+                    // ⚠️ A POINTER, BECAUSE A thread_local DESTRUCTOR RUNS ON FREED
+                    // STORAGE ON THIS TOOLCHAIN. GCC on mingw-w64 implements
+                    // thread_local with emutls, whose pthread key is destroyed
+                    // BEFORE the key libstdc++ uses to run C++ destructors -- so by
+                    // the time ~random_device() ran it was reading a free()d block,
+                    // and `_M_fini()` would act on whatever the heap had put there.
+                    // Measured on this toolchain: std::random_device is NOT trivially
+                    // destructible (std::mt19937_64 is), and every thread_local
+                    // destructor here runs post-free, 300/300.
+                    //
+                    // Found by scripts/check_thread_local_guard.sh, which was written
+                    // for the same defect class in the epoch code and immediately
+                    // named this site -- the guard doing its job on its first run.
+                    // ⚠️ ONE PER PROCESS, NOT ONE PER THREAD, AND THE FIRST VERSION
+                    // OF THIS FIX GOT THE BOUND WRONG (round-6 F35). It said
+                    // "one device per connman thread, bounded by the thread count"
+                    // -- but the bound is per thread that EVER REACHES THIS SITE,
+                    // and CConnman is started and stopped repeatedly (every restart
+                    // brings a fresh InactivityCheck thread). Over a long-running
+                    // node with reconnect churn that is unbounded growth, slowly.
+                    // A leak whose bound is stated wrongly is worse than one stated
+                    // plainly: the wrong bound is what stops anyone looking again.
+                    //
+                    // std::random_device is stateless per call for our purposes here
+                    // (a ping nonce), so one shared instance behind a mutex is both
+                    // correct and genuinely bounded. The mutex cost is irrelevant at
+                    // ping frequency.
+                    static std::mutex rd_mu;
+                    static std::random_device* rd = nullptr;
+                    uint64_t nonce;
+                    {
+                        std::lock_guard<std::mutex> rd_lk(rd_mu);
+                        if (rd == nullptr) rd = new std::random_device();
+                        nonce = (static_cast<uint64_t>((*rd)()) << 32) | (*rd)();
+                    }
                     CNetMessage ping_msg = m_msg_processor->CreatePingMessage(nonce);
                     PushMessage(node.get(), ping_msg);
                     last_ping_sent[node_id] = now;

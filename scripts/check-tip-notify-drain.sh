@@ -88,7 +88,7 @@ fi
 
 # 4. The callback must not carry a CBlockIndex*. Reverting to a pointer
 #    reintroduces the use-after-free (CBlockIndex objects are destroyed by
-#    EvictLowestWorkNotOnBestChain, driven by the headers thread) and re-opens
+#    EvictLowestWorkLeafNotPinned, driven by the headers thread) and re-opens
 #    the cycle the moment a consumer takes a lock.
 if grep -q "using TipUpdateCallback = std::function<void(const CBlockIndex\*)>" src/consensus/chain.h 2>/dev/null; then
     echo "FAIL: TipUpdateCallback passes a CBlockIndex* again. It must pass VALUES."
