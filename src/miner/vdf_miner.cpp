@@ -126,10 +126,32 @@ void CVDFMiner::MiningLoop()
         // DEFERRED-RECLAMATION CHECKPOINT — loop top, before any wait in this
         // round. Three injected callbacks on this thread resolve index pointers
         // (m_templateProvider, m_tipOutputProvider, m_blockFoundCallback); all
-        // three have returned by the time control is back here. Pin bound: one
-        // VDF round. vdf_miner.cpp contains no CBlockIndex token at all — every
-        // resolve arrives through a callback, so only a call-graph census finds
-        // it, never a grep of this file.
+        // three have returned by the time control is back here. vdf_miner.cpp
+        // contains no CBlockIndex token at all — every resolve arrives through a
+        // callback, so only a call-graph census finds it, never a grep of this file.
+        //
+        // ⚠️ THIS COMMENT USED TO SAY "Pin bound: one VDF round", AND THAT WAS
+        // FALSE (round-8 F46). The bound is one VDF round PLUS EVERY WAIT IN THAT
+        // ROUND, and this loop contains EIGHT of them — two at 120 SECONDS. A DilV
+        // miner in cooldown after winning a block is a normal operating state, and
+        // it sat here ONLINE for up to two minutes at a time, freezing
+        // DrainGraveyard's minimum at this thread's last checkpoint for the whole
+        // cooldown. Same class as the idle headers processor (F45) at a hundred
+        // times the duration, on the chain's miners.
+        //
+        // ⚠️ AND THE FALSE BOUND IS WHY NOBODY LOOKED: the comment answered the
+        // question. That is the third time in this PR that a wrong bound in a
+        // comment concealed the thing it described — see lessons_learned.md, "THE
+        // POPULATION ERROR" and "A LEAK WHOSE BOUND IS STATED WRONGLY".
+        //
+        // MEASURED BOUND, now that every wait below is bracketed by an
+        // EpochOfflineScope: **one VDF round of actual computation**, with no wait
+        // included, because a waiting miner has left the quiescent-state
+        // calculation entirely. Each scope is braced to its own wait — not to the
+        // enclosing block — so the thread is back online before anything resolves.
+        // Every one of the eight predicates reads only `m_epochChanged` and
+        // `m_running`; none resolves a CBlockIndex*, so the plain offline scope is
+        // correct here and no EpochOnlineWindow is needed.
         g_chainstate.EpochCheckpoint("vdf-miner");
 
         // ---------------------------------------------------------------
@@ -156,8 +178,12 @@ void CVDFMiner::MiningLoop()
                               << "s (min block time " << m_minBlockTimeSec << "s)"
                               << std::endl;
                 std::unique_lock<std::mutex> lock(m_epochMutex);
-                m_epochCV.wait_for(lock, std::chrono::seconds(remaining),
-                    [this] { return m_epochChanged || !m_running; });
+                {
+                    // OFFLINE ACROSS THE WAIT (round-8 F46) -- see the loop-top note.
+                    EpochOfflineScope offline(&g_chainstate);
+                    m_epochCV.wait_for(lock, std::chrono::seconds(remaining),
+                        [this] { return m_epochChanged || !m_running; });
+                }
 
                 // If epoch changed during wait, restart loop (re-check wait)
                 if (m_epochChanged) {
@@ -180,8 +206,12 @@ void CVDFMiner::MiningLoop()
         if (!templateOpt) {
             // No template available — wait and retry
             std::unique_lock<std::mutex> lock(m_epochMutex);
-            m_epochCV.wait_for(lock, std::chrono::seconds(5),
-                [this] { return m_epochChanged || !m_running; });
+            {
+                // OFFLINE ACROSS THE WAIT (round-8 F46) -- see the loop-top note.
+                EpochOfflineScope offline(&g_chainstate);
+                m_epochCV.wait_for(lock, std::chrono::seconds(5),
+                    [this] { return m_epochChanged || !m_running; });
+            }
             m_epochChanged = false;
             continue;
         }
@@ -234,8 +264,12 @@ void CVDFMiner::MiningLoop()
                               << " blocks, time-based expiry active)" << std::endl;
 
                 std::unique_lock<std::mutex> lock(m_epochMutex);
-                m_epochCV.wait_for(lock, std::chrono::seconds(120),
-                                   [this] { return m_epochChanged || !m_running; });
+                {
+                    // OFFLINE ACROSS THE WAIT (round-8 F46) -- see the loop-top note.
+                    EpochOfflineScope offline(&g_chainstate);
+                    m_epochCV.wait_for(lock, std::chrono::seconds(120),
+                                       [this] { return m_epochChanged || !m_running; });
+                }
                 m_epochChanged = false;
                 continue;
             }
@@ -265,8 +299,12 @@ void CVDFMiner::MiningLoop()
                 // (cooldown=0 with MIN_COOLDOWN=0) never deadlocks if it somehow
                 // enters this branch due to a stale cached miner count.
                 std::unique_lock<std::mutex> lock(m_epochMutex);
-                m_epochCV.wait_for(lock, std::chrono::seconds(120),
-                                   [this] { return m_epochChanged || !m_running; });
+                {
+                    // OFFLINE ACROSS THE WAIT (round-8 F46) -- see the loop-top note.
+                    EpochOfflineScope offline(&g_chainstate);
+                    m_epochCV.wait_for(lock, std::chrono::seconds(120),
+                                       [this] { return m_epochChanged || !m_running; });
+                }
                 m_epochChanged = false;
                 continue;
             }
@@ -366,8 +404,12 @@ void CVDFMiner::MiningLoop()
                         std::cout << "  Tip output: " << tipVdfOutput.GetHex().substr(0, 16) << "..." << std::endl;
                     }
                     std::unique_lock<std::mutex> lk(m_epochMutex);
-                    m_epochCV.wait_for(lk, std::chrono::seconds(10),
-                        [this] { return m_epochChanged || !m_running; });
+                    {
+                        // OFFLINE ACROSS THE WAIT (round-8 F46) -- see the loop-top note.
+                        EpochOfflineScope offline(&g_chainstate);
+                        m_epochCV.wait_for(lk, std::chrono::seconds(10),
+                            [this] { return m_epochChanged || !m_running; });
+                    }
                     m_epochChanged = false;
                     continue;
                 }
@@ -396,8 +438,12 @@ void CVDFMiner::MiningLoop()
                           << " (last win: " << lastWin << ", cooldown: " << cd
                           << ", height: " << height << ")" << std::endl;
             std::unique_lock<std::mutex> lk(m_epochMutex);
-            m_epochCV.wait_for(lk, std::chrono::seconds(10),
-                               [this] { return m_epochChanged || !m_running; });
+            {
+                // OFFLINE ACROSS THE WAIT (round-8 F46) -- see the loop-top note.
+                EpochOfflineScope offline(&g_chainstate);
+                m_epochCV.wait_for(lk, std::chrono::seconds(10),
+                                   [this] { return m_epochChanged || !m_running; });
+            }
             m_epochChanged = false;
             continue;
         }
@@ -430,8 +476,12 @@ void CVDFMiner::MiningLoop()
 
             if (graceRemaining > 0) {
                 std::unique_lock<std::mutex> lock(m_epochMutex);
-                m_epochCV.wait_for(lock, std::chrono::seconds(graceRemaining),
-                    [this] { return m_epochChanged || !m_running; });
+                {
+                    // OFFLINE ACROSS THE WAIT (round-8 F46) -- see the loop-top note.
+                    EpochOfflineScope offline(&g_chainstate);
+                    m_epochCV.wait_for(lock, std::chrono::seconds(graceRemaining),
+                        [this] { return m_epochChanged || !m_running; });
+                }
 
                 if (m_epochChanged || !m_running) {
                     m_epochChanged = false;
@@ -464,8 +514,12 @@ void CVDFMiner::MiningLoop()
         // the minimum block time delay, so we just need to wait for
         // notification here.
         std::unique_lock<std::mutex> lock(m_epochMutex);
-        m_epochCV.wait_for(lock, std::chrono::seconds(5),
-            [this] { return m_epochChanged || !m_running; });
+        {
+            // OFFLINE ACROSS THE WAIT (round-8 F46) -- see the loop-top note.
+            EpochOfflineScope offline(&g_chainstate);
+            m_epochCV.wait_for(lock, std::chrono::seconds(5),
+                [this] { return m_epochChanged || !m_running; });
+        }
         m_epochChanged = false;
     }
 

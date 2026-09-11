@@ -7957,7 +7957,21 @@ load_genesis_block:  // Bug #29: Label for automatic retry after blockchain wipe
                 s_registrationManager->Tick(static_cast<uint32_t>(tipH),
                                              g_node_state.running.load());
             }
-            std::this_thread::sleep_for(std::chrono::seconds(1));
+            // ⚠️ OFFLINE ACROSS THE MAIN LOOP'S OWN SLEEP (round-8 F46). This
+            // loop checkpoints at its top and then sleeps one second EVERY
+            // ITERATION, so the node's main thread spent essentially all of its
+            // life holding an epoch it published a second ago -- capping
+            // DrainGraveyard's minimum continuously, on every node, forever.
+            //
+            // ⚠️ FOUND BY scripts/check_participant_waits.sh ON ITS FIRST RUN,
+            // not by review: it is the same shape as F45 and F46 and it survived
+            // both of those rounds because a one-second sleep does not look like
+            // a defect next to a two-minute one. Duration is not the thing that
+            // makes a pin matter; DUTY CYCLE is, and this one is ~100%.
+            {
+                EpochOfflineScope offline(&g_chainstate);
+                std::this_thread::sleep_for(std::chrono::seconds(1));
+            }
 
             // Check if new block was found and mining template needs update
             if (g_node_state.new_block_found.load()) {

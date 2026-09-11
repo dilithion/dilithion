@@ -87,8 +87,21 @@ void CCachedChainStats::UpdateThread() {
             std::cerr << "[CachedStats] Unknown update error" << std::endl;
         }
 
-        // Sleep for interval
-        std::this_thread::sleep_for(std::chrono::milliseconds(UPDATE_INTERVAL_MS));
+        // ⚠️ OFFLINE ACROSS THE SLEEP (round-8 F46). One second is a small pin
+        // next to the miner's two minutes -- and it is a pin on EVERY node,
+        // FOREVER, because this updater runs at 1 Hz for the life of the process.
+        // It spends essentially all of its time here, so the epoch it published
+        // before the sleep is the one that caps DrainGraveyard's minimum for
+        // essentially all of that time. A small pin held permanently is not a
+        // small problem, and the rule has to be uniform or the next reader has to
+        // re-derive where the line is.
+        //
+        // Safe by construction: the update above has returned, so nothing resolved
+        // in this round is still live, and the loop re-enters before the next one.
+        {
+            EpochOfflineScope offline(&g_chainstate);
+            std::this_thread::sleep_for(std::chrono::milliseconds(UPDATE_INTERVAL_MS));
+        }
     }
 }
 

@@ -418,7 +418,15 @@ void CMiningController::MiningWorker(uint32_t threadId) {
         if (nonce64 > UINT32_MAX && (nonce64 % UINT32_MAX) < nonceStep) {
             // Nonce space exhausted - brief pause to allow template update
             // In production, would trigger callback to request new template
-            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            // ⚠️ OFFLINE ACROSS THE PAUSE (round-8 F46). 100 ms is small, but this
+            // is a REGISTERED participant and the rule is uniform: a thread that
+            // is sleeping holds nothing and must not be in the quiescent-state
+            // calculation. Uniform beats case-by-case here, because a per-site
+            // judgement is a per-site thing to get wrong later.
+            {
+                EpochOfflineScope offline(&g_chainstate);
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            }
             nonce64 = threadId;  // Reset to start of this thread's range
         }
 
@@ -462,8 +470,15 @@ void CMiningController::MiningWorker(uint32_t threadId) {
         
         // CID 1675230 FIX: Sleep outside the lock to prevent blocking other threads
         // If template is not available, sleep briefly and retry
+        // ⚠️ OFFLINE ACROSS THE RETRY SLEEP (round-8 F46). This is the one that can
+        // run long: "no template available" persists for as long as the node has
+        // no template to give, so this branch can spin here indefinitely at 100 ms
+        // a time with the epoch frozen between iterations.
         if (!templateValid) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            {
+                EpochOfflineScope offline(&g_chainstate);
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            }
             continue;
         }
 
@@ -623,6 +638,12 @@ void CMiningController::MiningWorker(uint32_t threadId) {
     }
 }
 
+// ⚠️ NOT AN EPOCH PARTICIPANT, AND THAT IS A DECISION (round-8 F46). This thread
+// sleeps one second at a time forever, which would be a permanent pin if it were a
+// participant -- it is not. It never calls EpochCheckpoint and never resolves a
+// CBlockIndex*: it reads m_hashCount and prints. A thread with no published epoch
+// is not in the quiescent-state calculation at all, so it needs no scope. Recorded
+// so the next census does not mistake the absence for an omission.
 void CMiningController::HashRateMonitor() {
     uint64_t lastHashes = 0;
     uint64_t lastTime = GetTimeMillis();

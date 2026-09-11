@@ -313,6 +313,27 @@ void CHttpServer::WorkerThread() {
             // every write through one helper so a single scope can cover them, and
             // set send timeouts on accepted HTTP sockets. Both change this server's
             // network behaviour, so they are filed rather than smuggled in here.
+            //
+            // ⚠️ AND THE WRITES ARE DELIBERATELY *NOT* WRAPPED, WHICH IS NOT THE
+            // SAME AS BEING FORGOTTEN (round-8 F46). Wrapping a send in an
+            // EpochOfflineScope publishes "I hold nothing" -- and at the send
+            // sites, unlike the recv above, THAT CANNOT BE SHOWN WITHOUT AUDITING
+            // EVERY HANDLER: each has already run its resolve, and whether a
+            // CBlockIndex* is still live on its stack is a per-handler fact.
+            // Publishing that promise without the proof would UNPIN A HOLDER,
+            // which is the use-after-free direction -- strictly worse than the
+            // bounded pin it would remove. So the read is scoped (provably safe:
+            // nothing above it resolves) and the writes are not, until the funnel
+            // gives one place where the property can be established once.
+            //
+            // The other two blocking sites in this file, hand-read because #194's
+            // comment stripper REFUSES this file (it contains a raw string literal
+            // by design, so the mechanical census could not certify it):
+            //   * CHttpServer::AcceptThread's accept() -- excluded, not a
+            //     participant, holds nothing across the call;
+            //   * CHttpServer::CleanupThread's 1 s sleep x300 -- not a participant
+            //     either: it resolves no CBlockIndex*, so it has no epoch to
+            //     freeze. Stated rather than left as an omission.
         }
         if (!got_work) {
             break;  // Shutdown signaled
@@ -389,12 +410,29 @@ void CHttpServer::HandleRequest(SOCKET client_socket) {
     const std::string clientIP = GetPeerIP(client_socket);
 
     // Read request
+    //
+    // ⚠️ OFFLINE ACROSS THE READ (round-8 F46). This `recv` blocks for as long as
+    // the client takes to send a request -- and a client that connects and then
+    // says nothing blocks it until the socket times out, which on this server is
+    // NOT BOUNDED because nothing sets SO_RCVTIMEO on accepted sockets (that fix
+    // is filed and belongs to another lane). An epoch published at the worker's
+    // loop top would freeze for that entire period.
+    //
+    // Safe here, and provably so rather than by assertion: this is the FIRST
+    // statement of HandleRequest that can block, and nothing above it resolves a
+    // CBlockIndex* -- GetPeerIP reads the kernel socket. The thread genuinely
+    // holds nothing, which is the precondition a scope needs.
     char buffer[4096];
+    int bytes_read_raw;
+    {
+        EpochOfflineScope offline(&g_chainstate);
 #ifdef _WIN32
-    int bytes_read = recv(client_socket, buffer, sizeof(buffer) - 1, 0);
+        bytes_read_raw = recv(client_socket, buffer, sizeof(buffer) - 1, 0);
 #else
-    ssize_t bytes_read = recv(client_socket, buffer, sizeof(buffer) - 1, 0);
+        bytes_read_raw = static_cast<int>(recv(client_socket, buffer, sizeof(buffer) - 1, 0));
 #endif
+    }
+    const int bytes_read = bytes_read_raw;
 
     if (bytes_read <= 0) {
         return;
