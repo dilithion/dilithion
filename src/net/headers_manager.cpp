@@ -194,31 +194,64 @@ CHeadersManager::CHeadersManager()
     // A seat's MEDIUM asked the fair question: this flag guards
     // InitializeDoSProtectedSync, but the constructor above STILL BUILDS a
     // RandomX checker for testnet. Does anything else reach a header proof check?
-    // Censused at a60fe10d, greps excluding src/test/:
     //
-    //   (1) checker CONSTRUCTION — 2 sites, both the branch directly above:
-    //         headers_manager.cpp:197  make_unique<VDFHeaderProofChecker>
-    //         headers_manager.cpp:200  make_unique<RandomXHeaderProofChecker>
-    //       Nothing else in non-test code constructs either checker.
+    // ⛔ THIS BLOCK CITED LINE NUMBERS UNTIL 2026-09-12, AND A SEAT FOUND THEM
+    // STALE. They were measured at a60fe10d and had rotted by 186b2b89 — in a
+    // block that explicitly offers itself as re-runnable evidence, which makes
+    // stale coordinates worse here than anywhere else in this file: they invite
+    // the next reader to check, hand them wrong numbers, and the natural reading
+    // is that the CENSUS is wrong rather than that its citations rotted.
     //
-    //   (2) CheckHeaderProof CALL sites — 2, both through m_proof_checker inside
-    //       HeadersSyncState:
-    //         headerssync.cpp:261, headerssync.cpp:312
-    //       So a proof check requires a HeadersSyncState to exist.
+    // ⛔ AND ONE OF THE PUBLISHED PATTERNS WAS SELF-CONFIRMING. The old step (1)
+    // grep was `make_unique<VDFHeaderProofChecker>`; the code constructs through
+    // the fully-qualified `::dilithion::net::port::` form, so at 186b2b89 that
+    // pattern matched NOTHING BUT THIS COMMENT'S OWN TEXT. Re-running it would
+    // have "confirmed" the census by finding the census. A check that can only
+    // match its own prose is not a check.
     //
-    //   (3) A HeadersSyncState is created ONLY by InitializeDoSProtectedSync —
-    //       which is behind the refusal above.
+    // SO THE EVIDENCE IS NOW THE COMMANDS, NOT THE COORDINATES. Paste any of
+    // these at any sha; a census whose evidence is a grep does not rot, and one
+    // whose evidence is a line number rots silently and on someone else's time.
+    // Outputs shown are from 186b2b89.
     //
-    //   (4) And that entry point has ZERO PRODUCTION CALLERS. Every non-test grep
-    //       hit for InitializeDoSProtectedSync / ProcessHeadersWithDoSProtection
-    //       is a COMMENT: chainparams.cpp:148-149, :172; headerssync.cpp:46;
-    //       headers_manager.cpp:61, :408. Not one is a call.
+    //   (1) checker CONSTRUCTION — is the branch above the only one?
+    //         git grep -n "make_unique<.*HeaderProofChecker>" -- src ':!src/test'
+    //       -> TWO code hits, both in the if/else directly above, one per checker.
+    //          Nothing else in non-test code builds either. NO LINE NUMBERS ON
+    //          PURPOSE — see the note at the end. The pattern wildcards the
+    //          namespace, so a re-qualification cannot hide a site the way it hid
+    //          these from the previous version of this census.
+    //
+    //   (2) CheckHeaderProof CALL sites — note `-e`, since `->` parses as a switch:
+    //         git grep -n -e "->CheckHeaderProof(" -- src ':!src/test'
+    //       -> TWO code hits, both in headerssync.cpp, both through m_proof_checker
+    //          inside HeadersSyncState. A proof check REQUIRES a HeadersSyncState.
+    //
+    //   (3) HeadersSyncState CREATION — exactly one site:
+    //         git grep -n "make_shared<HeadersSyncState>" -- src ':!src/test'
+    //       -> ONE code hit, in this file, inside InitializeDoSProtectedSync and
+    //          AFTER the refusal, which returns false before it. So
+    //          ProcessHeadersWithDoSProtection cannot create state — it only looks
+    //          up an existing entry, and the bypass a panel asked about does not
+    //          exist. (Independently censused by COORD, same conclusion.)
+    //
+    //   (4) CALLS to either entry point, definitions and comments excluded:
+    //         git grep -nE "(InitializeDoSProtectedSync|ProcessHeadersWithDoSProtection)\s*\("     //             -- src ':!src/test' | grep -vE ":[[:space:]]*//|bool CHeadersManager::|bool "
+    //       -> ZERO. Every remaining non-test hit is a comment or a declaration.
     //
     // So the testnet checker object the constructor builds is UNREACHABLE twice
     // over: nothing creates the state that would use it, and if a future caller
-    // tries, the refusal stops it before the state exists. That is the whole
-    // argument, and each step is a grep someone can re-run at this sha rather
-    // than a claim to be taken on trust.
+    // tries, the refusal stops it before the state exists.
+    //
+    // ⚠️ TWO NOTES ON READING THE OUTPUT, both learned by getting them wrong here:
+    //   * NO LINE NUMBERS ARE QUOTED ABOVE, only counts and files. Rewriting this
+    //     very comment shifted every line it had just cited — the rot reappeared
+    //     inside the commit that was fixing it. Counts and filenames survive an
+    //     edit; coordinates do not.
+    //   * EACH COMMAND ALSO MATCHES THE LINE OF THIS COMMENT THAT PRINTS IT.
+    //     That is harmless but you must not count it: the claim is about the CODE
+    //     hits. Add `| grep -v "^src/net/headers_manager.cpp:.*//"` if you want
+    //     the commands to exclude their own documentation.
     //
     // ⚠️ IF (4) EVER STOPS BEING TRUE — i.e. A-3 wires a real caller — step (4)
     // is gone and the refusal at that caller becomes the ONLY thing standing
