@@ -5808,17 +5808,17 @@ bool CWallet::MigrateToEncryptedSeedV7Unlocked(bool* persistedToDisk,
     CHDExtendedKey snap_hdMasterKeyDecrypted = hdMasterKeyDecrypted;
     std::vector<uint8_t> snap_vchEncryptedMnemonic = vchEncryptedMnemonic;
     std::vector<uint8_t> snap_vchMnemonicMAC = vchMnemonicMAC;
-    std::vector<uint8_t> snap_vchMnemonicIV(vchMnemonicIV.begin(), vchMnemonicIV.end());
+    std::vector<uint8_t, SecureAllocator<uint8_t>> snap_vchMnemonicIV = vchMnemonicIV;
     std::vector<uint8_t> snap_vchEncryptedHDMasterKey = vchEncryptedHDMasterKey;
     std::vector<uint8_t> snap_vchHDMasterKeyMAC = vchHDMasterKeyMAC;
-    std::vector<uint8_t> snap_vchHDMasterKeyIV(vchHDMasterKeyIV.begin(), vchHDMasterKeyIV.end());
+    std::vector<uint8_t, SecureAllocator<uint8_t>> snap_vchHDMasterKeyIV = vchHDMasterKeyIV;
     // MIK snapshot (re-MAC'd in Step 2b). Note: m_mik->privkey is kept cleared
     // outside migration, so only the at-rest ciphertext/IV/MAC + flag matter for
     // rollback consistency with the on-disk file.
     bool snap_fHasMIK = fHasMIK;
     std::vector<uint8_t> snap_vchEncryptedMIKPrivKey_all = vchEncryptedMIKPrivKey;
     std::vector<uint8_t> snap_vchMIKPrivKeyMAC_all = vchMIKPrivKeyMAC;
-    std::vector<uint8_t> snap_vchMIKPrivKeyIV_all(vchMIKPrivKeyIV.begin(), vchMIKPrivKeyIV.end());
+    std::vector<uint8_t, SecureAllocator<uint8_t>> snap_vchMIKPrivKeyIV_all = vchMIKPrivKeyIV;
     std::vector<uint8_t> snap_vchMIKPubKey = vchMIKPubKey;
     // LP-7 (HIGH-2): per-address spending keys are re-MAC'd in Step 2c so the
     // migrated v7 file carries v7-keyed (not legacy-AES-keyed) per-address MACs.
@@ -5831,24 +5831,58 @@ bool CWallet::MigrateToEncryptedSeedV7Unlocked(bool* persistedToDisk,
     // writer would then (correctly) emit the intact legacy layout again.
     uint32_t snap_loadedFileVersion = m_loadedFileVersion;
 
-    auto rollback = [&]() {
+    // ⛔ THE RESTORE MUST NOT BE ABLE TO FAIL (external panel). It previously used
+    // COPY-ASSIGNMENT throughout -- `mapCryptedKeys = snap_mapCryptedKeys` allocates,
+    // and so does every vector assignment and every `.assign(begin, end)`. Running
+    // inside the guard's DESTRUCTOR, an allocation failure there is swallowed (it has
+    // to be: a destructor that throws while unwinding calls std::terminate), and the
+    // swallow leaves a PARTIALLY restored object -- some members rolled back, some
+    // not, an incomplete key map -- which the process then carries on with and may
+    // later save to disk.
+    //
+    // Swallowing was correct C++ and the wrong place to stop. The question is what a
+    // FAILED restore leaves behind, and the answer has to be "cannot happen" rather
+    // than "is handled".
+    //
+    // So the restore SWAPS instead of copying. Container swap allocates nothing and
+    // is noexcept; the snapshots are already-built copies, so afterwards they hold
+    // the abandoned values -- harmless, because the guard fires exactly once. The
+    // three IV snapshots are now declared with the members' OWN allocator type,
+    // because a swap between std::vector<uint8_t> and
+    // std::vector<uint8_t, SecureAllocator<uint8_t>> is not expressible, which is
+    // exactly why the old code reached for the allocating `.assign()`.
+    //
+    // ⚠️ The static_asserts are the ENFORCEMENT. Without them this is a claim in a
+    // comment; with them, a change that makes any of these operations throwing fails
+    // the BUILD instead of silently restoring the hazard.
+    static_assert(std::is_trivially_copyable<CHDExtendedKey>::value,
+                  "CHDExtendedKey must stay trivially copyable or the restore can throw");
+    auto rollback = [&]() noexcept {
+        static_assert(noexcept(vchEncryptedMnemonic.swap(snap_vchEncryptedMnemonic)),
+                      "vector swap must be noexcept or the restore can fail half-done");
+        static_assert(noexcept(mapCryptedKeys.swap(snap_mapCryptedKeys)),
+                      "map swap must be noexcept or the key map can be left incomplete");
+        static_assert(noexcept(vchMnemonicIV.swap(snap_vchMnemonicIV)),
+                      "secure-allocator vector swap must be noexcept");
+
         m_loadedFileVersion = snap_loadedFileVersion;
         hdMasterKey = snap_hdMasterKey;
         fHDMasterKeyEncrypted = snap_fHDMasterKeyEncrypted;
         fHDMasterKeyCached = snap_fHDMasterKeyCached;
         hdMasterKeyDecrypted = snap_hdMasterKeyDecrypted;
-        vchEncryptedMnemonic = snap_vchEncryptedMnemonic;
-        vchMnemonicMAC = snap_vchMnemonicMAC;
-        vchMnemonicIV.assign(snap_vchMnemonicIV.begin(), snap_vchMnemonicIV.end());
-        vchEncryptedHDMasterKey = snap_vchEncryptedHDMasterKey;
-        vchHDMasterKeyMAC = snap_vchHDMasterKeyMAC;
-        vchHDMasterKeyIV.assign(snap_vchHDMasterKeyIV.begin(), snap_vchHDMasterKeyIV.end());
         fHasMIK = snap_fHasMIK;
-        vchEncryptedMIKPrivKey = snap_vchEncryptedMIKPrivKey_all;
-        vchMIKPrivKeyMAC = snap_vchMIKPrivKeyMAC_all;
-        vchMIKPrivKeyIV.assign(snap_vchMIKPrivKeyIV_all.begin(), snap_vchMIKPrivKeyIV_all.end());
-        vchMIKPubKey = snap_vchMIKPubKey;
-        mapCryptedKeys = snap_mapCryptedKeys;
+
+        vchEncryptedMnemonic.swap(snap_vchEncryptedMnemonic);
+        vchMnemonicMAC.swap(snap_vchMnemonicMAC);
+        vchMnemonicIV.swap(snap_vchMnemonicIV);
+        vchEncryptedHDMasterKey.swap(snap_vchEncryptedHDMasterKey);
+        vchHDMasterKeyMAC.swap(snap_vchHDMasterKeyMAC);
+        vchHDMasterKeyIV.swap(snap_vchHDMasterKeyIV);
+        vchEncryptedMIKPrivKey.swap(snap_vchEncryptedMIKPrivKey_all);
+        vchMIKPrivKeyMAC.swap(snap_vchMIKPrivKeyMAC_all);
+        vchMIKPrivKeyIV.swap(snap_vchMIKPrivKeyIV_all);
+        vchMIKPubKey.swap(snap_vchMIKPubKey);
+        mapCryptedKeys.swap(snap_mapCryptedKeys);
     };
 
     // EXCEPTION SAFETY (in-house read, HIGH). rollback() used to be invoked BY HAND
@@ -6291,6 +6325,22 @@ bool CWallet::MigrateToEncryptedSeedV7Unlocked(bool* persistedToDisk,
             // Roll back in-memory state to match it (including the loaded version).
             return false;
         }
+        // ⛔ DISMISS HERE, NOT AFTER THE BRANCH (external panel; both responding
+        // seats raised it independently). The disk now holds the migrated v7 file.
+        // Any restore from this point would put PRE-MIGRATION MEMORY back over an
+        // ALREADY-COMMITTED v7 DISK, leaving the two disagreeing -- the one outcome
+        // worse than either failing cleanly.
+        //
+        // The seats could not confirm whether the statements between the successful
+        // save and the old dismiss point could throw, because those lines were not in
+        // the diff they were given. They cannot: the only statement was
+        // `if (persistedToDisk) *persistedToDisk = true;` -- a pointer test and a bool
+        // store, no allocation, no call. But "I checked, it cannot throw" is a fact
+        // about today's code that the next edit silently invalidates. Dismissing FIRST
+        // removes the window instead of documenting it, so there is no claim left to
+        // keep true.
+        rollbackGuard.dismiss();
+
         // The migrated v7 (no-plaintext) file is now on disk — only NOW is it safe
         // for the caller to clear the migration flag / treat the file as v7.
         if (persistedToDisk) *persistedToDisk = true;
@@ -6301,8 +6351,10 @@ bool CWallet::MigrateToEncryptedSeedV7Unlocked(bool* persistedToDisk,
         return false;
     }
 
-    // Step 3 persisted the v7 file. ONLY NOW is it safe not to restore.
-    rollbackGuard.dismiss();
+    // Dismissed immediately after the successful save above -- that is what closes
+    // the memory-vs-disk window. Deliberately NOT repeated here: a second dismiss
+    // would restore the impression that the safe point is the end of the function
+    // rather than the save itself.
     return true;
 }
 
