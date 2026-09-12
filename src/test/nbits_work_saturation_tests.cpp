@@ -201,6 +201,17 @@ void test_production_validators_reject_both_classes()
 
     CHeadersManager mgr(ThresholdBetweenHonestAndInflated());
 
+    // Genesis is the one parent a fresh manager knows (the constructor inserts it into
+    // mapHeaders), so it is how any arm reaches the post-parent-resolution branch.
+    const CBlock genesisBlock = Genesis::CreateGenesisBlockForChain();
+    const CBlockHeader genesisHeader = genesisBlock;
+    auto ChildOf = [&](uint32_t nBits) {
+        CBlockHeader c = HeaderWithNBits(nBits);
+        c.hashPrevBlock = genesisHeader.GetHash();
+        c.nTime = genesisHeader.nTime + 100;
+        return c;
+    };
+
     // ---- QuickValidateHeader: checks nBits UNCONDITIONALLY ------------------
     // Its two nBits guards precede any pprev handling, so it is the validator that
     // covers a header whose parent we do not have.
@@ -272,14 +283,6 @@ void test_production_validators_reject_both_classes()
     // GENESIS is the one parent a FRESH manager genuinely knows, because the
     // constructor inserts it into mapHeaders. That makes it the cheapest — and
     // currently the only cheap — way to exercise the post-parent-resolution branch.
-    const CBlock genesisBlock = Genesis::CreateGenesisBlockForChain();
-    const CBlockHeader genesisHeader = genesisBlock;
-    auto ChildOf = [&](uint32_t nBits) {
-        CBlockHeader c = HeaderWithNBits(nBits);
-        c.hashPrevBlock = genesisHeader.GetHash();
-        c.nTime = genesisHeader.nTime + 100;  // after the parent, well inside any gap rule
-        return c;
-    };
     Check("PROD/Validate: honest nBits accepted with a KNOWN parent",
           mgr.ValidateHeader(ChildOf(0x1d00ffffu), &genesisHeader));
     Check("PROD/Validate: zero-mantissa REJECTED with a KNOWN parent",
@@ -288,18 +291,137 @@ void test_production_validators_reject_both_classes()
           !mgr.ValidateHeader(ChildOf(0x01000001u), &genesisHeader));
 
     // ---- ACCUMULATED WORK, the observable rather than a verdict --------------
-    // Feed poison through the real header-processing entry point and require that
-    // the manager's best-header work never becomes saturated and never advances on
-    // a rejected header.
+    //
+    // ⛔ THE FIRST VERSION OF THIS BLOCK COULD PASS FOR THE WRONG REASON, and review
+    // caught it. Its poison headers were PARENTLESS — hashPrevBlock was never set —
+    // so they were liable to be dropped as unknown-parent orphans BEFORE any nBits
+    // guard ran. "work did not advance" is then true because nothing was processed,
+    // which is indistinguishable from "the guard rejected it".
+    //
+    // Two changes make the arm discriminate:
+    //   1. the poison headers are PARENTED TO GENESIS, so they transit the guarded
+    //      path rather than being discarded upstream of it;
+    //   2. an HONEST control must make best-header work ADVANCE. Without it, a build
+    //      in which ProcessHeaders silently did nothing at all would pass every
+    //      assertion here.
+    {
+        // The control FIRST: if this does not advance, every "did not advance" below
+        // proves nothing, and the arm says so by failing here rather than passing
+        // quietly further down.
+        CHeadersManager ctrl(ThresholdBetweenHonestAndInflated());
+        const uint256 ctrl_before = ctrl.GetBestHeaderChainWork();
+        ctrl.ProcessHeaders(7, std::vector<CBlockHeader>{ChildOf(0x1d00ffffu)});
+        const uint256 ctrl_after = ctrl.GetBestHeaderChainWork();
+        Check("PROD/Process CONTROL: an HONEST parented header ADVANCES best-header "
+              "work (without this, the 'did not advance' arms below are vacuous)",
+              std::memcmp(ctrl_before.data, ctrl_after.data, 32) != 0);
+    }
+
     for (uint32_t nBits : {0x1e000000u, 0x01000001u}) {
         CHeadersManager fresh(ThresholdBetweenHonestAndInflated());
         const uint256 before = fresh.GetBestHeaderChainWork();
-        fresh.ProcessHeaders(7, std::vector<CBlockHeader>{HeaderWithNBits(nBits)});
+        fresh.ProcessHeaders(7, std::vector<CBlockHeader>{ChildOf(nBits)});
         const uint256 after = fresh.GetBestHeaderChainWork();
         Check("PROD/Process: best-header work is not SATURATED after a poison header",
               !IsSaturated(after));
         Check("PROD/Process: best-header work did not advance on a rejected header",
               std::memcmp(before.data, after.data, 32) == 0);
+    }
+
+    std::cout << " OK" << std::endl;
+}
+
+
+// ---------------------------------------------------------------------------
+// ⛔ ARM 5 — PIN THE MASK. Review found that the refuted 0x007FFFFF mask, and also
+// 0x0000FFFF and 0x000000FF, would pass every arm in this file: every honest arm
+// has low mantissa bytes set and every poison arm has a zero mantissa, so a
+// NARROWER mask accepts everything the honest arms accept and rejects everything
+// the poison arms reject. The suite could not tell the masks apart.
+//
+// These arms fail for any mask narrower than the producer's 0x00FFFFFF, which also
+// converts the settled-by-measurement sign-bit question into a test so it cannot be
+// re-raised as a finding.
+// ---------------------------------------------------------------------------
+void test_mask_matches_the_producer_and_is_pinned()
+{
+    std::cout << "  test_mask_matches_the_producer_and_is_pinned..." << std::flush;
+    using ::dilithion::consensus::NBitsUsableForWork;
+    using ::dilithion::consensus::ComputeChainWork;
+
+    // Bit 23 set, no other mantissa bits: 0x007FFFFF would REJECT this. It must be
+    // ACCEPTED, because ComputeChainWork treats it as mantissa 0x800000 and returns
+    // LESS work than an honest header — measured, not argued.
+    Check("MASK: 0x1d800000 (bit 23 only) is accepted", NBitsUsableForWork(0x1d800000u));
+    Check("MASK: 0x1d800000 does not saturate", !IsSaturated(ComputeChainWork(0x1d800000u)));
+
+    // Bit 16 set only: 0x0000FFFF and 0x000000FF would both REJECT this.
+    Check("MASK: 0x1d010000 (bit 16 only) is accepted", NBitsUsableForWork(0x1d010000u));
+    Check("MASK: 0x1d010000 does not saturate", !IsSaturated(ComputeChainWork(0x1d010000u)));
+
+    // And the boundary the mask exists for is still rejected.
+    Check("MASK: 0x1e000000 (zero mantissa) is still rejected",
+          !NBitsUsableForWork(0x1e000000u));
+
+    std::cout << " OK" << std::endl;
+}
+
+// ---------------------------------------------------------------------------
+// ⛔ ARM 6 — DIRECT ARMS FOR THE BOUND. Review found it had none, so four distinct
+// mutations went uncaught: deleting the zero-bound early return; weakening >= to >;
+// an off-by-one in the 32-byte zero scan; and substituting a hardcoded 2^200 cap for
+// the parameter, which arm 4 could not detect because arm 4 injects exactly 2^200.
+// ---------------------------------------------------------------------------
+void test_single_header_bound_direct()
+{
+    std::cout << "  test_single_header_bound_direct..." << std::flush;
+    using ::dilithion::consensus::SingleHeaderWorkIsWithinBound;
+    using ::dilithion::consensus::ComputeChainWork;
+
+    // ZERO BOUND is inert — and this is load-bearing in production, not a nicety:
+    // regtest and testnet run nMinimumChainWork = 0, and without the early return
+    // every header on those networks would be REJECTED.
+    uint256 zero; std::memset(zero.data, 0, 32);
+    Check("BOUND: a zero bound is inert (honest)", SingleHeaderWorkIsWithinBound(0x1d00ffffu, zero));
+    Check("BOUND: a zero bound is inert (inflated)", SingleHeaderWorkIsWithinBound(0x01000001u, zero));
+
+    // Off-by-one in the 32-byte zero scan: a bound that is non-zero ONLY in the first
+    // or ONLY in the last byte must NOT be treated as zero.
+    uint256 lowByte; std::memset(lowByte.data, 0, 32); lowByte.data[0] = 0x01;
+    Check("BOUND: non-zero in byte 0 is not treated as a zero bound",
+          !SingleHeaderWorkIsWithinBound(0x1d00ffffu, lowByte));
+    uint256 highByte; std::memset(highByte.data, 0, 32); highByte.data[31] = 0x01;
+    Check("BOUND: non-zero in byte 31 is not treated as a zero bound (honest work is below it)",
+          SingleHeaderWorkIsWithinBound(0x1d00ffffu, highByte));
+
+    // EQUALITY: single work EXACTLY equal to the bound must be REJECTED (>= not >).
+    const uint256 honestWork = ComputeChainWork(0x1d00ffffu);
+    Check("BOUND: work exactly EQUAL to the bound is rejected (>= not >)",
+          !SingleHeaderWorkIsWithinBound(0x1d00ffffu, honestWork));
+
+    // JUST BELOW: a bound one unit above that work must accept it.
+    uint256 justAbove = honestWork;
+    for (int i = 0; i < 32; ++i) { if (++justAbove.data[i] != 0) break; }
+    Check("BOUND: work just BELOW the bound is accepted",
+          SingleHeaderWorkIsWithinBound(0x1d00ffffu, justAbove));
+
+    // ⛔ THE PRODUCTION PARAMETER, not a test constant. Arm 4 injects exactly 2^200,
+    // so a hardcoded 2^200 substituted for the parameter would pass it. This uses the
+    // chain's real nMinimumChainWork against its real genesisNBits.
+    if (Dilithion::g_chainParams != nullptr) {
+        const uint256 prodBound = Dilithion::g_chainParams->nMinimumChainWork;
+        const uint32_t prodNBits = Dilithion::g_chainParams->genesisNBits;
+        bool boundIsZero = true;
+        for (int i = 0; i < 32; ++i) if (prodBound.data[i] != 0) { boundIsZero = false; break; }
+        // An honest genesis header must never be rejected by this bound on any network.
+        Check("BOUND: real genesisNBits is within the real nMinimumChainWork",
+              SingleHeaderWorkIsWithinBound(prodNBits, prodBound));
+        // Stated rather than asserted: on this network the bound may be zero, in which
+        // case the check above passed via the inert path. That is recorded, not hidden.
+        if (boundIsZero) {
+            std::cout << "\n    [note] this network's nMinimumChainWork is ZERO, so the "
+                         "production arm above exercised the INERT path" << std::flush;
+        }
     }
 
     std::cout << " OK" << std::endl;
@@ -314,6 +436,8 @@ int main()
     test_honest_nbits_still_accepted();
     test_mantissa_one_is_accepted_zero_is_not();
     test_production_validators_reject_both_classes();
+    test_mask_matches_the_producer_and_is_pinned();
+    test_single_header_bound_direct();
 
     if (g_failures != 0) {
         std::cerr << "nbits_work_saturation_tests: " << g_failures << " FAILURE(S)" << std::endl;

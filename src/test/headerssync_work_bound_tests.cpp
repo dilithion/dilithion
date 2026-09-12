@@ -4,7 +4,10 @@
 // LP-10 A-2 / F3 — a SINGLE header must not satisfy the minimum-chain-work gate
 // on its own, and a VDF header must not pass unchecked.
 //
-// WHY THIS SUITE EXISTS. Blocker 1 added NBitsIsSaneForWorkAccounting, which
+// WHY THIS SUITE EXISTS. Blocker 1 added a saturation predicate (then named
+// NBitsIsSaneForWorkAccounting, since UNIFIED into
+// dilithion::consensus::NBitsUsableForWork in chain_work.h — there were two copies
+// of one predicate and they could drift), which
 // rejects a ZERO MANTISSA because ComputeChainWork saturates there. F3 asked
 // whether zero mantissa was the only shape that mattered. It is not. Measured
 // against ComputeChainWork directly:

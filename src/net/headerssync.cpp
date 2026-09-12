@@ -40,15 +40,18 @@ namespace {
 // had NO nBits check at all while still accumulating work from the peer's raw
 // nBits. Guarding one and not the other is the sibling shape this mission keeps
 // hitting.
-bool NBitsIsSaneForWorkAccounting(uint32_t nBits)
-{
-    // Zero mantissa is the SATURATION trigger, and the only one:
-    // ComputeChainWork's other paths clamp rather than saturate.
-    if ((nBits & 0x00FFFFFFu) == 0) return false;
-    // A zero word is a subset of the above, kept explicit for readers.
-    if (nBits == 0) return false;
-    return true;
-}
+// ⛔ NBitsIsSaneForWorkAccounting DELETED — it was a SECOND saturation predicate.
+//
+// Its body was `(nBits & 0x00FFFFFF) == 0 -> false`, which is exactly
+// dilithion::consensus::NBitsUsableForWork negated. Two copies of one predicate,
+// behaviour-identical today and free to drift tomorrow — which is the precise shape
+// the hoist into chain_work.h existed to kill, and review caught that the first fold
+// migrated this file's BOUND sites to the shared definition while leaving its
+// SATURATION sites on the local copy.
+//
+// Both call sites below now use the shared predicate. No forwarding stub is left, on
+// purpose: a stale reference becomes a COMPILE ERROR rather than resolving to a
+// hidden second copy, which is how the original instance of this defect hid.
 
 // ⛔ AND SATURATION WAS NEVER THE WHOLE PROBLEM. The guard above closes exactly
 // one shape and leaves an equally large hole open, MEASURED against
@@ -513,7 +516,7 @@ bool HeadersSyncState::ValidateAndProcessSingleHeader(const CBlockHeader& header
                   << std::hex << header.nBits << std::dec << std::endl;
         return false;
     }
-    if (!NBitsIsSaneForWorkAccounting(header.nBits)) {
+    if (!::dilithion::consensus::NBitsUsableForWork(header.nBits)) {
         std::cerr << "[HeadersSyncState] Rejecting header with unusable nBits 0x"
                   << std::hex << header.nBits << std::dec << std::endl;
         return false;
@@ -546,7 +549,7 @@ bool HeadersSyncState::ValidateAndStoreRedownloadedHeader(const CBlockHeader& he
                   << std::hex << header.nBits << std::dec << std::endl;
         return false;
     }
-    if (!NBitsIsSaneForWorkAccounting(header.nBits)) {
+    if (!::dilithion::consensus::NBitsUsableForWork(header.nBits)) {
         std::cerr << "[HeadersSyncState] REDOWNLOAD: unusable nBits 0x"
                   << std::hex << header.nBits << std::dec << std::endl;
         return false;

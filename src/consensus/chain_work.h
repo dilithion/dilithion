@@ -137,8 +137,21 @@ inline bool ChainWorkGreaterOrEqual(const uint256& a, const uint256& b)
 //
 //   SingleHeaderWorkIsWithinBound(nBits, minimum_required_work)
 //     CONTRACT: "one header's work contribution does not on its own reach the
-//     configured chain-work threshold." That is a bound on MAGNITUDE, and it is
-//     the only one of the two that closes the EXPONENT-INFLATION class.
+//     configured chain-work threshold." It CAPS SINGLE-HEADER MAGNITUDE.
+//
+//     ⛔ IT DOES NOT CLOSE THE EXPONENT-INFLATION CLASS, and an earlier version of
+//     this comment claimed it did. Three reviewers found the overclaim independently:
+//       * it rejects only work >= the bound, so an attacker picks an nBits whose work
+//         is far above an honest header (~2^76) but STRICTLY BELOW the bound and
+//         ACCUMULATES it across many headers to overtake best-header selection;
+//       * the bound is static, so it weakens as real tip work grows past it;
+//       * on a network with nMinimumChainWork == 0 -- regtest and testnet today -- it
+//         is INERT by design, so the class is wholly unguarded there.
+//     ⛔ THE CLASS IS CLOSED ONLY BY REAL RETARGET / DIFFICULTY-TRANSITION
+//     VALIDATION, which is still simplified at the call sites (see the "simplified"
+//     note at CHeadersManager::ValidateHeader step 3). These two predicates raise the
+//     cost of the cheapest attacks; they are not a substitute for that validation and
+//     must not be described as one.
 //
 // ⛔ WHY BOTH ARE NEEDED, MEASURED RATHER THAN ARGUED (probe over ComputeChainWork,
 // reimplementing its body verbatim so the probe cannot drift from the subject):
@@ -151,8 +164,9 @@ inline bool ChainWorkGreaterOrEqual(const uint256& a, const uint256& b)
 //   0x03000001   0x000001   31             pass   <- same class
 //
 // A SMALL `size` byte puts the quotient at the top of the 256-bit word without the
-// mantissa ever being zero. **The saturation guard passes every one of those.** Only
-// a bound on the resulting magnitude rejects them, which is this predicate.
+// mantissa ever being zero. **The saturation guard passes every one of those**, and the
+// magnitude bound below rejects the ones at or above the threshold. ⚠️ It does NOT
+// reject work merely FAR ABOVE HONEST but below the bound -- see the contract note.
 //
 // ⚠️ AND THE SIGN-BIT CASES ARE RECORDED AS *MEASURED, NOT A VECTOR*, so the next
 // reader does not re-raise them: an external panel proposed masking 0x007FFFFF on the
