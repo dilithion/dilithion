@@ -26,6 +26,8 @@
 #include <algorithm>
 #include <random>  // WALLET-007 FIX: For std::shuffle
 #include <cstring>
+#include <cstdlib>   // LP-7 diag: getenv (env-gated diagnostics)
+#include <functional>  // LP-7: RAII rollback guard
 #include <fstream>
 #include <iostream>
 #include <cstdio>   // For snprintf (thread-safe number formatting)
@@ -5806,17 +5808,17 @@ bool CWallet::MigrateToEncryptedSeedV7Unlocked(bool* persistedToDisk,
     CHDExtendedKey snap_hdMasterKeyDecrypted = hdMasterKeyDecrypted;
     std::vector<uint8_t> snap_vchEncryptedMnemonic = vchEncryptedMnemonic;
     std::vector<uint8_t> snap_vchMnemonicMAC = vchMnemonicMAC;
-    std::vector<uint8_t> snap_vchMnemonicIV(vchMnemonicIV.begin(), vchMnemonicIV.end());
+    std::vector<uint8_t, SecureAllocator<uint8_t>> snap_vchMnemonicIV = vchMnemonicIV;
     std::vector<uint8_t> snap_vchEncryptedHDMasterKey = vchEncryptedHDMasterKey;
     std::vector<uint8_t> snap_vchHDMasterKeyMAC = vchHDMasterKeyMAC;
-    std::vector<uint8_t> snap_vchHDMasterKeyIV(vchHDMasterKeyIV.begin(), vchHDMasterKeyIV.end());
+    std::vector<uint8_t, SecureAllocator<uint8_t>> snap_vchHDMasterKeyIV = vchHDMasterKeyIV;
     // MIK snapshot (re-MAC'd in Step 2b). Note: m_mik->privkey is kept cleared
     // outside migration, so only the at-rest ciphertext/IV/MAC + flag matter for
     // rollback consistency with the on-disk file.
     bool snap_fHasMIK = fHasMIK;
     std::vector<uint8_t> snap_vchEncryptedMIKPrivKey_all = vchEncryptedMIKPrivKey;
     std::vector<uint8_t> snap_vchMIKPrivKeyMAC_all = vchMIKPrivKeyMAC;
-    std::vector<uint8_t> snap_vchMIKPrivKeyIV_all(vchMIKPrivKeyIV.begin(), vchMIKPrivKeyIV.end());
+    std::vector<uint8_t, SecureAllocator<uint8_t>> snap_vchMIKPrivKeyIV_all = vchMIKPrivKeyIV;
     std::vector<uint8_t> snap_vchMIKPubKey = vchMIKPubKey;
     // LP-7 (HIGH-2): per-address spending keys are re-MAC'd in Step 2c so the
     // migrated v7 file carries v7-keyed (not legacy-AES-keyed) per-address MACs.
@@ -5829,25 +5831,108 @@ bool CWallet::MigrateToEncryptedSeedV7Unlocked(bool* persistedToDisk,
     // writer would then (correctly) emit the intact legacy layout again.
     uint32_t snap_loadedFileVersion = m_loadedFileVersion;
 
-    auto rollback = [&]() {
+    // ⛔ THE RESTORE MUST NOT BE ABLE TO FAIL (external panel). It previously used
+    // COPY-ASSIGNMENT throughout -- `mapCryptedKeys = snap_mapCryptedKeys` allocates,
+    // and so does every vector assignment and every `.assign(begin, end)`. Running
+    // inside the guard's DESTRUCTOR, an allocation failure there is swallowed (it has
+    // to be: a destructor that throws while unwinding calls std::terminate), and the
+    // swallow leaves a PARTIALLY restored object -- some members rolled back, some
+    // not, an incomplete key map -- which the process then carries on with and may
+    // later save to disk.
+    //
+    // Swallowing was correct C++ and the wrong place to stop. The question is what a
+    // FAILED restore leaves behind, and the answer has to be "cannot happen" rather
+    // than "is handled".
+    //
+    // So the restore SWAPS instead of copying. Container swap allocates nothing and
+    // is noexcept; the snapshots are already-built copies, so afterwards they hold
+    // the abandoned values -- harmless, because the guard fires exactly once. The
+    // three IV snapshots are now declared with the members' OWN allocator type,
+    // because a swap between std::vector<uint8_t> and
+    // std::vector<uint8_t, SecureAllocator<uint8_t>> is not expressible, which is
+    // exactly why the old code reached for the allocating `.assign()`.
+    //
+    // ⚠️ The static_asserts are the ENFORCEMENT. Without them this is a claim in a
+    // comment; with them, a change that makes any of these operations throwing fails
+    // the BUILD instead of silently restoring the hazard.
+    static_assert(std::is_trivially_copyable<CHDExtendedKey>::value,
+                  "CHDExtendedKey must stay trivially copyable or the restore can throw");
+    auto rollback = [&]() noexcept {
+        static_assert(noexcept(vchEncryptedMnemonic.swap(snap_vchEncryptedMnemonic)),
+                      "vector swap must be noexcept or the restore can fail half-done");
+        static_assert(noexcept(mapCryptedKeys.swap(snap_mapCryptedKeys)),
+                      "map swap must be noexcept or the key map can be left incomplete");
+        static_assert(noexcept(vchMnemonicIV.swap(snap_vchMnemonicIV)),
+                      "secure-allocator vector swap must be noexcept");
+
         m_loadedFileVersion = snap_loadedFileVersion;
         hdMasterKey = snap_hdMasterKey;
         fHDMasterKeyEncrypted = snap_fHDMasterKeyEncrypted;
         fHDMasterKeyCached = snap_fHDMasterKeyCached;
         hdMasterKeyDecrypted = snap_hdMasterKeyDecrypted;
-        vchEncryptedMnemonic = snap_vchEncryptedMnemonic;
-        vchMnemonicMAC = snap_vchMnemonicMAC;
-        vchMnemonicIV.assign(snap_vchMnemonicIV.begin(), snap_vchMnemonicIV.end());
-        vchEncryptedHDMasterKey = snap_vchEncryptedHDMasterKey;
-        vchHDMasterKeyMAC = snap_vchHDMasterKeyMAC;
-        vchHDMasterKeyIV.assign(snap_vchHDMasterKeyIV.begin(), snap_vchHDMasterKeyIV.end());
         fHasMIK = snap_fHasMIK;
-        vchEncryptedMIKPrivKey = snap_vchEncryptedMIKPrivKey_all;
-        vchMIKPrivKeyMAC = snap_vchMIKPrivKeyMAC_all;
-        vchMIKPrivKeyIV.assign(snap_vchMIKPrivKeyIV_all.begin(), snap_vchMIKPrivKeyIV_all.end());
-        vchMIKPubKey = snap_vchMIKPubKey;
-        mapCryptedKeys = snap_mapCryptedKeys;
+
+        vchEncryptedMnemonic.swap(snap_vchEncryptedMnemonic);
+        vchMnemonicMAC.swap(snap_vchMnemonicMAC);
+        vchMnemonicIV.swap(snap_vchMnemonicIV);
+        vchEncryptedHDMasterKey.swap(snap_vchEncryptedHDMasterKey);
+        vchHDMasterKeyMAC.swap(snap_vchHDMasterKeyMAC);
+        vchHDMasterKeyIV.swap(snap_vchHDMasterKeyIV);
+        vchEncryptedMIKPrivKey.swap(snap_vchEncryptedMIKPrivKey_all);
+        vchMIKPrivKeyMAC.swap(snap_vchMIKPrivKeyMAC_all);
+        vchMIKPrivKeyIV.swap(snap_vchMIKPrivKeyIV_all);
+        vchMIKPubKey.swap(snap_vchMIKPubKey);
+        mapCryptedKeys.swap(snap_mapCryptedKeys);
     };
+
+    // EXCEPTION SAFETY (in-house read, HIGH). rollback() used to be invoked BY HAND
+    // on every early return, and there is no try/catch anywhere in this function --
+    // so an exception thrown in Steps 1 to 2c unwound straight past every call site.
+    // The RPC layer catches std::exception, so the process SURVIVES and carries on
+    // with in-memory state half-migrated while the on-disk file is still legacy, and
+    // the next ordinary operation that calls SaveUnlocked() persists that mixture.
+    //
+    // The worst case is Step 2c: it re-MACs the key map IN A LOOP while
+    // m_loadedFileVersion is still v6, so an exception mid-loop leaves some entries
+    // with v7-keyed MACs and some legacy. Those addresses then fail MAC verification
+    // on the next load. No key material is destroyed -- it is loss of ACCESS through
+    // MAC mismatch, recoverable by someone who understands the keying -- but it
+    // reaches a user as "my coins are gone", which is the same thing from where they
+    // are standing.
+    //
+    // So rollback is now an RAII guard rather than a call. Every exit restores by
+    // CONSTRUCTION: the documented early returns, the exception paths, and the early
+    // return someone adds next year without reading this comment. A third return
+    // code would not have done that, and it would have made the
+    // two-indistinguishable-exits problem into three -- today a caller cannot tell
+    // whether memory is trustworthy after a failure, because the exception exit is
+    // the one that did NOT restore.
+    //
+    // The destructor must not throw while unwinding: that calls std::terminate, and
+    // a failed restore is bad where terminating the node is worse.
+    struct RollbackGuard {
+        std::function<void()> restore;
+        bool armed = true;
+        void dismiss() { armed = false; }
+        ~RollbackGuard() {
+            if (!armed) return;
+            try {
+                restore();
+            } catch (...) {
+                // Deliberately swallowed -- see above.
+            }
+        }
+    } rollbackGuard{rollback};
+    // ⚠️ ON THE std::function WRAPPER (external panel, noted not blocking): type
+    // erasure is a weaker "cannot fail" story than calling the noexcept lambda
+    // directly, and that is fair. What it costs is bounded and it is bounded HERE:
+    // std::function's only throwing operation is CONSTRUCTION (it may allocate),
+    // and that happens on the line above -- BEFORE any member has been mutated, so
+    // a failure there aborts the migration with nothing to roll back. Invoking it
+    // afterwards allocates nothing, and the target is declared noexcept. The
+    // alternative (a templated scope guard at file scope) buys a stronger static
+    // story for a wider blast radius, so it is deliberately not taken here.
+
 
     // --- Step 1: recover + re-encrypt the mnemonic under the master key ---
     // Legacy HD-first wallets stored the mnemonic under an obfuscation key derived
@@ -5856,58 +5941,267 @@ bool CWallet::MigrateToEncryptedSeedV7Unlocked(bool* persistedToDisk,
     // re-encrypt under the master key (which also attaches a MAC).
     if (!vchEncryptedMnemonic.empty()) {
         std::vector<uint8_t> ivVec(vchMnemonicIV.begin(), vchMnemonicIV.end());
-        std::vector<uint8_t> mnemonicPlain;
-        bool decOk = false;
 
-        // Primary case (legacy HD-first wallet): mnemonic under the obfuscation key
-        // derived from the seed. F1 round 3: use the LIVE seed via DecryptHDMasterKey,
-        // NOT hdMasterKey.seed directly — in the defer-and-preserve (seed-already-
-        // encrypted) state that slot is scrubbed and the seed lives in the cache /
-        // ciphertext. DecryptHDMasterKey returns the right value in both states.
-        {
+        // LP-7 (WALLET-LP7-MIGRATION-NEVER-COMPLETES): TRY EACH ARM UNTIL ONE
+        // VERIFIES, not until one DECRYPTS.
+        //
+        // The previous shape gated the second arm on the first arm's DECRYPT
+        // failing:
+        //     decOk = <obfuscation-key decrypt>
+        //     if (!decOk) { decOk = <master-key decrypt>; }
+        //     if (!decOk) { rollback(); return false; }
+        //     verified = MnemonicReDerivesSeed(...)
+        //     if (!verified) { DEFER }            // <-- no path back to arm 2
+        //
+        // For a legacy wallet whose mnemonic sits under the MASTER key, arm 1 runs
+        // with the WRONG key, and AES-CBC + PKCS#7 accepts a wrong-key block
+        // whenever the trailing bytes happen to form valid padding. Measured
+        // against the real CCrypter::Decrypt: 765 / 200,000 = 0.3825% (strict-PKCS#7
+        // prediction 0.3922%, so the decrypt is strict and there is no laxer path).
+        // When that happens decOk is true holding GARBAGE, arm 2 never runs, the
+        // identity guard correctly rejects, and migration defers. Key, IV and
+        // ciphertext are all fixed for a given wallet, so it recurs on EVERY future
+        // unlock: that wallet can NEVER migrate, and its seed stays unencrypted at
+        // rest -- the exact condition LP-7 exists to close -- while the log promises
+        // a retry that cannot succeed. About 1 in 260 legacy master-key-mnemonic
+        // wallets on v4.5.0 / v4.5.1 / v4.5.2.
+        //
+        // The guard is NOT at fault and is not touched: a stage-B probe over 5,000
+        // fresh mnemonics found derivation stable and injective (0 mismatches).
+        // Rejecting garbage is the guard doing its job; the defect is that a
+        // rejection had nowhere to go.
+        //
+        // So each arm now runs decrypt-THEN-verify, and a failed verification falls
+        // through to the next arm instead of ending the attempt. Behaviour is
+        // unchanged for every wallet that migrates today: arm 1 is still tried
+        // first, and when its output verifies the loop stops before arm 2 runs, by
+        // the same path and with no extra work.
+        auto armObfuscation = [&](std::vector<uint8_t>& out) -> bool {
+            // Primary case (legacy HD-first wallet): mnemonic under the obfuscation
+            // key derived from the seed. Use the LIVE seed via DecryptHDMasterKey,
+            // NOT hdMasterKey.seed directly -- in the defer-and-preserve
+            // (seed-already-encrypted) state that slot is scrubbed and the seed
+            // lives in the cache / ciphertext. DecryptHDMasterKey is right in both.
             CHDExtendedKey live;
-            if (DecryptHDMasterKey(live)) {
-                std::vector<uint8_t> obfKey(WALLET_CRYPTO_KEY_SIZE);
-                std::vector<uint8_t> hdSeed(live.seed, live.seed + 32);
-                DeriveEncryptionKey(hdSeed, "mnemonic", obfKey);
-                memory_cleanse(hdSeed.data(), hdSeed.size());
-                live.Wipe();
-
-                CCrypter obfCrypter;
-                decOk = obfCrypter.SetKey(obfKey, ivVec) &&
-                        obfCrypter.Decrypt(vchEncryptedMnemonic, mnemonicPlain);
-                memory_cleanse(obfKey.data(), obfKey.size());
+            if (!DecryptHDMasterKey(live)) {
+                return false;
             }
-        }
+            std::vector<uint8_t> obfKey(WALLET_CRYPTO_KEY_SIZE);
+            std::vector<uint8_t> hdSeed(live.seed, live.seed + 32);
+            DeriveEncryptionKey(hdSeed, "mnemonic", obfKey);
+            memory_cleanse(hdSeed.data(), hdSeed.size());
+            live.Wipe();
 
-        // Fallback: a legacy wallet whose mnemonic was encrypted under the master
-        // key directly (no MAC). Try the master key if the obfuscation key failed.
-        if (!decOk) {
+            CCrypter obfCrypter;
+            const bool ok = obfCrypter.SetKey(obfKey, ivVec) &&
+                            obfCrypter.Decrypt(vchEncryptedMnemonic, out);
+            memory_cleanse(obfKey.data(), obfKey.size());
+            return ok;
+        };
+
+        auto armMasterKey = [&](std::vector<uint8_t>& out) -> bool {
+            // Fallback: a legacy wallet whose mnemonic was encrypted under the
+            // master key directly (no MAC).
             std::vector<uint8_t> mkVec(vMasterKey.data_ptr(),
                                        vMasterKey.data_ptr() + vMasterKey.size());
             CCrypter mkCrypter;
-            mnemonicPlain.clear();
-            decOk = mkCrypter.SetKey(mkVec, ivVec) &&
-                    mkCrypter.Decrypt(vchEncryptedMnemonic, mnemonicPlain);
+            const bool ok = mkCrypter.SetKey(mkVec, ivVec) &&
+                            mkCrypter.Decrypt(vchEncryptedMnemonic, out);
             memory_cleanse(mkVec.data(), mkVec.size());
+            return ok;
+        };
+
+        // The identity check, unchanged in substance and in order: the empty
+        // passphrase FIRST (the common cohort), then -- only if that fails AND the
+        // caller supplied a non-empty BIP39 passphrase -- retry WITH it, so a
+        // legitimate passphrase wallet can complete migration. Still fail-closed: a
+        // wrong or absent passphrase leaves this false on every arm, and the
+        // ABORT-AND-PRESERVE path below runs exactly as before.
+        auto phraseVerifies = [&](const std::string& phrase,
+                                  bool& usedPassphrase) -> bool {
+            usedPassphrase = false;
+            if (MnemonicReDerivesSeed(phrase, "")) {
+                return true;
+            }
+            if (!bip39Passphrase.empty() &&
+                MnemonicReDerivesSeed(phrase, bip39Passphrase)) {
+                usedPassphrase = true;
+                return true;
+            }
+            return false;
+        };
+
+        // LP-7 RESIDUAL MEASUREMENT FACILITY (contract aa61181, approved by Will
+        // 2026-09-11; kept permanently rather than deleted after the measurement).
+        // OFF unless DILITHION_LP7_DIAG is set, so nothing changes for any node
+        // that does not ask for it.
+        //
+        // It prints NO PHRASE, NO SEED AND NO KEY. Only which arm ran, whether it
+        // decrypted, whether the bytes are syntactically BIP39, their length and
+        // word count, and whether they verified -- enough to tell arm pre-emption
+        // apart from any other failure in a field log, and nothing more.
+        //
+        // ONE FIELD IS AN ORACLE, AND CALLING THIS "no secret" WOULD BE WRONG:
+        // verified_with_passphrase=1 CONFIRMS that the BIP39 passphrase the caller
+        // supplied was the correct one. It reveals no passphrase bytes, but it does
+        // answer a yes/no question about a secret, so anyone who can read the log
+        // learns that much. That is acceptable for an operator who deliberately
+        // enabled diagnostics on their own wallet; it is not "no secret", and the
+        // difference matters when someone decides where these logs may be sent.
+        //
+        // It reports PER ARM. The old single-line form could only ever observe one
+        // arm, because a spurious arm-1 acceptance ended the attempt -- the very
+        // defect being fixed made the instrument blind to it.
+        // GATE ON THE VALUE, NOT ON PRESENCE (in-house read, LOW -- and it is a
+        // PATTERN, not an instance: the same shape was found in a CI guard in an
+        // unrelated file the same day). `getenv(...) != nullptr` makes
+        // DILITHION_LP7_DIAG=0 turn the diagnostics ON, because every falsey value is
+        // still a present value. That matters more than usual here: the argument that
+        // the verified_with_passphrase oracle bit is acceptable rests on an operator
+        // DELIBERATELY enabling diagnostics, and a presence gate can be tripped by a
+        // parent process or a script that sets the variable to zero to turn it off.
+        //
+        // An environment variable read for presence is a boolean whose falsey values
+        // all mean true.
+        // ⛔ CASE-INSENSITIVE, because the previous token set was arbitrary:
+        // "true" and "TRUE" enabled it while "True", "ON" and "Yes" silently did
+        // NOT. For an ordinary verbosity flag that is a papercut; for a switch that
+        // emits an ORACLE BIT about whether the operator's BIP39 passphrase was
+        // correct, an operator who believes they turned it on and did not -- or who
+        // believes they turned it off and did not -- is the failure that matters.
+        // The accepted set is now explicit and closed, and unrecognised values are
+        // OFF rather than truthy-by-presence.
+        const bool lp7diag = [] {
+            const char* v = std::getenv("DILITHION_LP7_DIAG");
+            if (v == nullptr) return false;
+            std::string s(v);
+            std::transform(s.begin(), s.end(), s.begin(),
+                           [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+            return s == "1" || s == "true" || s == "yes" || s == "on";
+        }();
+
+        bool anyArmDecrypted = false;
+        bool verified = false;
+        std::string mnemonicStr;
+
+        for (int arm = 1; arm <= 2 && !verified; ++arm) {
+            std::vector<uint8_t> mnemonicPlain;
+            bool decOk = false;
+            const char* armName = nullptr;
+            if (arm == 1) {
+                armName = "1-obfuscation";
+                decOk = armObfuscation(mnemonicPlain);
+            } else if (arm == 2) {
+                armName = "2-masterkey";
+                decOk = armMasterKey(mnemonicPlain);
+            } else {
+                // Unreachable at the current bound, and deliberately NOT a
+                // fall-through to the last arm. A ternary here would run
+                // armMasterKey for arm 3 and label it "2-masterkey" -- silently
+                // mislabelling a log is how the original defect stayed invisible
+                // for three releases. A new arm must add its own branch.
+                break;
+            }
+            if (lp7diag) {
+                std::cerr << "[LP7DIAG] arm=" << armName
+                          << " decOk=" << (decOk ? 1 : 0)
+                          << " recovered_len=" << mnemonicPlain.size()
+                          << std::endl;
+            }
+            if (!decOk) {
+                memory_cleanse(mnemonicPlain.data(), mnemonicPlain.size());
+                continue;
+            }
+            anyArmDecrypted = true;
+
+            std::string candidate(mnemonicPlain.begin(), mnemonicPlain.end());
+            memory_cleanse(mnemonicPlain.data(), mnemonicPlain.size());
+
+            bool usedPassphrase = false;
+            const bool armVerified = phraseVerifies(candidate, usedPassphrase);
+            if (lp7diag) {
+                const bool syntactic = CMnemonic::Validate(candidate);
+                size_t spaces = 0;
+                for (char ch : candidate) {
+                    if (ch == ' ') ++spaces;
+                }
+                std::cerr << "[LP7DIAG] arm=" << armName
+                          << " phrase_len=" << candidate.size()
+                          << " bip39_syntactic=" << (syntactic ? 1 : 0);
+                if (syntactic) {
+                    std::cerr << " words=" << (spaces + 1);
+                } else {
+                    // On a pre-empted arm these are raw wrong-key bytes, not a
+                    // phrase. Counting 0x20 bytes in ~190 bytes of binary garbage
+                    // yields about 8, which reads in a field log like a short but
+                    // plausible mnemonic and is nothing of the kind. Report the
+                    // byte count under a name that cannot be mistaken for one.
+                    std::cerr << " words=n/a space_bytes=" << spaces;
+                }
+                // ORACLE BIT, AT THE FIELD THAT CARRIES IT: verified_with_passphrase=1
+                // emits no passphrase bytes, but it CONFIRMS the BIP39 passphrase the
+                // caller supplied was the correct one. Producing it on an operator's
+                // own wallet is fine; that is a different question from whether the
+                // resulting log may be SENT anywhere -- attached to a bug report,
+                // shipped to a log aggregator, pasted into a channel. Anyone deciding
+                // where these logs go needs this line, which is why it is here and not
+                // only in the block comment above.
+                std::cerr << " verified=" << (armVerified ? 1 : 0)
+                          << " verified_with_passphrase=" << (usedPassphrase ? 1 : 0)
+                          << std::endl;
+            }
+            if (armVerified) {
+                mnemonicStr = candidate;
+                verified = true;
+            }
+            // Cleanse the candidate on BOTH outcomes. The fall-through is a new exit
+            // that did not exist before, and it is the one that would otherwise
+            // leave a rejected phrase -- or a verified one, now copied into
+            // mnemonicStr -- sitting in a dead local.
+            if (!candidate.empty()) {
+                memory_cleanse(&candidate[0], candidate.size());
+            }
         }
 
-        if (!decOk) {
+        if (lp7diag) {
+            std::cerr << "[LP7DIAG] outcome="
+                      << (verified ? "verified"
+                                   : (anyArmDecrypted ? "decrypted-but-none-verified"
+                                                      : "no-arm-decrypted"))
+                      << std::endl;
+        }
+
+        if (!anyArmDecrypted) {
             // Could not recover the mnemonic plaintext under either key. Abort
             // migration (leave everything byte-identical) rather than risk a wallet
             // whose mnemonic becomes unreadable. Seed migration only proceeds when
             // the mnemonic can be carried forward.
-            memory_cleanse(mnemonicPlain.data(), mnemonicPlain.size());
-            rollback();
+            //
+            // THIS IS NOT A PASSPHRASE PROBLEM, and until now it said nothing at
+            // all. Neither key produced any plaintext, which means a truncated or
+            // corrupt mnemonic record, a ciphertext that is not a multiple of the
+            // block size, or DecryptHDMasterKey failing -- none of which a BIP39
+            // passphrase can fix. The caller cannot yet tell this exit apart from
+            // "an arm decrypted but nothing verified" and so reports the generic
+            // passphrase-deferred state, which sends the operator after a
+            // passphrase that does not exist while a corrupt record goes
+            // unreported. Propagating the distinction to the caller is a separate
+            // change; saying it out loud is not, and the silence was the worse
+            // half.
+            std::cerr << "[Wallet] LP-7: v7 seed migration ABORTED - the mnemonic "
+                         "record could not be decrypted under EITHER the "
+                         "seed-derived obfuscation key or the wallet master key. "
+                         "This is not a BIP39-passphrase problem: no passphrase "
+                         "affects this step. The record is likely truncated or "
+                         "corrupt. The wallet was NOT modified and remains loadable; "
+                         "migration will be retried on the next unlock and will keep "
+                         "failing until the record is readable." << std::endl;
             return false;
         }
 
-        std::string mnemonicStr(mnemonicPlain.begin(), mnemonicPlain.end());
-        memory_cleanse(mnemonicPlain.data(), mnemonicPlain.size());
-
         // LP-7 (F1, BLOCKER + fold MED-1): a successful Decrypt() only proves PKCS#7
-        // padding was well-formed — NOT that the recovered bytes are a real seed
-        // phrase, and CMnemonic::Validate only proves SYNTACTIC BIP39 — NOT that the
+        // padding was well-formed -- NOT that the recovered bytes are a real seed
+        // phrase, and CMnemonic::Validate only proves SYNTACTIC BIP39 -- NOT that the
         // phrase is THIS wallet's seed. Under a wrong-key edge case / partial
         // corruption / format confusion the decrypt can yield a DIFFERENT but
         // syntactically-valid BIP39 string. Re-encrypting that as the authoritative
@@ -5915,28 +6209,16 @@ bool CWallet::MigrateToEncryptedSeedV7Unlocked(bool* persistedToDisk,
         // ciphertext => PERMANENT seed loss (the live wallet keeps spending via the
         // in-memory seed, but a later restore-from-phrase yields the WRONG seed).
         //
-        // So positively confirm IDENTITY, not just syntax: re-derive the master seed
-        // from the recovered mnemonic and compare it byte-for-byte to the wallet's
-        // authoritative in-memory hdMasterKey.seed (MnemonicReDerivesSeed, which folds
-        // in the CMnemonic::Validate structural gate). Only on an EXACT match do we
-        // re-encrypt and discard the original. On ANY mismatch — garbage that passed
-        // Validate, OR a legitimate but non-re-derivable BIP39-passphrase wallet —
+        // So identity is confirmed POSITIVELY above, per arm, before any arm is
+        // allowed to win. Only on an EXACT match do we re-encrypt and discard the
+        // original. When NO arm produces a verifying phrase -- garbage that passed
+        // Validate, OR a legitimate but non-re-derivable BIP39-passphrase wallet --
         // ABORT migration loudly: do NOT call EncryptMnemonic (which would overwrite
         // vchEncryptedMnemonic/IV/MAC), roll back to the pre-migration snapshot so the
         // original ciphertext is preserved byte-for-byte, and leave the wallet in its
         // prior valid state. The migration safely defers and re-arms on the next
-        // unlock. INVARIANT (absolute): the original seed ciphertext is NEVER discarded
-        // unless the recovered phrase PROVABLY derives this wallet's seed.
-        //
-        // F1 round 3: try the empty passphrase FIRST (the common cohort, behaviour
-        // unchanged), then — only if that fails AND the caller supplied a non-empty
-        // BIP39 passphrase — retry the identity check WITH that passphrase so a
-        // legitimate passphrase wallet can complete migration. Still fail-closed: a
-        // wrong/absent passphrase leaves verified==false → ABORT-AND-PRESERVE.
-        bool verified = MnemonicReDerivesSeed(mnemonicStr, "");
-        if (!verified && !bip39Passphrase.empty()) {
-            verified = MnemonicReDerivesSeed(mnemonicStr, bip39Passphrase);
-        }
+        // unlock. INVARIANT (absolute): the original seed ciphertext is NEVER
+        // discarded unless the recovered phrase PROVABLY derives this wallet's seed.
         if (!verified) {
             // LOW-5: &mnemonicStr[0] on an empty string is UB; guard the cleanse.
             if (!mnemonicStr.empty()) {
@@ -5954,7 +6236,6 @@ bool CWallet::MigrateToEncryptedSeedV7Unlocked(bool* persistedToDisk,
                          "ciphertext was NOT modified; the wallet remains fully "
                          "loadable and usable. Migration will be retried on the next "
                          "unlock." << std::endl;
-            rollback();
             return false;
         }
 
@@ -5964,7 +6245,6 @@ bool CWallet::MigrateToEncryptedSeedV7Unlocked(bool* persistedToDisk,
             memory_cleanse(&mnemonicStr[0], mnemonicStr.size());
         }
         if (!reOk) {
-            rollback();
             return false;
         }
     }
@@ -5975,7 +6255,6 @@ bool CWallet::MigrateToEncryptedSeedV7Unlocked(bool* persistedToDisk,
     // case (a) needs this step.
     if (!seedAlreadyEncrypted) {
         if (!EncryptHDMasterKey()) {
-            rollback();
             return false;
         }
     }
@@ -5994,12 +6273,41 @@ bool CWallet::MigrateToEncryptedSeedV7Unlocked(bool* persistedToDisk,
                 m_mik->pubkey = vchMIKPubKey;
                 m_mik->identity = DFMP::DeriveIdentityFromMIK(vchMIKPubKey);
             }
+            // ⛔ THE PLAINTEXT MIK MUST NOT SURVIVE THIS SCOPE BY ANY EXIT (external
+            // panel). EncryptMIKPrivKey() can throw, and the clear that followed it
+            // was an ordinary statement -- so an exception left plaintext
+            // mining-identity key material resident, outside migration, contrary to
+            // the invariant this whole change asserts. The rollback lambda does not
+            // cover it either: it restores the MIK flag and the encrypted records,
+            // but m_mik->privkey is not one of the members it touches.
+            //
+            // ⚠️ AND THE OLD CLEAR DID NOT WIPE ANYTHING ON *ANY* PATH, which is
+            // worse than the exception case the panel found. privkey is a
+            // std::vector<uint8_t, SecureAllocator<uint8_t>>, and SecureAllocator
+            // wipes in DEALLOCATE. `clear()` does not deallocate -- it sets size to
+            // zero and keeps the capacity -- so the 4,032 plaintext bytes stayed in
+            // the retained buffer until the vector was destroyed or reallocated.
+            // "It is a secure allocator" was doing load-bearing work that the
+            // allocator does not actually do at that call.
+            //
+            // So: cleanse explicitly, in a destructor, which covers the normal
+            // return, the early return below, and an exception out of
+            // EncryptMIKPrivKey() identically. Non-throwing by construction --
+            // memory_cleanse is noexcept and guards null/zero itself.
+            struct MikPlaintextGuard {
+                DFMP::CMiningIdentityKey* mik;
+                ~MikPlaintextGuard() noexcept {
+                    if (mik != nullptr && !mik->privkey.empty()) {
+                        memory_cleanse(mik->privkey.data(), mik->privkey.size());
+                        mik->privkey.clear();
+                    }
+                }
+            } mikPlaintextGuard{m_mik.get()};
+
             m_mik->privkey.assign(mikPlain.begin(), mikPlain.end());
             bool mikOk = EncryptMIKPrivKey();   // adds MAC under master key
-            m_mik->privkey.clear();
             if (!mikOk) {
-                rollback();
-                return false;
+                    return false;
             }
         } else {
             // MIK plaintext unrecoverable — drop it (regenerated on next mining).
@@ -6033,20 +6341,17 @@ bool CWallet::MigrateToEncryptedSeedV7Unlocked(bool* persistedToDisk,
                 // Malformed entry — cannot re-MAC safely. Abort rather than write a
                 // v7 file with a per-address key that can't be authenticated.
                 memory_cleanse(mkVec.data(), mkVec.size());
-                rollback();
-                return false;
+                    return false;
             }
             CCrypter keyCrypter;
             if (!keyCrypter.SetKey(mkVec, ek.vchIV)) {
                 memory_cleanse(mkVec.data(), mkVec.size());
-                rollback();
-                return false;
+                    return false;
             }
             std::vector<uint8_t> newMAC;
             if (!ComputeRecordMAC(keyCrypter, ek.vchCryptedKey, newMAC)) {
                 memory_cleanse(mkVec.data(), mkVec.size());
-                rollback();
-                return false;
+                    return false;
             }
             ek.vchMAC = newMAC;
         }
@@ -6067,9 +6372,24 @@ bool CWallet::MigrateToEncryptedSeedV7Unlocked(bool* persistedToDisk,
         if (!SaveUnlocked()) {
             // The on-disk legacy file is still intact (temp file was discarded).
             // Roll back in-memory state to match it (including the loaded version).
-            rollback();
             return false;
         }
+        // ⛔ DISMISS HERE, NOT AFTER THE BRANCH (external panel; both responding
+        // seats raised it independently). The disk now holds the migrated v7 file.
+        // Any restore from this point would put PRE-MIGRATION MEMORY back over an
+        // ALREADY-COMMITTED v7 DISK, leaving the two disagreeing -- the one outcome
+        // worse than either failing cleanly.
+        //
+        // The seats could not confirm whether the statements between the successful
+        // save and the old dismiss point could throw, because those lines were not in
+        // the diff they were given. They cannot: the only statement was
+        // `if (persistedToDisk) *persistedToDisk = true;` -- a pointer test and a bool
+        // store, no allocation, no call. But "I checked, it cannot throw" is a fact
+        // about today's code that the next edit silently invalidates. Dismissing FIRST
+        // removes the window instead of documenting it, so there is no claim left to
+        // keep true.
+        rollbackGuard.dismiss();
+
         // The migrated v7 (no-plaintext) file is now on disk — only NOW is it safe
         // for the caller to clear the migration flag / treat the file as v7.
         if (persistedToDisk) *persistedToDisk = true;
@@ -6077,10 +6397,13 @@ bool CWallet::MigrateToEncryptedSeedV7Unlocked(bool* persistedToDisk,
         // Unreachable given the entry guard, but fail closed rather than report a
         // half-migrated success: roll back so in-memory state stays consistent with
         // the unchanged on-disk legacy file.
-        rollback();
         return false;
     }
 
+    // Dismissed immediately after the successful save above -- that is what closes
+    // the memory-vs-disk window. Deliberately NOT repeated here: a second dismiss
+    // would restore the impression that the safe point is the end of the function
+    // rather than the save itself.
     return true;
 }
 
