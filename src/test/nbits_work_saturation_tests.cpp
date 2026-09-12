@@ -304,39 +304,9 @@ void test_production_validators_reject_both_classes()
     //   2. an HONEST control must make best-header work ADVANCE. Without it, a build
     //      in which ProcessHeaders silently did nothing at all would pass every
     //      assertion here.
-    // ⛔ ZERO BOUND — THE REGTEST/TESTNET CONFIGURATION, AND THE ONE THAT PROVES THE
-    // SATURATION GUARD IS WIRED AT ALL.
-    //
-    // CONFIRMED BY FIXTURE MUTATION before this arm existed: removing the saturation
-    // guard from BOTH production validators left the whole suite PASSING, because the
-    // 2^200 bound below rejects saturated work anyway. So every arm in this file was
-    // consistent with the saturation guard never having been wired.
-    //
-    // With a ZERO bound the magnitude predicate is inert by design, so saturation is
-    // the ONLY guard — which is exactly the configuration regtest and testnet run.
-    {
-        uint256 zeroBound; std::memset(zeroBound.data, 0, 32);
-        CHeadersManager z(zeroBound);
-
-        // The inflation class is ACCEPTED here, and that is correct, not a bug: the
-        // bound is what rejects it and the bound is inert. Asserted so the arm states
-        // the exposure rather than leaving it implied.
-        Check("ZERO-BOUND: inflated nBits is ACCEPTED when the bound is inert "
-              "(the class is unguarded on a zero-bound network)",
-              z.QuickValidateHeader(HeaderWithNBits(0x01000001u), nullptr));
-
-        // ⛔ But saturation must STILL be rejected — this is the arm that dies if the
-        // saturation guard is removed from the validators.
-        Check("ZERO-BOUND: zero-mantissa is STILL REJECTED with an inert bound "
-              "(saturation is the only guard here)",
-              !z.QuickValidateHeader(HeaderWithNBits(0x1e000000u), nullptr));
-        Check("ZERO-BOUND: zero-mantissa is STILL REJECTED by ValidateHeader with a known parent",
-              !z.ValidateHeader(ChildOf(0x1e000000u), &genesisHeader));
-
-        // And an honest header still passes, so the arm is not "reject everything".
-        Check("ZERO-BOUND: honest nBits still accepted",
-              z.QuickValidateHeader(HeaderWithNBits(0x1d00ffffu), nullptr));
-    }
+    // (The hand-picked zero-bound block that stood here is SUPERSEDED by
+    //  test_property_saturation_guard_is_wired_with_inert_bound, which drives every
+    //  zero-mantissa case in the space through both validators instead of one vector.)
 
     {
         // The control FIRST: if this does not advance, every "did not advance" below
@@ -368,6 +338,187 @@ void test_production_validators_reject_both_classes()
     std::cout << " OK" << std::endl;
 }
 
+
+// ===========================================================================
+// GENERATORS — the nBits input space, and the bound space.
+//
+// ⛔ WHY THESE EXIST. Four separate review findings shared ONE shape: a hand-picked
+// input that could not distinguish the case it claimed to cover. A live 2^200 bound
+// masked a missing saturation guard; honest work could not separate a scanned byte 31
+// from a bound wrongly read as zero; a Regtest parameter exercised only the inert
+// path; two mask vectors could not refute a third mask. Three rounds fixed four
+// instances without touching what produced them.
+//
+// ⚠️ AND PROPERTY GENERATION HAS ITS OWN CHARACTERISTIC FAILURE: a WEAK property
+// passes over the whole space and proves nothing. So every property arm below is
+// still required to DIE to a specific mutant — the same mutants the hand-picked arms
+// caught. A property that survives a mutation its predecessor caught is weaker than
+// what it replaced, which is a regression wearing a methodology upgrade's clothes.
+// ===========================================================================
+
+// Every isolated mantissa bit, the zero mantissa, and a few composites, crossed with
+// the full exponent byte. Includes BOTH classes by construction — zero-mantissa
+// (saturating) and small-exponent (inflating) — so no arm over this space can be
+// vacuous for want of a case.
+std::vector<uint32_t> NBitsSpace()
+{
+    std::vector<uint32_t> mantissas;
+    mantissas.push_back(0x000000u);                       // the saturation trigger
+    for (int b = 0; b < 24; ++b) mantissas.push_back(1u << b);
+    mantissas.push_back(0x00ffffu);                       // honest DIL/DilV
+    mantissas.push_back(0x7fffffu);
+    mantissas.push_back(0xffffffu);
+    std::vector<uint32_t> out;
+    for (uint32_t e = 0; e < 256; ++e)
+        for (uint32_t m : mantissas) out.push_back((e << 24) | m);
+    return out;
+}
+
+struct NamedBound { const char* name; uint256 value; };
+
+// The bounds that matter, including the two that hand-picked arms got wrong: a bound
+// non-zero ONLY in byte 0, and one non-zero ONLY in byte 31 (the zero-scan off-by-one),
+// plus a REAL production parameter so no test-chosen constant can stand in for it.
+std::vector<NamedBound> BoundSpace()
+{
+    std::vector<NamedBound> out;
+    uint256 z; std::memset(z.data, 0, 32);
+    out.push_back({"zero (regtest/testnet: inert by design)", z});
+    uint256 b0; std::memset(b0.data, 0, 32); b0.data[0] = 0x01;
+    out.push_back({"non-zero in byte 0 only", b0});
+    uint256 b31; std::memset(b31.data, 0, 32); b31.data[31] = 0x01;
+    out.push_back({"non-zero in byte 31 only (the zero-scan off-by-one)", b31});
+    uint256 mid; std::memset(mid.data, 0, 32); mid.data[25] = 0x01;
+    out.push_back({"2^200", mid});
+    out.push_back({"the REAL DilV nMinimumChainWork", Dilithion::ChainParams::DilV().nMinimumChainWork});
+    return out;
+}
+
+bool BoundIsZero(const uint256& b)
+{
+    for (int i = 0; i < 32; ++i) if (b.data[i] != 0) return false;
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// PROPERTY 1 — SATURATION IFF ZERO MANTISSA, over the whole space.
+// Replaces nothing; it is the invariant the saturation predicate is defined by, and
+// it states in one assertion what three hand-picked arms approximated.
+// ---------------------------------------------------------------------------
+void test_property_saturation_iff_zero_mantissa()
+{
+    std::cout << "  test_property_saturation_iff_zero_mantissa..." << std::flush;
+    const auto space = NBitsSpace();
+    int sat = 0, unsat = 0;
+    for (uint32_t nBits : space) {
+        const bool zeroMantissa = (nBits & 0x00FFFFFFu) == 0;
+        const bool saturates = IsSaturated(::dilithion::consensus::ComputeChainWork(nBits));
+        if (saturates) ++sat; else ++unsat;
+        Check("PROPERTY: ComputeChainWork saturates IFF the mantissa is zero",
+              saturates == zeroMantissa);
+        Check("PROPERTY: NBitsUsableForWork rejects IFF it saturates",
+              ::dilithion::consensus::NBitsUsableForWork(nBits) == !saturates);
+    }
+    // NON-VACUITY: the space must contain BOTH outcomes, or the iff is untested on one
+    // side and the arm would pass over a space of one kind.
+    Check("PROPERTY: the space contains saturating cases", sat > 0);
+    Check("PROPERTY: the space contains non-saturating cases", unsat > 0);
+    std::cout << " OK (" << space.size() << " cases, " << sat << " saturating)" << std::endl;
+}
+
+// ---------------------------------------------------------------------------
+// PROPERTY 2 — REJECTION IFF WORK >= BOUND, and INERT IFF BOUND ZERO.
+// ⛔ REPLACES the byte-31 zero-scan arm and the production-parameter arm. Both failed
+// the same way: one hand-picked (nBits, bound) pair whose verdict was the same whether
+// the implementation was right or wrong. Crossing the whole nBits space with the bound
+// space removes the possibility of choosing a non-discriminating pair.
+// ---------------------------------------------------------------------------
+void test_property_bound_rejects_iff_work_reaches_it()
+{
+    std::cout << "  test_property_bound_rejects_iff_work_reaches_it..." << std::flush;
+    using ::dilithion::consensus::ComputeChainWork;
+    using ::dilithion::consensus::ChainWorkGreaterOrEqual;
+    using ::dilithion::consensus::SingleHeaderWorkIsWithinBound;
+
+    const auto space = NBitsSpace();
+    long checked = 0, rejected = 0;
+    for (const NamedBound& b : BoundSpace()) {
+        const bool inert = BoundIsZero(b.value);
+        int rejHere = 0;
+        for (uint32_t nBits : space) {
+            const bool within = SingleHeaderWorkIsWithinBound(nBits, b.value);
+            if (inert) {
+                // INERT IFF ZERO: a zero bound must accept everything, including the
+                // saturating and inflating classes. Production depends on this —
+                // regtest and testnet run a zero bound and would otherwise reject
+                // every header.
+                Check("PROPERTY: a zero bound is inert for EVERY nBits", within);
+            } else {
+                const bool reaches = ChainWorkGreaterOrEqual(ComputeChainWork(nBits), b.value);
+                Check("PROPERTY: rejection IFF single-header work reaches the bound",
+                      within == !reaches);
+                if (!within) { ++rejHere; ++rejected; }
+            }
+            ++checked;
+        }
+        // NON-VACUITY PER BOUND: a non-zero bound must reject SOMETHING over this
+        // space, or that bound contributes no evidence and the arm is padding.
+        if (!inert) {
+            Check("PROPERTY: each non-zero bound rejects at least one case "
+                  "(otherwise that bound proves nothing)", rejHere > 0);
+        }
+    }
+    std::cout << " OK (" << checked << " pairs, " << rejected << " rejections)" << std::endl;
+}
+
+// ---------------------------------------------------------------------------
+// PROPERTY 3 — THE SATURATION GUARD IS WIRED, measured where NOTHING ELSE CAN HIDE IT.
+// ⛔ REPLACES the hand-picked zero-bound arm. Its predecessor's defect: with a live
+// 2^200 bound, saturated work was rejected BY THE BOUND, so the whole suite passed
+// with the saturation guard deleted from both validators (measured: MUTANT E).
+//
+// A ZERO bound makes the magnitude predicate inert BY DESIGN, so the saturation guard
+// is the only thing that can reject — which is also exactly the regtest/testnet
+// configuration. Every zero-mantissa case in the space is driven through BOTH real
+// validators.
+// ---------------------------------------------------------------------------
+void test_property_saturation_guard_is_wired_with_inert_bound()
+{
+    std::cout << "  test_property_saturation_guard_is_wired_with_inert_bound..." << std::flush;
+    uint256 zeroBound; std::memset(zeroBound.data, 0, 32);
+    CHeadersManager z(zeroBound);
+
+    const CBlock genesisBlock = Genesis::CreateGenesisBlockForChain();
+    const CBlockHeader genesisHeader = genesisBlock;
+
+    int zeroMantissaCases = 0, honestCases = 0;
+    for (uint32_t nBits : NBitsSpace()) {
+        const bool zeroMantissa = (nBits & 0x00FFFFFFu) == 0;
+        CBlockHeader h = HeaderWithNBits(nBits);
+        if (zeroMantissa) {
+            ++zeroMantissaCases;
+            Check("PROPERTY/WIRED: every zero-mantissa nBits is REJECTED by "
+                  "QuickValidateHeader with an INERT bound",
+                  !z.QuickValidateHeader(h, nullptr));
+            CBlockHeader c = h;
+            c.hashPrevBlock = genesisHeader.GetHash();
+            c.nTime = genesisHeader.nTime + 100;
+            Check("PROPERTY/WIRED: every zero-mantissa nBits is REJECTED by "
+                  "ValidateHeader with a KNOWN parent and an INERT bound",
+                  !z.ValidateHeader(c, &genesisHeader));
+        }
+    }
+    // The honest side, so the arm is not "reject everything with an inert bound".
+    for (uint32_t nBits : {0x1d00ffffu, 0x1e01fffeu, 0x1b0404cbu}) {
+        ++honestCases;
+        Check("PROPERTY/WIRED: honest nBits still ACCEPTED with an inert bound",
+              z.QuickValidateHeader(HeaderWithNBits(nBits), nullptr));
+    }
+    Check("PROPERTY/WIRED: the space contained zero-mantissa cases to drive",
+          zeroMantissaCases > 0);
+    std::cout << " OK (" << zeroMantissaCases << " saturating, "
+              << honestCases << " honest)" << std::endl;
+}
 
 // ---------------------------------------------------------------------------
 // ⛔ ARM 5 — PIN THE MASK. Review found that the refuted 0x007FFFFF mask, and also
@@ -435,17 +586,32 @@ void test_single_header_bound_direct()
     uint256 lowByte; std::memset(lowByte.data, 0, 32); lowByte.data[0] = 0x01;
     Check("BOUND: non-zero in byte 0 is not treated as a zero bound",
           !SingleHeaderWorkIsWithinBound(0x1d00ffffu, lowByte));
-    // ⛔ THIS ARM USED HONEST WORK AND WAS NON-DISCRIMINATING. Honest work (~2^76) is
-    // below 2^248 whether byte 31 is scanned or the bound is wrongly treated as zero,
-    // so an `i < 31` off-by-one passed it unchanged — review found that, and the
-    // previous comment claimed the case was covered. SATURATED work is the only input
-    // that separates the two: it is ABOVE 2^248, so it is rejected only if byte 31 is
-    // actually scanned; treat the bound as zero and the inert path accepts it.
-    uint256 highByte; std::memset(highByte.data, 0, 32); highByte.data[31] = 0x01;
-    Check("BOUND: byte 31 IS scanned — saturated work is rejected against a "
-          "bound that is non-zero only in its top byte",
-          !SingleHeaderWorkIsWithinBound(0x1e000000u, highByte));
+    // (The byte-31 zero-scan arm that stood here is SUPERSEDED by
+    //  test_property_bound_rejects_iff_work_reaches_it, whose bound space includes a
+    //  bound non-zero only in byte 31 crossed with every nBits.)
 
+    // ⛔ DO NOT CONVERT THIS ARM TO A PROPERTY. MEASURED, 2026-09-12 (MUTANT G:
+    // ChainWorkGreaterOrEqual returns FALSE on equality instead of TRUE):
+    //
+    //   nbits_work_saturation_tests        1 FAILURE  <- THIS assertion, and only it
+    //   minimum_chain_work_kat_tests       PASS
+    //   headerssync_gate_arming_tests      PASS
+    //   vdf_checker_nbits_equality_tests   PASS
+    //
+    // This one hand-picked assertion is the ONLY thing in the tree that pins the
+    // comparator's equality sense. Two reasons it cannot be replaced by the property
+    // arm, and both are structural rather than a matter of adding cases:
+    //
+    //   1. test_property_bound_rejects_iff_work_reaches_it computes its ORACLE with
+    //      ChainWorkGreaterOrEqual — the same function. Mutate the comparator and both
+    //      sides of the iff move together, so the property passes over all 35840 pairs.
+    //      A property is only as strong as an oracle that is INDEPENDENT of the subject.
+    //   2. minimum_chain_work_kat_tests calls the comparator four times but only ever on
+    //      STRICTLY UNEQUAL values (a bound vs 1, a bound vs a derived tip), so it uses
+    //      the comparator as an instrument and cannot observe its equality sense at all.
+    //      Four references looked like coverage and were not — that was an inference, and
+    //      MUTANT G measured it false.
+    //
     // EQUALITY: single work EXACTLY equal to the bound must be REJECTED (>= not >).
     const uint256 honestWork = ComputeChainWork(0x1d00ffffu);
     Check("BOUND: work exactly EQUAL to the bound is rejected (>= not >)",
@@ -457,29 +623,16 @@ void test_single_header_bound_direct()
     Check("BOUND: work just BELOW the bound is accepted",
           SingleHeaderWorkIsWithinBound(0x1d00ffffu, justAbove));
 
-    // ⛔ THE PRODUCTION PARAMETER, not a test constant. Arm 4 injects exactly 2^200,
-    // so a hardcoded 2^200 substituted for the parameter would pass it. This uses the
-    // chain's real nMinimumChainWork against its real genesisNBits.
-    // ⛔ A NETWORK WITH A NON-ZERO BOUND, because main() runs Regtest where
-    // nMinimumChainWork == 0 and the arm below therefore only ever exercised the
-    // INERT path — asserting the accept direction and nothing else. Any constant
-    // between honest work and the inflation class passed it, and arm 4 injects
-    // exactly 2^200 so it could not catch a hardcoded substitution either.
-    // This uses a REAL ChainParams whose bound is non-zero, so the reject direction
-    // is exercised against a value nothing in this file chose.
-    {
-        const Dilithion::ChainParams dilv = Dilithion::ChainParams::DilV();
-        bool nonZero = false;
-        for (int i = 0; i < 32; ++i) if (dilv.nMinimumChainWork.data[i] != 0) { nonZero = true; break; }
-        Check("BOUND/prod: the DilV parameters carry a NON-ZERO nMinimumChainWork "
-              "(if this fails the arm below is inert and proves nothing)", nonZero);
-        if (nonZero) {
-            Check("BOUND/prod: an inflated header is REJECTED against the real DilV bound",
-                  !SingleHeaderWorkIsWithinBound(0x01000001u, dilv.nMinimumChainWork));
-            Check("BOUND/prod: the real DilV genesisNBits is ACCEPTED against the real bound",
-                  SingleHeaderWorkIsWithinBound(dilv.genesisNBits, dilv.nMinimumChainWork));
-        }
-    }
+    // ⛔ THE RUNNING NETWORK'S OWN PARAMETERS. The cross-network coverage moved out of
+    // here: the single-pair DilV arm that stood below is SUPERSEDED by
+    // test_property_bound_rejects_iff_work_reaches_it, whose bound space carries the
+    // REAL DilV nMinimumChainWork crossed with every nBits and a per-bound non-vacuity
+    // assertion, so a bound that rejects nothing fails loudly.
+    //
+    // What remains here is narrower and still worth its lines: whatever network THIS
+    // binary is linked against must not reject its own genesis header. main() runs
+    // Regtest, whose bound is zero, so this passes via the INERT path — and the arm
+    // PRINTS that rather than implying a reject direction it never exercised.
 
     if (Dilithion::g_chainParams != nullptr) {
         const uint256 prodBound = Dilithion::g_chainParams->nMinimumChainWork;
@@ -511,6 +664,9 @@ int main()
     test_production_validators_reject_both_classes();
     test_mask_matches_the_producer_and_is_pinned();
     test_single_header_bound_direct();
+    test_property_saturation_iff_zero_mantissa();
+    test_property_bound_rejects_iff_work_reaches_it();
+    test_property_saturation_guard_is_wired_with_inert_bound();
 
     if (g_failures != 0) {
         std::cerr << "nbits_work_saturation_tests: " << g_failures << " FAILURE(S)" << std::endl;
