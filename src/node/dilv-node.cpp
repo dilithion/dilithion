@@ -2976,26 +2976,33 @@ load_genesis_block:  // Bug #29: Label for automatic retry after blockchain wipe
                         std::cout << "  [v4.4] Startup integrity check: verifying undo data "
                                   << "for blocks [" << fromHeight << ".." << toHeight
                                   << "] via pprev walk..." << std::endl;
+                        // #120 startup-path follow-up: mirror the runtime
+                        // ChainstateIntegrityMonitor's self-heal contract at boot.
+                        // A single failed walk must NEVER be sufficient to WIPE.
+                        // Re-verify up to kRevalidateAttempts with backoff — a
+                        // transient storage-layer fault (flaky disk, fsync lag, AV
+                        // file lock on Windows, a momentary LevelDB IsIOError)
+                        // clears across retries; genuine corruption (missing key /
+                        // checksum / size / IsCorruption) reproduces every attempt.
+                        // We reuse the monitor's constants so the two paths can't
+                        // drift. This boot path is single-threaded and pre-monitor-
+                        // thread, so the backoff is a plain sleep (no Stop()/
+                        // InterruptibleWait seam exists yet).
                         UndoIntegrityFailure failure;
-                        if (!utxo_set.VerifyUndoDataInRange(pindexTip, fromHeight, toHeight, failure)) {
-                            std::cerr << "\n==========================================================" << std::endl;
-                            std::cerr << "[CRITICAL] Startup integrity check FAILED at height "
-                                      << failure.height << " hash=" << failure.blockHash.GetHex()
-                                      << " cause=" << failure.cause << std::endl;
-                            std::cerr << "This node cannot perform reorgs without manual recovery."
-                                      << " Writing auto_rebuild marker — node will wipe and resync"
-                                      << " on next launch." << std::endl;
-                            std::cerr << "==========================================================" << std::endl;
-
-                            const std::string reason =
-                                "Startup integrity check failed at height "
-                                + std::to_string(failure.height)
-                                + " cause=" + failure.cause
-                                + " hash=" + failure.blockHash.GetHex();
-                            Dilithion::WriteAutoRebuildMarker(config.datadir, reason);
-
+                        using IM = Dilithion::ChainstateIntegrityMonitor;
+                        // The retry loop, the wipe-vs-stop decision and the marker write all
+                        // live in Dilithion::RunStartupIntegrityCheck now. They used to be
+                        // inline here, in two byte-identical copies across the daemons, where
+                        // no test could link them -- chainstate_integrity_tests re-implemented
+                        // the decision in a lambda and asserted against its own copy, so
+                        // inverting this branch left the suite green (fresh pass HIGH-1).
+                        // Exit codes are unchanged: 0 continue, 1 stop-no-wipe, 2 wipe.
+                        const int integrityRc = Dilithion::RunStartupIntegrityCheck(
+                            utxo_set, pindexTip, fromHeight, toHeight, config.datadir,
+                            IM::kRevalidateAttempts, IM::kRevalidateBackoff, failure);
+                        if (integrityRc != 0) {
                             delete Dilithion::g_chainParams;
-                            return 2;  // Distinguishable exit code; wrapper restarts and wipes
+                            return integrityRc;
                         }
                         std::cout << "  [OK] Startup integrity check passed: "
                                   << (toHeight - fromHeight + 1)
