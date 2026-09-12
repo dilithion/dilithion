@@ -77,13 +77,23 @@ void RequireEqual(const char* what, const uint256& got, const uint256& want)
     }
 }
 
-// Load-bearing boolean check. Deliberately NOT the standard library's
-// assertion macro: this repo ships -DNDEBUG release builds (build-release.sh:62
-// passes it, and Makefile's `CXXFLAGS ?=` means an environment CXXFLAGS
-// replaces the default wholesale), under which every such assertion here would
-// compile to nothing and the suite would print ALL PASS with its guards
-// hollowed out -- including the single check
-// standing between a silently-short census and a plausible wrong total.
+// Load-bearing boolean check. Deliberately NOT the standard library's assertion
+// macro -- but the reason stated here until 2026-09-11 was WRONG, and the correct
+// one is narrower.
+//
+// The old reason: "-DNDEBUG release builds (build-release.sh:62) plus Makefile's
+// `CXXFLAGS ?=` means an environment CXXFLAGS replaces the default wholesale".
+// The Makefile now carries `$(OBJ_DIR)/test/%.o: override CXXFLAGS += -UNDEBUG`
+// (:1443 on this branch, :1429 on main -- grep the rule, not the line), and
+// `override` is there exactly so `make CXXFLAGS=...` cannot drop it. Test objects
+// built through this Makefile therefore KEEP their assertions; the environment
+// hole the old comment described is closed.
+//
+// What REQUIRE() still buys: the -UNDEBUG rule reaches only objects built THROUGH
+// the Makefile. A suite compiled by an IDE, a hand-written g++ line or a future
+// CMake target would strip assert() and print ALL PASS with its guards hollowed
+// out -- including the single check standing between a silently-short census and
+// a plausible wrong total.
 // Found by red-team round 2; the same reasoning as util/assert.h's Invariant().
 void RequireTrue(const char* what, bool ok)
 {

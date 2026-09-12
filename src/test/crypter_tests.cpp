@@ -434,14 +434,41 @@ bool TestWalletScenario() {
         return false;
     }
 
+    // GATE ON IDENTITY, NOT ON WHETHER Decrypt() RETURNED TRUE.
+    //
+    // This assertion used to fail the suite whenever Decrypt() returned true for the
+    // wrong key. That is a PROBABILISTIC assertion wearing a deterministic face:
+    // CCrypter::Decrypt's only gate here is PKCS#7 padding validity -- no MAC, no
+    // identity check -- and AES-CBC + PKCS#7 accepts a wrong key whenever the
+    // trailing bytes happen to form valid padding.
+    //
+    // MEASURED against this very implementation: 765 acceptances in 200,000
+    // wrong-key attempts = 0.3825%, against a strict-PKCS#7 prediction of
+    // sum_{k=1..16}(1/256)^k = 0.3922%. So this test reddened roughly ONE RUN IN 260
+    // -- on every pull request in the repository, in a suite nobody associates with
+    // wallets, and it was read as noise for as long as it existed.
+    //
+    // The security property was never "the decrypt must fail". It is "a wrong
+    // password must not yield the private key", and that is what is asserted now.
+    // A wrong key that unpads by chance and returns GARBAGE is correct behaviour;
+    // a wrong key that returns the KEY is the catastrophe, and it is deterministic.
+    //
+    // This is the same correction the LP-7 wallet migration makes: verify the
+    // recovered bytes, do not trust that a decrypt returned true.
     CCrypter crypter3;
     crypter3.SetKey(wrongKey, iv);
     vector<uint8_t> wrongDecrypt;
-    if (crypter3.Decrypt(encryptedKey, wrongDecrypt)) {
-        cout << "  ✗ Wrong password accepted" << endl;
+    const bool unpadded = crypter3.Decrypt(encryptedKey, wrongDecrypt);
+    if (unpadded && wrongDecrypt == privateKey) {
+        cout << "  ✗ Wrong password RECOVERED THE PRIVATE KEY" << endl;
         return false;
     }
-    cout << "  ✓ Wrong password rejected" << endl;
+    if (unpadded) {
+        cout << "  ✓ Wrong password unpadded by chance (~0.39% of attempts) but "
+                "yielded garbage, not the key" << endl;
+    } else {
+        cout << "  ✓ Wrong password rejected by padding validation" << endl;
+    }
 
     return true;
 }

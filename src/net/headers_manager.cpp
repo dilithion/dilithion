@@ -194,31 +194,84 @@ CHeadersManager::CHeadersManager()
     // A seat's MEDIUM asked the fair question: this flag guards
     // InitializeDoSProtectedSync, but the constructor above STILL BUILDS a
     // RandomX checker for testnet. Does anything else reach a header proof check?
-    // Censused at a60fe10d, greps excluding src/test/:
     //
-    //   (1) checker CONSTRUCTION — 2 sites, both the branch directly above:
-    //         headers_manager.cpp:197  make_unique<VDFHeaderProofChecker>
-    //         headers_manager.cpp:200  make_unique<RandomXHeaderProofChecker>
-    //       Nothing else in non-test code constructs either checker.
+    // ⛔ THIS BLOCK CITED LINE NUMBERS UNTIL 2026-09-12, AND A SEAT FOUND THEM
+    // STALE. They were measured at a60fe10d and had rotted by 186b2b89 — in a
+    // block that explicitly offers itself as re-runnable evidence, which makes
+    // stale coordinates worse here than anywhere else in this file: they invite
+    // the next reader to check, hand them wrong numbers, and the natural reading
+    // is that the CENSUS is wrong rather than that its citations rotted.
     //
-    //   (2) CheckHeaderProof CALL sites — 2, both through m_proof_checker inside
-    //       HeadersSyncState:
-    //         headerssync.cpp:261, headerssync.cpp:312
-    //       So a proof check requires a HeadersSyncState to exist.
+    // ⛔ AND ONE OF THE PUBLISHED PATTERNS WAS SELF-CONFIRMING. The old step (1)
+    // grep was `make_unique<VDFHeaderProofChecker>`; the code constructs through
+    // the fully-qualified `::dilithion::net::port::` form, so at 186b2b89 that
+    // pattern matched NOTHING BUT THIS COMMENT'S OWN TEXT. Re-running it would
+    // have "confirmed" the census by finding the census. A check that can only
+    // match its own prose is not a check.
     //
-    //   (3) A HeadersSyncState is created ONLY by InitializeDoSProtectedSync —
-    //       which is behind the refusal above.
+    // SO THE EVIDENCE IS NOW THE COMMANDS, NOT THE COORDINATES. Paste any of
+    // these at any sha; a census whose evidence is a grep does not rot, and one
+    // whose evidence is a line number rots silently and on someone else's time.
+    // Outputs shown are from 186b2b89.
     //
-    //   (4) And that entry point has ZERO PRODUCTION CALLERS. Every non-test grep
-    //       hit for InitializeDoSProtectedSync / ProcessHeadersWithDoSProtection
-    //       is a COMMENT: chainparams.cpp:148-149, :172; headerssync.cpp:46;
-    //       headers_manager.cpp:61, :408. Not one is a call.
+    //   (1) checker CONSTRUCTION — is the branch above the only one?
+    //         git grep -n "make_unique<.*HeaderProofChecker>" -- src ':!src/test'
+    //       -> TWO code hits, both in the if/else directly above, one per checker.
+    //          Nothing else in non-test code builds either. NO LINE NUMBERS ON
+    //          PURPOSE — see the note at the end. The pattern wildcards the
+    //          namespace, so a re-qualification cannot hide a site the way it hid
+    //          these from the previous version of this census.
+    //
+    //   (2) CheckHeaderProof CALL sites — note `-e`, since `->` parses as a switch:
+    //         git grep -n -e "->CheckHeaderProof(" -- src ':!src/test'
+    //       -> TWO code hits, both in headerssync.cpp, both through m_proof_checker
+    //          inside HeadersSyncState. A proof check REQUIRES a HeadersSyncState.
+    //
+    //   (3) HeadersSyncState CREATION — exactly one site:
+    //         git grep -n "make_shared<HeadersSyncState>" -- src ':!src/test'
+    //       -> ONE code hit, in this file, inside InitializeDoSProtectedSync and
+    //          AFTER the refusal, which returns false before it. So
+    //          ProcessHeadersWithDoSProtection cannot create state — it only looks
+    //          up an existing entry, and the bypass a panel asked about does not
+    //          exist. (Independently censused by COORD, same conclusion.)
+    //
+    //   (4) CALLS to either entry point, definitions and comments excluded:
+    //         git grep -nE "(InitializeDoSProtectedSync|ProcessHeadersWithDoSProtection)\s*\("     //             -- src ':!src/test'     //           | grep -vE ":[0-9]+:[[:space:]]*//"     //           | grep -vE ":[0-9]+:bool CHeadersManager::"     //           | grep -vE "\.h:[0-9]+:"
+    //       -> ZERO code hits. Every remaining non-test hit is a comment or a
+    //          declaration.
+    //
+    //       ⛔ THE FILTER'S FIRST VERSION COULD HIDE THE THING IT COUNTS, and two
+    //       seats found it independently. It excluded any line containing `bool `,
+    //       so a REAL call site written `bool ok = mgr.InitializeDoSProtectedSync(...)`
+    //       would have been filtered out and the ZERO would still have printed.
+    //       Measured on a fixture carrying exactly that line: the old filter kept
+    //       1 of 2 real calls; this one keeps 2 of 2, drops the comment-only line,
+    //       and drops both definitions and the header declaration — and still
+    //       returns ZERO on the tree, so the claim survives the stricter filter.
+    //
+    //       The repair is the shape, not the spelling: exclude COMMENT-ONLY lines
+    //       (anchored `:<lineno>:` then whitespace then `//`), never any line that
+    //       merely CONTAINS a comment or a type name.
+    //
+    //       SECOND instance of one class in this block — the first was a pattern
+    //       that matched only its own comment text. Both are checks whose success
+    //       condition can be satisfied by something other than the claim being
+    //       true. **Hostile-reading your own evidence commands is a separate step
+    //       from writing them**, and in this block it has now paid twice.
     //
     // So the testnet checker object the constructor builds is UNREACHABLE twice
     // over: nothing creates the state that would use it, and if a future caller
-    // tries, the refusal stops it before the state exists. That is the whole
-    // argument, and each step is a grep someone can re-run at this sha rather
-    // than a claim to be taken on trust.
+    // tries, the refusal stops it before the state exists.
+    //
+    // ⚠️ TWO NOTES ON READING THE OUTPUT, both learned by getting them wrong here:
+    //   * NO LINE NUMBERS ARE QUOTED ABOVE, only counts and files. Rewriting this
+    //     very comment shifted every line it had just cited — the rot reappeared
+    //     inside the commit that was fixing it. Counts and filenames survive an
+    //     edit; coordinates do not.
+    //   * EACH COMMAND ALSO MATCHES THE LINE OF THIS COMMENT THAT PRINTS IT.
+    //     That is harmless but you must not count it: the claim is about the CODE
+    //     hits. Add `| grep -v "^src/net/headers_manager.cpp:.*//"` if you want
+    //     the commands to exclude their own documentation.
     //
     // ⚠️ IF (4) EVER STOPS BEING TRUE — i.e. A-3 wires a real caller — step (4)
     // is gone and the refusal at that caller becomes the ONLY thing standing
@@ -801,6 +854,24 @@ bool CHeadersManager::ProcessHeaders(NodeId peer, const std::vector<CBlockHeader
 // DoS-Protected Header Sync (Bitcoin Core two-phase)
 // ============================================================================
 
+// Test/diagnostic observable: which PHASE a peer's DoS-protected session is in,
+// or nullopt when it has none.
+//
+// It reports the STATE MACHINE'S OWN FIELD, not a proxy inferred from a return
+// value. ProcessHeadersWithDoSProtection returns `true` both when a sync is
+// progressing and when it has just been terminated by a non-full headers message
+// — the termination sets success = true deliberately, because the headers in that
+// batch were valid. A test reading only the return value therefore cannot see the
+// abort at all, which is how the hardcoded `true` above survived unnoticed.
+std::optional<HeadersSyncState::State>
+CHeadersManager::GetHeadersSyncPhase(NodeId peer) const
+{
+    std::lock_guard<std::mutex> lock(cs_headers);
+    auto it = mapHeadersSyncStates.find(peer);
+    if (it == mapHeadersSyncStates.end() || !it->second) return std::nullopt;
+    return it->second->GetState();
+}
+
 bool CHeadersManager::ProcessHeadersWithDoSProtection(NodeId peer, const std::vector<CBlockHeader>& headers)
 {
     // Phase 6 PR6.1: per-peer rate limit. Same policy as ProcessHeaders.
@@ -846,6 +917,13 @@ bool CHeadersManager::ProcessHeadersWithDoSProtection(NodeId peer, const std::ve
         } else {
             sync_state = it->second;
             if (!sync_state || sync_state->GetState() == HeadersSyncState::State::FINAL) {
+                // Erase-by-key is SAFE HERE, unlike the two sites further down:
+                // cs_headers has been held continuously since the find() two
+                // lines above, so no other thread can have replaced the entry.
+                // The A-1 compare-and-erase is needed only where the lock was
+                // RELEASED across the expensive call. Recorded so this site is
+                // neither "fixed" unnecessarily nor copied as a pattern to the
+                // sites where it is wrong.
                 mapHeadersSyncStates.erase(peer);
                 sync_state = nullptr;
             }
@@ -859,11 +937,46 @@ bool CHeadersManager::ProcessHeadersWithDoSProtection(NodeId peer, const std::ve
     // validates headers and is expensive, and holding the global header lock
     // across it would serialise the header path. Safe now only because
     // sync_state is a shared_ptr taken above.
-    auto result = sync_state->ProcessNextHeaders(headers, true);
+    // ⛔ LP-10 F5 / D-1, THE CALLER'S HALF — this argument was hardcoded `true`.
+    //
+    // `full_headers_available` is the SYNC-TERMINATION SIGNAL: a NON-full headers
+    // message means the peer has nothing more to give (PRESYNC) or is declining to
+    // re-serve the chain it claimed (REDOWNLOAD), and HeadersSyncState aborts the
+    // sync on it. Passing a constant `true` told it every message was full, so
+    // BOTH aborts were unreachable from the only caller that exists — the signal
+    // was restored inside the state machine and still could not fire.
+    //
+    // Fixing the callee alone would have been the "wired" mistake in its purest
+    // form: a correct check no production path can reach.
+    //
+    // Core v28.0 net_processing.cpp:2787 derives it exactly this way:
+    //     ProcessNextHeaders(headers, headers.size() == MAX_HEADERS_RESULTS)
+    // A peer that fills the message to the protocol maximum has more to send; any
+    // shorter answer is the end of what it has.
+    const bool full_headers_message =
+        (headers.size() == Consensus::MAX_HEADERS_RESULTS);
+
+    auto result = sync_state->ProcessNextHeaders(headers, full_headers_message);
 
     if (!result.success) {
         std::lock_guard<std::mutex> lock(cs_headers);
-        mapHeadersSyncStates.erase(peer);
+        // LP-10 A-1 (H-3 / invariant I6): COMPARE-AND-ERASE, never erase by key.
+        //
+        // The lock was RELEASED for the expensive ProcessNextHeaders call above.
+        // In that window another thread can disconnect this peer (erasing S1) and
+        // re-initialise it (creating S2). An erase by NodeId here would then
+        // destroy S2 -- a session this thread never processed, whose owner is
+        // still using it. The §2.1b shared_ptr keeps S2's MEMORY alive, so this
+        // is not a use-after-free and TSan cannot see it: it is a silent, wrong
+        // DESTRUCTION of live session state. The A-9 harness drove this exact
+        // interleaving 24,002 times under TSan and correctly reported clean.
+        //
+        // MEASURED (A-1): erase-by-key destroyed 44 of 44 sessions in the ABA
+        // window; compare-and-erase destroyed 0 of 74 windows hit.
+        auto it = mapHeadersSyncStates.find(peer);
+        if (it != mapHeadersSyncStates.end() && it->second == sync_state) {
+            mapHeadersSyncStates.erase(it);
+        }
         return false;
     }
 
@@ -923,7 +1036,13 @@ bool CHeadersManager::ProcessHeadersWithDoSProtection(NodeId peer, const std::ve
     // and it previously ran unlocked (LP-10 §2.1b).
     if (sync_state->GetState() == HeadersSyncState::State::FINAL) {
         std::lock_guard<std::mutex> lock(cs_headers);
-        mapHeadersSyncStates.erase(peer);
+        // LP-10 A-1 (H-3 / invariant I6): COMPARE-AND-ERASE. Same reasoning as
+        // the !result.success site above -- this is its SIBLING, and fixing one
+        // without the other is the shape this mission has hit repeatedly.
+        auto it = mapHeadersSyncStates.find(peer);
+        if (it != mapHeadersSyncStates.end() && it->second == sync_state) {
+            mapHeadersSyncStates.erase(it);
+        }
     }
 
     return true;
@@ -1963,6 +2082,9 @@ void CHeadersManager::OnPeerDisconnected(NodeId peer)
 
     mapPeerStates.erase(peer);
     mapPeerStartHeight.erase(peer);  // BUG #62: Clean up peer height tracking
+    // Erase-by-key is CORRECT and DELIBERATE here: on disconnect we want to drop
+    // whatever session currently exists for this NodeId, regardless of identity.
+    // This is the one site where the A-1 compare-and-erase would be WRONG.
     mapHeadersSyncStates.erase(peer);  // Clean up DoS protection state
     m_peerHeaderRate.erase(peer);  // Phase 6 PR6.1 fix-up (subagent v1.5+ BLOCKER): prevent monotonic
                                    // memory leak under Bitcoin-level peer churn

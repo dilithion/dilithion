@@ -126,20 +126,43 @@ int CPeerManager::GetMisbehaviorScore(int peer_id) const {
     return m_scorer->GetScore(peer_id);
 }
 
-// Phase 3: typed-reason Misbehaving for HeadersSync-layer call sites.
-// Routes through the maybe_punish_node.h wrapper to compute the weight
-// (DefaultWeight + Q6=B override), maps to the legacy diagnostic enum
-// for banlist.dat audit, then calls the existing Misbehaving forwarder
-// so seed-node guard + banman.Ban + AddrMan signal all fire.
+// Phase 3: typed-reason Misbehaving for HeadersSync-layer call sites. Reads the
+// weight from maybe_punish_node.h::HeaderRejectWeight, maps to the legacy
+// diagnostic enum for banlist.dat audit, then calls the existing Misbehaving
+// forwarder so seed-node guard + banman.Ban + AddrMan signal all fire.
+//
+// ⚠️ THIS FUNCTION — NOT MaybePunishNodeForHeaders — IS THE PRODUCTION PATH.
+// The only raise site in the tree is net.cpp:1856 (HEADERS count too large), and
+// it calls straight into here. maybe_punish_node.h's file header used to say the
+// wrapper was "WIRED ... via the CPeerManager::MisbehaveHeaders forwarder"; the
+// forwarder has never called it. They are two paths onto two different scoring
+// interfaces (IPeerScorer vs CPeerManager::Misbehaving, which additionally runs
+// the seed-node guard and banman), and they share only the weight table.
+//
+// Which is why the zero-weight refusal below is DUPLICATED here rather than left
+// in the wrapper: a gate that lives only in the wrapper is a gate no production
+// call reaches. The wrapper carries the identical check, and a test pins each.
 void CPeerManager::MisbehaveHeaders(
     int peer_id,
     ::dilithion::net::port::HeaderRejectReason reason)
 {
     const int weight = ::dilithion::net::port::HeaderRejectWeight(reason);
+
+    // Honest-emittable reasons, and reasons that are OUR fault, are refused
+    // before the scorer is touched at all — a zero-weight Misbehaving() still
+    // creates the peer's score entry and still writes a line that reads as
+    // misbehavior. See the per-reason arguments in maybe_punish_node.h.
+    if (weight <= 0) return;
+
     const auto policy_type =
         ::dilithion::net::port::MapHeaderRejectToMisbehaviorType(reason);
+    // Every scored reason carries a policy type by construction: the sole reason
+    // without one (LocalStateUnavailable) is weight 0 and was refused above.
+    // Fail closed rather than mislabel if that ever stops being true.
+    if (!policy_type) return;
+
     const ::MisbehaviorType diag =
-        ::dilithion::net::port::MapPolicyToDiagnostic(policy_type);
+        ::dilithion::net::port::MapPolicyToDiagnostic(*policy_type);
     Misbehaving(peer_id, weight, diag);
 }
 
