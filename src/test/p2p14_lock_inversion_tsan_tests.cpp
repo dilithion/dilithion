@@ -117,8 +117,10 @@ int main(int argc, char* argv[])
 {
     const std::string arm = (argc > 1) ? argv[1] : "registered";
     const bool register_callback = (arm == "registered");
-    if (arm != "registered" && arm != "unregistered") {
-        std::cerr << "usage: " << argv[0] << " registered|unregistered\n";
+    const bool accessor_arm = (arm == "accessor-unsafe" || arm == "accessor-safe");
+    if (arm != "registered" && arm != "unregistered" && !accessor_arm) {
+        std::cerr << "usage: " << argv[0]
+                  << " registered|unregistered|accessor-unsafe|accessor-safe\n";
         return 2;
     }
 
@@ -148,6 +150,136 @@ int main(int argc, char* argv[])
 
     CChainState chainstate;
 
+    // ================================================================
+    // P2P-14/15 §0.3-POST — VALUE-ACCESSOR ARMS (a8, 2026-09-07)
+    // ================================================================
+    // Separate question from the lock-order arms above, needing its own
+    // control: NOT "do two locks invert" but "does a pointer escape its lock".
+    //
+    // GetBlockIndex acquires cs_main, RELEASES it, and returns a raw
+    // CBlockIndex*. Any caller that then dereferences it is reading an object
+    // another thread may be writing under the lock — LP10's measured shape at
+    // 6353bc33 ("a mutex on one side buys nothing"). OnBlockActivated did
+    // exactly this and was safe ONLY because its caller still held cs_main;
+    // the P2P-14/15 fix fires that callback with cs_main released, which
+    // deleted the guarantee. GetBlockHeightByHash reads and dereferences
+    // inside one lock scope and copies the value out.
+    //
+    // The writer: AddBlockIndex on an EXISTING hash takes cs_main and merges
+    // into the live entry (`existing->nStatus |= incoming`). cs_main is
+    // private, so a test cannot hold it directly — this is the available way
+    // to get a lock-held write to the same object.
+    //
+    // ⚠️ WHAT THESE ARMS DO AND DO NOT SHOW — corrected after red-team M-1,
+    // which found my original claim unsupported by my own fixture.
+    //
+    // THE RED ARM IS EVIDENCE. It shows the PRE-FIX pattern — pointer obtained
+    // under cs_main, dereferenced after release — races against a writer that
+    // holds cs_main. TSan names it: write of 4 bytes by T2 holding M0, previous
+    // read of the same address by T1 holding nothing, on the CBlockIndex.
+    //
+    // THE GREEN ARM IS NOT A CONTROL FOR IT, and saying so is the honest read.
+    // The unsafe arm reads nStatus (the field the writer varies); the safe arm
+    // reads nHeight, and the writer sets nHeight to the SAME value every
+    // iteration because AddBlockIndex's topology invariant forbids varying it.
+    // So nothing ever writes a different value to the field the safe arm reads.
+    // A deliberately UNSAFE read of nHeight would be green in this fixture too.
+    // The green is explained by the field choice, independently of the
+    // mechanism — it has no discriminating power.
+    //
+    // An earlier version of this comment stated the confound and then drew the
+    // conclusion the confound forbids ("a demonstration that POINTER ESCAPE
+    // races and VALUE RETURN does not"). It demonstrates no such thing.
+    //
+    // SO THE SAFE HALF RESTS ON CONSTRUCTION, LABELLED AS SUCH:
+    // GetBlockHeightByHash performs the lookup, the dereference and the copy
+    // inside one cs_main scope, so no pointer exists to outlive the lock. That
+    // is an argument, not a measurement, and it is the same resolution this
+    // project accepted for #178 — where two mutants of a real race both
+    // survived because the window was unobservable, the theatre test was
+    // DELETED, and the property was rested on `exchange()` being correct by
+    // construction with red-team adjudicating the argument rather than a badge.
+    //
+    // A genuine same-field A/B would need a value accessor for nStatus. That is
+    // production API added solely to make a test discriminate, which is its own
+    // smell; not added. If someone wants the measurement instead of the
+    // argument, that is the price.
+    if (accessor_arm) {
+        const bool unsafe = (arm == "accessor-unsafe");
+        std::cout << "[p2p1415-accessor] arm=" << arm << "  pattern="
+                  << (unsafe ? "GetBlockIndex + deref AFTER release (pre-fix)"
+                             : "GetBlockHeightByHash (value, under lock)")
+                  << std::endl;
+
+        // The key MUST be the header's own computed hash — AddBlockIndex trips
+        // `INVARIANT VIOLATION: pindex->GetBlockHash() == hash` (chain.cpp:98)
+        // otherwise. An invented key aborts the process before either thread
+        // runs, which reads as EXIT=134 with zero races: a fixture failure
+        // wearing the costume of a clean result.
+        uint256 prev;
+        std::memset(prev.data, 0, 32);
+        const CBlockHeader targetHeader = MakeVDFHeader(prev, 1700000042);
+        const uint256 target = targetHeader.GetHash();
+        {
+            auto idx = std::make_unique<CBlockIndex>();
+            idx->header = targetHeader;
+            idx->phashBlock = target;   // GetBlockHash() aborts without this
+            idx->nHeight = 0;   // null hashPrevBlock => genesis-shaped; AddBlockIndex requires 0
+            idx->nStatus = 0;
+            chainstate.AddBlockIndex(target, std::move(idx));
+        }
+
+        std::atomic<bool> stop{false};
+        std::atomic<uint64_t> reads{0}, writes{0};
+
+        std::thread reader([&]() {
+            while (!stop.load(std::memory_order_relaxed)) {
+                if (unsafe) {
+                    // PRE-FIX PATTERN — the pointer outlives the lock.
+                    CBlockIndex* p = chainstate.GetBlockIndex(target);
+                    if (p) {
+                        volatile uint32_t observed = p->nStatus;  // unlocked read
+                        (void)observed;
+                    }
+                } else {
+                    // POST-FIX PATTERN — nothing escapes the lock scope.
+                    int h = 0;
+                    (void)chainstate.GetBlockHeightByHash(target, h);
+                }
+                reads.fetch_add(1, std::memory_order_relaxed);
+            }
+        });
+
+        std::thread writer([&]() {
+            for (int i = 0; i < 4000 && !stop.load(std::memory_order_relaxed); ++i) {
+                auto dup = std::make_unique<CBlockIndex>();
+                dup->header = targetHeader;       // same hash → merge path, invariant holds
+                dup->phashBlock = target;         // GetBlockHash() aborts without this
+                dup->nHeight = 0;                 // same topology → no disagreement trip
+                dup->nStatus = (i & 1) ? 0x2 : 0x4;
+                chainstate.AddBlockIndex(target, std::move(dup));  // writes under cs_main
+                writes.fetch_add(1, std::memory_order_relaxed);
+            }
+            stop.store(true, std::memory_order_relaxed);
+        });
+
+        writer.join();
+        stop.store(true, std::memory_order_relaxed);
+        reader.join();
+
+        std::cout << "[p2p1415-accessor] reads=" << reads.load()
+                  << " writes=" << writes.load() << std::endl;
+        // Both counters must be non-zero or the arm proved nothing: a zero
+        // means one thread never ran and the result is about scheduling, not
+        // about the pattern.
+        if (reads.load() == 0 || writes.load() == 0) {
+            std::cerr << "[p2p1415-accessor] HARNESS DEFECT: a thread did no work; "
+                         "any race count from this run is meaningless" << std::endl;
+            return 3;
+        }
+        return 0;
+    }
+
     // Bypass the DB/UTXO work of the real ConnectTip. This does NOT bypass the
     // lock: ActivateBestChain still holds cs_main across the override and still
     // reaches NotifyTipUpdate, which is the only part of that path this harness
@@ -163,11 +295,26 @@ int main(int argc, char* argv[])
     // and dilv-node.cpp:3371. This single line is the difference between the
     // two arms, and it is the line that puts the reverse edge in the binary.
     if (register_callback) {
-        chainstate.RegisterTipUpdateCallback([](const CBlockIndex* pindex) {
-            if (g_node_context.headers_manager && pindex) {
+        // P2P-14/15 SIGNATURE UPDATE (a8, 2026-09-07). This registration was
+        // written against the pre-fix `void(const CBlockIndex*)` signature. The
+        // fix passes the header and hash BY VALUE, so the old form no longer
+        // compiles and this had to change with it.
+        //
+        // WHAT DID NOT CHANGE — and this is what keeps the two arms comparable:
+        // the callback still calls OnBlockActivated, which still takes
+        // cs_headers. The reverse edge this harness exists to put in the binary
+        // is identical; only the parameter list differs. If this arm ever stops
+        // reaching cs_headers, the harness stops testing anything.
+        //
+        // The RED baseline in docs/p2p14-lock-inversion/*.err was produced by
+        // the PRE-FIX harness against the PRE-FIX tree — the correct pairing.
+        // A post-fix green from this updated harness is evidence about the
+        // post-fix tree; it is NOT a re-run of the recorded baseline, and must
+        // not be presented as one.
+        chainstate.RegisterTipUpdateCallback([](const CBlockHeader& header, const uint256& hash) {
+            if (g_node_context.headers_manager) {
                 g_reverse_fired.fetch_add(1);
-                g_node_context.headers_manager->OnBlockActivated(
-                    pindex->header, pindex->GetBlockHash());
+                g_node_context.headers_manager->OnBlockActivated(header, hash);
             }
         });
     }

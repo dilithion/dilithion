@@ -2,6 +2,8 @@
 // Distributed under the MIT software license
 
 #include <consensus/chain.h>
+
+#include <string>
 #include <consensus/params.h>    // Consensus::MAX_REORG_DEPTH (single source of truth)
 #include <consensus/pow.h>
 #include <consensus/reorg_wal.h>  // P1-4: WAL for atomic reorgs
@@ -21,7 +23,10 @@
 #include <algorithm>
 #include <cstring>      // std::strcmp (env-var check)
 #include <mutex>        // std::once_flag (chain selector path startup log)
+#include <sstream>      // std::ostringstream (unregistered-resolver diagnostic)
 #include <set>
+#include <pthread.h>
+#include <type_traits>
 #include <thread>
 #include <chrono>
 
@@ -61,6 +66,32 @@ void CChainState::Cleanup() {
     // mapBlockIndex is cleared first, the set's destructor / further accesses
     // would dereference dangling pointers via the comparator.
     m_setBlockIndexCandidates.clear();
+
+    // ⚠️ THE LEAF SIDE INDEX IS THE SAME HAZARD, AND IT WAS MISSED (round-5
+    // reader, HIGH-1). Both structures hold NON-OWNING raw CBlockIndex*, exactly
+    // like the candidate set above — whose comment explains this hazard in as
+    // many words, three lines up from where the omission was written.
+    //
+    // Cleanup() is a THIRD membership mutator. PR #129 documented "maintenance is
+    // exactly TWO sites" (AddBlockIndex and the evictor's erase) and that was
+    // wrong TWICE -- see the four-site census at AddBlockIndex. It was
+    // FALSE: `mapBlockIndex.clear()` below frees every node, and without these two
+    // lines m_inDegree and m_evictableLeaves keep the freed pointers. The very
+    // next AddBlockIndex then calls m_evictableLeaves.insert(), whose comparator
+    // reads nChainWork and GetBlockHash() off FREED memory — a use-after-free on
+    // the first insert, and a permanently desynced index thereafter.
+    //
+    // NOT hypothetical: Cleanup() is reused in PRODUCTION, not only in teardown.
+    // dilithion-node.cpp:2970 and dilv-node.cpp:2836 do
+    //     Cleanup(); SetTip(nullptr); goto load_genesis_block;
+    // as the corrupted-DB auto-recovery path, and fixtures re-use it ~19 times.
+    //
+    // WHY THE ORIGINAL GREP MISSED IT: #129 searched for the SHAPE of insert and
+    // erase. `clear()` is neither, and the name-based search never saw it. A
+    // census of mapBlockIndex MUTATIONS finds it; a census of the two operations
+    // someone had in mind does not.
+    m_inDegree.clear();
+    m_evictableLeaves.clear();
 
     // Perf fix 2026-07-12: mapBlockIndex is about to be cleared below —
     // the cached tip set is now stale.
@@ -139,7 +170,74 @@ bool CChainState::AddBlockIndex(const uint256& hash, std::unique_ptr<CBlockIndex
             // map (same invariant the first-time-add path checks below).
             uint256 parentHash = pindex->pprev->GetBlockHash();
             ConsensusInvariant(mapBlockIndex.count(parentHash) > 0);
+
+            // ⚠️ HEIGHT RELATION, NOT JUST PARENT PRESENCE (round-6, kimi MEDIUM).
+            // The first-time-add path asserts `nHeight == pprev->nHeight + 1`
+            // (:225); this arm asserted only that the parent EXISTS. That gap
+            // mints pprev CYCLES: adopt X->pprev = P and then P->pprev = X, both
+            // at height 0, and every check above passes. The leaf index stays
+            // perfectly consistent — in-degree 1 each, neither is a leaf, nothing
+            // is evictable — so the invariant suite would call it healthy while
+            // FindFork's two-pointer walk spins forever on the cycle. A HANG, not
+            // a corruption, and invisible to every structural check we have.
+            //
+            // The same relation the first-time path enforces, enforced here.
+            //
+            // ⚠️ AND THIS MAKES THE WHOLE ARM UNREACHABLE — a proof, arrived at by
+            // adding the check and then following it through, not a claim made in
+            // advance:
+            //
+            //   * to reach this arm, `existing` must have a NULL pprev;
+            //   * an entry enters the map parentless only through the else-branch
+            //     at :243, which asserts `nHeight == 0` — so existing->nHeight == 0;
+            //   * this check then requires 0 == pprev->nHeight + 1, i.e. a parent
+            //     at height -1. Heights are non-negative.
+            //
+            // So adoption cannot occur, gpt6's cycle sequence cannot occur, and the
+            // arm is dead BY CONSTRUCTION rather than by anyone's assurance that no
+            // caller does it. That is the "unreachable and ENFORCED" outcome the
+            // review originally preferred, reached from the other direction: the
+            // cycle fix proves the unreachability rather than assuming it.
+            //
+            // The maintenance below STAYS. It costs two lines, it is correct if a
+            // future change ever reopens the arm (relaxing :243 for orphan handling
+            // is exactly the plausible change), and an unmaintained-but-unreachable
+            // arm is how this defect got here in the first place.
+            ConsensusInvariant(existing->nHeight == pindex->pprev->nHeight + 1);
+
             existing->pprev = pindex->pprev;
+
+            // ⚠️ THIS IS A FOURTH MEMBERSHIP MUTATOR, AND IT WAS UNMAINTAINED
+            // (round-5 seats, found independently by gpt6 and grok).
+            //
+            // Adoption CHANGES THE pprev GRAPH of a live map member. The adopted
+            // parent has just gained a child, so it is no longer a leaf — but
+            // without the two lines below it stayed in m_evictableLeaves with
+            // in-degree 0, and the evictor would free a node that `existing` names
+            // as pprev. That is the interior-node use-after-free this entire PR
+            // exists to close, reachable through the one mutator the maintenance
+            // census missed.
+            //
+            // gpt6's accepted sequence: insert P and X as parentless height-0
+            // entries, then merge another X with unchanged height and work and
+            // pprev = P. Every invariant above passes — the merge checks parent
+            // PRESENCE, not the height relation — and low-work unpinned P is then
+            // evicted with X->pprev dangling.
+            //
+            // MAINTAINED RATHER THAN INVARIANT-KILLED, and the choice is
+            // deliberate. No production caller adopts: ProcessNewHeader rejects
+            // orphans, so pprev is null only for genesis, and this arm is
+            // defence-in-depth. (An earlier version of this comment said
+            // add_block_index_flag_merge_tests "Case 5" exercises it. IT DOES NOT:
+            // Case 5 merges a null pprev with a null pprev, which never enters
+            // this arm -- its own note says so. Corrected rather than left, since
+            // a false citation is how a reviewer concludes a path is covered.) Turning it into a hard invariant failure would
+            // convert a tolerated, currently-harmless case into a NODE ABORT the
+            // first time some future orphan-handling change reached it. Three
+            // lines of maintenance make it correct whether or not it ever fires;
+            // an abort makes it fatal exactly when someone stops being lucky.
+            m_inDegree[existing->pprev] += 1;
+            m_evictableLeaves.erase(existing->pprev);
         }
         // (existing->pprev != nullptr && pindex->pprev == nullptr): keep
         // existing linkage. The incoming entry simply lacks information
@@ -174,7 +272,33 @@ bool CChainState::AddBlockIndex(const uint256& hash, std::unique_ptr<CBlockIndex
     }
 
     // Transfer ownership to map using move semantics
+    CBlockIndex* praw = pindex.get();
     mapBlockIndex[hash] = std::move(pindex);
+    // PR #129 round 4: keep the evictable-leaf side index in step. This is
+    // FOUR MAINTENANCE SITES, censused by SHAPE. This said "exactly TWO" three
+    //     times and was wrong twice over -- it missed Cleanup()'s clear() (round-5
+    //     reader) and the merge arm's pprev adoption (round-5 seats). Both were found by
+    //     other people, and both were missed the same way: the original census looked for
+    //     the two OPERATIONS someone had in mind rather than for every mutation.
+    //     The grep that finds all four:
+    //       mapBlockIndex MEMBERSHIP  ->  grep 'mapBlockIndex\s*\(\.\(insert\|emplace\|erase\|clear\)\|\[\)'
+    //           Cleanup()                     clear()  -> clear both structures
+    //           AddBlockIndex                 insert   -> LeafIndexOnInsert
+    //           EvictLowestWorkLeafNotPinned  erase()  -> LeafIndexOnErase
+    //       pprev GRAPH of a LIVE member  ->  grep '\->pprev\s*='
+    //           AddBlockIndex merge arm       adopt    -> in-degree + leaf erase
+    //     (BY SYMBOL, NOT BY LINE. This block cited :107/:232/:757/:167; by the
+    //      time a reviewer read it the actual lines were :108/:268/:890/:203. All
+    //      four drifted inside this PR, which is the third time line cites have
+    //      gone stale here -- a stale cite in a safety census sends the next
+    //      person to innocent code.)
+    //     A pprev written on a NEW index BEFORE AddBlockIndex (block_processing.cpp and
+    //     friends) is NOT a maintenance site: the entry is not in the map yet, and
+    //     LeafIndexOnInsert reads its pprev when it arrives. Only mutations of an entry
+    //     ALREADY in the map need maintenance.
+    // This is the INSERT site;
+    // LeafIndexMatchesBruteForce() goes false if either is removed.
+    LeafIndexOnInsert(praw);
 
     // Perf fix 2026-07-12: a brand-new entry is itself a new tip, and if it
     // has a parent, that parent just gained a child and stops being a tip.
@@ -183,6 +307,15 @@ bool CChainState::AddBlockIndex(const uint256& hash, std::unique_ptr<CBlockIndex
     return true;
 }
 
+namespace {
+// Defined with the epoch registry below; declared here because the two pointer
+// accessors sit above it. Called with cs_main HELD and the CURRENT global epoch:
+// a thread that obtains a CBlockIndex* without being a participant gets a PINNING
+// slot (value 0) rather than merely a record, and a thread that resolves while
+// OFFLINE re-enters at `current_epoch` before the pointer escapes the lock.
+void NoteIndexPointerResolved(uint64_t current_epoch);
+}  // namespace
+
 CBlockIndex* CChainState::GetBlockIndex(const uint256& hash) {
     // CRITICAL-1 FIX: Acquire lock before accessing shared state
     std::lock_guard<std::recursive_mutex> lock(cs_main);
@@ -190,9 +323,36 @@ CBlockIndex* CChainState::GetBlockIndex(const uint256& hash) {
     // HIGH-C001 FIX: Return raw pointer (non-owning) via .get()
     auto it = mapBlockIndex.find(hash);
     if (it != mapBlockIndex.end()) {
+        // A raw pointer is about to leave the lock scope. If this thread never
+        // checkpoints, that pointer's existence is what pins the graveyard.
+        //
+        // ⚠️ AND HERE IS THE HOLE, AT THE PLACE THE POINTER IS HANDED OUT: from this
+        // moment until the caller drops it, the caller MUST NOT make an epoch claim
+        // — not a checkpoint, not a quiesce, not the exit of an EpochOfflineScope.
+        // Any of the three publishes "I hold nothing" while this pointer is live,
+        // and the entry can then be freed under it. Nothing here can detect that;
+        // the pointer is a raw pointer on the caller's stack. It is a CONTRACT, and
+        // the resolve-then-claim direction is the half that has no detector at all
+        // (the offline-resolve counter catches claim-then-resolve, the other order).
+        // See the scope-site table in the quiescence proof for the per-site review.
+        NoteIndexPointerResolved(m_globalEpoch.load(std::memory_order_acquire));
         return it->second.get();  // Extract raw pointer from unique_ptr
     }
     return nullptr;
+}
+
+bool CChainState::GetBlockHeightByHash(const uint256& hash, int& heightOut) const {
+    // P2P-14/15 §0.3-POST. Read AND dereference inside one lock scope, so no
+    // pointer escapes for a caller to use after the lock is gone. See the
+    // header for why GetBlockIndex's pointer return is unsafe for this caller.
+    std::lock_guard<std::recursive_mutex> lock(cs_main);
+
+    auto it = mapBlockIndex.find(hash);
+    if (it == mapBlockIndex.end() || it->second == nullptr) {
+        return false;
+    }
+    heightOut = it->second->nHeight;  // dereferenced under the lock, copied out
+    return true;
 }
 
 bool CChainState::HasBlockIndex(const uint256& hash) const {
@@ -203,62 +363,1800 @@ bool CChainState::HasBlockIndex(const uint256& hash) const {
 }
 
 // Phase 6 PR6.1 (v1.5 §3.2 + Cursor v1.5+ A1): cap-eviction policy.
-// Evicts lowest-work entry NOT on the active chain.
-bool CChainState::EvictLowestWorkNotOnBestChain() {
+// LEAF-ONLY safe eviction — see the contract in chain.h. Re-does the
+// v4.5.0-pulled cap fix without the use-after-free: the prior version could
+// free an INTERIOR fork node whose higher-work child still referenced it via
+// pprev, dangling that child's pprev. This version frees ONLY unpinned leaves
+// (in-degree 0 in the pprev graph), lowest nChainWork first, multi-pass.
+// ============================================================================
+// EVICTABLE-LEAF SIDE INDEX (PR #129 round 4). See chain.h for the leaf lemma
+// and the nChainWork-immutability census that make this correct.
+// ============================================================================
+
+// ============================================================================
+// DEFERRED RECLAMATION. See chain.h for why this exists and why it needs
+// leaf-only eviction alongside it, and the quiescence proof doc for the
+// thread-by-thread table of checkpoint points.
+// ============================================================================
+
+namespace {
+
+// Per-thread epoch. A thread that has never checkpointed reads 0, which is
+// treated as "may hold anything" so nothing is ever freed on its account — the
+// safe direction. A thread only becomes a participant by checkpointing at least
+// once, which is exactly the point at which it starts making promises.
+//
+// The registry is a plain vector of pointers to the thread-locals plus a mutex.
+// It is written once per thread (first checkpoint) and read on every drain.
+struct EpochRegistry {
+    std::mutex mu;
+    std::vector<std::atomic<uint64_t>*> slots;
+
+    // THE PARTICIPANT TABLE, BUILT BY THE CODE THAT SPAWNS THE THREADS.
+    // `declared` is written at each spawn site, `registered` by each thread's
+    // first checkpoint. Deliberately not a static list: a static list cannot know
+    // whether the txindex thread was started on THIS run, and a count that
+    // includes a thread the config never spawned fails a healthy node.
+    //
+    // ⚠️ COUNTS, NOT A SET OF NAMES, AND THE DIFFERENCE IS A POOL. These were
+    // std::set<std::string>, so ONE `rpc-worker` reaching its first checkpoint
+    // satisfied the gate for the WHOLE POOL — the other fifteen could have been
+    // wired wrong and the census would still pass. A pool declares its size and
+    // every member registers itself, so the gate now compares thread counts.
+    std::map<std::string, size_t> declared;     // name -> how many threads promised
+    std::map<std::string, size_t> registered;   // name -> how many have checkpointed
+};
+
+EpochRegistry& Registry()
+{
+    // ⚠️ LEAKED ON PURPOSE, like the slots themselves. This was a Meyers static,
+    // destroyed during static destruction — and the thread_local destructors below
+    // LOCK ITS MUTEX. A thread that exits after this object is destroyed would lock
+    // freed memory: undefined behaviour at process exit, dependent on an ordering
+    // nobody controls. One allocation for the life of the process.
+    static EpochRegistry* r = new EpochRegistry();
+    return *r;
+}
+
+// A retired thread's slot value. The slots are deliberately leaked so a drain on
+// another thread can read them after the owner exits — but a DEAD thread's stale
+// epoch went on capping the minimum forever; see EpochThreadRecordDtor below.
+constexpr uint64_t EPOCH_SLOT_RETIRED = ~uint64_t{0};
+
+// ══════════════════════════════════════════════════════════════════════════════
+// ⚠️ THE PER-THREAD EXIT RECORD. READ THIS BEFORE ADDING ANY thread_local HERE.
+// ══════════════════════════════════════════════════════════════════════════════
+//
+// EVERY C++ thread_local DESTRUCTOR IN THIS PROCESS RUNS AFTER ITS OWN STORAGE HAS
+// BEEN free()d. That is not a race and not a bug in this file — it is how the
+// toolchain we ship on is built, and it was measured, not reasoned:
+//
+//   * GCC on mingw-w64 implements `thread_local` with **emutls**: one
+//     `malloc(size + 8)` block per variable per thread, the object at base+8, and
+//     ONE pthread key whose destructor (`emutls_destroy`) frees ALL of a thread's
+//     blocks.
+//   * libstdc++'s `__cxa_thread_atexit` has no `__cxa_thread_atexit_impl` to call
+//     on this CRT (measured: absent from every `libmsvcrt*.a` / `libucrt*.a`), so
+//     it falls back to a per-thread list of `elt {dtor, obj, next, dll}` — 32 bytes,
+//     one `new elt` per registration — held in a **second** pthread key.
+//   * winpthreads runs key destructors in key-index order, and emutls' key is
+//     created first (on the first TLS access, which necessarily precedes the first
+//     destructor registration).
+//
+// So the storage is freed, and only then are the C++ destructors called on it.
+// Measured with `--wrap=free`: **300/300 and 600/600 destructors ran on a freed
+// block**, every run. Reading it usually returns the old bytes, which is why this
+// survived six fixes and 260 suite runs. It returns something else exactly when the
+// block is RE-ISSUED in the microsecond window between the free and the destructor —
+// and the thing that re-issues it is A THREAD STARTING, whose first
+// `__cxa_thread_atexit` allocates a 32-byte `elt` in the same size class. Plain heap
+// churn never did it (0 in 4000); a starting thread did, at ~2% per exit.
+//
+// WHAT THAT COST, in the two destructors this file used to have:
+//   * the record: `recorded` re-read as the low byte of a heap pointer (TRUE) with
+//     `id` overwritten by `elt.next == NULL` (a default-constructed thread::id) —
+//     the exact trace that was chased for days — or `recorded` re-read as FALSE, in
+//     which case the destructor returned early, `live` was never decremented, and
+//     **the startup gate refused a healthy node, permanently**.
+//   * the retirer, which was worse: `slot` re-read as NULL (~1–2% per exit) meant
+//     the slot was never retired and capped `DrainGraveyard`'s minimum for the
+//     process lifetime — the unbounded leak the retirer exists to prevent — and
+//     `slot` re-read as a live pointer (~1–3%) made `slot->store(~0)` an **8-byte
+//     0xFF write into a foreign heap block**. That is reachable on any Windows node
+//     that mines: `StopMining()` exits every worker on each template update and
+//     `StartMining()` restarts them immediately, which is precisely the
+//     starting-thread pressure above.
+//
+// ⚠️ THE FIX IS NOT "READ FEWER MEMBERS". Six attempts changed WHAT was read from
+// the freed block; none could work, because the block is freed either way. The exit
+// hook must not touch emutls storage AT ALL. So the per-thread state lives in a
+// heap record owned by **our own pthread key**, whose destructor receives that
+// record AS ITS ARGUMENT — pthread key VALUES live in the pthread TLS array, not in
+// emutls, and are handed to the destructor by winpthreads itself.
+//
+// RULE FOR ANYONE ADDING STATE HERE: a `thread_local` in this file may be
+// **trivially destructible only** (a pointer, an int, a bool). Anything that needs
+// to act at thread exit goes in EpochThreadRecord. There is a `static_assert` on
+// every thread_local below and a grep-guard in `scripts/check_thread_local_guard.sh`
+// so this is enforced by a machine and not by this comment.
+struct EpochThreadRecord {
+    // The detector's accusation (see NoteIndexPointerResolved).
+    bool recorded{false};
+    std::thread::id id{};
+
+    // The epoch slot this thread published into, retired at exit. Held HERE rather
+    // than read from `t_epoch_slot` at exit for the reason above.
+    std::atomic<uint64_t>* slot{nullptr};
+
+    // TEST-ONLY hold count. It lives here rather than in a thread_local because the
+    // exit hook asserts on it, and a thread_local read at exit is a read of freed
+    // memory — the assertion would fire on garbage.
+    int holds{0};
+};
+
+void EpochThreadRecordDtor(void* p);
+
+pthread_key_t   g_epoch_record_key;
+std::once_flag  g_epoch_record_key_once;
+
+// A raw pointer: trivially destructible, so it gets no dynamic initialisation and
+// no __cxa_thread_atexit registration, and there is nothing of ours to read at
+// teardown. It is a CACHE of the pthread key's value, never the owner.
+thread_local EpochThreadRecord* t_epoch_record = nullptr;
+static_assert(std::is_trivially_destructible<EpochThreadRecord*>::value,
+              "see the header comment: a thread_local here must be trivially "
+              "destructible, because its destructor would run on freed storage");
+
+// ⚠️ THE TEARDOWN CONTRACT, STATED HERE BECAUSE IT IS NOT INFERABLE FROM THE CODE.
+// EpochThreadRecordDtor `delete`s the record and leaves `t_epoch_record` DANGLING --
+// it cannot clear it, because clearing it is a write to emutls storage that is
+// already freed, which is the whole defect this design exists to avoid. So:
+//
+//   ⛔ NOTHING THAT RUNS AFTER THIS THREAD'S EPOCH HOOK MAY CALL MyEpochRecord(),
+//      OR ANY EPOCH API THAT REACHES IT (EpochCheckpoint, EpochQuiesce,
+//      NoteIndexPointerResolved, GetBlockIndex, GetTip, NoteEpochPointerHeld).
+//
+// A later pthread-key destructor, or any at-exit callback that runs on a thread whose
+// epoch hook has already fired, would take the `t_epoch_record != nullptr` fast path
+// and dereference freed memory: the same defect class as the one this replaced,
+// arriving through a different door.
+//
+// AUDITED, not assumed (2026-09-11, round-6 F30): `pthread_key_create`, `FlsAlloc`,
+// `TlsAlloc` and `__cxa_thread_atexit` appear NOWHERE ELSE in non-test `src/` -- this
+// is the only key in the tree, so there is no second destructor to order against
+// today. **Anyone adding one must order it BEFORE this key** (create it earlier;
+// winpthreads runs destructors in key-index order) **or must not touch epoch state.**
+//
+// The fast path is deliberately NOT hardened against this with an "already destroyed"
+// flag: such a flag would itself have to live in emutls to be readable here, which is
+// the circularity that produced the original bug. The contract is the mechanism.
+//
+// ⚠️ AND THE HOOK ASSUMES THE THREAD EXITS THROUGH THE pthread WRAPPER (round-6 F34).
+// winpthreads runs key destructors for threads it created and that return normally or
+// via `pthread_exit`. A thread started with raw `CreateThread`/`_beginthreadex` -- by a
+// dependency, say -- or one killed with `ExitThread`/`TerminateThread`, LEAKS its
+// record and never retires its slot. That is loud rather than silent (the census and
+// the periodic GRAVEYARD PINNED log both show it) but it is unbounded, so it is stated
+// rather than left to be rediscovered. Every thread this codebase starts is a
+// `std::thread`, which is a pthread on this platform.
+EpochThreadRecord& MyEpochRecord()
+{
+    if (t_epoch_record == nullptr) {
+        std::call_once(g_epoch_record_key_once, [] {
+            // ⚠️ ConsensusInvariant ABORTS THE PROCESS; that is the intended
+            // behaviour here and not a debug nicety. If key creation could fail
+            // non-fatally, the epoch system would carry on with NO EXIT HOOK AT
+            // ALL: every thread that exits keeps its slot at its last published
+            // epoch, DrainGraveyard's minimum freezes, and the node grows without
+            // bound while behaving perfectly. A loud abort at the first record is
+            // strictly better than a silent unbounded leak discovered in
+            // production. (Round-6 F30 asked for this to be explicit rather than
+            // implied by the word "not survivable".)
+            const int rc = pthread_key_create(&g_epoch_record_key,
+                                              &EpochThreadRecordDtor);
+            ConsensusInvariant(rc == 0);
+        });
+        auto* rec = new EpochThreadRecord();
+        // Same reasoning: a failed setspecific means this thread has a record that
+        // no hook will ever be handed, i.e. a permanent pin. Abort, do not degrade.
+        const int rc = pthread_setspecific(g_epoch_record_key, rec);
+        ConsensusInvariant(rc == 0);
+        t_epoch_record = rec;
+    }
+    return *t_epoch_record;
+}
+
+thread_local std::atomic<uint64_t>* t_epoch_slot = nullptr;
+thread_local const char* t_epoch_name = nullptr;
+static_assert(std::is_trivially_destructible<std::atomic<uint64_t>*>::value, "");
+static_assert(std::is_trivially_destructible<const char*>::value, "");
+// TEST-ONLY hold tracking. Production cannot know when a caller is still holding a
+// resolved pointer -- the pointer is a raw CBlockIndex* on someone's stack -- so the
+// no-pointer-across-a-boundary rule is a CONTRACT, not a checked property. A test
+// declares its holds with EpochPointerHold and turns this on; the boundary then
+// asserts instead of trusting.
+std::atomic<bool> g_epoch_hold_tracking{false};
+
+// OFFLINE = "I am blocked and hold nothing". See CChainState::EpochQuiesce.
+thread_local bool t_epoch_offline = false;
+static_assert(std::is_trivially_destructible<bool>::value, "");
+
+// Set when a resolve-while-offline re-enters, so the accusation the quiesce
+// withdrew is restored on the way back through (see NoteIndexPointerResolved).
+// (Was a thread_local. It is set and consumed within a single call of
+// NoteIndexPointerResolved, so thread-local storage bought nothing and implied a
+// lifetime the value does not have; it is a local variable now.)
+
+// Count of resolves that happened while a thread was OFFLINE. That is a design
+// error — a thread must re-enter before it resolves — and it is made SAFE here
+// (the resolve re-enters immediately, under cs_main, before the pointer escapes)
+// rather than silent. Non-zero means a quiesce/checkpoint pairing is wrong.
+std::atomic<uint64_t> g_offline_resolves{0};
+
+std::atomic<uint64_t>* MyEpochSlot()
+{
+    if (t_epoch_slot == nullptr) {
+        // ⚠️ THE EXIT RECORD IS OBTAINED FIRST, AND THE ORDER IS THE POINT.
+        // This used to publish the slot into the registry, cache it in
+        // t_epoch_slot, and only THEN call MyEpochRecord() to hand the slot to
+        // the exit hook. MyEpochRecord() allocates: if that `new` threw and any
+        // caller up the stack caught the exception, the slot was already
+        // registered and cached but NO EXIT HOOK OWNED IT -- so the thread would
+        // never retire it, and one unretired slot caps DrainGraveyard's minimum
+        // FOR THE PROCESS LIFETIME. A permanent, silent pin, arrived at through
+        // an allocation failure rather than a logic error.
+        //
+        // Obtaining the record first makes the failure harmless: if it throws,
+        // nothing has been published, and the next call simply tries again.
+        // Nothing between this line and the assignment below can throw.
+        EpochThreadRecord& rec = MyEpochRecord();
+
+        // ⚠️ THE SLOT IS OWNED UNTIL IT IS PUBLISHED (round-7 F38). The previous
+        // comment here claimed "nothing between this line and the assignment
+        // below can throw". THAT WAS FALSE and I wrote it: the `new` can throw,
+        // the mutex lock can throw, and push_back can throw on reallocation. The
+        // consequences were harmless -- an exception before push_back leaked one
+        // word, after it left a registered slot no thread published into, which
+        // reads as a permanently quiescent participant rather than a pin -- but
+        // an overstated safety sentence is exactly what stops the next reader
+        // checking, which is the same mistake as the wrong leak bound below.
+        // unique_ptr makes the harmless part structural instead of argued.
+        std::unique_ptr<std::atomic<uint64_t>> owned(new std::atomic<uint64_t>(0));
+        std::atomic<uint64_t>* slot = owned.get();
+        {
+            std::lock_guard<std::mutex> lk(Registry().mu);
+            Registry().slots.push_back(slot);   // may throw; `owned` still frees
+        }
+        // Published: the registry now owns it for the life of the process.
+        (void)owned.release();
+
+        // ⚠️ AND THE BOUND ON THAT LEAK IS *NOT* THE THREAD COUNT (round-7 F39).
+        // This said "one machine word per participating thread, bounded by the
+        // thread count, freed at exit" -- THE SAME MISTAKE I had just corrected
+        // for connman's random_device one round earlier, in the same file, in my
+        // own hand. Slots are retained per thread that EVER participated: the
+        // exit hook RETIRES a slot (publishes the maximum epoch) and never
+        // reclaims it, deliberately, because a drain on another thread may read
+        // it after the owner is gone. So on a node whose miners restart on every
+        // template update, this grows for the life of the process at one word
+        // plus one vector entry per thread ever seen -- not per thread alive.
+        //
+        // ⚠️ ACCEPTED WITH A BUDGET, NOT JUST A COST (round-8 F54). "It grows" is
+        // not a decision; a decision names the rate, the ceiling and what trips a
+        // redesign:
+        //   RATE. Slots accrue per thread that ever participated. The restarting
+        //     populations are the miners (StopMining/StartMining on every template
+        //     update, so ~1 worker-set per block) and the index sync loops (once
+        //     each). At a 60 s target spacing and 4 mining workers that is ~5,760
+        //     slots/day, ~2.1M/year.
+        //   CEILING. Each slot is 8 bytes of atomic plus one pointer in
+        //     Registry().slots: ~16 bytes all-in, so ~92 KB/day, ~34 MB/year of
+        //     continuous mining. Memory is not the constraint.
+        //   WHAT ACTUALLY TRIPS. DrainGraveyard is O(slots) per call, so the cost
+        //     that matters is DRAIN LATENCY, not bytes. graveyard_occupancy_bench
+        //     reports drain max/mean on every run.
+        //   ⚠️ THE TRIGGER, AS A DATE AND NOT A MARGIN (round-9 F59). "2.5x margin"
+        //     is a snapshot, and a snapshot of a quantity that GROWS says nothing
+        //     about when it stops being true. Restated: at ~5,760 slots/day the
+        //     50 ms threshold arrives at roughly 250,000-300,000 slots, which is
+        //     **six to eight weeks of continuous mining**. Not "someday" -- inside
+        //     a release cycle.
+        //     (Measured today: 19.3 ms max at 500,000 entries with ~100,000 live
+        //     slots-worth of survivors. 50 ms is the same number the
+        //     deque-vs-vector note above uses as its flip condition.)
+        //
+        //   ⚠️ AND THE DECISION, because a trigger with no decision is a deferral
+        //     wearing a threshold's clothes. NOT building the free list now.
+        //
+        //     ⚠️ AND THE MECHANISM IS NOT "THE BENCH IS THE GATE" -- that claim was
+        //     wrong in two ways, both caught in round 10 (F66):
+        //       * the CI leg is REPORT-ONLY, deliberately: three identical local
+        //         runs measured 3.4 / 10.7 / 3.6 ms, a 3.1x spread, so a fixed
+        //         millisecond gate on a shared runner would fire on noise;
+        //       * and a fresh bench PROCESS never inherits a node's accumulated
+        //         slots. The bench builds its own population from scratch, so it
+        //         measures the SHAPE of the cost, never the value a long-running
+        //         node has reached. It cannot observe the thing that grows.
+        //
+        //     THE REAL MECHANISM, stated so it has an owner and a reader: the
+        //     growth is visible from a LIVE NODE, not from the bench --
+        //     `LiveEpochParticipants()` and the periodic census both report slot
+        //     counts, and `DrainGraveyard`'s cost is a function of that number. A
+        //     node that has been mining for weeks is the only instrument that can
+        //     say whether 250,000 slots has arrived. The bench's CI number is a
+        //     REGRESSION signal on the per-slot cost (did a change make each slot
+        //     more expensive?), which is a different and smaller question.
+        //     Recorded as a follow-up rather than pretended to be solved here.
+        //   THE SHAPE OF THE FIX, if it trips: a generation-stamped free list --
+        //     a retired slot is reusable once every thread has passed the epoch in
+        //     which it retired, which is this file's own rule applied one level
+        //     down. Not built, because 2.5x is not a reason to build it.
+        //
+        // The bare cost, for the record: 8 bytes plus a pointer per historical
+        // participant. Reuse would need a
+        // free-list whose safety is the very lifetime problem this file exists to
+        // solve -- a retired slot cannot be recycled until every thread that
+        // might read it has passed an epoch, which is the same proof obligation
+        // one level down. If it ever matters, the trigger is DrainGraveyard's
+        // per-call cost, which is O(slots) and is already reported by
+        // graveyard_occupancy_bench on every run.
+        //
+        // Twice now the wrong bound was the SAME error: naming the population as
+        // "threads" when it is "threads that ever reached here". See
+        // lessons_learned.md, "A LEAK WHOSE BOUND IS STATED WRONGLY".
+
+        // The hook retires the slot from the record it is GIVEN, so it never
+        // reads a thread_local at teardown. Set BEFORE the t_epoch_slot cache, so
+        // there is no window in which this thread is a participant with no
+        // retirer -- both assignments are noexcept, and the order documents which
+        // one is load-bearing.
+        rec.slot = slot;
+        t_epoch_slot = slot;
+    }
+    return t_epoch_slot;
+}
+
+// ── THE DETECTOR: A THREAD THAT RESOLVES AND NEVER CHECKPOINTS ──────────────
+//
+// EpochRegistrationComplete() counts participants against a table, and a table
+// is maintained by hand: the ninth thread that resolves block indices and forgets
+// to checkpoint is added by someone who would also have forgotten the table row.
+// A count alone therefore catches "a WIRED thread has not reached its checkpoint
+// yet", not "an UNWIRED thread was added" -- which is the case that actually
+// leaks. So the second one is detected mechanically instead, at the only place it
+// can be seen without a list: the moment a raw pointer leaves cs_main.
+//
+// Recorded ONCE per thread (a thread_local flag, so the mutex is touched once in
+// a thread's life and never on the hot path) and CLEARED when that thread later
+// checkpoints -- so resolving before the first checkpoint, which every thread
+// does during startup, is not an accusation. What survives to the startup census
+// is exactly: threads that hold pointers and have made no promise.
+struct UnregisteredResolvers {
+    std::mutex mu;
+
+    // ⚠️ THE COUNT IS AUTHORITATIVE; THE ID LIST IS DIAGNOSTICS. It used to be the
+    // other way round -- the count WAS ids.size() + overflow, and withdrawal was an
+    // erase-by-thread-id. The accounting therefore depended on a std::thread::id
+    // still being readable when the withdrawal ran, and at thread exit it was not:
+    // a withdrawal was traced firing with `recorded` true and `id`
+    // DEFAULT-CONSTRUCTED ("thread::id of a non-executing thread"), so the erase
+    // matched nothing and the accusation became PERMANENT.
+    //
+    // ⚠️ AND THAT TRACE HAD A CAUSE WORTH KNOWING, because the obvious reading of
+    // it is wrong. It was NOT a torn write or a lost id. The exit hook was a
+    // thread_local destructor, and on this toolchain those run AFTER emutls has
+    // freed the storage they are destroying -- the `recorded`/`id` pair was being
+    // read out of a freed 32-byte block that a STARTING thread had already
+    // re-issued for its own `__cxa_thread_atexit` bookkeeping. `recorded` read as
+    // the low byte of a heap pointer (true), `id` as that record's null `next`
+    // (default). Making the count authoritative removed the dependency on `id` and
+    // narrowed the failure, but could not close it: the block is freed either way.
+    // The mechanism is fixed at EpochThreadRecord -- read that first.
+    //
+    // The phantom was not cosmetic. It fails EpochRegistrationComplete forever, so
+    // the startup gate REFUSES TO START A HEALTHY NODE -- measured at roughly one
+    // run in twenty of a thread-heavy suite, and only found because the flake rate
+    // refused to go away under six successive fixes aimed at the wrong layer.
+    //
+    // A counter needs no lookup at teardown: the exit hook knows only "this thread
+    // was recorded", from the record it is handed, and decrements.
+    size_t live{0};                     // authoritative number of accused threads
+    std::vector<std::thread::id> ids;   // best-effort, for the message only, capped
+    size_t overflow{0};                 // ids beyond the cap (diagnostics only)
+};
+
+UnregisteredResolvers& Unregistered()
+{
+    // Leaked for the same reason as Registry(): ~UnregisteredRecordScope locks this
+    // mutex from a thread_local destructor, which can run after static destruction.
+    static UnregisteredResolvers* u = new UnregisteredResolvers();
+    return *u;
+}
+
+constexpr size_t MAX_RECORDED_OFFENDERS = 8;
+
+void ClearUnregisteredRecord();
+
+
+// ⚠️ A PARTICIPATING THREAD THAT EXITS USED TO PIN THE GRAVEYARD FOR THE PROCESS
+// LIFETIME. Its slot kept the last epoch it published, `DrainGraveyard` takes the
+// MINIMUM across all slots, and nothing ever raised a dead thread's value again —
+// so the minimum froze and NOTHING WAS EVER FREED AFTERWARDS. This is not exotic:
+// the miner threads exit whenever mining stops, the index sync loops exit when they
+// finish syncing, the RPC and websocket threads exit on Stop(). Any one of those
+// permanently freezes reclamation, and the node then grows without bound while
+// behaving perfectly — the same silent shape as a thread that never checkpoints,
+// arrived at from the opposite direction.
+//
+// Found by the occupancy bench, not by reading: the run ended with 24,936 entries
+// still in the graveyard and a final drain freeing ZERO with every thread quiescent.
+//
+// A thread that has exited holds no CBlockIndex*, so it must never lower the
+// minimum. Retiring the slot to the maximum epoch says exactly that.
+//
+// ⚠️ THE HOOK IS A pthread KEY DESTRUCTOR, NOT A thread_local DESTRUCTOR, and the
+// difference is the whole point — see EpochThreadRecord above. It is handed the
+// record as its ARGUMENT and reads no thread-local storage, because by the time it
+// runs, every thread_local block belonging to this thread has already been freed.
+void EpochThreadRecordDtor(void* p)
+{
+    // POSIX has already set this thread's key value to NULL before calling us, and
+    // nothing below touches thread-local storage, so no re-registration can occur
+    // and this runs exactly once per thread.
+    auto* rec = static_cast<EpochThreadRecord*>(p);
+    if (rec == nullptr) return;
+
+    // ⚠️ RETIRING IS A CLAIM TOO — "this thread holds nothing, ever again" — and it
+    // was the one boundary that did not check. EpochCheckpoint and EpochQuiesce both
+    // assert the hold count under test-time tracking; this publishes the strongest
+    // statement of the three. The count is read from the RECORD; when it lived in a
+    // thread_local this assertion was evaluating freed memory and could fire, or
+    // fail to fire, on whatever the heap had put there.
+    if (g_epoch_hold_tracking.load(std::memory_order_relaxed)) {
+        ConsensusInvariant(rec->holds == 0);
+    }
+
+    // Only a thread that ever checkpointed has a slot; one that never did has
+    // nothing to retire (and pins nothing, because it never made a promise).
+    if (rec->slot != nullptr) {
+        rec->slot->store(EPOCH_SLOT_RETIRED, std::memory_order_release);
+    }
+
+    // Withdraw the accusation, if this thread carried one. Same hook, because the
+    // two used to be separate thread_local destructors and their SPLIT was itself a
+    // trap: a thread's accusation was withdrawn by one and its slot retired by the
+    // other, so the record count could reach zero while a slot still sat at 0
+    // pinning the entire graveyard. One hook, one order, one place to read.
+    if (rec->recorded) {
+        rec->recorded = false;
+        auto& u = Unregistered();
+        std::lock_guard<std::mutex> lk(u.mu);
+        if (u.live > 0) --u.live;
+        bool listed = false;
+        for (size_t i = 0; i < u.ids.size(); ++i) {
+            if (u.ids[i] == rec->id) {
+                u.ids.erase(u.ids.begin() + i);
+                listed = true;
+                break;
+            }
+        }
+        // Not in the capped list means it was counted in `overflow`. Diagnostics
+        // only — `live` above is the authoritative number either way.
+        if (!listed && u.overflow > 0) --u.overflow;
+    }
+
+    delete rec;
+}
+
+void NoteIndexPointerResolved(uint64_t current_epoch)
+{
+    // Set by the offline branch below and consumed a few lines later, in the same
+    // call. A local, because that is its entire lifetime.
+    bool reresolve_after_offline = false;
+
+    // The hot path for a participant that is ONLINE: two thread-local loads and a
+    // predicted branch. No lock, no atomic.
+    if (t_epoch_slot != nullptr && !t_epoch_offline) return;
+
+    if (t_epoch_offline) {
+        // ⚠️ A RESOLVE WHILE OFFLINE IS A DESIGN ERROR, MADE SAFE RATHER THAN
+        // SILENT. The thread published "I hold nothing" before blocking and is now
+        // taking a pointer without having re-entered — a quiesce/checkpoint pairing
+        // is wrong somewhere. Re-entering HERE is safe: we are under cs_main and the
+        // entry is still linked, so its eventual unlink gets a strictly higher stamp
+        // than the epoch published now, and the drain cannot free it under us. The
+        // counter is what makes the mispairing findable.
+        g_offline_resolves.fetch_add(1, std::memory_order_relaxed);
+        t_epoch_offline = false;
+        t_epoch_slot->store(current_epoch, std::memory_order_release);
+
+        // ⚠️ RE-RECORD, BECAUSE THE QUIESCE WITHDREW THE ACCUSATION. A thread that
+        // was accused (slot 0, pinning) and then parked had its record withdrawn by
+        // EpochQuiesce — correctly, since parking claims it holds nothing. If it
+        // now resolves anyway, the claim is false and the accusation must come
+        // back: re-entering at `current_epoch` alone pins only what is unlinked
+        // AFTER this moment, and the census would report the thread as clean while
+        // it holds a pointer it took after promising it would not.
+        //
+        // The recording path below does exactly that, so fall through to it rather
+        // than returning here. The slot is already non-null, so it is not
+        // re-created at 0 — the epoch published above is the correct pin for a
+        // pointer resolved at this instant, under cs_main, while the entry is still
+        // linked.
+        reresolve_after_offline = true;
+    }
+
+    // A thread that came back online through the path above re-records below, so
+    // that a quiesce-withdrawn accusation is restored the moment its claim is
+    // falsified.
+    if (reresolve_after_offline) {
+        // ⚠️ THIS BRANCH RECORDED AN ACCUSATION WITHOUT COUNTING IT. It set
+        // `recorded` and pushed the id, but never `++u2.live` -- while EVERY
+        // withdrawal path (ClearUnregisteredRecord and the exit hook) does
+        // `--u2.live` off that same `recorded` flag. So a thread that quiesced and
+        // then resolved anyway ATE ANOTHER THREAD'S ACCUSATION on its way out: an
+        // UNDER-count, the opposite direction to the phantom, and the direction
+        // that matters more -- an accusation silently cancelled is a real leaking
+        // thread the census stops reporting.
+        //
+        // Found by the decorrelated reader while tracing the phantom, not by any
+        // arm here. It survived because `live` became authoritative only in the
+        // round-5 fold and this branch was written before that; the count and the
+        // flag were consistent when the count WAS the list.
+        auto& u2 = Unregistered();
+        EpochThreadRecord& me2 = MyEpochRecord();
+        if (!me2.recorded) {
+            me2.recorded = true;
+            me2.id = std::this_thread::get_id();
+            std::lock_guard<std::mutex> lk2(u2.mu);
+            ++u2.live;                                 // authoritative -- see above
+            if (u2.ids.size() < MAX_RECORDED_OFFENDERS) u2.ids.push_back(me2.id);
+            else ++u2.overflow;
+        }
+        return;
+    }
+
+    // ⚠️ NO SLOT MEANS NO PIN, AND THAT WAS THE UAF DIRECTION. A thread that
+    // resolves and has never checkpointed used to be merely RECORDED: it had no
+    // slot, so DrainGraveyard's minimum ignored it entirely and went on freeing
+    // the very entry it was holding. The startup gate refuses such a node, but the
+    // PERIODIC census only logs while the drain keeps freeing — so between spawn
+    // and the next census, an unregistered resolver was read-after-free bait.
+    //
+    // Creating the slot at value 0 inverts the direction: 0 is below every stamp,
+    // so the drain refuses to free ANYTHING while this thread holds a pointer and
+    // has made no promise. That is a loud, bounded-by-the-operator leak instead of
+    // a use-after-free, and it is the direction every other rule here takes.
+    auto* slot = MyEpochSlot();   // created at 0, and 0 pins everything
+    (void)slot;
+
+    EpochThreadRecord& me = MyEpochRecord();
+    if (me.recorded) return;
+    me.recorded = true;
+    me.id = std::this_thread::get_id();
+
+    auto& u = Unregistered();
+    std::lock_guard<std::mutex> lk(u.mu);
+    ++u.live;                                  // authoritative
+    if (u.ids.size() < MAX_RECORDED_OFFENDERS) {
+        u.ids.push_back(me.id);                // best-effort, for the diagnostic
+    } else {
+        ++u.overflow;
+    }
+}
+
+// Called from the first checkpoint of a thread that had already resolved: it has
+// now made the promise, so the accusation is withdrawn.
+void ClearUnregisteredRecord()
+{
+    // Called from a LIVE thread (a checkpoint or a quiesce). The EXIT path is
+    // EpochThreadRecordDtor, which does the same withdrawal from a record it is
+    // handed rather than one it looks up — that asymmetry is the fix, not a
+    // duplication to be tidied away. See EpochThreadRecord.
+    EpochThreadRecord& me = MyEpochRecord();
+    if (!me.recorded) return;
+    me.recorded = false;
+    auto& u = Unregistered();
+    std::lock_guard<std::mutex> lk(u.mu);
+    if (u.live > 0) --u.live;           // authoritative, needs no lookup
+    for (size_t i = 0; i < u.ids.size(); ++i) {
+        if (u.ids[i] == me.id) { u.ids.erase(u.ids.begin() + i); return; }
+    }
+    if (u.overflow > 0) --u.overflow;   // best-effort tidy of the diagnostic list
+}
+
+}  // namespace
+
+void CChainState::EpochCheckpoint(const char* name)
+{
+    // ⚠️ A NAMELESS CHECKPOINT ON AN UNNAMED THREAD IS INERT, AND THE HEADER ALREADY
+    // SAID WHY BEFORE THE CODE DID IT. EpochOfflineScope's constructor gates its
+    // re-entry behind m_active precisely because "a nameless checkpoint would
+    // publish the current epoch and UNPIN a thread that may be holding a pointer at
+    // slot 0" — and then EpochOnlineWindow's constructor called this unconditionally,
+    // which is that same unpin through the other scope. Convergent 3/3 in round 5,
+    // and a contradiction between two comments a dozen lines apart in one header.
+    //
+    // The rule the whole mechanism rests on: A THREAD PUBLISHES A PROMISE ONLY IF IT
+    // HAS DECLARED ITSELF. An unnamed thread has declared nothing, may be pinning at
+    // slot 0 after a resolve, and must stay exactly where it is. Naming yourself is
+    // how you become able to make promises — EpochCheckpoint(name) below.
+    if (name == nullptr && t_epoch_name == nullptr) {
+        static std::atomic<bool> reported{false};
+        bool expected = false;
+        if (reported.compare_exchange_strong(expected, true)) {
+            std::cerr << "[Chain] NOTE: a nameless checkpoint was made by a thread "
+                         "with no registered participant name. Ignored: an "
+                         "undeclared thread must not publish a promise, because it "
+                         "may be pinning a pointer it resolved. Give that thread a "
+                         "named checkpoint at its loop top." << std::endl;
+        }
+        return;
+    }
+
+    // Publish "I am now at the current global epoch, and I hold no CBlockIndex*".
+    // acquire on the read / release on the store: a drain that observes this value
+    // must also observe everything this thread did before the checkpoint.
+    // A checkpoint claims "I hold no CBlockIndex* at this instant" just as loudly
+    // as a quiesce does; under test-time hold tracking it is checked the same way.
+    if (g_epoch_hold_tracking.load(std::memory_order_relaxed)) {
+        ConsensusInvariant(MyEpochRecord().holds == 0);
+    }
+
+    const uint64_t now = m_globalEpoch.load(std::memory_order_acquire);
+    MyEpochSlot()->store(now, std::memory_order_release);
+    t_epoch_offline = false;   // re-entering the quiescent-state calculation
+
+    // Register THIS thread's exit hook. MyEpochSlot() above already created the
+    // record and stored the slot in it, so this is a statement of intent rather
+    // than a load-bearing call -- but it is kept because the old version of this
+    // line WAS load-bearing and the reason is worth carrying: a thread that never
+    // reaches its exit hook never retires its slot, and one unretired slot caps
+    // reclamation for the process lifetime.
+    (void)MyEpochRecord();
+
+    // This thread may have resolved a pointer before reaching its first
+    // checkpoint -- every thread does, during startup. It is a participant now,
+    // so it is no longer an offender.
+    ClearUnregisteredRecord();
+
+    // Answer the declaration made at this thread's spawn site. Once only: the
+    // name is passed on every loop iteration and this costs a predicted branch.
+    // ⚠️ ONE THREAD, ONE NAME — AND NOTHING CHECKED IT. `t_epoch_name` is set by
+    // the FIRST named checkpoint and never revisited, so a thread that registers as
+    // "rpc-accept" and later checkpoints as "rpc-worker" silently keeps the first
+    // name: the second pool's registration count comes up short and the census
+    // either fails for an invented reason or is satisfied by the wrong thread. The
+    // scopes make this easy to do by accident, because a name is chosen per SITE
+    // while a slot belongs to a THREAD. Refuse it out loud.
+    if (name != nullptr && t_epoch_name != nullptr &&
+        std::strcmp(name, t_epoch_name) != 0) {
+        std::cerr << "[Chain] FATAL: thread registered as '" << t_epoch_name
+                  << "' is now checkpointing as '" << name
+                  << "'. A thread must carry ONE participant name: slots belong to "
+                  << "threads, names to declarations, and the census compares "
+                  << "counts per name." << std::endl;
+        ConsensusInvariant(false);
+    }
+
+    if (name != nullptr && t_epoch_name == nullptr) {
+        t_epoch_name = name;
+        std::lock_guard<std::mutex> lk(Registry().mu);
+        // COUNTED PER THREAD, not inserted as a name: a pool of sixteen
+        // `rpc-worker`s must produce sixteen registrations, or the census is
+        // satisfied by whichever one happened to start first.
+        Registry().registered[name] += 1;
+    }
+}
+
+bool CChainState::EpochQuiesce()
+{
+    // ⚠️ FAIL CLOSED ON AN UNREGISTERED THREAD, AND REPORT WHETHER WE DID. A
+    // thread with no registered name is one whose participation nobody declared: it
+    // may have resolved a pointer and be pinning at slot 0 (see
+    // NoteIndexPointerResolved), and publishing RETIRED for it would UNPIN A HOLDER
+    // -- the exact use-after-free direction this file exists to remove, arriving
+    // through a different door. An unregistered thread therefore stays ONLINE and
+    // keeps pinning, and the scope that asked becomes inert.
+    //
+    // Reachable in production: CWebSocketServer::SocketWrite is called from
+    // SendToClient / Broadcast, which run on threads other than the websocket
+    // server thread.
+    if (t_epoch_name == nullptr) {
+        static std::atomic<bool> reported{false};
+        bool expected = false;
+        if (reported.compare_exchange_strong(expected, true)) {
+            std::cerr << "[Chain] NOTE: an epoch scope was opened on a thread with "
+                         "no registered participant name. It stays ONLINE (pinning) "
+                         "rather than publishing a promise nobody declared. If that "
+                         "thread resolves block indices, give it a named checkpoint "
+                         "at its loop top." << std::endl;
+        }
+        return false;
+    }
+
+    // GO OFFLINE: "I am about to block, and I hold no CBlockIndex*."
+    //
+    // ⚠️ THIS EXISTS BECAUSE "CHECKPOINT BEFORE THE WAIT" WAS NOT ENOUGH, AND THE
+    // DESIGN NOTE'S CLAIM THAT AN RPC SERVER PARKED IN accept() PINS NOTHING WAS
+    // FALSE. Publishing epoch E before blocking pins every entry unlinked after E
+    // for as long as the thread stays parked: the slot never advances while it is
+    // in cv.wait() or accept(). At the measured ingress ceiling one parked hour is
+    // ~37M entries. Bounding the pin by "one unit of work" is only true of a thread
+    // that keeps looping.
+    //
+    // The fix is the RCU offline/online protocol: a blocked thread leaves the
+    // quiescent-state calculation entirely, exactly as a thread that has exited
+    // does, and re-enters BEFORE it resolves anything. EpochOfflineScope pairs the
+    // two so no wake path can forget the second half.
+    // ⚠️ ORDER MATTERS, AND IT WAS WRONG: THE CHECKS COME FIRST. This used to
+    // withdraw the accusation and publish RETIRED and only then assert the hold
+    // count — so a thread quiescing with a pointer in hand had already unpinned
+    // itself and dropped its own accusation before anything objected. On a build
+    // where the invariant does not abort, the damage was done. Check, then act.
+    if (g_epoch_hold_tracking.load(std::memory_order_relaxed)) {
+        ConsensusInvariant(MyEpochRecord().holds == 0);
+    }
+
+    // ⚠️ REFUSES AN OFFLINE *STATE*, WHICH IS NARROWER THAN "REFUSES NESTING",
+    // AND THE PREVIOUS COMMENT OVERSTATED IT. What this rejects is quiescing while
+    // the flag is already set. It does NOT reject a live outer SCOPE whose flag has
+    // since been cleared, so both of these pass:
+    //
+    //     offline -> EpochOnlineWindow (clears the flag) -> offline
+    //     offline -> an instrumented resolve (clears the flag) -> offline
+    //
+    // The first is the legal nest by design. The second is a genuine gap: a resolve
+    // inside an offline scope re-enters the thread, after which a further quiesce
+    // looks like a first one. Closing it needs protocol state per scope rather than
+    // a single bool. Recorded as the narrower guarantee that is actually true
+    // today, rather than claimed away.
+    //
+    // (The earlier example -- HandleClient's scope enclosing socket_write's -- is no
+    // longer live: F12 braced both to their own blocking calls.)
+    //
+    // A counter instead of a refusal would make nesting "work" and hide the design
+    // error, which is why this is a refusal and not a depth count.
+    ConsensusInvariant(!t_epoch_offline);
+
+    // ⚠️ DEFENSIVE, AND CURRENTLY UNREACHABLE AS A CLEARER — SAY SO RATHER THAN
+    // IMPLY IT STILL FIRES. The round-4 fail-closed rule above means only a thread
+    // with a registered NAME reaches this line; a name is set only by
+    // EpochCheckpoint(name), which itself calls ClearUnregisteredRecord(); and a
+    // thread with a slot is never re-recorded (NoteIndexPointerResolved records only
+    // when t_epoch_slot == nullptr). So by the time any thread can quiesce, its
+    // accusation is already withdrawn and this call finds nothing.
+    //
+    // It stays because the reasoning above is a CHAIN OF THREE PRECONDITIONS, any of
+    // which a future change could break — and if one does, the claim "offline means I
+    // hold nothing" and a standing accusation would both be live at once. Kept as a
+    // guard, not as a mechanism, and the F15 arm now asserts the unreachability
+    // instead of pretending to exercise it.
+    //
+    // Round-3 added the withdrawal here for a case round-4's fix removed. That is a
+    // fold subsuming an earlier fold, which is worth noticing rather than leaving as
+    // two fixes that look independent.
+    ClearUnregisteredRecord();
+
+    t_epoch_offline = true;
+    MyEpochSlot()->store(EPOCH_SLOT_RETIRED, std::memory_order_release);
+    return true;
+}
+
+bool CChainState::IsEpochParticipant()
+{
+    return t_epoch_name != nullptr;
+}
+
+uint64_t CChainState::OfflineResolveCount()
+{
+    return g_offline_resolves.load(std::memory_order_relaxed);
+}
+
+void CChainState::DeclareEpochParticipant(const char* name, size_t count)
+{
+    // Called by whoever spawns the threads, AFTER the spawns succeed. This is the
+    // executable half of the wiring census: it cannot drift from the set of
+    // threads that actually exist, because the same code creates both.
+    //
+    // `count` is how many threads carry this name. A pool passes its size, so the
+    // census fails if fifteen of sixteen workers reach their checkpoint.
+    std::lock_guard<std::mutex> lk(Registry().mu);
+    Registry().declared[name] += count;
+}
+
+size_t CChainState::DeclaredEpochParticipants() const
+{
+    std::lock_guard<std::mutex> lk(Registry().mu);
+    size_t n = 0;
+    for (const auto& kv : Registry().declared) n += kv.second;
+    return n;   // THREADS declared, not names
+}
+
+size_t CChainState::LiveEpochParticipants() const
+{
+    // ⚠️ RETIRED SLOTS ARE EXCLUDED, AND THE OLD NAME LIED ABOUT THAT. This was
+    // RegisteredEpochThreads() returning slots.size() -- a HISTORICAL count, since
+    // slots are never removed (a drain on another thread may read one after its
+    // owner exits). A caller asking "how many threads participate right now" got
+    // every thread that ever did. Retired and offline slots hold the max epoch and
+    // pin nothing, so they are not participants for any purpose a caller has.
+    std::lock_guard<std::mutex> lk(Registry().mu);
+    size_t live = 0;
+    for (std::atomic<uint64_t>* slot : Registry().slots) {
+        if (slot->load(std::memory_order_acquire) != EPOCH_SLOT_RETIRED) ++live;
+    }
+    return live;
+}
+
+size_t CChainState::EverRegisteredEpochSlots() const
+{
+    // The historical count, named as such: total slots ever created, retired ones
+    // included. Only useful for diagnostics about churn.
+    std::lock_guard<std::mutex> lk(Registry().mu);
+    return Registry().slots.size();
+}
+
+size_t CChainState::UnregisteredResolverThreads(std::string& detail) const
+{
+    auto& u = Unregistered();
+    std::lock_guard<std::mutex> lk(u.mu);
+    const size_t n = u.live;            // authoritative; ids/overflow are for text
+    if (n == 0) { detail.clear(); return 0; }
+
+    std::ostringstream os;
+    os << n << " thread(s) obtained a CBlockIndex* and have NEVER checkpointed";
+    if (!u.ids.empty()) {
+        os << " (ids:";
+        for (const auto& id : u.ids) os << ' ' << id;
+        os << ')';
+    }
+    if (u.overflow > 0) os << " (+" << u.overflow << " beyond the record cap)";
+    detail = os.str();
+    return n;
+}
+
+bool CChainState::EpochRegistrationComplete(std::string& why) const
+{
+    // A THREAD THAT NEVER REGISTERS PINS THE GRAVEYARD FOREVER. That is the safe
+    // direction -- nothing is freed on the account of a thread that made no
+    // promise -- but it is a LEAK, and a silent one: the node runs correctly and
+    // memory grows without bound, which is the worst shape a defect can take. So
+    // it is asserted at startup rather than trusted.
+    //
+    // TWO INDEPENDENT FAILURES, and they catch different mistakes:
+    //
+    //   (1) DECLARED BUT NOT REGISTERED. A spawn site declared a participant and
+    //       that thread has not reached its first checkpoint. Named, not counted,
+    //       so the diagnostic says which thread. Catches a checkpoint that was
+    //       removed, mis-placed after a blocking wait, or never reached.
+    //
+    //   (2) RESOLVED WITHOUT EVER CHECKPOINTING. Observed at the moment a raw
+    //       pointer left cs_main -- no list involved. This is the one that catches
+    //       the NINTH THREAD: whoever adds a thread and forgets the checkpoint is
+    //       the same person who would forget to declare it, so (1) alone would say
+    //       nothing. (2) needs nobody to remember anything.
+    std::vector<std::string> missing;
+    {
+        std::lock_guard<std::mutex> lk(Registry().mu);
+        for (const auto& kv : Registry().declared) {
+            auto it = Registry().registered.find(kv.first);
+            const size_t have = (it == Registry().registered.end()) ? 0 : it->second;
+            if (have < kv.second) {
+                missing.push_back(kv.first + " (" + std::to_string(have) + " of " +
+                                  std::to_string(kv.second) + " threads)");
+            }
+        }
+    }
+    std::string rogue_detail;
+    const size_t rogue = UnregisteredResolverThreads(rogue_detail);
+    if (missing.empty() && rogue == 0) return true;
+
+    std::ostringstream os;
+    os << "deferred reclamation: ";
+    if (!missing.empty()) {
+        os << missing.size() << " declared thread(s) have never checkpointed [";
+        for (size_t i = 0; i < missing.size(); ++i) {
+            if (i) os << ", ";
+            os << missing[i];
+        }
+        os << "]. ";
+    }
+    if (rogue > 0) {
+        os << rogue_detail << " -- these HOLD POINTERS and made no promise. ";
+    }
+    os << "A thread that never checkpoints PINS THE GRAVEYARD FOR THE PROCESS "
+          "LIFETIME -- memory grows without bound while the node behaves "
+          "correctly. Add EpochCheckpoint(\"<name>\") at that thread's "
+          "no-pointer-held boundary (BEFORE any blocking wait, not after the "
+          "work), or, if it provably never resolves a CBlockIndex*, do not "
+          "declare it and add it to the exclusion list in "
+          "docs/contracts/deferred-reclamation-quiescence-proof.md.";
+    why = os.str();
+    return false;
+}
+
+void CChainState::SetEpochHoldTrackingForTest(bool on)
+{
+    g_epoch_hold_tracking.store(on, std::memory_order_relaxed);
+}
+
+void CChainState::NoteEpochPointerHeld(int delta)
+{
+    // Refuse the unbalanced call rather than absorbing it: a stray -1 would drive
+    // the count under the holds a caller really has and quietly disable the
+    // boundary assertions, which is worse than no tracking at all.
+    EpochThreadRecord& rec = MyEpochRecord();
+    ConsensusInvariant(rec.holds + delta >= 0);
+    rec.holds += delta;
+}
+
+void CChainState::SetDeepDrainInvariantsForTest(bool on)
+{
+    // Turns the exhaustive "no live entry names this as pprev" scan back on. It is
+    // O(map) PER FREED ENTRY -- measured 0.73 ms per entry at 50,000 entries, so
+    // ~7 ms each at the 500,000 cap -- which is why production runs the O(log n)
+    // in-degree check instead and the test suites turn this on to corroborate it.
+    m_deepDrainInvariants.store(on, std::memory_order_relaxed);
+}
+
+void CChainState::SetEvictionImmediateFreeForTest(bool on)
+{
+    // Never called from production code -- grep is the enforcement, and the only
+    // caller is src/test/blockindex_uaf_asan_arm.cpp. Turning this on reproduces
+    // the pre-deferral behaviour exactly: the evictor destroys the CBlockIndex at
+    // the unlink, while other threads may still hold pointers to it.
+    m_immediateFreeForTest.store(on, std::memory_order_relaxed);
+}
+
+bool CChainState::AwaitEpochRegistration(int timeout_ms, std::string& why)
+{
+    // Threads start asynchronously, so at the instant the last one is spawned
+    // some have not yet reached their first checkpoint. That is not a defect --
+    // running INDEFINITELY with a participant missing is. So this polls to a
+    // deadline and then reports; the caller decides what a failure means.
+    //
+    // Every checkpoint is placed BEFORE its thread's blocking wait, so a thread
+    // reaches its first one as soon as it starts running -- it does not need any
+    // work to arrive. A participant still missing after seconds is therefore a
+    // thread that never checkpoints, not a thread that is merely idle.
+    // The deadline is generous ON PURPOSE. Every checkpoint is placed BEFORE its
+    // thread's blocking wait, so a thread reaches its first one as soon as it is
+    // scheduled — it needs no work to arrive. Seconds would be enough on an idle
+    // machine; the callers pass a minute so that a loaded or virtualised host
+    // cannot be refused a start over scheduling latency. A participant still
+    // missing after that is a thread that never checkpoints, not a slow one.
+    const auto deadline = std::chrono::steady_clock::now() +
+                          std::chrono::milliseconds(timeout_ms);
+    for (;;) {
+        if (EpochRegistrationComplete(why)) return true;
+        if (std::chrono::steady_clock::now() >= deadline) return false;
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+}
+
+size_t CChainState::DrainGraveyard()
+{
+    std::lock_guard<std::recursive_mutex> lock(cs_main);
+    if (m_graveyard.empty()) return 0;
+
+    // The minimum epoch across every registered thread. A thread sitting at 0 has
+    // never checkpointed, so it makes no promise and pins the whole graveyard —
+    // the SAFE direction.
+    //
+    // ⚠️ AN EMPTY REGISTRY USED TO FREE EVERYTHING, AND THE COMMENT HERE CLAIMED
+    // THE OPPOSITE. `safe_epoch` starts at the global epoch and is only ever
+    // LOWERED by a registered slot — so with NO slots at all nothing lowered it,
+    // the `safe_epoch == 0` guard never fired (the global epoch starts at 1), and
+    // every graveyard entry was freed on the spot. NO PARTICIPANTS MEANS NO
+    // PROMISES: nothing may be freed.
+    uint64_t safe_epoch;
+    {
+        std::lock_guard<std::mutex> lk(Registry().mu);
+        if (Registry().slots.empty()) return 0;
+        safe_epoch = m_globalEpoch.load(std::memory_order_acquire);
+        for (std::atomic<uint64_t>* slot : Registry().slots) {
+            const uint64_t v = slot->load(std::memory_order_acquire);
+            if (v < safe_epoch) safe_epoch = v;
+        }
+    }
+    if (safe_epoch == 0) {
+        // A thread holds a pointer and has made no promise: its slot was created at
+        // 0 by NoteIndexPointerResolved precisely so this refusal happens. Say so,
+        // or an operator watching memory grow is left to guess.
+        std::string detail;
+        if (UnregisteredResolverThreads(detail) > 0 &&
+            m_graveyard.size() >= m_graveyardWarnAt) {
+            std::cerr << "[Chain] ⚠️  DRAIN REFUSED: " << detail
+                      << ". Nothing can be freed while a thread holds a "
+                      << "CBlockIndex* and has never checkpointed." << std::endl;
+        }
+        return 0;
+    }
+
+    // ── THE CUTOFF, NOT A FULL WALK ────────────────────────────────────────
+    //
+    // ⚠️ THIS USED TO WALK AND REBUILD THE WHOLE GRAVEYARD ON EVERY CALL, EVEN WHEN
+    // NOTHING COULD BE FREED. In the PINNED regime — one slow or parked participant
+    // — the graveyard grows at the ingress rate while every 1 Hz drain copies all of
+    // it under cs_main, so the lock hold grows linearly with the time since the pin.
+    // CON-27's class again, and the 6.1 ms measurement did not show it because it
+    // was taken in the DRAINING regime.
+    //
+    // The vector is already sorted: stamps come from fetch_add under cs_main, so
+    // they strictly increase, and entries are appended in that order. The first
+    // entry answers "is anything freeable at all?" in O(1), and a binary search
+    // finds the cutoff in O(log G). The survivors ARE moved by the erase below —
+    // this line used to claim otherwise, which is the opposite of what a vector
+    // erase does and contradicted the corrected comment twenty lines down.
+    // ⚠️ AN ENDPOINT SANITY CHECK, NOT A SORTEDNESS PROOF — and calling it the
+    // latter was wrong. `front < back` passes for [2, 1, 3]: it cannot detect an
+    // out-of-order interior, which is exactly what would break the binary search.
+    // It is here because it is O(1) and catches a gross inversion (a stamp assigned
+    // out of order, a container mutated elsewhere); the REAL guarantee comes from
+    // the append path, where stamps are taken from fetch_add under cs_main and
+    // therefore increase by construction. The full check runs under the deep-drain
+    // switch below.
+    ConsensusInvariant(m_graveyard.size() < 2 ||
+                       m_graveyard.front().unlinked_epoch <
+                           m_graveyard.back().unlinked_epoch);
+
+    if (m_graveyard.front().unlinked_epoch > safe_epoch) return 0;   // O(1) early-out
+
+    if (m_deepDrainInvariants.load(std::memory_order_relaxed)) {
+        // The sortedness the fast path rests on, checked rather than assumed.
+        for (size_t i = 1; i < m_graveyard.size(); ++i) {
+            ConsensusInvariant(m_graveyard[i - 1].unlinked_epoch <
+                               m_graveyard[i].unlinked_epoch);
+        }
+    }
+
+    // FREE WHEN EVERY THREAD HAS REACHED THE UNLINK EPOCH, NOT PASSED IT.
+    //
+    // ⚠️ THE PROOF THAT EQUALITY IS SAFE LIVES HERE, NOT IN A REVIEW THREAD. Two
+    // external panels (round 1 and round 9) independently called this comparator a
+    // BLOCKER — the same false positive, nine rounds apart — because the one fact
+    // that settles it was not at the site. It is now:
+    //
+    //     THE STAMP IS POST-INCREMENT.  `m_globalEpoch.fetch_add(1, acq_rel) + 1`
+    //     (this file, the evictor's push_back). So an entry unlinked when the
+    //     counter held N is stamped N+1.
+    //
+    //     A CHECKPOINT ONLY EVER *LOADS*.  `MyEpochSlot()->store(m_globalEpoch
+    //     .load(acquire))`. A thread that checkpointed before the unlink therefore
+    //     published at most N, which is STRICTLY LESS THAN the stamp N+1.
+    //
+    //     THE EVICTOR IS THE ONLY WRITER of the counter, one fetch_add per unlink,
+    //     under cs_main. Nothing else can advance it between the two.
+    //
+    // Therefore `slot == stamp` means the thread stood at a no-pointer boundary at
+    // or after the unlink, never before it: equality is EXACT, and `<` would simply
+    // retain every entry for one extra epoch with no safety gained. The review
+    // objection ("if fetch_add returned the PRE-increment value, equality would be a
+    // UAF") is correct in the abstract and is why the `+ 1` is load-bearing rather
+    // than cosmetic — so the mutation harness now flips it to pre-increment and the
+    // suite must die (arm "F55" in scripts/red_arms_pr198_r1_folds.sh).
+    //
+    // ⚠️ This was `>=` and that is an off-by-one in the one rule the whole mechanism
+    // rests on. A thread's slot holds the epoch at which it last stood at a boundary
+    // HOLDING NOTHING. If that value is >= the epoch in which the entry was
+    // unlinked, then at that boundary the thread held no pointer, and anything it
+    // has acquired since was resolved from a map the entry had already left. So
+    // reaching the unlink epoch is sufficient; requiring strictly greater meant
+    // nothing was ever freed until an unrelated later eviction bumped the counter.
+    const auto cut = std::upper_bound(
+        m_graveyard.begin(), m_graveyard.end(), safe_epoch,
+        [](uint64_t epoch, const GraveyardEntry& e) { return epoch < e.unlinked_epoch; });
+
+    size_t freed = 0;
+    for (auto it = m_graveyard.begin(); it != cut; ++it) {
+        // ---- INVARIANTS AT THE MOMENT OF THE ACTUAL FREE ------------------
+        CBlockIndex* n = it->node.get();
+
+        // (1) pnext is set only for active-chain members, and active-chain
+        //     ancestors are pinned by eviction clause (a), so an entry with pnext
+        //     set is never evictable. A walk from a graveyard entry therefore
+        //     terminates immediately rather than re-entering the live map.
+        ConsensusInvariant(n->pnext == nullptr);
+
+        // (2) pskip is inert repo-wide (only ever assigned nullptr or copied; no
+        //     BuildSkip exists). If BuildSkip is ever implemented this fires,
+        //     which is the point — a tripwire on a future change.
+        ConsensusInvariant(n->pskip == nullptr);
+
+        // (3) NOTHING LIVE MAY STILL NAME IT AS pprev.
+        //
+        //     ⚠️ THIS CHECK WAS A TAUTOLOGY AND PROVED NOTHING. It read
+        //     `it_deg == m_inDegree.end() || it_deg->second == 0` — but
+        //     LeafIndexOnErase erased the victim's in-degree row at UNLINK, so at
+        //     free time the first disjunct was ALWAYS true and the assertion could
+        //     not fail for any input. The row is now KEPT from unlink until free
+        //     exactly so this can be a real check, and erased here.
+        const auto it_deg = m_inDegree.find(n);
+        ConsensusInvariant(it_deg != m_inDegree.end());   // kept until this moment
+        ConsensusInvariant(it_deg->second == 0);          // and still a leaf
+        m_inDegree.erase(it_deg);
+
+        //     The exhaustive scan is what validates m_inDegree ITSELF rather than
+        //     trusting it, so it stays — behind a runtime switch the suites turn on,
+        //     because it is O(map) per freed entry (0.73 ms each at n=50,000).
+        //     `#ifndef NDEBUG` was tried and is a FALSE claim about this repo:
+        //     NDEBUG is defined nowhere (Makefile:1396-1401), and chain.cpp is
+        //     compiled once into CORE_OBJECTS and linked into both the node and the
+        //     tests, so no per-object flag separates them either.
+        if (m_deepDrainInvariants.load(std::memory_order_relaxed)) {
+            for (const auto& kv : mapBlockIndex) {
+                ConsensusInvariant(kv.second->pprev != n);
+            }
+        }
+
+        it->node.reset();   // the actual free
+        ++freed;
+    }
+
+    // The freed prefix is erased and the survivors keep their order and their
+    // stamps, so the next call's O(1) early-out still holds. NOTE the survivors ARE
+    // touched: erase moves them down. An earlier comment here claimed "only the
+    // freed prefix is touched", which is the opposite of what a vector erase does
+    // and would have misled the next reader about the cost.
+    //
+    // ⚠️ THIS ERASE MOVES THE SURVIVING SUFFIX, AND THAT IS A DELIBERATE,
+    // MEASURED CHOICE. An external seat flagged it as O(G) per partial reclamation
+    // and proposed a deque; the deque was implemented and measured 45% SLOWER at
+    // the scale that actually occurs (drain max 28.0 ms vs 19.3 ms, mean 1.5 vs
+    // 1.0, same fixture and configuration) — 16-byte entries move contiguously
+    // faster than a deque iterates chunks and destroys across segments. See the
+    // container's declaration in chain.h for the numbers and for the threshold at
+    // which the asymptotics would win.
+    m_graveyard.erase(m_graveyard.begin(), cut);
+
+    // The warn threshold is a high-water mark, not a rate: once the graveyard has
+    // drained back down, a later climb should report again.
+    if (m_graveyard.size() * 2 < m_graveyardWarnAt && m_graveyardWarnAt > 1024) {
+        m_graveyardWarnAt /= 2;
+    }
+    return freed;
+}
+
+bool CChainState::LeafWorkOrder::operator()(const CBlockIndex* a,
+                                            const CBlockIndex* b) const
+{
+    // LOWEST work first: the evictor wants the cheapest victim at begin().
+    // ChainWorkGreaterThan is the ONLY valid chainWork comparison — nChainWork is
+    // a uint256 and is NOT memcmp-comparable, so operator< / memcmp would give a
+    // wrong order silently (the same trap the evictor's old scan documented).
+    if (ChainWorkGreaterThan(b->nChainWork, a->nChainWork)) return true;   // a < b
+    if (ChainWorkGreaterThan(a->nChainWork, b->nChainWork)) return false;  // a > b
+    // Equal work: break by hash so the order is TOTAL and deterministic. Without
+    // a tiebreak, std::set treats equal-work entries as duplicates and silently
+    // drops all but one — which would make the index disagree with mapBlockIndex
+    // and under-evict forever.
+    return a->GetBlockHash() < b->GetBlockHash();
+}
+
+void CChainState::LeafIndexOnInsert(CBlockIndex* pnew)
+{
+    if (!pnew) return;
+    // A newly inserted entry has no children yet, so it is a leaf by definition.
+    m_inDegree[pnew];                       // default-construct to 0 if absent
+    m_evictableLeaves.insert(pnew);
+    // Its parent just gained a child and is therefore no longer a leaf.
+    if (pnew->pprev) {
+        m_inDegree[pnew->pprev] += 1;
+        m_evictableLeaves.erase(pnew->pprev);
+    }
+}
+
+void CChainState::LeafIndexOnErase(CBlockIndex* pgone)
+{
+    if (!pgone) return;
+    m_evictableLeaves.erase(pgone);
+
+    // ⚠️ THE VICTIM'S OWN in-degree ROW IS DELIBERATELY *NOT* ERASED HERE. It used
+    // to be, and that is what made the drain's free-time "nobody names this as
+    // pprev" assertion a TAUTOLOGY: by the time the entry was freed its row was
+    // already gone, so the `== end()` disjunct always held. The row is kept until
+    // DrainGraveyard actually frees the node, where it is asserted to be zero and
+    // erased. Between unlink and free the key belongs to a graveyard entry, which
+    // is why LeafIndexMatchesBruteForce accounts for graveyard entries explicitly
+    // rather than comparing raw sizes. Cleanup() drops the whole map, so nothing
+    // leaks a row there.
+    // The parent lost a child; if that was its last, the parent becomes a leaf
+    // and is now itself a candidate for eviction (the cascade the multi-pass
+    // loop used to discover by rescanning).
+    if (pgone->pprev) {
+        auto it = m_inDegree.find(pgone->pprev);
+        if (it != m_inDegree.end()) {
+            if (it->second > 0) it->second -= 1;
+            if (it->second == 0) m_evictableLeaves.insert(pgone->pprev);
+        }
+    }
+}
+
+// ============================================================================
+// THE PIN CLAUSES AND THE RAW-POINTER LEDGER — PRESERVED, NOT DELETED.
+//
+// PR #129 round 4 replaced the build-the-whole-pinned-set evictor with the leaf
+// side index above. The CODE these comments annotated is gone; the REASONING is
+// not obsolete — IsLeafPinnedDirect implements exactly these four clauses,
+// reduced by the leaf lemma to direct tests, and the landmine ledger is a
+// statement about raw CBlockIndex* holders that is unaffected by how a victim
+// gets selected.
+//
+// Kept because they carry corrections from three review rounds — the clause-(d)
+// parent-pin hole, the false best-header-tip pin, the candidate bound and what
+// it does and does not prove — and register rows CON-25/26/27 cite them. A
+// refactor that silently drops the reasoning behind the code it rewrites is how
+// the next reviewer re-derives a settled question, or re-opens a closed hole.
+//
+// WHERE EACH CLAUSE NOW LIVES: (a) tip compare, (b) candidate-set lookup,
+// (c) the HAVE_DATA/validity flag test, (d) the pending-snapshot lookup — all in
+// IsLeafPinnedDirect, all O(1)/O(log n) because a leaf is never a strict
+// ancestor and therefore can never be pinned transitively.
+// ============================================================================
+    // ---- (2) Build the pinned set (never evicted) ------------------------
+    // (a) every ancestor of the active tip.
+    // (b) every reorg candidate AND all of its pprev ancestors.
+    //
+    //     ⚠️ WHAT BOUNDS THIS SET — the question the external panel put first, and
+    //     the one this file previously did not answer. Since the cap is advisory,
+    //     the pinned set IS the floor on memory: whatever cannot be evicted is
+    //     what the node must hold. So "can an attacker grow the candidate set?"
+    //     decides whether a remote party can drive that floor up.
+    //
+    //     HEADERS ALONE CANNOT, and the bound is a validity level, not a policy.
+    //     Every `m_setBlockIndexCandidates.insert` in this file — grep it; there
+    //     are exactly two, one in the useNewPath arm of the connect path and one
+    //     in RecomputeCandidates() — is gated by IsBlockACandidateForActivation(),
+    //     which requires `(nStatus & BLOCK_VALID_MASK) >= BLOCK_VALID_TRANSACTIONS`
+    //     and says so explicitly: "Pre-validation BLOCK_VALID_HEADER entries are
+    //     NOT candidates — they live in mapBlockIndex for fork visibility, not for
+    //     activation."
+    //
+    //     (Cited by SYMBOL, not by line. An earlier version of this paragraph gave
+    //     line numbers; they drifted twice inside this one PR as the file was
+    //     edited, and a stale cite in a security argument is how a reader ends up
+    //     reading the wrong function.)
+    //
+    //     Header spam therefore produces BLOCK_VALID_HEADER entries that can never
+    //     enter the candidate set and so can never be pinned by this clause. They
+    //     stay evictable leaves, which is exactly what the evictor is for.
+    //
+    //     ⚠️ WHAT IT ACTUALLY COSTS TO PIN ONE, stated precisely, because an
+    //     earlier version of this said "FULLY VALIDATED BLOCKS — real work at the
+    //     real difficulty" and that OVERSTATES the barrier (non-author reader,
+    //     LOW-2). The gate flag is stamped by MarkBlockReceived() (block_index.h),
+    //     which sets BLOCK_HAVE_DATA and raises validity to
+    //     BLOCK_VALID_TRANSACTIONS in ONE op ON RECEIPT — not after full
+    //     validation — and the connect-path insert runs before ConnectTip has
+    //     ruled on the block. So the true cost is supplying PoW-valid BLOCK DATA
+    //     at the fork point's difficulty.
+    //
+    //     TWO CLAIMS REMOVED HERE, not softened (external panel round 3): "pinned
+    //     only TRANSIENTLY until activation resolves it" and "the difference
+    //     between remotely exhaustible and not". Neither follows from these gates.
+    //     The prune in RecomputeCandidates removes strictly-lower-work candidates
+    //     only, so equal-work alternatives persist until work advances and can be
+    //     repopulated — residency is not bounded by activation. And "not remotely
+    //     exhaustible" is a claim about an attacker's whole budget that the gates
+    //     do not establish.
+    //
+    //     WHAT IS PROVEN, and the only thing to carry forward: header-only entries
+    //     can never pin, and pinning requires PoW-bearing block data at fork-point
+    //     difficulty. Size the pinned set from that and no more.
+    //
+    //     KEEP THIS TRUE. If a future change ever admits header-only entries to
+    //     the candidate set, the advisory cap becomes remotely exhaustible and
+    //     this whole argument has to be redone.
+    //
+    //     This is the chain selector's activation-reachable set. pindexBestHeader
+    //     does not exist on CChainState — best-header state lives in
+    //     CHeadersManager — so the candidate set is the in-scope handle on it.
+    //
+    //     ⚠️ CORRECTED (external panel, item 7). This used to add: "it transitively
+    //     pins the best-header tip whenever that tip has a block-index entry (such
+    //     a tip is, by construction, a candidate)." The parenthesis is FALSE, and
+    //     the paragraph directly above is why: a candidate needs
+    //     BLOCK_VALID_TRANSACTIONS, whereas a best-HEADER tip is by definition
+    //     header-only until its block arrives and validates. So a best-header tip
+    //     is precisely the case that is NOT pinned here.
+    //
+    //     That is correct behaviour, not a hole — an un-downloaded header tip is
+    //     re-obtainable by PEER RE-ANNOUNCEMENT if that fork ever becomes the
+    //     most-work chain, and holding it meanwhile is exactly the memory the cap
+    //     exists to reclaim. The old wording claimed a pin that does not exist,
+    //     which is the more dangerous half: it would let a reader assume
+    //     header-tip protection that nothing provides.
+    //
+    //     (An earlier version of this correction justified it with "mapHeaders is
+    //     a separate, unbounded store". That is FALSE — mapHeaders is capped and
+    //     PruneOrphanedHeaders erases non-best-chain headers behind the tip — and
+    //     chain.h's EvictLowestWorkLeafNotPinned doc already warned in as many
+    //     words not to rest the argument on it. Fixing one wrong claim by
+    //     introducing another, against a warning in the file being edited, is the
+    //     failure this PR keeps finding; recorded rather than quietly patched.)
+    // (c) BELT for any future HAVE_DATA-before-validity ingress path: every
+    //     entry that HAS block data but is NOT yet fully validated
+    //     (BLOCK_HAVE_DATA set, validity level below BLOCK_VALID_TRANSACTIONS).
+    //
+    //     IMPORTANT — what clause (c) does NOT cover (PR #129 re-red-team HIGH-1):
+    //     it does NOT cover the real BLOCKER-1 target, i.e. a block sitting in
+    //     CBlockValidationQueue. Every production data-ingress path stamps a
+    //     block via MarkBlockReceived() (block_index.h:182-184), which sets
+    //     BLOCK_HAVE_DATA *and* RaiseValidity(BLOCK_VALID_TRANSACTIONS) in ONE
+    //     op. So a queued block is HAVE_DATA + VALID_TRANSACTIONS — it is
+    //     `fully_validated` and therefore is NOT matched by the
+    //     `have_data && !fully_validated` predicate below. It is also not yet a
+    //     m_setBlockIndexCandidates member during the cs_main-released queue
+    //     wait (it only joins the candidate set inside ActivateBestChain, in the
+    //     worker), so clause (b) does not pin it either: during the BLOCKER-1
+    //     window it is still an evictable leaf.
+    //
+    //     The SOLE mechanism that closes BLOCKER-1 for queued blocks is the
+    //     by-hash re-resolve in block_validation_queue.cpp ProcessBlock:
+    //     `pindex = m_chainstate.GetBlockIndex(blockHash)` re-looked-up under the
+    //     lock after the cs_main release, with the null case handled. The cached
+    //     raw QueuedBlock::pindex MUST NOT be re-read across a cs_main release.
+    //
+    //     Clause (c) is kept as a belt: it pins any index that ever holds
+    //     BLOCK_HAVE_DATA WITHOUT having reached VALID_TRANSACTIONS — a state
+    //     no current peer-reachable path produces (the two flags are coupled in
+    //     MarkBlockReceived), but one a future split ingress path (data first,
+    //     validity later) could introduce. If such a path is ever added, clause
+    //     (c) already protects its raw-pointer holders; it is defense-in-depth
+    //     for that hypothetical, NOT coverage of today's queued block.
+    // ---- (d) PR #129 MEDIUM-2: pin the async queue's pending blocks AND their
+    //     pprev-ancestor chains. A queued block is HAVE_DATA + VALID_TRANSACTIONS
+    //     (MarkBlockReceived couples both flags), so clause (c) above does NOT
+    //     match it, and it is not yet a candidate (clause (b)) during the
+    //     cs_main-released async wait — it is an evictable leaf, and so are its
+    //     non-active ancestors. Multi-pass eviction can therefore cascade up a
+    //     queued block's parent fork and free the parent out from under the
+    //     worker's create path (block_validation_queue.cpp ProcessBlock parent
+    //     lookup), stalling a valid competing fork's adoption under adversarial
+    //     cap pressure. To prevent that LIVENESS hole we pin every hash the queue
+    //     reports as pending (queued + the single in-flight block mid-ProcessBlock)
+    //     plus each one's pprev ancestors.
+    //
+    //     This is ADDITIVE liveness defense. It does NOT replace the worker's
+    //     by-hash re-resolve, which remains the authoritative correctness path —
+    //     but NOT for the reason this comment used to give.
+    //
+    //     ⚠️ CORRECTED (external panel round 2). It read: "pinning guards against
+    //     EVICTION, not against the AddBlockIndex flag-merge that can still
+    //     destroy a specific unique_ptr and re-home the canonical pointer for a
+    //     hash." AddBlockIndex does no such thing: its merge branch mutates the
+    //     EXISTING object in place and discards the incoming pindex, so the
+    //     mapped unique_ptr is never replaced and the address is stable. Pinned
+    //     by test_height_one_header_then_data_sequence
+    //     (add_block_index_flag_merge_tests.cpp), which asserts the pointer is
+    //     identical across a merge.
+    //
+    //     THE REAL REASON the re-resolve is mandatory: the cached
+    //     QueuedBlock::pindex was captured BEFORE this pin was established and
+    //     before any of it was checked, so it is a pointer of unknown provenance.
+    //     The re-resolve reads the pointer the pin actually protects. That is a
+    //     narrower claim than the old one and it is true.
+    //
+    //     Lock order: we already hold cs_main; the provider returns HASHES only
+    //     (a pure read of queue state under the queue's own mutex), establishing
+    //     cs_main -> queue-mutex and never the reverse. The mapBlockIndex lookup
+    //     and pprev walk below run under the cs_main we hold.
+        // ⚠️ THE `continue` BELOW USED TO BE A HOLE, and the comment above used to
+        // claim it was not (external panel round 2: gpt6 HIGH, kimi MEDIUM, found
+        // independently). The walk starts at find(h), so a pending block that is
+        // NOT YET INDEXED — precisely the create-path case — pinned NOTHING: its
+        // ancestor walk never ran and its parent stayed evictable. The create path
+        // could therefore evict the very parent it was about to resolve. Safety
+        // held (resolve-after-evict sees a clean null, never a dangling pointer);
+        // LIVENESS did not — a valid competing fork stalls under cap pressure.
+        //
+        // Closed at the SOURCE rather than here: GetPendingBlockHashes now reports
+        // each pending block's hashPrevBlock as well, so the parent is pinned by
+        // HASH whether or not the child has an entry yet, and the walk below then
+        // covers the rest of that parent's chain. The `continue` is now what it
+        // always read as — a benign miss for a hash with no index entry.
+            // Pin the pending block AND walk its pprev chain (the cascade target),
+            // using the same cycle-guarded idiom as clause (b). Stop as soon as we
+            // reach an already-pinned ancestor (active chain / candidate) or null.
+    // ---- (2.1) RAW-POINTER-HOLDER LANDMINE LEDGER (re-red-team HIGH-1/HIGH-2)-
+    // The pinned set above is the COMPLETE protection for every raw CBlockIndex*
+    // held outside mapBlockIndex that could be dereferenced after a cs_main
+    // release. The eviction invariant ("freeing a leaf cannot dangle anyone")
+    // is built over the pprev graph PLUS clause (c); it does NOT automatically
+    // cover any other subsystem that caches a raw index pointer. Every known
+    // external holder, with its current status — anyone WIRING one of the dead
+    // holders MUST either add its target to this pin set or switch the consumer
+    // to a by-hash re-lookup (CChainState::GetBlockIndex), or it re-arms
+    // BLOCKER-1's class:
+    //   * block_validation_queue.h:56  QueuedBlock::pindex  — LIVE; the fixed
+    //       bug. NOT covered by clause (c) here (a queued block is
+    //       HAVE_DATA + VALID_TRANSACTIONS via MarkBlockReceived, so it is
+    //       `fully_validated` and the clause-(c) predicate skips it — see clause
+    //       (c) above). CORRECTNESS is closed SOLELY by the queue's by-hash
+    //       re-resolve in block_validation_queue.cpp (GetBlockIndex under the
+    //       lock, null case handled); the cached raw pointer is never re-read.
+    //       LIVENESS (PR #129 MEDIUM-2): clause (d) above ADDITIONALLY pins the
+    //       queue's pending/in-flight blocks and their pprev ancestors so a
+    //       cascade does not free a queued block's parent and stall fork
+    //       adoption. Clause (d) is defense-in-depth for liveness — it does NOT
+    //       license re-reading the cached pindex, so the by-hash re-resolve
+    //       remains mandatory. (The parenthetical here used to say the flag-merge
+    //       "can still re-home the canonical pointer even for a pinned hash".
+    //       That is FALSE — the merge mutates in place; see the correction at
+    //       clause (d) above. The re-resolve is mandatory because the cached
+    //       pointer predates the pin, not because the merge moves anything.)
+    //   * block_index.h:17  CBlockIndex::pskip — INERT (never assigned; no
+    //       BuildSkip exists). pskip is NOT counted in the in-degree map, so a
+    //       node referenced only via some other node's pskip would be a freeable
+    //       leaf. If anyone adds BuildSkip(), pskip targets must be pinned or
+    //       counted in in-degree before eviction is safe.
+    //   * peers.h:104/105  pindexBestKnownBlock / pindexLastCommonBlock —
+    //       DECLARED-ONLY (block tracking moved to CBlockTracker). In upstream
+    //       Bitcoin Core these point at arbitrary per-peer fork tips — exactly
+    //       evictable leaves. A future peer-manager port that wires them must
+    //       pin or hash-re-lookup.
+    //   * node_state.h:23  QueuedBlock::pindex (via peers.h vBlocksInFlight) —
+    //       DEAD (sole writer MarkBlockAsInFlight has zero callers). Same
+    //       landmine if re-wired.
+    //   * pnext (block_index.h:16) — SAFE: only ever set on active-chain nodes
+    //       (all fully pinned by clause (a)), so it is intentionally NOT a
+    //       landmine.
+
+bool CChainState::IsLeafPinnedDirect(const CBlockIndex* leaf,
+                                     const std::set<uint256>& pending) const
+{
+    // ONLY VALID FOR LEAVES. Per the leaf lemma in chain.h, a leaf can never be
+    // reached by an ancestor walk, so the four pin clauses reduce to these four
+    // direct tests. Calling this on a non-leaf would be wrong and would under-pin.
+    if (!leaf) return true;  // treat unknown as pinned: never evict what we cannot judge
+
+    // (a) the active tip. Any OTHER active-chain entry has an active-chain child
+    //     and therefore is not a leaf, so this single pointer compare covers the
+    //     whole active chain for leaves.
+    if (leaf == pindexTip) return true;
+
+    // (b) a reorg candidate. Same argument: a strict ancestor of a candidate has
+    //     a child, so only a candidate itself can be a pinned leaf here.
+    if (m_setBlockIndexCandidates.count(const_cast<CBlockIndex*>(leaf)) > 0) return true;
+
+    // (c) HAVE_DATA without full validity — a property of the entry itself, never
+    //     transitive. Defense-in-depth for a split ingress path.
+    const bool have_data = (leaf->nStatus & CBlockIndex::BLOCK_HAVE_DATA) != 0;
+    const bool fully_validated =
+        (leaf->nStatus & CBlockIndex::BLOCK_VALID_MASK) >= CBlockIndex::BLOCK_VALID_TRANSACTIONS;
+    if (have_data && !fully_validated) return true;
+
+    // (d) queued / in-flight blocks AND their parents (the provider reports both).
+    //     Snapshot is taken ONCE per eviction call by the caller, not per leaf.
+    if (pending.count(leaf->GetBlockHash()) > 0) return true;
+
+    return false;
+}
+
+bool CChainState::LeafIndexMatchesBruteForce() const
+{
+    // DEBUG/TEST ONLY. Recompute in-degree and the leaf set the expensive way and
+    // compare with the incrementally maintained ones. This is the check that the
+    // two maintenance sites are complete: delete either one and this goes false.
+    std::map<const CBlockIndex*, size_t> want_degree;
+    for (const auto& kv : mapBlockIndex) want_degree[kv.second.get()];
+    for (const auto& kv : mapBlockIndex) {
+        CBlockIndex* p = kv.second.get();
+        if (p->pprev) {
+            auto it = want_degree.find(p->pprev);
+            if (it != want_degree.end()) it->second += 1;
+        }
+    }
+    // ⚠️ m_inDegree LEGITIMATELY CARRIES ROWS THE LIVE MAP DOES NOT. A victim's row
+    // is kept from unlink until the drain frees it, so that the free-time assertion
+    // is a real check rather than the tautology it used to be. A raw size compare
+    // would therefore fail whenever the graveyard is non-empty. Account for them
+    // explicitly instead -- which is a STRONGER check than the size compare was: it
+    // says the extra rows are exactly the graveyard's, and that each is a leaf.
+    std::set<const CBlockIndex*> in_graveyard;
+    for (const auto& e : m_graveyard) {
+        if (e.node) in_graveyard.insert(e.node.get());
+    }
+    if (want_degree.size() + in_graveyard.size() != m_inDegree.size()) return false;
+    for (const auto& kv : want_degree) {
+        auto it = m_inDegree.find(kv.first);
+        if (it == m_inDegree.end() || it->second != kv.second) return false;
+    }
+    for (const CBlockIndex* g : in_graveyard) {
+        auto it = m_inDegree.find(g);
+        if (it == m_inDegree.end() || it->second != 0) return false;
+    }
+
+    std::set<const CBlockIndex*> want_leaves;
+    for (const auto& kv : want_degree) if (kv.second == 0) want_leaves.insert(kv.first);
+    if (want_leaves.size() != m_evictableLeaves.size()) return false;
+    for (const CBlockIndex* p : m_evictableLeaves) {
+        if (want_leaves.count(p) == 0) return false;
+    }
+
+    // ORDER, NOT ONLY MEMBERSHIP (round-5 seats). The checks above compare the SET
+    // of leaves and would pass with the comparator returning anything consistent —
+    // so a mutant that drops the (work, hash) tiebreak, or reverses the work
+    // comparison, survives them. Order is the whole point of the structure: the
+    // evictor takes begin() and calls it the lowest-work victim.
+    //
+    // Walk the set and assert it really is non-decreasing by (work, hash) under
+    // ChainWorkGreaterThan — the same comparison the comparator is supposed to use,
+    // written out here independently so a broken comparator cannot certify itself.
+    const CBlockIndex* prev_leaf = nullptr;
+    for (const CBlockIndex* p : m_evictableLeaves) {
+        if (prev_leaf != nullptr) {
+            if (ChainWorkGreaterThan(prev_leaf->nChainWork, p->nChainWork)) {
+                return false;   // strictly decreasing work: order is wrong
+            }
+            const bool equal_work =
+                !ChainWorkGreaterThan(prev_leaf->nChainWork, p->nChainWork) &&
+                !ChainWorkGreaterThan(p->nChainWork, prev_leaf->nChainWork);
+            if (equal_work && !(prev_leaf->GetBlockHash() < p->GetBlockHash())) {
+                return false;   // equal work but the hash tiebreak is not honoured
+            }
+        }
+        prev_leaf = p;
+    }
+    return true;
+}
+
+bool CChainState::EvictLowestWorkLeafNotPinned(size_t target_max) {
     std::lock_guard<std::recursive_mutex> lock(cs_main);
 
     if (mapBlockIndex.empty()) return false;
 
-    // Build a set of active-chain hashes by walking pindexTip → genesis.
-    // O(active_chain_height); cheap relative to map walk below.
-    std::set<uint256> active_chain_hashes;
-    for (CBlockIndex* p = pindexTip; p != nullptr; p = p->pprev) {
-        active_chain_hashes.insert(p->GetBlockHash());
-    }
-
-    // Find the entry with minimum nChainWork that is NOT on the active
-    // chain. Use ChainWorkGreaterThan (from consensus/pow.h) — chainWork
-    // stored in uint256 doesn't have a memcmp-compatible byte ordering;
-    // raw memcmp gives wrong magnitude comparison.
-    CBlockIndex* worst = nullptr;
-    uint256      worst_work;
-    bool         worst_set = false;
-    for (auto& kv : mapBlockIndex) {
-        CBlockIndex* p = kv.second.get();
-        if (!p) continue;
-        if (active_chain_hashes.count(kv.first) > 0) continue;  // skip active
-        // We want minimum: p < worst means p has LESS work than current worst.
-        // ChainWorkGreaterThan(a, b) = a > b. So p has less work iff
-        // ChainWorkGreaterThan(worst_work, p->nChainWork) is true
-        // (worst_work > p means p < worst_work, so p is lower-work).
-        if (!worst_set || ChainWorkGreaterThan(worst_work, p->nChainWork)) {
-            worst = p;
-            worst_work = p->nChainWork;
-            worst_set = true;
+    // ---- (0) O(1) EARLY-OUT: the index IS the active chain ------------------
+    //
+    // MEASURED REASON THIS EXISTS. At a 500,000-entry index this routine costs
+    // ~665 ms of cs_main hold and ~55 MB of transient allocation PER CALL
+    // (src/tools/evict_cost_bench.cpp). In the all-pinned case it pays all of
+    // that and then returns false, having freed nothing — and that case is not
+    // an edge case, it is the STEADY STATE of any node whose active height has
+    // reached the cap. Past saturation the routine runs on every new header, so
+    // an attacker who spams headers to the cap buys a ~0.66 s global-lock stall
+    // per header. This check removes that entirely.
+    //
+    // THE CONDITION IS PROVABLE, WHICH IS WHY IT IS THIS ONE. Every entry on the
+    // active chain is in mapBlockIndex, so mapBlockIndex.size() >= activeLen
+    // always. If it is also <= activeLen then the two sets are EQUAL: the index
+    // is exactly the active chain, every entry is pinned by clause (a), and no
+    // eligible leaf can exist. Returning false is not an approximation here, it
+    // is the same answer the full path computes.
+    //
+    // ⚠️ A WIDER CONDITION WAS PROPOSED AND IS NOT SOUND — recording it so nobody
+    // re-adds it. The suggestion was
+    //     size() <= activeLen + candidates.size() + pending.size()
+    // on the reasoning that those are all pinned. They are, but they OVERLAP the
+    // active chain rather than extending it: IsBlockACandidateForActivation gates
+    // on validity only, so the active tip and its recent ancestors are normally
+    // candidates too. Counter-example — 100 active entries, 5 candidates all ON
+    // the active chain, 5 unpinned fork leaves, size 105 <= 100 + 5 + 0. The
+    // condition fires and the five leaves are never evicted. Because the cap is
+    // advisory the damage is bounded (the map exceeds its target rather than
+    // anything unsafe), but it would silently weaken the cap under exactly the
+    // fork-spam conditions the cap exists for. Sufficient-and-provable beats
+    // sufficient-looking.
+    //
+    // Not exact, deliberately: an index that is active chain PLUS only pinned
+    // non-chain entries also has nothing evictable and is NOT caught here. That
+    // case falls through to the full path and pays for the answer. This check
+    // buys the common, attacker-relevant case at O(1) and claims nothing more.
+    if (pindexTip != nullptr) {
+        const size_t activeLen = static_cast<size_t>(pindexTip->nHeight) + 1;
+        if (mapBlockIndex.size() <= activeLen) {
+            return false;  // index == active chain; every entry pinned by (a)
         }
     }
 
-    if (!worst_set) {
-        // All entries are on the active chain. At production cap sizes
-        // (DIL=500K vs ~24K chain height) this is unreachable; if it
-        // happens, caller falls back to fail-closed.
-        return false;
+    // ---- (1) SELECT FROM THE SIDE INDEX, DO NOT REBUILD ANYTHING ------------
+    //
+    // What this replaces, and why: the previous body built an index-sized
+    // in-degree map on every call and then rescanned the WHOLE map once per
+    // victim. Measured at 500,000 entries that was 485 ms of cs_main hold and
+    // 43 MB transient, against main's 211 ms / 20 MB — 2.31x WORSE than the code
+    // this PR set out to make safe, on a path an attacker reaches by spamming
+    // headers to the cap (CON-27, src/tools/evict_cost_bench.cpp).
+    //
+    // m_evictableLeaves is maintained incrementally at FOUR sites (see the
+    // census at AddBlockIndex; "two" was wrong and hid two real UAFs)
+    // (AddBlockIndex and the erase below) and is ordered lowest-work-first, so
+    // the victim is at begin() and selection is O(log n) instead of O(n).
+    //
+    // The pinned SET is never built. Per the leaf lemma in chain.h a leaf cannot
+    // be reached by an ancestor walk, so pinnedness for a leaf is four direct
+    // tests — IsLeafPinnedDirect. The only per-call setup is one snapshot of the
+    // pending hashes, taken here rather than per candidate.
+    std::set<uint256> pending_snapshot;
+    if (m_pendingBlockHashProvider) {
+        // Lock order cs_main -> queue mutex, unchanged: we hold cs_main and the
+        // provider takes the queue's own mutex and returns hashes only.
+        pending_snapshot = m_pendingBlockHashProvider();
     }
 
-    // Remove from m_setBlockIndexCandidates if present (avoid dangling
-    // pointer in the candidate set).
-    m_setBlockIndexCandidates.erase(worst);
+    // ---- (2) Multi-pass leaf eviction ---------------------------------------
+    //
+    // Cascades still work, and now without a rescan: erasing a leaf decrements
+    // its parent's in-degree, and LeafIndexOnErase inserts the parent into
+    // m_evictableLeaves the moment that hits zero. The next iteration therefore
+    // sees the parent as a candidate automatically.
+    //
+    // Pinned leaves are excluded for the duration of this call so one at begin()
+    // cannot spin the loop.
+    //
+    // THE BOUND ON HOW MANY GET SKIPPED, with the term that was missing (round-5
+    // seats). It is the number of PINNED LEAVES, which is at most:
+    //
+    //     1                       clause (a) — only the tip can be a pinned leaf,
+    //                             since any other active-chain entry has an
+    //                             active-chain child and is therefore not a leaf
+    //   + candidate leaves        clause (b) — each costs PoW-bearing block data
+    //                             at fork-point difficulty to create
+    //   + HAVE_DATA-not-valid     clause (c) — ⚠️ THIS TERM WAS OMITTED. Entries
+    //     leaves                  with block data whose validity has not reached
+    //                             VALID_TRANSACTIONS. Bounded by in-flight block
+    //                             downloads, i.e. by ingress, not by the attacker
+    //                             directly — but it is NOT zero and the old
+    //                             comment read as if the bound had only two terms.
+    //   + pending entries         clause (d) — queued + in-flight blocks and their
+    //                             parents, bounded by MAX_QUEUE_DEPTH (100) times
+    //                             two, plus their ancestors
+    //
+    // None of these is attacker-controlled without spending real work, so the skip
+    // count is bounded by node configuration and ingress rather than by anything a
+    // peer can inflate for free. That is the claim; the clause-(c) term is stated
+    // rather than quietly assumed to be zero.
+    bool evicted_any = false;
 
-    // Erase from mapBlockIndex. unique_ptr cleanup destroys CBlockIndex.
-    uint256 worst_hash = worst->GetBlockHash();
-    mapBlockIndex.erase(worst_hash);
+    // TEMPORARY EXCLUSION, NOT A SKIP-LIST (round-5 seats, gpt6 MEDIUM).
+    //
+    // The previous version kept pinned leaves IN m_evictableLeaves and restarted
+    // iteration at begin() after every eviction, re-visiting and re-testing each
+    // of them every pass. With k pinned leaves ordered before v victims that is
+    // >= v*k pin tests inside ONE cs_main hold — and the bench only ever measured
+    // the single-victim case, so the quadratic term was invisible to it. A comment
+    // claimed the exclusion; the code did not implement it.
+    //
+    // Now a pinned leaf is REMOVED from the set for the duration of this call and
+    // reinstated at the end, so each is tested at most once per call: the loop is
+    // O((v + k) log n) rather than O(v*k). Removal is safe because pinnedness is
+    // evaluated against a snapshot taken once at the top — nothing inside this
+    // call can change it — and the entries are put back before returning, so the
+    // set is unchanged as seen by anyone else. cs_main is held throughout, so no
+    // other thread can observe the intermediate state.
+    // RAII, NOT A TRAILING LOOP (round-6, kimi LOW). Reinstatement used to be a
+    // for-loop near the end of the function, with a ConsensusInvariant and several
+    // allocations between the first exclusion and it. Any future throwing path in
+    // that span would have left the excluded leaves permanently OUT of the index —
+    // a silent, cumulative shrink of the evictable set that no single-call test
+    // could see. A guard makes "they always go back" structural instead of
+    // positional.
+    struct LeafReinstater {
+        std::set<CBlockIndex*, LeafWorkOrder>& set_ref;
+        std::vector<CBlockIndex*> excluded;
+        ~LeafReinstater() {
+            for (CBlockIndex* p : excluded) set_ref.insert(p);
+        }
+    } reinstater{m_evictableLeaves, {}};
+    std::vector<CBlockIndex*>& excluded = reinstater.excluded;
+    excluded.reserve(16);
 
-    // Perf fix 2026-07-12: eviction can remove a tip outright, or (if the
-    // evicted block was the last child of its parent) restore its parent
-    // to tip status — either way the cached set is stale.
-    m_chainTipsCacheDirty = true;
+    for (;;) {
+        if (target_max > 0 && mapBlockIndex.size() <= target_max) break;
 
-    return true;
+        CBlockIndex* victim = nullptr;
+        while (!m_evictableLeaves.empty()) {
+            CBlockIndex* cand = *m_evictableLeaves.begin();
+            if (IsLeafPinnedDirect(cand, pending_snapshot)) {
+                m_evictableLeaves.erase(m_evictableLeaves.begin());
+                excluded.push_back(cand);   // reinstated below, before returning
+                continue;
+            }
+            victim = cand;   // lowest-work unpinned leaf: the set is ordered
+            break;
+        }
+
+        if (!victim) {
+            // No eligible leaf. Callers treat this as "cap not enforced" and
+            // proceed — the cap is ADVISORY and must never gate chain progress.
+            break;
+        }
+
+        // ⚠️ THE COMMENT HERE SAID ONE THING AND THE CODE DID THE OTHER (round-5
+        // reader, MEDIUM-1). It read "erase by the map's own key, NOT by
+        // victim->GetBlockHash()" — directly above a line that did exactly
+        // `victim_key = victim->GetBlockHash()`. A comment that contradicts the
+        // line beneath it is worse than none: it tells the next reader the hazard
+        // is handled.
+        //
+        // Now it genuinely erases by the MAP'S key. The two can only disagree if
+        // an entry's phashBlock diverges from the key it is stored under — which
+        // AddBlockIndex's Invariant currently makes unreachable, so this is
+        // defence in depth rather than a live fix. It is worth having anyway
+        // because the bench printed the null-phashBlock diagnostic twice during a
+        // run, which is the shape that would make them disagree.
+        auto victim_it = mapBlockIndex.find(victim->GetBlockHash());
+        ConsensusInvariant(victim_it != mapBlockIndex.end() &&
+                           victim_it->second.get() == victim);
+        const uint256 victim_key = victim_it->first;
+
+        // Drop it from the candidate set BEFORE the unique_ptr frees it, or the
+        // set keeps a dangling pointer.
+        m_setBlockIndexCandidates.erase(victim);
+
+        // Side-index maintenance MUST run before the erase destroys the object:
+        // it reads victim->pprev. This is the ERASE site -- one of four, not the
+        // "second and last" this used to claim.
+        LeafIndexOnErase(victim);
+
+        // UNLINK NOW, FREE LATER. Previously `mapBlockIndex.erase()` destroyed the
+        // CBlockIndex here, which is what makes the 62 resolve-then-use windows a
+        // use-after-free. The entry leaves every structure immediately — so a
+        // by-hash re-resolve returns null exactly as before, and nothing reachable
+        // from the map points at it — but the memory is handed to the graveyard
+        // and released only once every participating thread has passed this epoch.
+        {
+            auto node = std::move(mapBlockIndex[victim_key]);
+            mapBlockIndex.erase(victim_key);
+            if (m_immediateFreeForTest.load(std::memory_order_relaxed)) {
+                // ⚠️ THE IN-DEGREE ROW MUST GO WITH IT. LeafIndexOnErase now KEEPS
+                // the victim's row so the drain's free-time assertion is real, and
+                // the drain erases it at the free — but this branch frees WITHOUT
+                // going through the drain, so it left a row keyed to a destroyed
+                // node. Harmless in the ASan arm that uses it, and a dangling key
+                // in the side index for anything else, including
+                // LeafIndexMatchesBruteForce. The test-only path is still a path.
+                m_inDegree.erase(victim);
+                // TEST-ONLY: free in place, which is what this code did before
+                // deferral existed. It is here so the ASan arms can compare the
+                // defect and the fix IN ONE BINARY, on one fixture, with deferral
+                // as the single variable -- rather than comparing two builds and
+                // arguing that nothing else differed. `node` goes out of scope
+                // here and the CBlockIndex is destroyed at this instant.
+                node.reset();
+            } else {
+                m_graveyard.push_back(GraveyardEntry{
+                    std::move(node),
+                    m_globalEpoch.fetch_add(1, std::memory_order_acq_rel) + 1});
+
+                // ⚠️ A GRAVEYARD THAT NEVER DRAINS IS A SILENT LEAK, and this
+                // branch shipped exactly that for one commit: every checkpoint was
+                // wired and NOTHING IN PRODUCTION CALLED DrainGraveyard(), so the
+                // node behaved perfectly and grew without bound. The drain is now
+                // called from the node main loop, and this is the tripwire that
+                // makes its absence — or a thread pinning the graveyard forever —
+                // visible in the log instead of only in RSS. Rate-limited by
+                // doubling, so a growing graveyard reports at 1k, 2k, 4k ... and a
+                // healthy one never reports at all.
+                if (m_graveyard.size() >= m_graveyardWarnAt) {
+                    std::cerr << "[Chain] ⚠️  GRAVEYARD NOT DRAINING: "
+                              << m_graveyard.size() << " unlinked block-index "
+                              << "entries are awaiting reclamation. Either no "
+                              << "thread is calling DrainGraveyard(), or a "
+                              << "registered thread has stopped checkpointing and "
+                              << "is pinning every entry." << std::endl;
+                    m_graveyardWarnAt *= 2;
+                }
+            }
+        }
+        evicted_any = true;
+    }
+
+    // REINSTATE the temporarily-excluded pinned leaves. They were removed only to
+    // stop the loop re-testing them; they are still leaves and still belong in the
+    // index. Missing this would silently shrink the evictable set for the rest of
+    // the process -- a slow leak of evictability that no test asserting a single
+    // call would ever see, which is why LeafIndexMatchesBruteForce is checked
+    // after eviction in the invariant suite.
+    // (reinstatement now happens in LeafReinstater's destructor, on every path
+    // including an exception — see the guard's declaration above.)
+
+    if (evicted_any) {
+        m_chainTipsCacheDirty = true;
+    }
+
+    return evicted_any;
 }
 
 CBlockIndex* CChainState::FindFork(CBlockIndex* pindex1, CBlockIndex* pindex2) {
@@ -370,6 +2268,14 @@ bool CChainState::MaybeAnchorVdfGrace(CBlockIndex* p) {
 }
 
 bool CChainState::ActivateBestChain(CBlockIndex* pindexNew, const CBlock& block, bool& reorgOccurred) {
+    // P2P-14/15: DECLARATION ORDER IS LOAD-BEARING. `drain` is declared BEFORE
+    // the lock_guard, so C++ destroys it AFTER the guard — i.e. the tip
+    // callbacks fire with cs_main already released, which is what breaks the
+    // cs_main ↔ cs_headers cycle. Reversing these two lines silently restores
+    // the deadlock. It also covers every return path in this function, of which
+    // there are many, without a goto or a wrapper.
+    TipNotifyDrain drain(*this);
+
     // CRITICAL-1 FIX: Acquire lock before accessing shared state
     // This protects pindexTip, mapBlockIndex, and all chain operations
     std::lock_guard<std::recursive_mutex> lock(cs_main);
@@ -1911,10 +3817,26 @@ bool CChainState::ConnectTip(CBlockIndex* pindex, const CBlock& block, bool skip
     // NOTE: cs_main IS held during these callbacks. ConnectTip is called
     // from ActivateBestChain (line 208) and reorg paths (lines 663/749/773
     // /822) which all acquire cs_main; the lock is held for the full
-    // duration of ConnectTip. (Compare with DisconnectTip, which releases
-    // cs_main BEFORE invoking its callbacks -- see line ~1425.) Callbacks
-    // that touch their own subsystem locks (cs_wallet, etc.) must order
-    // them consistently with cs_main to avoid deadlock.
+    // duration of ConnectTip.
+    //
+    // ⚠️ THIS COMMENT USED TO SEND THE READER TO A CLAIM THAT HAD ALREADY BEEN
+    // RETRACTED. It said "(Compare with DisconnectTip, which releases cs_main
+    // BEFORE invoking its callbacks -- see line ~1425.)" -- and the disconnect
+    // site itself refutes exactly that, in this file, at the comment above
+    // m_blockDisconnectCallbacks: cs_main is a RECURSIVE mutex, DisconnectTip is
+    // called from ActivateBestChain which holds it at FUNCTION scope, and an
+    // inner scope ending only decrements the recursion count. So BOTH callback
+    // families fire with cs_main HELD. There is no contrast to draw.
+    //
+    // The correction landed at the disconnect site and not at this pointer to
+    // it, so anyone starting here read a retracted claim as live -- a comment
+    // has no decay function, and a fix aimed at one site leaves its siblings.
+    //
+    // Callbacks that touch their own subsystem locks (cs_wallet, etc.) must
+    // order them consistently with cs_main to avoid deadlock. The tip-notify
+    // callback is the worked example: it must NOT take g_wait_cluster_mtx here,
+    // because the wait-* RPC predicates take that mutex and then cs_main. See
+    // CRPCServer::NotifyBlockTipChanged in src/rpc/server.cpp.
     // IBD OPTIMIZATION: Pass cached hash to avoid RandomX recomputation
     for (size_t i = 0; i < m_blockConnectCallbacks.size(); ++i) {
         try {
@@ -2115,11 +4037,27 @@ bool CChainState::DisconnectTip(CBlockIndex* pindex, bool force_skip_utxo) {
     }
 
     // BUG #56 FIX: Notify block disconnect callbacks (wallet update)
-    // NOTE: cs_main is NOT held during these callbacks. The cs_main scope
-    // ends at line ~1425 above ("cs_main released here"); the disconnect
-    // callbacks fire afterwards. (Compare with ConnectTip, where cs_main
-    // IS held during its callbacks -- see line ~1283.) The wallet has its
-    // own lock (cs_wallet).
+    //
+    // ⚠️ CORRECTED BY P2P-14/15 (port-review L6/M1). This used to assert
+    // "cs_main is NOT held during these callbacks", reasoning that an inner
+    // cs_main scope had ended above. THAT IS FALSE ON THE REORG PATH:
+    //
+    //   cs_main is a RECURSIVE mutex. DisconnectTip is called from
+    //   ActivateBestChain (chain.cpp:777, :1087, :1176, :1249), which holds
+    //   cs_main at FUNCTION scope. An inner scope ending decrements the
+    //   recursion count; it does not release the mutex while an outer frame
+    //   holds it. So on every reorg these callbacks fire WITH cs_main HELD.
+    //
+    // This is the third instance of the same recursive-mutex mis-reasoning
+    // found in this blast radius, and it is the exact shape of the defect
+    // P2P-14/15 fixed for the TIP callback — a consumer that takes its own
+    // lock here creates a cs_main → <consumer lock> edge.
+    //
+    // The behaviour is NOT changed here: rerouting the block connect/disconnect
+    // callback families through a deferred drain is a separate contract with
+    // its own consumers (wallet, txindex, coinstatsindex, ZMQ) to audit. Only
+    // the false claim is removed, so nobody builds on it. The wallet's own
+    // cs_wallet does not make the ordering safe — it is what would deadlock.
     for (size_t i = 0; i < m_blockDisconnectCallbacks.size(); ++i) {
         try {
             m_blockDisconnectCallbacks[i](block, disconnectHeight, disconnectHash);
@@ -2376,7 +4314,119 @@ std::vector<std::pair<int, uint256>> CChainState::GetChainSnapshot(int maxBlocks
 
 CBlockIndex* CChainState::GetTip() const {
     std::lock_guard<std::recursive_mutex> lock(cs_main);
+    if (pindexTip != nullptr) NoteIndexPointerResolved(m_globalEpoch.load(std::memory_order_acquire));
     return pindexTip;
+}
+
+std::vector<ActiveChainHeader> CChainState::GetActiveChainHeaders() const {
+    // P2P-16 F2. ONE cs_main hold; the pointers never escape it.
+    std::vector<ActiveChainHeader> out;
+
+    std::lock_guard<std::recursive_mutex> lock(cs_main);
+    if (!pindexTip) return out;
+
+    out.reserve(static_cast<size_t>(pindexTip->nHeight) + 1);
+    for (const CBlockIndex* p = pindexTip; p != nullptr; p = p->pprev) {
+        ActiveChainHeader e;
+        e.hash   = p->GetBlockHash();
+        e.header = p->header;
+        e.height = p->nHeight;
+        out.push_back(std::move(e));
+    }
+    // Walked tip-down; BulkLoadHeaders needs parents first.
+    std::reverse(out.begin(), out.end());
+    return out;
+}
+
+// P2P-16 / external review r3 G4. Counts entries to the locator resolver - the
+// only function on this path that walks pprev under cs_main. It exists so a test
+// can assert a NEGATIVE that is otherwise invisible: that a header batch
+// rejected on size or emptiness never reaches the walk at all. Without an
+// instrument, "the cheap checks run first" is a claim about source order, not
+// about behaviour, and moving them back would break nothing observable.
+static std::atomic<uint64_t> g_resolveLocatorHashesCalls{0};
+namespace chaintest {
+uint64_t ResolveLocatorHashesCallCount() { return g_resolveLocatorHashesCalls.load(std::memory_order_relaxed); }
+}  // namespace chaintest
+
+std::vector<uint256> CChainState::ResolveLocatorHashes(int headersHeight,
+                                                       std::vector<int> (*pattern)(int),
+                                                       std::vector<int>& heightsOut,
+                                                       int& tipHeightOut) const {
+    g_resolveLocatorHashesCalls.fetch_add(1, std::memory_order_relaxed);
+    heightsOut.clear();
+    std::vector<uint256> out;
+
+    // COMPLEXITY, corrected — my previous comment here was FALSE and it mattered.
+    //
+    // It claimed "O(log n) per height ... uses the pskip skip-list". pskip is
+    // INERT: both CBlockIndex constructors null it, the copy-ctor copies that
+    // nullptr, and no BuildSkip exists anywhere in the tree - see the eviction
+    // note beside EvictLowestWorkLeafNotPinned, which says the same. (Symbols,
+    // not line numbers: the previous version of this comment cited
+    // block_index.cpp:14/:32/:57, and line numbers in a safety comment go stale
+    // silently while the comment keeps reading as if it had been checked.)
+    // CBlockIndex::GetAncestor therefore falls back to a LINEAR pprev walk every
+    // time. Calling it once per scheduled height would be up to 64 independent
+    // O(n) walks — and, because this function holds cs_main for all of them, it
+    // would move work INTO the lock that the code it replaced did outside it.
+    // At DilV's ~250k height that is millions of pointer chases per locator, on
+    // a path an inbound peer can drive.
+    //
+    // So: ONE descending walk. The schedule is sorted descending, and heights are
+    // picked off as the walk passes them — O(tip) pointer hops total for the
+    // whole locator instead of O(64 * tip), with the lock held for one pass.
+    std::lock_guard<std::recursive_mutex> lock(cs_main);
+
+    // Distinguish "no tip at all" from "tip is genesis": a chain at height 0 is
+    // a real chain and must still yield its genesis entry (external review F3).
+    if (!pindexTip) { tipHeightOut = -1; return out; }
+    tipHeightOut = pindexTip->nHeight;
+    if (pattern == nullptr) return out;
+
+    std::vector<int> wanted;
+    for (int h : pattern(std::max(tipHeightOut, headersHeight))) {
+        if (h >= 0 && h <= tipHeightOut) wanted.push_back(h);
+    }
+    if (wanted.empty()) return out;
+
+    std::sort(wanted.begin(), wanted.end(), std::greater<int>());
+    wanted.erase(std::unique(wanted.begin(), wanted.end()), wanted.end());
+
+    const CBlockIndex* walk = pindexTip;
+    for (int h : wanted) {
+        while (walk && walk->nHeight > h) walk = walk->pprev;
+        if (!walk) break;                       // chain shorter than advertised
+        heightsOut.push_back(h);
+        out.push_back(walk->nHeight == h ? walk->GetBlockHash() : uint256());
+    }
+    return out;
+}
+
+std::vector<uint256> CChainState::GetAncestorHashes(const std::vector<int>& heights,
+                                                    int* tipHeightOut) const {
+    // P2P-16. The whole point is that the walk happens INSIDE this lock and only
+    // copies leave it. Do not be tempted to return the CBlockIndex*s "for
+    // efficiency" — that reintroduces exactly the use-after-free this replaces.
+    std::vector<uint256> out;
+    out.reserve(heights.size());
+
+    std::lock_guard<std::recursive_mutex> lock(cs_main);
+    // The tip height leaves under the SAME acquisition as the hashes, so the
+    // caller can pair them coherently. Reading the height separately (even from
+    // the lock-free cached accessor) lets the tip move between the two reads and
+    // silently pairs a height with hashes from a different chain state.
+    if (tipHeightOut) *tipHeightOut = pindexTip ? pindexTip->nHeight : 0;
+    for (int h : heights) {
+        uint256 hash;  // null by default = "not on the best chain at that height"
+        if (pindexTip && h >= 0 && h <= pindexTip->nHeight) {
+            if (const CBlockIndex* p = pindexTip->GetAncestor(h)) {
+                hash = p->GetBlockHash();
+            }
+        }
+        out.push_back(hash);
+    }
+    return out;
 }
 
 // ============================================================================
@@ -2514,23 +4564,84 @@ void CChainState::RegisterTipUpdateCallback(TipUpdateCallback callback) {
 }
 
 void CChainState::NotifyTipUpdate(const CBlockIndex* pindex) {
-    // NOTE: Caller must already hold cs_main lock
-    // This is always called from within ActivateBestChain which holds the lock
+    // NOTE: Caller must already hold cs_main lock.
+    // All four call sites are inside ActivateBestChain, which owns the guard.
+    //
+    // P2P-14/15: this SNAPSHOTS and returns. It does not invoke callbacks —
+    // invoking them here is what created the cs_main → cs_headers edge that
+    // closes the deadlock cycle (docs/p2p14-lock-inversion/). The pointer is
+    // dereferenced HERE, under the lock, and never leaves this function.
 
     if (pindex == nullptr) {
         return;
     }
 
-    // Execute all registered callbacks with exception handling
-    for (size_t i = 0; i < m_tipCallbacks.size(); ++i) {
-        try {
-            m_tipCallbacks[i](pindex);
-        } catch (const std::exception& e) {
-            std::cerr << "[Chain] ERROR: Tip callback " << i << " threw exception: " << e.what() << std::endl;
-            // Continue executing other callbacks even if one fails
-        } catch (...) {
-            std::cerr << "[Chain] ERROR: Tip callback " << i << " threw unknown exception" << std::endl;
-            // Continue executing other callbacks even if one fails
+    m_pendingTipNotifications.push_back(
+        PendingTipNotification{pindex->header, pindex->GetBlockHash()});
+
+    // UNDRAINED-QUEUE CANARY.
+    //
+    // All four NotifyTipUpdate call sites (chain.cpp:684, :749, :803, :1324)
+    // are inside ActivateBestChain, which declares the one TipNotifyDrain. So
+    // the queue is bounded by the notifications of a single activation — a
+    // handful — and is emptied before that function returns.
+    //
+    // The failure this guards is a FUTURE one: someone adds a fifth call site
+    // in a scope with no TipNotifyDrain. That notification would be queued and
+    // never fired, so a tip update would be silently dropped and the queue
+    // would grow without bound. Both halves of that are invisible — no crash,
+    // no failing test, just a consumer that stops being told about new tips.
+    //
+    // Growth is the observable symptom, so watch it rather than trusting the
+    // structure to stay as it is. This is a loud log, not an assert: dropping
+    // a node in production over a bookkeeping leak would be a worse failure
+    // than the leak.
+    constexpr size_t kPendingTipNotificationWarnThreshold = 64;
+    if (m_pendingTipNotifications.size() > kPendingTipNotificationWarnThreshold) {
+        std::cerr << "[Chain] WARNING: " << m_pendingTipNotifications.size()
+                  << " undrained tip notifications. A NotifyTipUpdate call site is "
+                     "almost certainly queueing in a scope with no TipNotifyDrain "
+                     "— tip updates are being silently dropped. See P2P-14/15."
+                  << std::endl;
+    }
+}
+
+void CChainState::DrainTipNotifications() {
+    // Fires the snapshots taken by NotifyTipUpdate, with cs_main NOT held.
+    // See the header for why "the guard ended" genuinely means "the mutex is
+    // free" here, and for the two facts that would invalidate it.
+
+    std::vector<PendingTipNotification> toFire;
+    std::vector<TipUpdateCallback> callbacks;
+    {
+        // Brief re-acquisition to move the queue out. Both the queue AND the
+        // callback vector are copied under the lock: RegisterTipUpdateCallback
+        // mutates m_tipCallbacks under cs_main, so iterating it unlocked would
+        // be a data race — the exact class of defect this change exists to fix.
+        std::lock_guard<std::recursive_mutex> lock(cs_main);
+        if (m_pendingTipNotifications.empty()) {
+            return;
+        }
+        toFire.swap(m_pendingTipNotifications);
+        callbacks = m_tipCallbacks;
+    }
+
+    // cs_main is released. Consumers may now take their own locks (cs_headers)
+    // without inverting against it.
+    //
+    // Ordering: notifications fire in the order they were queued, and the queue
+    // is only appended under cs_main, so per-activation order is preserved.
+    for (const auto& notification : toFire) {
+        for (size_t i = 0; i < callbacks.size(); ++i) {
+            try {
+                callbacks[i](notification.header, notification.hash);
+            } catch (const std::exception& e) {
+                std::cerr << "[Chain] ERROR: Tip callback " << i << " threw exception: " << e.what() << std::endl;
+                // Continue executing other callbacks even if one fails
+            } catch (...) {
+                std::cerr << "[Chain] ERROR: Tip callback " << i << " threw unknown exception" << std::endl;
+                // Continue executing other callbacks even if one fails
+            }
         }
     }
 }
@@ -2545,6 +4656,14 @@ void CChainState::RegisterBlockConnectCallback(BlockConnectCallback callback) {
 void CChainState::RegisterBlockDisconnectCallback(BlockDisconnectCallback callback) {
     std::lock_guard<std::recursive_mutex> lock(cs_main);
     m_blockDisconnectCallbacks.push_back(callback);
+}
+
+void CChainState::RegisterPendingBlockHashProvider(PendingBlockHashProvider provider) {
+    // PR #129 MEDIUM-2: single provider (the async validation queue). Holding
+    // cs_main while assigning keeps it consistent with eviction's read under the
+    // same lock.
+    std::lock_guard<std::recursive_mutex> lock(cs_main);
+    m_pendingBlockHashProvider = std::move(provider);
 }
 
 // ============================================================================

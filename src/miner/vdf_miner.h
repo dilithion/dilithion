@@ -40,6 +40,23 @@
 class CVDFMiner {
 public:
     using Address = std::array<uint8_t, 20>;
+    // ⚠️ THESE THREE CALLBACKS RUN ON THE MINER THREAD, AND THEY MUST NOT BLOCK
+    // (round-8 F53). MiningLoop is a registered epoch participant: it publishes an
+    // epoch at its loop top, and every one of these is invoked with that epoch
+    // live. A callback that waits on a condition variable, sleeps, or performs
+    // blocking I/O therefore freezes DrainGraveyard's minimum for its whole
+    // duration -- the same defect the eight waits in MiningLoop itself carried
+    // (F46), arriving through an injected std::function instead.
+    //
+    // ⚠️ AND NO CHECKER SEES IT. scripts/check_participant_waits.sh follows ONE HOP
+    // from a checkpointing function; an injected callable is not a call it can
+    // resolve, so these escape it by construction. The contract is written here
+    // because the machine cannot hold it -- which is exactly the situation where a
+    // comment IS the mechanism and has to say so.
+    //
+    // If a callback must block, it takes an EpochOfflineScope around the blocking
+    // part itself -- it must NOT be wrapped at the injection site, because the
+    // scope has to bracket the wait and nothing else.
     using BlockFoundCallback = std::function<void(const CBlock&)>;
     using TemplateProvider = std::function<std::optional<CBlockTemplate>()>;
 

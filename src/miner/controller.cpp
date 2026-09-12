@@ -27,6 +27,12 @@
 #include <set>
 #include <stdexcept>
 
+// Deferred reclamation: this thread resolves CBlockIndex* through its injected
+// callbacks, so it checkpoints. g_chainstate is defined in src/core/globals.cpp
+// and declared per-TU (the idiom used by headers_manager.cpp / tx_index.cpp).
+#include <consensus/chain.h>
+extern CChainState g_chainstate;
+
 #ifdef _WIN32
     #include <windows.h>  // For GlobalMemoryStatusEx
 #endif
@@ -272,6 +278,12 @@ bool CMiningController::StartMining(const CBlockTemplate& blockTemplate) {
     m_workers.reserve(m_nThreads);
     for (uint32_t i = 0; i < m_nThreads; ++i) {
         m_workers.emplace_back(&CMiningController::MiningWorker, this, i);
+        // ⚠️ DECLARED PER SUCCESSFUL SPAWN. Declaring the total after the loop is
+        // skipped ENTIRELY if a std::thread constructor throws partway through --
+        // the exception leaves StartMining before the declaration, so the workers
+        // that DID start run undeclared. One declaration per thread that actually
+        // exists makes the count honest on every path out of this loop.
+        g_chainstate.DeclareEpochParticipant("mining-worker", 1);
     }
 
     // Start hash rate monitoring thread
@@ -378,6 +390,18 @@ void CMiningController::MiningWorker(uint32_t threadId) {
         const uint64_t UPGRADE_CHECK_INTERVAL = 1000;  // Check every 1000 hashes
 
         while (m_mining) {
+        // DEFERRED-RECLAMATION CHECKPOINT — loop top. This thread resolves index
+        // pointers only inside m_blockFoundCallback (the node's block-found lambda
+        // does the GetTip/GetBlockIndex work), which has returned by the time
+        // control is back here, so at this instant it holds none. Nothing in this
+        // file mentions CBlockIndex — the resolve is entirely inside an injected
+        // callback, which is why a text search of the miner misses it.
+        //
+        // Per-iteration cost is an acquire load plus a release store, single-digit
+        // nanoseconds, against a loop body that computes a RandomX hash
+        // (~100us light / ~1ms full). Not measurable.
+        g_chainstate.EpochCheckpoint("mining-worker");
+
         // BUG FIX: Periodically check for LIGHT→FULL mode upgrade
         // Only thread 0 logs to avoid spam
         if (!vm.isFullMode() && ++hashesForUpgradeCheck >= UPGRADE_CHECK_INTERVAL) {
@@ -394,7 +418,15 @@ void CMiningController::MiningWorker(uint32_t threadId) {
         if (nonce64 > UINT32_MAX && (nonce64 % UINT32_MAX) < nonceStep) {
             // Nonce space exhausted - brief pause to allow template update
             // In production, would trigger callback to request new template
-            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            // ⚠️ OFFLINE ACROSS THE PAUSE (round-8 F46). 100 ms is small, but this
+            // is a REGISTERED participant and the rule is uniform: a thread that
+            // is sleeping holds nothing and must not be in the quiescent-state
+            // calculation. Uniform beats case-by-case here, because a per-site
+            // judgement is a per-site thing to get wrong later.
+            {
+                EpochOfflineScope offline(&g_chainstate);
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            }
             nonce64 = threadId;  // Reset to start of this thread's range
         }
 
@@ -438,8 +470,15 @@ void CMiningController::MiningWorker(uint32_t threadId) {
         
         // CID 1675230 FIX: Sleep outside the lock to prevent blocking other threads
         // If template is not available, sleep briefly and retry
+        // ⚠️ OFFLINE ACROSS THE RETRY SLEEP (round-8 F46). This is the one that can
+        // run long: "no template available" persists for as long as the node has
+        // no template to give, so this branch can spin here indefinitely at 100 ms
+        // a time with the epoch frozen between iterations.
         if (!templateValid) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            {
+                EpochOfflineScope offline(&g_chainstate);
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            }
             continue;
         }
 
@@ -599,6 +638,12 @@ void CMiningController::MiningWorker(uint32_t threadId) {
     }
 }
 
+// ⚠️ NOT AN EPOCH PARTICIPANT, AND THAT IS A DECISION (round-8 F46). This thread
+// sleeps one second at a time forever, which would be a permanent pin if it were a
+// participant -- it is not. It never calls EpochCheckpoint and never resolves a
+// CBlockIndex*: it reads m_hashCount and prints. A thread with no published epoch
+// is not in the quiescent-state calculation at all, so it needs no scope. Recorded
+// so the next census does not mistake the absence for an omission.
 void CMiningController::HashRateMonitor() {
     uint64_t lastHashes = 0;
     uint64_t lastTime = GetTimeMillis();

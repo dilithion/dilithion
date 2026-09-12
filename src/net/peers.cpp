@@ -126,20 +126,43 @@ int CPeerManager::GetMisbehaviorScore(int peer_id) const {
     return m_scorer->GetScore(peer_id);
 }
 
-// Phase 3: typed-reason Misbehaving for HeadersSync-layer call sites.
-// Routes through the maybe_punish_node.h wrapper to compute the weight
-// (DefaultWeight + Q6=B override), maps to the legacy diagnostic enum
-// for banlist.dat audit, then calls the existing Misbehaving forwarder
-// so seed-node guard + banman.Ban + AddrMan signal all fire.
+// Phase 3: typed-reason Misbehaving for HeadersSync-layer call sites. Reads the
+// weight from maybe_punish_node.h::HeaderRejectWeight, maps to the legacy
+// diagnostic enum for banlist.dat audit, then calls the existing Misbehaving
+// forwarder so seed-node guard + banman.Ban + AddrMan signal all fire.
+//
+// ⚠️ THIS FUNCTION — NOT MaybePunishNodeForHeaders — IS THE PRODUCTION PATH.
+// The only raise site in the tree is net.cpp:1856 (HEADERS count too large), and
+// it calls straight into here. maybe_punish_node.h's file header used to say the
+// wrapper was "WIRED ... via the CPeerManager::MisbehaveHeaders forwarder"; the
+// forwarder has never called it. They are two paths onto two different scoring
+// interfaces (IPeerScorer vs CPeerManager::Misbehaving, which additionally runs
+// the seed-node guard and banman), and they share only the weight table.
+//
+// Which is why the zero-weight refusal below is DUPLICATED here rather than left
+// in the wrapper: a gate that lives only in the wrapper is a gate no production
+// call reaches. The wrapper carries the identical check, and a test pins each.
 void CPeerManager::MisbehaveHeaders(
     int peer_id,
     ::dilithion::net::port::HeaderRejectReason reason)
 {
     const int weight = ::dilithion::net::port::HeaderRejectWeight(reason);
+
+    // Honest-emittable reasons, and reasons that are OUR fault, are refused
+    // before the scorer is touched at all — a zero-weight Misbehaving() still
+    // creates the peer's score entry and still writes a line that reads as
+    // misbehavior. See the per-reason arguments in maybe_punish_node.h.
+    if (weight <= 0) return;
+
     const auto policy_type =
         ::dilithion::net::port::MapHeaderRejectToMisbehaviorType(reason);
+    // Every scored reason carries a policy type by construction: the sole reason
+    // without one (LocalStateUnavailable) is weight 0 and was refused above.
+    // Fail closed rather than mislabel if that ever stops being true.
+    if (!policy_type) return;
+
     const ::MisbehaviorType diag =
-        ::dilithion::net::port::MapPolicyToDiagnostic(policy_type);
+        ::dilithion::net::port::MapPolicyToDiagnostic(*policy_type);
     Misbehaving(peer_id, weight, diag);
 }
 
@@ -960,7 +983,12 @@ size_t CPeerManager::GetAddressCount() const {
 }
 
 bool CPeerManager::EvictPeersIfNeeded() {
-    std::lock_guard<std::recursive_mutex> lock(cs_peers);
+    // P2P-14/15: unique_lock, NOT lock_guard, so the fallback branch below can
+    // RELEASE cs_peers before dispatching. See the comment at that branch — the
+    // dispatch reaches cs_headers, and holding cs_peers across it is the inner
+    // leg of the same cycle this contract closes. unique_lock keeps every early
+    // return in this function unchanged (it unlocks on destruction if still held).
+    std::unique_lock<std::recursive_mutex> lock(cs_peers);
 
     // Only evict if we're at or over the limit
     if (peers.size() < MAX_TOTAL_CONNECTIONS) {
@@ -1085,10 +1113,52 @@ bool CPeerManager::EvictPeersIfNeeded() {
             // there is no socket / m_nodes entry for the reaper to find, so fall
             // back to the legacy direct path to clean up the orphaned peers-map
             // entry. Dispatch first (while state is still observable), then erase.
+            //
+            // ⚠️ P2P-14/15: cs_peers is RELEASED before dispatching. This branch
+            // was the INNER leg of the same cycle the accept-path fix addressed,
+            // and it survived that fix because only the outer lock was hoisted:
+            //
+            //   peers.cpp:963            unique_lock(cs_peers)            HELD
+            //     -> DispatchPeerDisconnected (this line)
+            //   peers.cpp:1708           headers_manager->OnPeerDisconnected
+            //   headers_manager.cpp:1470 lock_guard(cs_headers)           ACQUIRED
+            //
+            // against the live reverse edge: ProcessHeaders holds cs_headers
+            // (headers_manager.cpp:222) and calls Misbehaving at :351/:498/:530/
+            // :674/:2917/:2987, which takes cs_peers via GetPeer (peers.cpp:283).
+            // cs_headers is a plain mutex; cs_peers being recursive buys nothing
+            // across threads. Two threads, opposite order = deadlock.
+            //
+            // Found by the confirmation read, AFTER two earlier passes had each
+            // declared the cycle closed. Recorded because the pattern is the
+            // lesson: fixing one lock level and claiming completion, three times.
+            //
+            // Releasing here is the contract's own rule — decide under the lock,
+            // act after. The decision (peer_to_evict, and that no live CNode
+            // exists) is already taken; the peer may be gone by the time
+            // RemovePeer runs, in which case it is a no-op. That staleness is
+            // the same trade the accept path accepts.
+            // ⚠️ PREMISE THIS UNLOCK DEPENDS ON, written out because it is
+            // load-bearing and invisible (port-review Q2).
+            //
+            // cs_peers is a RECURSIVE mutex. unlock() decrements the count by
+            // ONE. If a caller of EvictPeersIfNeeded already held cs_peers in an
+            // outer frame, this unlock would NOT release it, the dispatch below
+            // would still run inside cs_peers, and the comment above would be
+            // asserting the opposite of the truth — silently, with no test red.
+            //
+            // It is safe because BOTH callers hold nothing:
+            //   peers.cpp:1135   PeriodicMaintenance      (the live route)
+            //   connman.cpp:487  AcceptConnection         (dead code — zero callers)
+            // Verified at source. If a third caller appears, or either of those
+            // gains an outer cs_peers, THIS UNLOCK STOPS WORKING and the cycle
+            // returns. The sibling construct TipNotifyDrain (chain.h) writes its
+            // equivalent premise out the same way, for the same reason.
+            lock.unlock();
             if (g_node_context.connman) {
                 g_node_context.connman->DispatchPeerDisconnected(peer_to_evict);
             }
-            RemovePeer(peer_to_evict);
+            RemovePeer(peer_to_evict);  // re-acquires cs_peers itself
         }
         return true;
     }
@@ -1717,9 +1787,19 @@ void CPeerManager::OnPeerDisconnected(int peer_id)
     // (never reused, connman m_next_node_id), so on a long-running seed serving
     // IBD to churning peers the maps grew unbounded = slow memory-exhaustion DoS.
     // Wiring it here releases that state on EVERY disconnect.
-    // Lock-order safety (F-009 BLOCKER-1): this runs under the eviction/disconnect
-    // locks (cs_vNodes and/or cs_peers — e.g. EvictPeersIfNeeded holds cs_peers
-    // across DispatchPeerDisconnected). CleanupPeerRateLimitState takes only the
+    // Lock-order safety (F-009 BLOCKER-1).
+    //
+    // ⚠️ CORRECTED BY P2P-14/15 (port-review N12). This used to read "this runs
+    // under the eviction/disconnect locks (cs_vNodes and/or cs_peers — e.g.
+    // EvictPeersIfNeeded holds cs_peers across DispatchPeerDisconnected)".
+    // BOTH halves are now false: DisconnectNodes dispatches after releasing
+    // cs_vNodes, and EvictPeersIfNeeded releases cs_peers before dispatching.
+    // The stale text mattered — I cited it as evidence that the edge was live
+    // while it was describing the pre-fix tree.
+    //
+    // The F-009 reasoning below still stands on its own terms: it only requires
+    // that the rate-limit mutexes sit LAST, which they do whether or not an
+    // outer net lock is held. CleanupPeerRateLimitState takes only the
     // rate-limit mutexes, which sit LAST in the global order
     // (cs_vNodes → cs_peers → {rate-limit mutexes}). This is safe ONLY because the
     // invariant "never call Misbehaving / acquire cs_peers while holding a rate-limit

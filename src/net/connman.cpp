@@ -5,6 +5,7 @@
 // See: docs/developer/LIBEVENT-NETWORKING-PORT-PLAN.md
 
 #include <net/connman.h>
+#include <type_traits>   // static_assert on thread_local destructibility
 #include <net/netaddress.h>
 #include <net/peers.h>
 #include <net/net.h>
@@ -14,6 +15,11 @@
 #include <net/serialize.h>
 #include <net/banman.h>  // For MisbehaviorType
 #include <core/chainparams.h>  // Phase 4: per-chain outbound class targets
+#include <consensus/chain.h>    // g_chainstate: deferred-reclamation epoch checkpoints
+
+// Defined in src/core/globals.cpp; declared per-TU, matching the idiom in
+// headers_manager.cpp / block_processing.cpp / tx_index.cpp.
+extern CChainState g_chainstate;
 #include <util/time.h>
 #include <util/logging.h>
 #include <util/strencodings.h>  // For strprintf
@@ -240,6 +246,33 @@ bool CConnman::Start(CPeerManager& peer_mgr, CNetMessageProcessor& msg_proc, con
         return false;
     }
 
+    // These three P2P threads reach block_processing and therefore resolve
+    // CBlockIndex*; ThreadSocketHandler and ThreadOpenConnections are NOT declared
+    // because they move bytes and addresses and never touch mapBlockIndex — and if
+    // that ever changes, the resolve-time detector in chain.cpp names them without
+    // anyone updating this list.
+    // ⚠️ DECLARED AFTER THE SPAWNS SUCCEED, NOT BEFORE THEM. A declaration made
+    // before a std::thread constructor that then THROWS leaves a name nobody will
+    // ever answer for, and the startup census refuses to start the node over a
+    // thread that does not exist — a false positive that bricks a node. Declaring
+    // after the spawn is safe in the other direction: a thread that checkpoints
+    // before its declaration lands is simply already in the registered set, and
+    // the census only ever asks for declared-minus-registered.
+    // These two are declared here, AFTER every spawn in this function has
+    // succeeded — the same rule as the pool below. Their threads were created
+    // earlier in Start(), but a declaration is a promise about a RUNNING thread,
+    // and until the last spawn succeeds this function can still return false and
+    // join them all.
+    g_chainstate.DeclareEpochParticipant("p2p-msg-handler");
+    g_chainstate.DeclareEpochParticipant("p2p-headers-worker");
+    // ⚠️ DECLARED WITH A COUNT, BECAUSE THIS IS A POOL. The registry used to
+    // hold a SET OF NAMES, so one worker reaching its first checkpoint
+    // satisfied the census for every sibling: fifteen of sixteen could have
+    // been wired wrong and the gate would still have passed.
+    g_chainstate.DeclareEpochParticipant("p2p-blocks-worker",
+                                        m_blocks_worker_threads.size());
+
+
     LogPrintf(NET, INFO, "[CConnman] Started successfully (with async headers + %d parallel block workers)\n", NUM_BLOCK_WORKERS);
     return true;
 }
@@ -442,33 +475,77 @@ bool CConnman::AcceptConnection(std::unique_ptr<CSocket> socket, const NetProtoc
         return false;
     }
 
-    // Check connection limits
+    // Check connection limits.
+    //
+    // P2P-14/15: EvictPeersIfNeeded() is called with cs_vNodes RELEASED.
+    //
+    // ⚠️ CORRECTED CLAIM (final-head red-team). An earlier version of this
+    // comment called this "the SECOND live forward edge … that survived the
+    // DisconnectNodes fix". **That was wrong about liveness: AcceptConnection
+    // has ZERO callers in the entire tree** — no production call site, no test.
+    // The comment at connman.cpp:1325-1331 says so explicitly, and I quoted its
+    // neighbouring lines while making the opposite claim.
+    //
+    // The cycle it describes was real; the entry point was not. The LIVE route
+    // into EvictPeersIfNeeded is peers.cpp:1135 (PeriodicMaintenance), and the
+    // inversion on that route is closed inside EvictPeersIfNeeded itself, where
+    // cs_peers is now released before the fallback dispatch.
+    //
+    // This change is therefore DEFENCE IN DEPTH on a currently-unreachable
+    // function, not the load-bearing fix. Kept because if AcceptConnection ever
+    // gains a caller it must not reintroduce the inversion — but do not cite it
+    // as the fix that closed the cycle.
+    //
+    // The shape it guards against, for whoever revives this function:
+    //
+    //     connman.cpp:447           lock_guard(cs_vNodes)              HELD
+    //       -> EvictPeersIfNeeded
+    //     peers.cpp:963             lock_guard(cs_peers)
+    //       -> fallback dispatch when no live CNode exists
+    //     peers.cpp:1089            connman->DispatchPeerDisconnected(id)
+    //     peers.cpp:1708           headers_manager->OnPeerDisconnected(id)
+    //     headers_manager.cpp:1470  lock_guard(cs_headers)             ACQUIRED
+    //
+    // against the live reverse edge headers_manager.cpp:222 (cs_headers) -> :498
+    // PushMessage -> connman.cpp:598 (cs_vNodes). Both non-recursive: deadlock.
+    //
+    // The codebase already knew: the sibling accept path at connman.cpp:1302-1310
+    // DELIBERATELY refuses to call EvictPeersIfNeeded under cs_vNodes and says
+    // why. One accept path refused and the other did it. This aligns them.
+    //
+    // Counts are read under the lock and the DECISION is taken after releasing —
+    // the same "decide under the lock, act after" rule this contract applies
+    // everywhere else. The counts may be one connection stale by the time they
+    // are used; that is already true of the sibling path, and connection caps
+    // are advisory under concurrency regardless.
+    size_t inbound_count = 0;
+    size_t total_count = 0;
     {
         std::lock_guard<std::mutex> lock(cs_vNodes);
-        size_t inbound_count = 0;
-        size_t total_count = m_nodes.size();
+        total_count = m_nodes.size();
         for (const auto& node : m_nodes) {
             if (node->fInbound) {
                 inbound_count++;
             }
         }
-        if (inbound_count >= static_cast<size_t>(m_options.nMaxInbound)) {
-            // Phase 4: Try to evict a low-trust peer to make room
-            if (m_peer_manager && m_peer_manager->EvictPeersIfNeeded()) {
-                if (g_verbose.load(std::memory_order_relaxed))
-                    std::cout << "[P2P] Evicted low-value peer to accept new inbound" << std::endl;
-                // Continue to accept — slot freed by eviction
-            } else {
-                LogPrintf(NET, WARN, "[CConnman] Inbound connection limit reached (%zu/%d)\n",
-                          inbound_count, m_options.nMaxInbound);
-                return false;
-            }
-        }
-        if (total_count >= static_cast<size_t>(m_options.nMaxTotal)) {
-            LogPrintf(NET, WARN, "[CConnman] Total connection limit reached (%zu/%d)\n",
-                      total_count, m_options.nMaxTotal);
+    }
+    // cs_vNodes RELEASED — eviction may now take cs_peers/cs_headers safely.
+    if (inbound_count >= static_cast<size_t>(m_options.nMaxInbound)) {
+        // Phase 4: Try to evict a low-trust peer to make room
+        if (m_peer_manager && m_peer_manager->EvictPeersIfNeeded()) {
+            if (g_verbose.load(std::memory_order_relaxed))
+                std::cout << "[P2P] Evicted low-value peer to accept new inbound" << std::endl;
+            // Continue to accept — slot freed by eviction
+        } else {
+            LogPrintf(NET, WARN, "[CConnman] Inbound connection limit reached (%zu/%d)\n",
+                      inbound_count, m_options.nMaxInbound);
             return false;
         }
+    }
+    if (total_count >= static_cast<size_t>(m_options.nMaxTotal)) {
+        LogPrintf(NET, WARN, "[CConnman] Total connection limit reached (%zu/%d)\n",
+                  total_count, m_options.nMaxTotal);
+        return false;
     }
 
     // Extract IP string (supports both IPv4 and IPv6)
@@ -694,6 +771,15 @@ void CConnman::ThreadMessageHandler() {
     LogPrintf(NET, INFO, "[CConnman] ThreadMessageHandler started (async dispatch mode)\n");
 
     while (!flagInterruptMsgProc.load()) {
+        // DEFERRED-RECLAMATION CHECKPOINT — the loop top, which for THIS thread is
+        // the every-iteration point: its wait sits at the BOTTOM and is skipped
+        // entirely while fMoreWork is true, so a checkpoint there would never fire
+        // during IBD. Here the batch is not yet collected and nothing is resolved.
+        // Gap between checkpoints: one batch (<=500 messages) plus at most the
+        // 100ms bottom wait. Control messages are processed INLINE on this thread
+        // (getheaders/getdata/inv), and those resolve block indices.
+        g_chainstate.EpochCheckpoint("p2p-msg-handler");
+
         bool fMoreWork = false;
 
         // IBD Redesign Phase 1: Collect messages and route by type
@@ -811,9 +897,20 @@ void CConnman::ThreadMessageHandler() {
         // Wait for more work
         if (!fMoreWork && !flagInterruptMsgProc.load()) {
             std::unique_lock<std::mutex> lock(mutexMsgProc);
-            condMsgProc.wait_for(lock, std::chrono::milliseconds(100), [this] {
-                return fMsgProcWake.load() || flagInterruptMsgProc.load();
-            });
+            {
+                // OFFLINE FOR THE DURATION OF THE WAIT. Checkpointing before the wait
+                // publishes an epoch that then FREEZES while this thread is parked, pinning
+                // every entry unlinked afterwards -- a server asleep in accept() for an hour
+                // pins an hour of evictions, which is what made the design note's "parked
+                // threads pin nothing" false. Going offline removes this thread from the
+                // quiescent-state calculation entirely, exactly as an exited thread is
+                // removed; the scope re-enters on EVERY exit path, before anything is
+                // resolved.
+                EpochOfflineScope offline(&g_chainstate);
+                condMsgProc.wait_for(lock, std::chrono::milliseconds(100), [this] {
+                    return fMsgProcWake.load() || flagInterruptMsgProc.load();
+                });
+            }
             fMsgProcWake.store(false);
         }
     }
@@ -872,12 +969,30 @@ void CConnman::HeadersWorkerThread() {
     while (!flagInterruptMsgProc.load()) {
         QueuedMessage msg;
 
+        // DEFERRED-RECLAMATION CHECKPOINT — before the wait, not after the work.
+        // At the loop top this thread has finished the previous unit and taken no
+        // new one, so it holds no CBlockIndex*. ProcessQueuedMessage below reaches
+        // block_processing, which resolves index pointers, so this thread IS a
+        // participant: without this it would pin the graveyard for the whole run.
+        g_chainstate.EpochCheckpoint("p2p-headers-worker");
+
         // Wait for work
         {
             std::unique_lock<std::mutex> lock(m_headers_queue_mutex);
-            m_headers_cv.wait(lock, [this] {
-                return !m_headers_queue.empty() || flagInterruptMsgProc.load();
-            });
+            {
+                // OFFLINE FOR THE DURATION OF THE WAIT. Checkpointing before the wait
+                // publishes an epoch that then FREEZES while this thread is parked, pinning
+                // every entry unlinked afterwards -- a server asleep in accept() for an hour
+                // pins an hour of evictions, which is what made the design note's "parked
+                // threads pin nothing" false. Going offline removes this thread from the
+                // quiescent-state calculation entirely, exactly as an exited thread is
+                // removed; the scope re-enters on EVERY exit path, before anything is
+                // resolved.
+                EpochOfflineScope offline(&g_chainstate);
+                m_headers_cv.wait(lock, [this] {
+                    return !m_headers_queue.empty() || flagInterruptMsgProc.load();
+                });
+            }
 
             if (flagInterruptMsgProc.load()) {
                 break;
@@ -915,12 +1030,30 @@ void CConnman::BlocksWorkerThread() {
     while (!flagInterruptMsgProc.load()) {
         QueuedMessage msg;
 
+        // DEFERRED-RECLAMATION CHECKPOINT — before the wait, not after the work.
+        // At the loop top this thread has finished the previous unit and taken no
+        // new one, so it holds no CBlockIndex*. ProcessQueuedMessage below reaches
+        // block_processing, which resolves index pointers, so this thread IS a
+        // participant: without this it would pin the graveyard for the whole run.
+        g_chainstate.EpochCheckpoint("p2p-blocks-worker");
+
         // Wait for work
         {
             std::unique_lock<std::mutex> lock(m_blocks_queue_mutex);
-            m_blocks_cv.wait(lock, [this] {
-                return !m_blocks_queue.empty() || flagInterruptMsgProc.load();
-            });
+            {
+                // OFFLINE FOR THE DURATION OF THE WAIT. Checkpointing before the wait
+                // publishes an epoch that then FREEZES while this thread is parked, pinning
+                // every entry unlinked afterwards -- a server asleep in accept() for an hour
+                // pins an hour of evictions, which is what made the design note's "parked
+                // threads pin nothing" false. Going offline removes this thread from the
+                // quiescent-state calculation entirely, exactly as an exited thread is
+                // removed; the scope re-enters on EVERY exit path, before anything is
+                // resolved.
+                EpochOfflineScope offline(&g_chainstate);
+                m_blocks_cv.wait(lock, [this] {
+                    return !m_blocks_queue.empty() || flagInterruptMsgProc.load();
+                });
+            }
 
             if (flagInterruptMsgProc.load()) {
                 break;
@@ -1726,39 +1859,154 @@ void CConnman::ExtractMessages(CNode* pnode) {
 }
 
 void CConnman::DisconnectNodes() {
-    // BUG #148 + BUG #153 FIX: Remove from CPeerManager BEFORE destroying CNode
-    // This eliminates race window where node_refs could point to freed memory
-    std::vector<int> nodes_to_remove;
+    // P2P-14/15: THIS IS THE PRIMARY DISCONNECT REAPER and it was the forward
+    // edge of both lock-order cycles. DispatchPeerDisconnected reaches
+    // CPeerManager::OnPeerDisconnected (cs_peers) and, through it,
+    // CHeadersManager::OnPeerDisconnected (cs_headers). Calling it inside the
+    // cs_vNodes scope below produced cs_vNodes → cs_peers → cs_headers, against
+    // the ratified order in net.h where cs_headers sits ABOVE both.
+    //
+    // (Eviction at peers.cpp:1089 dispatches too, but only as a FALLBACK when
+    // no live CNode exists — since the 2026-06-01 socket-orphan fix this is the
+    // path that runs in production. An earlier draft of the contract cited only
+    // the eviction path, taken from a stale net.h comment rather than the call
+    // graph, and would have left this site untouched.)
+    //
+    // Fixed by the ratified rule — decide under the lock, act after releasing —
+    // in two phases. THE THREE ORDERING CONSTRAINTS ENCODED BY PRIOR BUG FIXES
+    // ARE PRESERVED, and they are why this is a detach rather than a plain
+    // "collect ids and dispatch later":
+    //
+    //   BUG #262 — DispatchPeerDisconnected MUST precede RemoveNode, because
+    //              OnPeerDisconnected → GetAndClearPeerBlocks needs the peer to
+    //              still exist in the peers map or mapBlocksInFlight leaks.
+    //   BUG #153 — RemoveNode MUST precede CNode destruction, so node_refs is
+    //              cleared while the CNode is still alive.
+    //   BUG #148 — no node_ref may outlive its CNode.
+    //
+    // Phase 1 DETACHES the unique_ptrs into a local, so the CNodes stay ALIVE
+    // with cs_vNodes released; phase 2 then runs dispatch → RemoveNode →
+    // CloseSocket in the required order, and the locals destruct afterwards.
+    //
+    // On the ordering guarantees the CNode now provably outlives RemoveNode,
+    // where before it was destroyed inside the lock. (An earlier version of
+    // this comment called that "strictly safer than before". It was NOT: taking
+    // ownership in `detached` makes an escaping exception FREE the remaining
+    // CNodes without RemoveNode, which the pre-fix code could not do. That is
+    // why phase 2 contains exceptions per node — see below. Corrected after
+    // red-team H-2 rather than left standing.)
+    std::vector<std::unique_ptr<CNode>> detached;
 
+    // Phase 1 — under cs_vNodes: decide and detach only. No outbound calls.
     {
         std::lock_guard<std::mutex> lock(cs_vNodes);
+        // Reserve BEFORE detaching anything (confirmation-read F-2). push_back
+        // can throw bad_alloc on reallocation, and by then `detached` already
+        // owns nodes erased from m_nodes — the unwind would free them without
+        // RemoveNode, which is the same node_refs-dangles-on-throw failure the
+        // phase-2 try/catch closes. Allocating up front means the only throw
+        // point happens while nothing is detached yet.
+        detached.reserve(m_nodes.size());
 
         auto it = m_nodes.begin();
         while (it != m_nodes.end()) {
             if ((*it)->fDisconnect.load()) {
-                int node_id = (*it)->id;
-                nodes_to_remove.push_back(node_id);
-
-                // BUG #262 FIX (Memory Leak): Call OnPeerDisconnected BEFORE RemoveNode
-                // OnPeerDisconnected calls GetAndClearPeerBlocks which needs the peer
-                // to exist in the peers map to clean up mapBlocksInFlight entries.
-                // If RemoveNode is called first, GetAndClearPeerBlocks bails early
-                // and mapBlocksInFlight entries are never cleaned up = memory leak.
-                DispatchPeerDisconnected(node_id);
-
-                // BUG #153 FIX: Remove from CPeerManager BEFORE destroying CNode
-                // This ensures node_refs is cleared while CNode still exists.
-                if (m_peer_manager) {
-                    m_peer_manager->RemoveNode(node_id);
-                }
-
-                (*it)->CloseSocket();
+                detached.push_back(std::move(*it));
                 it = m_nodes.erase(it);
             } else {
                 ++it;
             }
         }
     }
+
+    // Phase 2 — cs_vNodes RELEASED. Consumers may now take cs_peers/cs_headers
+    // without inverting against it.
+    //
+    // ⚠️ EVERY ITERATION IS EXCEPTION-CONTAINED, and that is not defensive
+    // padding — it is required for correctness of THIS construction.
+    //
+    // Phase 1 moved the CNodes out of m_nodes into `detached`, so `detached`
+    // now OWNS them. If any phase-2 call escaped with an exception, the loop
+    // would abandon and `detached`'s destructor would free every REMAINING
+    // CNode without ever calling RemoveNode — leaving CPeerManager::node_refs
+    // holding raw pointers to freed memory, which GetNode() then hands to
+    // Misbehaving / PeriodicMaintenance / GetConnectionCount. That is a
+    // use-after-free, and it breaks BUG #148 and BUG #153 on the throw path.
+    //
+    // Nothing on this path is noexcept: DispatchPeerDisconnected reaches
+    // CPeerManager::OnPeerDisconnected, the headers manager and the DNA
+    // collector, and any of them can throw (bad_alloc alone suffices).
+    //
+    // The PRE-FIX code could not fail this way: the CNode stayed owned by
+    // m_nodes until after RemoveNode, so an escaping exception left it alive
+    // and re-reapable. Taking ownership is what makes a throw destructive, so
+    // taking ownership obliges us to contain the throw.
+    for (auto& node : detached) {
+        if (!node) {
+            continue;
+        }
+        const int node_id = node->id;
+
+        try {
+            // BUG #262: before RemoveNode.
+            DispatchPeerDisconnected(node_id);
+        } catch (const std::exception& e) {
+            // Port-review N10: LogPrintf, not std::cerr. DisconnectNodes runs on
+            // the ~20 Hz reaper loop and the rest of this function already uses
+            // categorised LogPrintf(NET, …); raw unthrottled stderr on a hot loop
+            // is a log-flood vector as well as an inconsistency.
+            LogPrintf(NET, ERROR,
+                      "[CConnman] DispatchPeerDisconnected threw for node %d: %s — continuing "
+                      "teardown so node_refs cannot dangle\n", node_id, e.what());
+        } catch (...) {
+            LogPrintf(NET, ERROR,
+                      "[CConnman] DispatchPeerDisconnected threw (unknown) for node %d — "
+                      "continuing teardown so node_refs cannot dangle\n", node_id);
+        }
+
+        // BUG #153: MUST happen before the CNode dies (it dies when `detached`
+        // unwinds). Reached even if the dispatch above threw — that is the
+        // whole point of containing it.
+        try {
+            if (m_peer_manager) {
+                m_peer_manager->RemoveNode(node_id);
+            }
+        } catch (...) {
+            // Confirmation-read F-3: continuing to free THIS node would hand a
+            // dangling CNode* to anything still holding its node_ref — the
+            // narrowed form of the same UAF. Deliberately LEAK the CNode
+            // instead. A leaked node is strictly better than a freed one that
+            // node_refs may still point at and hand to Misbehaving /
+            // PeriodicMaintenance / GetConnectionCount.
+            LogPrintf(NET, ERROR,
+                      "[CConnman] RemoveNode threw for node %d — node_refs may still hold this id; "
+                      "closing its socket and LEAKING the CNode rather than freeing one that may "
+                      "still be referenced\n", node_id);
+            // Port-review N11: close the socket BEFORE leaking the object.
+            // An earlier version did `release(); continue;` and skipped this,
+            // which leaked the file descriptor AND the connection slot along
+            // with the node — the fd would never be reclaimed and the accept
+            // caps would count a peer that no longer exists. Upstream closes
+            // the socket on the reaping path for exactly this reason. Leaking
+            // the CNode is the deliberate trade (see above); leaking the fd is
+            // not, and was not intended.
+            try {
+                node->CloseSocket();
+            } catch (...) {
+                LogPrintf(NET, ERROR, "[CConnman] CloseSocket also threw for node %d\n", node_id);
+            }
+            (void)node.release();
+            continue;  // object deliberately leaked; do not touch it again
+        }
+
+        try {
+            node->CloseSocket();
+        } catch (...) {
+            LogPrintf(NET, ERROR, "[CConnman] CloseSocket threw for node %d\n", node_id);
+        }
+    }
+    // `detached` unwinds here — CNodes destroyed after RemoveNode. BUG #148/#153
+    // hold on every path, including the throwing one.
 }
 
 void CConnman::InactivityCheck() {
@@ -1846,8 +2094,42 @@ void CConnman::InactivityCheck() {
 
                 if (should_ping && m_msg_processor) {
                     // Generate random nonce for ping (CWE-676 fix: use std::random_device instead of rand())
-                    static thread_local std::random_device rd;
-                    uint64_t nonce = (static_cast<uint64_t>(rd()) << 32) | rd();
+                    //
+                    // ⚠️ A POINTER, BECAUSE A thread_local DESTRUCTOR RUNS ON FREED
+                    // STORAGE ON THIS TOOLCHAIN. GCC on mingw-w64 implements
+                    // thread_local with emutls, whose pthread key is destroyed
+                    // BEFORE the key libstdc++ uses to run C++ destructors -- so by
+                    // the time ~random_device() ran it was reading a free()d block,
+                    // and `_M_fini()` would act on whatever the heap had put there.
+                    // Measured on this toolchain: std::random_device is NOT trivially
+                    // destructible (std::mt19937_64 is), and every thread_local
+                    // destructor here runs post-free, 300/300.
+                    //
+                    // Found by scripts/check_thread_local_guard.sh, which was written
+                    // for the same defect class in the epoch code and immediately
+                    // named this site -- the guard doing its job on its first run.
+                    // ⚠️ ONE PER PROCESS, NOT ONE PER THREAD, AND THE FIRST VERSION
+                    // OF THIS FIX GOT THE BOUND WRONG (round-6 F35). It said
+                    // "one device per connman thread, bounded by the thread count"
+                    // -- but the bound is per thread that EVER REACHES THIS SITE,
+                    // and CConnman is started and stopped repeatedly (every restart
+                    // brings a fresh InactivityCheck thread). Over a long-running
+                    // node with reconnect churn that is unbounded growth, slowly.
+                    // A leak whose bound is stated wrongly is worse than one stated
+                    // plainly: the wrong bound is what stops anyone looking again.
+                    //
+                    // std::random_device is stateless per call for our purposes here
+                    // (a ping nonce), so one shared instance behind a mutex is both
+                    // correct and genuinely bounded. The mutex cost is irrelevant at
+                    // ping frequency.
+                    static std::mutex rd_mu;
+                    static std::random_device* rd = nullptr;
+                    uint64_t nonce;
+                    {
+                        std::lock_guard<std::mutex> rd_lk(rd_mu);
+                        if (rd == nullptr) rd = new std::random_device();
+                        nonce = (static_cast<uint64_t>((*rd)()) << 32) | (*rd)();
+                    }
                     CNetMessage ping_msg = m_msg_processor->CreatePingMessage(nonce);
                     PushMessage(node.get(), ping_msg);
                     last_ping_sent[node_id] = now;
