@@ -9320,6 +9320,35 @@ load_genesis_block:  // Bug #29: Label for automatic retry after blockchain wipe
         #endif
         std::cerr << "===========================================================" << std::endl;
 
+        // ⛔ QUIESCE BEFORE RELEASING THE INDEX. This is the blocker the independent
+        // read found, and it is a regression THIS PR would otherwise introduce.
+        //
+        // Before this change, WriteBlock held m_mutex for its whole body, so
+        // ~CCoinStatsIndex simply BLOCKED until the callback returned. That was never
+        // designed — it was an unstated side effect of the lock's scope. Narrowing
+        // the lock to fix the inversion silently dropped it, because nothing named
+        // it. Stop() joins m_sync_thread only and never takes m_mutex, so the
+        // destructor can now take m_mutex, free m_db and destroy the object while a
+        // callback-thread WriteBlock sits in the unlock window — which then calls
+        // lock.lock() on a mutex inside a freed object.
+        //
+        // The normal shutdown path is already safe because g_node_context.Shutdown()
+        // runs first and stops the validation queue and connman, so no callback can
+        // still be in flight. These EXCEPTION paths did not, and a use-after-free
+        // reachable only on the shutdown-exception path is strictly worse than the
+        // latent inversion this PR exists to close.
+        //
+        // Shutdown() is idempotent by construction — every action is guarded by
+        // `if (ptr)` and nulls the pointer — so calling it here is safe even when the
+        // exception arrived after a partial shutdown.
+        //
+        // ⚠️ NOT a post-retake `if (!m_db)` re-check: locking a mutex inside a freed
+        // object happens BEFORE any such check could run.
+        try {
+            g_node_context.Shutdown();
+        } catch (...) {
+            // Already unwinding a failure; do not mask it with a second one.
+        }
         // PR-7G R3: release tx_index before chainParams cleanup so the
         // reindex thread (which reads g_chainstate.GetBlocksAtHeight /
         // GetBlockIndex) is joined before any global it depends on can
@@ -9380,6 +9409,35 @@ load_genesis_block:  // Bug #29: Label for automatic retry after blockchain wipe
         #endif
         std::cerr << "===========================================================" << std::endl;
 
+        // ⛔ QUIESCE BEFORE RELEASING THE INDEX. This is the blocker the independent
+        // read found, and it is a regression THIS PR would otherwise introduce.
+        //
+        // Before this change, WriteBlock held m_mutex for its whole body, so
+        // ~CCoinStatsIndex simply BLOCKED until the callback returned. That was never
+        // designed — it was an unstated side effect of the lock's scope. Narrowing
+        // the lock to fix the inversion silently dropped it, because nothing named
+        // it. Stop() joins m_sync_thread only and never takes m_mutex, so the
+        // destructor can now take m_mutex, free m_db and destroy the object while a
+        // callback-thread WriteBlock sits in the unlock window — which then calls
+        // lock.lock() on a mutex inside a freed object.
+        //
+        // The normal shutdown path is already safe because g_node_context.Shutdown()
+        // runs first and stops the validation queue and connman, so no callback can
+        // still be in flight. These EXCEPTION paths did not, and a use-after-free
+        // reachable only on the shutdown-exception path is strictly worse than the
+        // latent inversion this PR exists to close.
+        //
+        // Shutdown() is idempotent by construction — every action is guarded by
+        // `if (ptr)` and nulls the pointer — so calling it here is safe even when the
+        // exception arrived after a partial shutdown.
+        //
+        // ⚠️ NOT a post-retake `if (!m_db)` re-check: locking a mutex inside a freed
+        // object happens BEFORE any such check could run.
+        try {
+            g_node_context.Shutdown();
+        } catch (...) {
+            // Already unwinding a failure; do not mask it with a second one.
+        }
         // PR-7G R3: release tx_index before chainParams cleanup. See the
         // matching note in the std::exception catch above.
         g_tx_index.reset();

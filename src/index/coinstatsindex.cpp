@@ -549,18 +549,33 @@ bool CCoinStatsIndex::WriteBlock(const CBlock& block, int height, const uint256&
         // clear is in chain.cpp, outside the shutdown sequence), so quiescing the
         // callback SOURCE is the only thing that holds it.
         //
-        // [measured, dilithion-node.cpp] the index is reset at four sites:
-        //   :3552  before the callback is registered           - safe by order
-        //   :9258  normal shutdown, AFTER g_node_context.Shutdown() (:9220),
-        //          which stops the validation queue and connman - quiesced
-        //   :9324  catch (std::exception)                       - NOT QUIESCED
-        //   :9380  catch (...)                                  - NOT QUIESCED
-        // Both catch blocks were read line by line: neither calls Shutdown(),
-        // Stop(), connman or anything validation-related before the reset. So on
-        // an exception path the premise DOES NOT HOLD today. That is a
-        // shutdown-ordering gap which this change makes reachable; it is FILED,
-        // not silently patched here, and that is why this note names the exact
-        // sites instead of asserting "shutdown handles it".
+        // [measured, dilithion-node.cpp] the index is reset at four sites, named by
+        // IDENTITY rather than by line number -- the earlier version of this comment
+        // cited lines that were already six off, which is exactly how a comment
+        // decays into a confident wrong answer:
+        //
+        //   * the pre-registration reset in the reindex/startup path
+        //         - safe BY ORDER: the callback is not registered yet
+        //   * the normal-shutdown reset, which follows g_node_context.Shutdown()
+        //         - QUIESCED: that call stops the validation queue and connman, so
+        //           no callback can still be in flight
+        //   * the reset in `catch (const std::exception&)` in main()
+        //   * the reset in `catch (...)` in main()
+        //         - these two were NOT quiesced, and this change made that
+        //           reachable. Both now call g_node_context.Shutdown() first.
+        //
+        // ⛔ WHY IT MATTERED, and it is the general lesson rather than this bug:
+        // THE OLD WHOLE-BODY LOCK WAS DOING TWO JOBS. Mutual exclusion, and -- as an
+        // unstated side effect of its SCOPE -- keeping ~CCoinStatsIndex out until the
+        // callback finished, because the destructor takes the same mutex. Narrowing
+        // the lock to fix the inversion silently dropped the second job, because
+        // nothing had ever named it. Stop() joins m_sync_thread only and never takes
+        // m_mutex, so without the quiesce the destructor could free m_db while a
+        // callback-thread WriteBlock sat in this very unlock window.
+        //
+        // ANY TIME YOU SHORTEN A LOCK'S SCOPE, ask what the long scope was
+        // incidentally guaranteeing -- lifetime, ordering, back-pressure. None of
+        // those are written down anywhere.
         //
         // AND a post-retake `if (!m_db) return false;` must NOT stand in for this
         // argument: re-checking m_db after the retake closes only the null-deref
