@@ -37,11 +37,40 @@
     #define SOCKET_ERROR -1
 #endif
 
+// Deferred reclamation: this thread resolves CBlockIndex*, so it checkpoints.
+// g_chainstate is defined in src/core/globals.cpp and declared per-TU (the idiom
+// used by headers_manager.cpp / block_processing.cpp / tx_index.cpp).
+#include <consensus/chain.h>
+extern CChainState g_chainstate;
+
 // Constructor
 CHttpServer::CHttpServer(int port, bool public_api)
     : m_port(port), m_public_api(public_api),
       m_num_threads(DEFAULT_HTTP_THREADS),
       m_work_queue(CHttpWorkQueue<SOCKET>::DEFAULT_HTTP_WORKQUEUE) {
+}
+
+// ⚠️ SEE THE HEADER: this is the bound on a worker's ONLINE window, and it is a
+// function so the arm can call the production path rather than a copy of it.
+// 10 s both ways, the same value CRPCServer sets on its accepted sockets --
+// one number, one rationale, two servers.
+bool CHttpServer::ApplyClientSocketTimeouts(SOCKET client_socket) {
+#ifdef _WIN32
+    DWORD tv = static_cast<DWORD>(CLIENT_SOCKET_TIMEOUT_MS);
+    const bool rcv = setsockopt(client_socket, SOL_SOCKET, SO_RCVTIMEO,
+                                (const char*)&tv, sizeof(tv)) == 0;
+    const bool snd = setsockopt(client_socket, SOL_SOCKET, SO_SNDTIMEO,
+                                (const char*)&tv, sizeof(tv)) == 0;
+#else
+    struct timeval tv;
+    tv.tv_sec  = CLIENT_SOCKET_TIMEOUT_MS / 1000;
+    tv.tv_usec = (CLIENT_SOCKET_TIMEOUT_MS % 1000) * 1000;
+    const bool rcv = setsockopt(client_socket, SOL_SOCKET, SO_RCVTIMEO,
+                                (const char*)&tv, sizeof(tv)) == 0;
+    const bool snd = setsockopt(client_socket, SOL_SOCKET, SO_SNDTIMEO,
+                                (const char*)&tv, sizeof(tv)) == 0;
+#endif
+    return rcv && snd;
 }
 
 // Destructor
@@ -133,6 +162,11 @@ bool CHttpServer::Start() {
             m_workers.emplace_back(&CHttpServer::WorkerThread, this);
         }
         std::cout << "[HttpServer] Started " << m_num_threads << " worker threads" << std::endl;
+        // Declared AFTER the spawns succeed, with the pool's size: a declaration
+        // made before a std::thread constructor that throws leaves a name nobody
+        // will ever answer for, and the startup census would refuse to start the
+        // node over a thread that does not exist.
+        g_chainstate.DeclareEpochParticipant("http-worker", m_workers.size());
 
         // Launch accept thread
         m_accept_thread = std::thread(&CHttpServer::AcceptThread, this);
@@ -212,6 +246,14 @@ void CHttpServer::Stop() {
 }
 
 // Accept thread main loop - STRESS TEST FIX: Only accepts connections and queues them
+// ⚠️ DELIBERATELY NOT AN EPOCH PARTICIPANT, AND SAYING SO IS THE POINT. This is the
+// one spawned thread in the HTTP server with neither a registration nor a scope, so
+// an enumeration of "which threads participate" would otherwise show a hole here and
+// a reader could not tell an omission from a decision. It accepts a socket and hands
+// it to the work queue: it never resolves a CBlockIndex*, never dereferences one, and
+// holds nothing across its accept(). If it ever gains work that touches the block
+// index -- anything reaching mapBlockIndex -- it needs a named checkpoint at this
+// loop's top, and the resolve-time detector in chain.cpp will name it in the meantime.
 void CHttpServer::AcceptThread() {
     std::cout << "[HttpServer] Accept thread started" << std::endl;
 
@@ -227,6 +269,53 @@ void CHttpServer::AcceptThread() {
             if (m_running.load()) {
                 std::cerr << "[HttpServer] Failed to accept connection" << std::endl;
             }
+            continue;
+        }
+
+        // ⚠️ SOCKET TIMEOUTS, AND THEY ARE WHAT MAKES THE WORKER'S PIN BOUNDED
+        // (round-8 F48, 3/3 convergent). Until this existed, the exemption markers
+        // on the send sites claimed the pin was "bounded" -- and it was not: with
+        // no SO_SNDTIMEO a client that simply STOPS READING parks a checkpointing
+        // WorkerThread for as long as it likes, and with no SO_RCVTIMEO one that
+        // connects and says nothing does the same on the read. That is the
+        // round-1 parked-participant class, left online BY POLICY, with a comment
+        // asserting the opposite.
+        //
+        // ⚠️ THAT COMMENT WAS THIS PR'S OWN LESSON, COMMITTED AGAIN. "A wrong
+        // bound in a comment conceals what it describes" -- connman's leak (F35),
+        // MyEpochSlot's (F39), "Pin bound: one VDF round" (F46), and now a
+        // "bounded pin" that nothing bounded. Four times on one branch, so the
+        // bound is now a VALUE SET IN CODE that the markers quote, not an
+        // adjective.
+        //
+        // 10 s both ways, matching CRPCServer's accepted sockets exactly
+        // (rpc/server.cpp) -- one number, one rationale, two servers. It bounds
+        // the worker's ONLINE window on the 18 unfunnelled sends at 10 s per
+        // send; the write funnel is still fe's and is what would remove the
+        // window rather than bound it.
+        //
+        // ⚠️ FAIL CLOSED: A SOCKET WITHOUT TIMEOUTS IS NOT ADMITTED (round-9 F56).
+        // This was `(void)ApplyClientSocketTimeouts(...)` -- the result discarded,
+        // the connection accepted regardless. A failed setsockopt therefore
+        // SILENTLY RESTORED the unbounded pin, on a socket whose send sites carry
+        // markers reading "BOUNDED AT 10 s BY SO_SNDTIMEO". That is the
+        // adjective-versus-value family in its FIFTH form on this branch: the
+        // value existed, was correct, and was not enforced.
+        //
+        // Rejecting costs one client its connection. Admitting costs a
+        // checkpointing worker an unbounded online window, on a socket the
+        // attacker chose. Once per occurrence, not per connection, so a
+        // systematically failing platform says so once instead of flooding.
+        if (!ApplyClientSocketTimeouts(client_socket)) {
+            static std::atomic<bool> s_warned{false};
+            if (!s_warned.exchange(true)) {
+                std::cerr << "[HttpServer] REFUSING connections: socket timeouts "
+                             "could not be set, and an untimed socket can pin a "
+                             "checkpointing worker for as long as a client likes. "
+                             "This message appears once." << std::endl;
+            }
+            shutdown(client_socket, SHUT_RDWR);
+            close(client_socket);
             continue;
         }
 
@@ -247,11 +336,96 @@ void CHttpServer::AcceptThread() {
 
 // Worker thread main loop - STRESS TEST FIX: Processes requests from queue
 void CHttpServer::WorkerThread() {
+    // REGISTER AT ENTRY, THEN GO OFFLINE WHILE BLOCKED.
+    //
+    // ⚠️ THE OFFLINE SCOPE ALONE DOES NOT REGISTER THIS THREAD. A name reaches
+    // the registry on its first NAMED checkpoint, and the scope's checkpoint is in
+    // its DESTRUCTOR — which runs only when the wait RETURNS. On an idle node no
+    // request ever arrives, so this thread would never register and the startup
+    // census would refuse to start the node. Registering here, once, before the
+    // first block, is what makes the census a statement about threads that EXIST
+    // rather than threads that have been handed work.
+    g_chainstate.EpochCheckpoint("http-worker");
+
     while (m_running.load()) {
         SOCKET client_socket;
 
+        // DEFERRED-RECLAMATION CHECKPOINT — before the blocking dequeue, not
+        // after the request. The /metrics handler and the REST branch both
+        // resolve a CBlockIndex* on THIS thread, so it is a participant; at the
+        // loop top the previous request is finished and no new one is taken.
+        //
+        // ⚠️ THE AGGREGATE BOUND, because "10 s per blocking call" is not by itself
+        // a bound on the connection (round-9 F56). It would not be if this server
+        // kept connections alive: N requests on one socket would be N x 10 s with
+        // one checkpoint at the start. It does not -- EVERY response carries
+        // `Connection: close` (verified: this file emits no keep-alive header at
+        // all), so a connection is exactly one request, and the worker returns HERE
+        // and re-checkpoints before taking another.
+        //
+        // So the ONLINE interval per connection is: one request's handling, whose
+        // blocking parts are each capped at 10 s by the socket timeouts set at
+        // accept. If keep-alive is ever added, THIS COMMENT IS THE THING THAT GOES
+        // STALE -- the fix then is a checkpoint between requests on the same
+        // socket, not a bigger timeout.
         // Wait for work from queue (blocks until item available or shutdown)
-        if (!m_work_queue.Dequeue(client_socket)) {
+        bool got_work;
+        {
+            // OFFLINE WHILE BLOCKED: Dequeue parks until a request arrives, and an
+            // epoch published before it would freeze for the whole idle period.
+            // The scope re-enters before HandleRequest, which is what resolves.
+            EpochOfflineScope offline(&g_chainstate);
+            got_work = m_work_queue.Dequeue(client_socket);
+            // ⚠️ COVERAGE LIMIT, STATED RATHER THAN IMPLIED: this thread's WRITE
+            // side is NOT offline. The RPC server funnels every response through
+            // one socket_write lambda and the websocket through one SocketWrite, so
+            // both were wired; http_server has no such funnel -- SendResponse plus
+            // a dozen raw send() calls scattered through HandleRequest -- so an
+            // HTTP response to a slow client is written while this thread is
+            // ONLINE and pins for the duration of the send.
+            //
+            // ⚠️ THE HISTORY OF THIS ONE SENTENCE IS THE WHOLE LESSON. Round 4:
+            // it claimed the pin was "bounded by the socket timeouts set on the
+            // client socket" -- ASSERTED, NOT CHECKED, and there was no setsockopt
+            // anywhere in this file, so a blackholed client pinned this thread for
+            // TCP's retransmit lifetime. Caught 3/3, against my claim. Round 8: I
+            // had corrected the sentence but STILL written "bounded" into the
+            // exemption markers, with nothing bounding it -- caught 3/3 again,
+            // against my claim again.
+            //
+            // It is bounded NOW, by SO_SNDTIMEO/SO_RCVTIMEO set at accept time in
+            // AcceptThread: 10 s, the same value the RPC server uses. The markers
+            // quote the value rather than the adjective, so the next reader can
+            // check the claim by reading one line of code instead of trusting a
+            // word.
+            //
+            // Two changes are needed and neither belongs in a reclamation PR: route
+            // every write through one helper so a single scope can cover them, and
+            // set send timeouts on accepted HTTP sockets. Both change this server's
+            // network behaviour, so they are filed rather than smuggled in here.
+            //
+            // ⚠️ AND THE WRITES ARE DELIBERATELY *NOT* WRAPPED, WHICH IS NOT THE
+            // SAME AS BEING FORGOTTEN (round-8 F46). Wrapping a send in an
+            // EpochOfflineScope publishes "I hold nothing" -- and at the send
+            // sites, unlike the recv above, THAT CANNOT BE SHOWN WITHOUT AUDITING
+            // EVERY HANDLER: each has already run its resolve, and whether a
+            // CBlockIndex* is still live on its stack is a per-handler fact.
+            // Publishing that promise without the proof would UNPIN A HOLDER,
+            // which is the use-after-free direction -- strictly worse than the
+            // bounded pin it would remove. So the read is scoped (provably safe:
+            // nothing above it resolves) and the writes are not, until the funnel
+            // gives one place where the property can be established once.
+            //
+            // The other two blocking sites in this file, hand-read because #194's
+            // comment stripper REFUSES this file (it contains a raw string literal
+            // by design, so the mechanical census could not certify it):
+            //   * CHttpServer::AcceptThread's accept() -- excluded, not a
+            //     participant, holds nothing across the call;
+            //   * CHttpServer::CleanupThread's 1 s sleep x300 -- not a participant
+            //     either: it resolves no CBlockIndex*, so it has no epoch to
+            //     freeze. Stated rather than left as an omission.
+        }
+        if (!got_work) {
             break;  // Shutdown signaled
         }
 
@@ -326,12 +500,29 @@ void CHttpServer::HandleRequest(SOCKET client_socket) {
     const std::string clientIP = GetPeerIP(client_socket);
 
     // Read request
+    //
+    // ⚠️ OFFLINE ACROSS THE READ (round-8 F46). This `recv` blocks for as long as
+    // the client takes to send a request -- and a client that connects and then
+    // says nothing blocks it until the socket times out, which on this server is
+    // NOT BOUNDED because nothing sets SO_RCVTIMEO on accepted sockets (that fix
+    // is filed and belongs to another lane). An epoch published at the worker's
+    // loop top would freeze for that entire period.
+    //
+    // Safe here, and provably so rather than by assertion: this is the FIRST
+    // statement of HandleRequest that can block, and nothing above it resolves a
+    // CBlockIndex* -- GetPeerIP reads the kernel socket. The thread genuinely
+    // holds nothing, which is the precondition a scope needs.
     char buffer[4096];
+    int bytes_read_raw;
+    {
+        EpochOfflineScope offline(&g_chainstate);
 #ifdef _WIN32
-    int bytes_read = recv(client_socket, buffer, sizeof(buffer) - 1, 0);
+        bytes_read_raw = recv(client_socket, buffer, sizeof(buffer) - 1, 0);
 #else
-    ssize_t bytes_read = recv(client_socket, buffer, sizeof(buffer) - 1, 0);
+        bytes_read_raw = static_cast<int>(recv(client_socket, buffer, sizeof(buffer) - 1, 0));
 #endif
+    }
+    const int bytes_read = bytes_read_raw;
 
     if (bytes_read <= 0) {
         return;
@@ -412,8 +603,10 @@ void CHttpServer::HandleRequest(SOCKET client_socket) {
         response << "\r\n";
         std::string response_str = response.str();
 #ifdef _WIN32
+        // EPOCH-WAIT-EXEMPT: BOUNDED AT 10 s BY SO_SNDTIMEO, set on this socket at accept time (see AcceptThread) -- that value, not the word "bounded", is the bound. The site stays ONLINE because a send publishes "I hold nothing" and here that cannot be shown: the handler above has already run its resolve, so whether a CBlockIndex* is still live is a per-handler fact, and promising without the proof would UNPIN A HOLDER -- the use-after-free direction, worse than a 10 s pin. The write funnel (fe) removes the window; the timeout only caps it.
         send(client_socket, response_str.c_str(), static_cast<int>(response_str.size()), 0);
 #else
+        // EPOCH-WAIT-EXEMPT: BOUNDED AT 10 s BY SO_SNDTIMEO, set on this socket at accept time (see AcceptThread) -- that value, not the word "bounded", is the bound. The site stays ONLINE because a send publishes "I hold nothing" and here that cannot be shown: the handler above has already run its resolve, so whether a CBlockIndex* is still live is a per-handler fact, and promising without the proof would UNPIN A HOLDER -- the use-after-free direction, worse than a 10 s pin. The write funnel (fe) removes the window; the timeout only caps it.
         send(client_socket, response_str.c_str(), response_str.size(), 0);
 #endif
         return;
@@ -499,8 +692,10 @@ void CHttpServer::HandleRequest(SOCKET client_socket) {
 
                 // Send raw response (handler builds complete HTTP response)
 #ifdef _WIN32
+                // EPOCH-WAIT-EXEMPT: BOUNDED AT 10 s BY SO_SNDTIMEO, set on this socket at accept time (see AcceptThread) -- that value, not the word "bounded", is the bound. The site stays ONLINE because a send publishes "I hold nothing" and here that cannot be shown: the handler above has already run its resolve, so whether a CBlockIndex* is still live is a per-handler fact, and promising without the proof would UNPIN A HOLDER -- the use-after-free direction, worse than a 10 s pin. The write funnel (fe) removes the window; the timeout only caps it.
                 send(client_socket, response.c_str(), static_cast<int>(response.size()), 0);
 #else
+                // EPOCH-WAIT-EXEMPT: BOUNDED AT 10 s BY SO_SNDTIMEO, set on this socket at accept time (see AcceptThread) -- that value, not the word "bounded", is the bound. The site stays ONLINE because a send publishes "I hold nothing" and here that cannot be shown: the handler above has already run its resolve, so whether a CBlockIndex* is still live is a per-handler fact, and promising without the proof would UNPIN A HOLDER -- the use-after-free direction, worse than a 10 s pin. The write funnel (fe) removes the window; the timeout only caps it.
                 send(client_socket, response.c_str(), response.size(), 0);
 #endif
             } catch (const std::exception& e) {
@@ -668,6 +863,7 @@ void CHttpServer::SendResponse(SOCKET client_socket,
     // On Windows, SOCKET_ERROR is -1. On Unix, -1 indicates error and errno is set.
     size_t response_len = response_str.length();
 #ifdef _WIN32
+    // EPOCH-WAIT-EXEMPT: BOUNDED AT 10 s BY SO_SNDTIMEO, set at accept time and enforced by refusing sockets that will not take it. Same reasoning as the raw sends in HandleRequest: publishing "I hold nothing" here cannot be shown -- the handler that called SendResponse has already run its resolve -- and promising it falsely would UNPIN A HOLDER, the use-after-free direction, worse than a 10 s pin. ⚠️ These two were INVISIBLE to the guard until round 9: SendResponse is TWO hops from the checkpoint (WorkerThread -> HandleRequest -> SendResponse) and the guard only followed one.
     int bytes_sent = send(client_socket, response_str.c_str(), static_cast<int>(response_len), 0);
     if (bytes_sent == SOCKET_ERROR) {
         // Failed to send response - log error but continue (connection may be closed)
@@ -679,6 +875,7 @@ void CHttpServer::SendResponse(SOCKET client_socket,
                   << " of " << response_len << " bytes)" << std::endl;
     }
 #else
+    // EPOCH-WAIT-EXEMPT: BOUNDED AT 10 s BY SO_SNDTIMEO, set at accept time and enforced by refusing sockets that will not take it. Same reasoning as the raw sends in HandleRequest: publishing "I hold nothing" here cannot be shown -- the handler that called SendResponse has already run its resolve -- and promising it falsely would UNPIN A HOLDER, the use-after-free direction, worse than a 10 s pin. ⚠️ These two were INVISIBLE to the guard until round 9: SendResponse is TWO hops from the checkpoint (WorkerThread -> HandleRequest -> SendResponse) and the guard only followed one.
     ssize_t bytes_sent = send(client_socket, response_str.c_str(), response_len, MSG_NOSIGNAL);
     if (bytes_sent < 0) {
         // Failed to send response - log error but continue (connection may be closed)

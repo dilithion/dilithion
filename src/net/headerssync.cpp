@@ -14,6 +14,115 @@
 #include <iostream>
 #include <random>
 
+namespace {
+
+// LP-10 A-2 / blocker 1 — reject nBits values that make chain-work accounting
+// meaningless, in BOTH phases.
+//
+// THE EXPLOIT THIS CLOSES, measured on DilV before this check existed:
+//   ComputeChainWork (consensus/chain_work.h:44-47) SATURATES to 0xFF..FF when
+//   the MANTISSA is zero. 0x1e000000 qualifies -- a non-zero WORD with a zero
+//   mantissa -- so it slipped past the old `nBits == 0` guard. One header with
+//   that nBits was therefore worth MAXIMUM possible chain work and satisfied
+//   DilV's measured nMinimumChainWork on its own: "sufficient work demonstrated
+//   at HEIGHT 1". The honest-nBits control did NOT open the gate, so the
+//   saturation was the cause and nothing else.
+//
+//   `nBits == 0` is the exact shape #189 proved insufficient in the census
+//   generator, where a 0x1e000000 hole passed until the gate was tightened to
+//   test the mantissa. Same defect, second location.
+//
+// WHY HERE AND NOT IN ComputeChainWork: that helper is shared consensus code used
+// for the real chain's work accounting. Changing its saturation behaviour is a
+// consensus change and out of scope. This rejects the input instead.
+//
+// CALLED FROM BOTH PHASES DELIBERATELY. PRESYNC had the weak guard; REDOWNLOAD
+// had NO nBits check at all while still accumulating work from the peer's raw
+// nBits. Guarding one and not the other is the sibling shape this mission keeps
+// hitting.
+bool NBitsIsSaneForWorkAccounting(uint32_t nBits)
+{
+    // Zero mantissa is the SATURATION trigger, and the only one:
+    // ComputeChainWork's other paths clamp rather than saturate.
+    if ((nBits & 0x00FFFFFFu) == 0) return false;
+    // A zero word is a subset of the above, kept explicit for readers.
+    if (nBits == 0) return false;
+    return true;
+}
+
+// ⛔ AND SATURATION WAS NEVER THE WHOLE PROBLEM. The guard above closes exactly
+// one shape and leaves an equally large hole open, MEASURED against
+// ComputeChainWork rather than reasoned about:
+//
+//   nBits        size  mantissa   work (top 4 bytes, LE MSB-side)
+//   0x1d00ffff    29   0x00ffff   00000000…  (DilV genesis — ~2^80, honest)
+//   0x1e000000    30   0x000000   ffffffff…  (saturated — REJECTED above)
+//   0x00000001     0   0x000001   ff000000…  (~2^255 — ACCEPTED above)
+//   0x00000002     0   0x000002   ff000000…  (~2^255 — ACCEPTED above)
+//   0x01000001     1   0x000001   ff000000…  (~2^255 — ACCEPTED above)
+//
+// A SMALL exponent puts the quotient at the TOP of the 256-bit word, so one
+// header claims within a factor of two of the maximum without ever tripping the
+// mantissa test. Enumerating shapes was the wrong instrument: the next encoding
+// nobody thought of is worth the same.
+//
+// So bound the PROPERTY the gate exists to defend instead of the encoding. The
+// PRESYNC gate's entire purpose is that a peer must present a chain whose
+// CUMULATIVE work reaches nMinimumChainWork; a single header reaching it alone
+// means the accounting has stopped meaning anything. That bound is objective,
+// needs no new constant, and does not enumerate anything.
+//
+// The honest margin is not close: nMinimumChainWork accumulates over hundreds of
+// thousands of blocks, so a real block's contribution is smaller by many orders
+// of magnitude. Nothing an honest producer emits comes near this.
+//
+// NOT A CONSENSUS CHANGE: this rejects a peer's INPUT to a dormant DoS gate.
+// ComputeChainWork itself is shared consensus code and is untouched — a real
+// chain's work accounting still behaves exactly as before.
+//
+// ⚠️ RESIDUAL, STATED RATHER THAN ABSORBED: this bounds work, it does not make
+// nBits well-formed. Core decides that in SetCompact (fNegative / fOverflow /
+// zero) and returns ZERO work for a malformed target rather than maximum;
+// ComputeChainWork has no such decode, and giving it one is a consensus change
+// that belongs in its own review. Until then a malformed-but-small-work nBits
+// still passes here — it just cannot inflate the gate.
+bool SingleHeaderWorkIsWithinBound(uint32_t nBits, const uint256& minimum_required_work)
+{
+    // A zero bound means no gate is configured (test callers, and any caller
+    // before nMinimumChainWork is set). Bounding against zero would reject every
+    // header, so the check is inert rather than fail-closed here: this function
+    // guards the gate's arithmetic, and with no gate there is nothing to inflate.
+    bool bound_is_zero = true;
+    for (int i = 0; i < 32; ++i) {
+        if (minimum_required_work.data[i] != 0) { bound_is_zero = false; break; }
+    }
+    if (bound_is_zero) return true;
+
+    const uint256 single = ::dilithion::consensus::ComputeChainWork(nBits);
+    // ⚠️ READ THE SENSE CAREFULLY — BOTH SENSES ARE SPELLED OUT BECAUSE THIS
+    // COMMENT ONCE LED A REVIEWER TO A FALSE HIGH.
+    //
+    // The function is named for what it RETURNS, not for what it rejects:
+    //   returns TRUE  <=> single-header work is BELOW the minimum   (within bound, fine)
+    //   returns FALSE <=> single-header work REACHES the minimum    (the hazard)
+    // and every caller rejects on the NEGATION: `if (!SingleHeaderWorkIsWithinBound(...))`.
+    //
+    // `>=` and not `>` inside the negation, because a header that EXACTLY meets the
+    // minimum satisfies the gate on its own — which is the thing being prevented, so
+    // it must land on the FALSE side.
+    //
+    // The previous comment stated only the rejection half ("a single header that
+    // exactly meets the minimum satisfies the gate on its own") directly above a
+    // `return !...`, and an external seat reading carefully mapped that sentence onto
+    // the return value and raised a HIGH for an inverted bound. The guard was correct;
+    // the COMMENT was ambiguous. A comment that leads a careful reviewer to invent a
+    // blocker is a defect in the comment, and the proof that it was ambiguous is that
+    // it happened.
+    return !::dilithion::consensus::ChainWorkGreaterOrEqual(single, minimum_required_work);
+}
+
+}  // namespace
+
 // ============================================================================
 // Constructor
 // ============================================================================
@@ -23,6 +132,7 @@ HeadersSyncState::HeadersSyncState(
     const HeadersSyncParams& params,
     const uint256& chain_start_hash,
     int64_t chain_start_height,
+    const uint256& chain_start_work,
     const uint256& minimum_work,
     const ::dilithion::net::IHeaderProofChecker* proof_checker
 )
@@ -30,6 +140,7 @@ HeadersSyncState::HeadersSyncState(
       m_params(params),
       m_chain_start_hash(chain_start_hash),
       m_chain_start_height(chain_start_height),
+      m_chain_start_work(chain_start_work),   // LP-10 A-2: RETAIN it; see the header
       m_minimum_required_work(minimum_work),
       m_commit_offset(std::random_device{}() % params.commitment_period),
       m_max_commitments(0),
@@ -39,9 +150,39 @@ HeadersSyncState::HeadersSyncState(
       m_download_state(State::PRESYNC),
       m_proof_checker(proof_checker)
 {
-    // Initialize chain work to zero
-    memset(m_current_chain_work.data, 0, 32);
-    memset(m_redownload_chain_work.data, 0, 32);
+    // LP-10 §2.0 (2026-09-08): SEED the accumulators from the chain start.
+    //
+    // These were memset to zero. chain_start is our LOCAL TIP (see
+    // CHeadersManager::InitializeDoSProtectedSync, which passes hashBestHeader),
+    // not genesis, so a zeroed accumulator made
+    // ChainWorkGreaterOrEqual(m_current_chain_work, m_minimum_required_work)
+    // ask "has this peer supplied a whole threshold's worth of NEW work beyond
+    // our tip?" rather than "does this chain exceed the absolute minimum?".
+    // Against an absolute, from-genesis nMinimumChainWork that is FALSE WHENEVER
+    // THE RECEIVED SUFFIX CARRIES LESS THAN A FULL THRESHOLD OF WORK, however
+    // much our own tip already has: PRESYNC never reaches REDOWNLOAD,
+    // pow_validated_headers stays empty, and header sync stalls.
+    //
+    // (Three earlier wordings of this sentence were wrong in the same direction
+    // -- "any node with history", then "any non-fresh node", then "any node
+    // whose tip already carries a threshold". All three are refuted by the same
+    // counterexample: a node at or past the threshold still PASSES if the peer
+    // supplies a full threshold of NEW work. This site was the FIFTH sibling of
+    // that fix, found by all three external seats after the .h twin, the seeding
+    // suite and the KAT had already been corrected -- the same
+    // fix-the-named-site-miss-the-siblings defect, five times over. The
+    // invariant is about the SUFFIX, never about our tip.)
+    //
+    // Upstream Core seeds from chain_start->nChainWork. Both accumulators are
+    // seeded, not just m_current_chain_work, so the REDOWNLOAD tally is on the
+    // same absolute scale as the PRESYNC one.
+    //
+    // Caller contract: chain_start_work is cumulative work INCLUDING
+    // chain_start_hash. The caller must fail closed rather than pass zero for
+    // an unknown start -- a zero here is indistinguishable from the bug this
+    // replaces.
+    m_current_chain_work = chain_start_work;
+    m_redownload_chain_work = chain_start_work;
 
     // Generate random salt for commitment hashing
     // This prevents attackers from precomputing commitment collisions
@@ -72,35 +213,55 @@ HeadersSyncState::HeadersSyncState(
 
 HeadersSyncState::ProcessingResult HeadersSyncState::ProcessNextHeaders(
     const std::vector<CBlockHeader>& headers,
-    bool /* full_headers_available */)
+    bool full_headers_available)
 {
     ProcessingResult result;
     result.success = false;
     result.request_more = false;
 
-    if (headers.empty()) {
-        // Empty headers message - peer has no more headers
-        if (m_download_state == State::PRESYNC) {
-            // Check if we have enough work to proceed
-            if (ChainWorkGreaterOrEqual(m_current_chain_work, m_minimum_required_work)) {
-                std::cout << "[HeadersSyncState] Peer " << m_id
-                          << " PRESYNC complete, transitioning to REDOWNLOAD" << std::endl;
-                m_download_state = State::REDOWNLOAD;
-                result.success = true;
-                result.request_more = true;  // Request headers again for phase 2
-            } else {
-                std::cout << "[HeadersSyncState] Peer " << m_id
-                          << " insufficient chain work in PRESYNC" << std::endl;
-                Finalize();
-            }
-        } else if (m_download_state == State::REDOWNLOAD) {
-            // Finished redownloading
-            result.pow_validated_headers = PopHeadersReadyForAcceptance();
-            result.success = true;
-            Finalize();
-        }
-        return result;
-    }
+    // ⛔ LP-10 F5 / D-2 — AN EMPTY BATCH IS REFUSED, as upstream refuses it.
+    //
+    // Core v28.0 headerssync.cpp:74-75:
+    //     Assume(!received_headers.empty());
+    //     if (received_headers.empty()) return ret;
+    // An empty HEADERS message is the CALLER's business, not this state
+    // machine's.
+    //
+    // WHAT WAS HERE, AND WHY IT HAD TO GO. This function used to hang BOTH state
+    // transitions off `headers.empty()`: the PRESYNC -> REDOWNLOAD promotion and
+    // the REDOWNLOAD completion. That was invented, not ported. Its consequence
+    // was found TWICE by earlier reviews on this mission and fixed neither time:
+    //
+    //   REVIEW_grill_substitute_r2.md:143 — the below-threshold rejection "is
+    //     reached ONLY when headers.empty()", and the non-empty PRESYNC branch
+    //     "does nothing at all" on failure, so "a test that feeds a
+    //     below-threshold chain and then stops observes NO REJECTION EVER — it
+    //     just keeps being asked for more."
+    //   REVIEW_port_189.md:29 — the gate "fires only on an empty headers batch".
+    //
+    // Both described it as a hazard for whoever writes the tests. It was a port
+    // defect, and the tests had been shaped around it: every arm in this mission
+    // that needed a phase change sent an empty batch.
+    //
+    // NOTHING IS LOST BY REMOVING IT, because D-1 restored the signal that
+    // upstream uses for the same purposes:
+    //   * promotion — the work check inside the PRESYNC branch below already
+    //     calls EnterRedownloadPhase the moment cumulative work crosses the
+    //     threshold, which is Core's behaviour and always was;
+    //   * "the peer has nothing more" — a NON-FULL headers message, which D-1
+    //     made an abort at both phases;
+    //   * REDOWNLOAD completion — `m_header_commitments.empty()` in the
+    //     REDOWNLOAD branch below, which is what actually means "done".
+    // The empty batch was a fourth, redundant, invented signal, and it was the
+    // only one any test used.
+    //
+    // ⚠️ D-5 IS DELIBERATELY NOT PORTED HERE. Core also guards
+    // `m_download_state != State::FINAL` on entry (:54, :77); ours does not, and a
+    // call after Finalize() silently returns success = false, so a caller bug
+    // reads as a peer failure. That is a separate divergence, tracked in
+    // FINDING_F5_state_machine_divergences.md, and it gets its own change rather
+    // than riding along in this one.
+    if (headers.empty()) return result;
 
     if (m_download_state == State::PRESYNC) {
         // Phase 1: Build commitments
@@ -116,11 +277,37 @@ HeadersSyncState::ProcessingResult HeadersSyncState::ProcessNextHeaders(
             std::cout << "[HeadersSyncState] Peer " << m_id
                       << " sufficient work demonstrated at height " << m_current_height
                       << ", transitioning to REDOWNLOAD" << std::endl;
-            m_download_state = State::REDOWNLOAD;
+            EnterRedownloadPhase();   // LP-10 A-2: reseeds all five fields
         }
 
+        // ⛔ LP-10 F5 / D-1 — THE SYNC-TERMINATION SIGNAL, RESTORED.
+        // This parameter was declared and its NAME commented out, so the abort
+        // below did not exist and a peer answering with SHORT batches was treated
+        // exactly like one answering with full ones: request_more was
+        // unconditionally true and we kept asking.
+        //
+        // Core v28.0 headerssync.cpp:86 — a FULL message means the peer may have
+        // more; so does having just switched to REDOWNLOAD, which needs the chain
+        // re-requested from the beginning. Anything else (:91): "If we're in
+        // PRESYNC and we get a non-full headers message, then the peer's chain has
+        // ended and definitely doesn't have enough work, so we can stop our sync."
+        //
+        // Read AFTER the promotion check above, exactly as Core does — a batch
+        // that both completed the work threshold AND was short must still be
+        // re-requested for phase 2.
+        const bool just_promoted = (m_download_state == State::REDOWNLOAD);
+
         result.success = true;
-        result.request_more = true;
+        result.request_more = full_headers_available || just_promoted;
+
+        if (!result.request_more) {
+            std::cout << "[HeadersSyncState] Peer " << m_id
+                      << " sync aborted: incomplete headers message at height "
+                      << m_current_height
+                      << " (presync) — the chain has ended below the threshold"
+                      << std::endl;
+            Finalize();
+        }
 
     } else if (m_download_state == State::REDOWNLOAD) {
         // Phase 2: Validate against commitments
@@ -133,18 +320,52 @@ HeadersSyncState::ProcessingResult HeadersSyncState::ProcessNextHeaders(
             }
         }
 
-        // Check if buffer is large enough to return headers
-        if (m_redownloaded_headers.size() >= m_params.redownload_buffer_size ||
-            m_process_all_remaining_headers) {
+        // ⛔ POP EXACTLY ONCE. This block used to call
+        // PopHeadersReadyForAcceptance() twice and ASSIGN each result:
+        //
+        //     if (buffer full || process_all) result.pow_validated_headers = Pop();
+        //     ...
+        //     if (commitments empty)          result.pow_validated_headers = Pop();
+        //
+        // When BOTH conditions held, the first Pop drained the buffer into the
+        // result and the second Pop — now running on an empty buffer, because Pop
+        // clears it — returned an empty vector and OVERWROTE the first. Measured
+        // by a reviewer's probe (P5): 2 headers in, 0 out. Validated headers were
+        // silently dropped, with no error and no log line.
+        //
+        // Capturing `finished` once also removes a second read of
+        // m_header_commitments, which Finalize() clears — so the old code read a
+        // field for `request_more` and then re-read it after a call that could
+        // change it.
+        const bool finished  = m_header_commitments.empty();
+        const bool drain_now = m_redownloaded_headers.size() >= m_params.redownload_buffer_size
+                               || m_process_all_remaining_headers;
+
+        if (drain_now || finished) {
             result.pow_validated_headers = PopHeadersReadyForAcceptance();
         }
 
+        // LP-10 F5 / D-1, the REDOWNLOAD half. Core v28.0 headerssync.cpp:127:
+        // "For some reason our peer gave us a high-work chain, but is now
+        // declining to serve us that full chain again. Give up."
+        //
+        // success stays TRUE in that case, and deliberately — the headers in THIS
+        // batch were validated against their commitments and there is simply
+        // nothing further to do. Core says so in as many words: "there's no more
+        // processing to be done with these headers, so we can still return
+        // success." Turning it into a failure would discard good headers and, once
+        // A-3 wires the reject reasons, would score a peer for stopping early.
         result.success = true;
-        result.request_more = !m_header_commitments.empty();
+        result.request_more = !finished && full_headers_available;
 
-        // If no more commitments to verify, we're done
-        if (m_header_commitments.empty()) {
-            result.pow_validated_headers = PopHeadersReadyForAcceptance();
+        if (!result.request_more) {
+            if (!finished) {
+                std::cout << "[HeadersSyncState] Peer " << m_id
+                          << " sync aborted: incomplete headers message at height "
+                          << m_redownload_buffer_last_height
+                          << " (redownload) — peer is declining to re-serve its own"
+                             " chain" << std::endl;
+            }
             Finalize();
         }
     }
@@ -184,6 +405,43 @@ uint32_t HeadersSyncState::GetPresyncTime() const {
 // ============================================================================
 // Phase 1: PRESYNC - Build Commitments
 // ============================================================================
+
+// LP-10 A-2 / blocker 2 — the reseed block upstream performs at this transition
+// (bitcoin-v28.0/src/headerssync.cpp:166-172), which our port dropped entirely.
+//
+// WHAT GOES WRONG WITHOUT IT. PRESYNC stores commitments at ABSOLUTE heights
+// (m_current_height starts at chain_start_height) while REDOWNLOAD checks them at
+// BUFFER-RELATIVE ones (m_redownload_buffer_last_height started at 0). The two
+// phases evaluate the SAME `% commitment_period == m_commit_offset` predicate at
+// heights offset by chain_start_height, so they agree ONLY when
+// chain_start_height is an exact multiple of the period — a 1-in-584 accident.
+// Every other start height checks commitments against the wrong headers and,
+// composed with the mismatch penalty, rejects honest peers.
+//
+// MEASURED (A-2): with a 54,000 start height REDOWNLOAD failed; with 53,728
+// (= 584 x 92) it passed, on the SAME binary and the SAME headers. After this
+// reseed both pass.
+//
+// The anchor fields matter as much as the height: without them the first
+// redownloaded header's hashPrevBlock was taken from the PEER's own header
+// (making the peer choose the anchor) and m_redownload_buffer_last_hash was left
+// null, which made the continuity check unreachable for that first header.
+// Blocker 2 and the "unanchored first header" note were ONE missing block.
+void HeadersSyncState::EnterRedownloadPhase()
+{
+    m_redownloaded_headers.clear();
+    m_redownload_buffer_last_height     = m_chain_start_height;
+    m_redownload_buffer_first_prev_hash = m_chain_start_hash;
+    m_redownload_buffer_last_hash       = m_chain_start_hash;
+    // The fifth field. Only expressible because m_chain_start_work is retained --
+    // m_current_chain_work has absorbed every PRESYNC header by now, so it is NOT
+    // a substitute. Reseeding here also RESTORES correctness after any PRESYNC
+    // mutation, which the constructor's value alone could not do: that value was
+    // correct at this point only by accident, since nothing happened to touch it.
+    m_redownload_chain_work             = m_chain_start_work;
+
+    m_download_state = State::REDOWNLOAD;
+}
 
 bool HeadersSyncState::ValidateAndStoreHeadersCommitments(
     const std::vector<CBlockHeader>& headers)
@@ -226,6 +484,23 @@ bool HeadersSyncState::ValidateAndProcessSingleHeader(const CBlockHeader& header
     // IHeaderProofChecker if injected. Falls back to the legacy inline
     // `IsVDFBlock()` branch + CheckProofOfWork path if no checker was
     // passed (un-migrated test callsites).
+    // ⛔ FAIL CLOSED WHEN THERE IS NO CHECKER AND THE HEADER IS A VDF BLOCK.
+    // The fallback below reads `else if (!header.IsVDFBlock())`, so before this
+    // clause a VDF header arriving with no injected checker was subjected to NO
+    // proof check of any kind — and its nBits still fed the work accumulator a
+    // few lines down. That is the fail-OPEN shape #189 shipped once: an absent
+    // input silently becoming a permissive verdict.
+    //
+    // Production always injects a checker (CHeadersManager selects one per
+    // network), so this refuses a state production does not reach rather than
+    // changing any live behaviour. A test that wants VDF headers must inject the
+    // VDF checker — which is the point.
+    if (!m_proof_checker && header.IsVDFBlock()) {
+        std::cerr << "[HeadersSyncState] VDF header with no proof checker — refusing"
+                  << std::endl;
+        return false;
+    }
+
     if (m_proof_checker) {
         if (!m_proof_checker->CheckHeaderProof(header)) {
             std::cerr << "[HeadersSyncState] Invalid proof for header "
@@ -256,8 +531,15 @@ bool HeadersSyncState::ValidateAndProcessSingleHeader(const CBlockHeader& header
     }
 
     // 3. Basic sanity checks
-    if (header.nBits == 0) {
-        std::cerr << "[HeadersSyncState] Zero nBits" << std::endl;
+    if (!SingleHeaderWorkIsWithinBound(header.nBits, m_minimum_required_work)) {
+        std::cerr << "[HeadersSyncState] PRESYNC: single-header work reaches the "
+                     "minimum-chain-work gate on its own, nBits 0x"
+                  << std::hex << header.nBits << std::dec << std::endl;
+        return false;
+    }
+    if (!NBitsIsSaneForWorkAccounting(header.nBits)) {
+        std::cerr << "[HeadersSyncState] Rejecting header with unusable nBits 0x"
+                  << std::hex << header.nBits << std::dec << std::endl;
         return false;
     }
 
@@ -274,8 +556,44 @@ bool HeadersSyncState::ValidateAndProcessSingleHeader(const CBlockHeader& header
 // ============================================================================
 
 bool HeadersSyncState::ValidateAndStoreRedownloadedHeader(const CBlockHeader& header) {
+    // 0. LP-10 A-2 / blocker 1 — nBits sanity, BEFORE anything uses it.
+    //
+    // This phase previously had NO nBits check of any kind while still
+    // accumulating chain work from the peer's raw nBits below (m_redownload_chain_work).
+    // PRESYNC had the weak `nBits == 0` guard and this path had nothing, so a
+    // saturating nBits rejected in phase 1 would have been accepted in phase 2 --
+    // a guard present at one site and absent at its sibling.
+    if (!SingleHeaderWorkIsWithinBound(header.nBits, m_minimum_required_work)) {
+        std::cerr << "[HeadersSyncState] REDOWNLOAD: single-header work reaches the "
+                     "minimum-chain-work gate on its own, nBits 0x"
+                  << std::hex << header.nBits << std::dec << std::endl;
+        return false;
+    }
+    if (!NBitsIsSaneForWorkAccounting(header.nBits)) {
+        std::cerr << "[HeadersSyncState] REDOWNLOAD: unusable nBits 0x"
+                  << std::hex << header.nBits << std::dec << std::endl;
+        return false;
+    }
+
     // 1. Phase 3: route through IHeaderProofChecker if injected (same
     // pattern as ValidateAndProcessSingleHeader above).
+    // ⛔ FAIL CLOSED WHEN THERE IS NO CHECKER AND THE HEADER IS A VDF BLOCK.
+    // The fallback below reads `else if (!header.IsVDFBlock())`, so before this
+    // clause a VDF header arriving with no injected checker was subjected to NO
+    // proof check of any kind — and its nBits still fed the work accumulator a
+    // few lines down. That is the fail-OPEN shape #189 shipped once: an absent
+    // input silently becoming a permissive verdict.
+    //
+    // Production always injects a checker (CHeadersManager selects one per
+    // network), so this refuses a state production does not reach rather than
+    // changing any live behaviour. A test that wants VDF headers must inject the
+    // VDF checker — which is the point.
+    if (!m_proof_checker && header.IsVDFBlock()) {
+        std::cerr << "[HeadersSyncState] VDF header with no proof checker — refusing"
+                  << std::endl;
+        return false;
+    }
+
     uint256 hash = header.GetHash();
     if (m_proof_checker) {
         if (!m_proof_checker->CheckHeaderProof(header)) {
@@ -289,15 +607,35 @@ bool HeadersSyncState::ValidateAndStoreRedownloadedHeader(const CBlockHeader& he
         }
     }
 
-    // 2. Check continuity
-    if (!m_redownloaded_headers.empty()) {
-        if (header.hashPrevBlock != m_redownload_buffer_last_hash) {
-            std::cerr << "[HeadersSyncState] Chain discontinuity in REDOWNLOAD" << std::endl;
-            return false;
-        }
-    } else {
-        // First redownloaded header
-        m_redownload_buffer_first_prev_hash = header.hashPrevBlock;
+    // 2. Check continuity — UNCONDITIONALLY, first header included.
+    //
+    // ⛔ THIS SITE PREVIOUSLY EXEMPTED THE FIRST HEADER, and the blocker-2 commit
+    // message claimed the exemption was closed by the transition reseed. IT WAS
+    // NOT — a reviewer's probe (P1) drove a first REDOWNLOAD header with a garbage
+    // hashPrevBlock and it returned success. The claim was wrong and this is the
+    // code that makes it true.
+    //
+    // The old shape was:
+    //     if (!m_redownloaded_headers.empty()) { ...check... }
+    //     else { m_redownload_buffer_first_prev_hash = header.hashPrevBlock; }
+    //
+    // Two defects in four lines. The check was SKIPPED for the first header, and
+    // the else-branch then took the anchor FROM THE PEER — so even after
+    // EnterRedownloadPhase seeded both hash fields from m_chain_start_hash, the
+    // very first header overwrote the anchor with a value the peer chose. The
+    // reseed was correct and was immediately clobbered.
+    //
+    // Unconditional now, which is what upstream does: EnterRedownloadPhase sets
+    // m_redownload_buffer_last_hash = m_chain_start_hash, so the first header's
+    // hashPrevBlock MUST equal the chain start or the chain is not anchored to it.
+    // Nothing assigns m_redownload_buffer_first_prev_hash here any more — the
+    // reseed owns it, and PopHeadersReadyForAcceptance reconstructs from it.
+    if (header.hashPrevBlock != m_redownload_buffer_last_hash) {
+        std::cerr << "[HeadersSyncState] Chain discontinuity in REDOWNLOAD"
+                  << (m_redownloaded_headers.empty()
+                      ? " (FIRST header does not connect to chain start)" : "")
+                  << std::endl;
+        return false;
     }
 
     // 3. Check commitment if at commitment position

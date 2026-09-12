@@ -240,6 +240,33 @@ public:
      */
     int GetPort() const { return m_port; }
 
+public:
+
+    // ⚠️ THE BOUND ON A WORKER'S ONLINE WINDOW, AS A VALUE AND AS A FUNCTION
+    // (round-8 F48). The 18 unfunnelled sends in HandleRequest run with the
+    // worker ONLINE, and until this existed nothing bounded them: a client that
+    // stops reading parked a checkpointing thread for as long as it liked. The
+    // exemption markers on those sends quote this number.
+    //
+    // It is a named function rather than two inline setsockopt calls so an arm
+    // can exercise the PRODUCTION path instead of a copy of it -- a test that
+    // re-implements the thing it checks proves only that the author can write it
+    // twice.
+    static constexpr int CLIENT_SOCKET_TIMEOUT_MS = 10000;   // 10 s, both ways
+
+    /**
+     * Apply SO_RCVTIMEO and SO_SNDTIMEO to an accepted client socket.
+     * Returns true if BOTH were accepted by the OS.
+     *
+     * ⚠️ FAILURE IS NOT SURVIVABLE FOR THAT CONNECTION (round-9 F56). This doc
+     * used to say failure was "non-fatal at the call site" -- true when AcceptThread
+     * discarded the result, and that discard is exactly what silently restored the
+     * unbounded pin on a socket whose send sites claim a 10 s bound. AcceptThread
+     * now REJECTS a socket that will not take the options, and
+     * scripts/check_http_socket_timeouts.sh fails if that rejection is removed.
+     */
+    static bool ApplyClientSocketTimeouts(SOCKET client_socket);
+
 private:
     /**
      * Accept thread main loop

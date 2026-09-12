@@ -50,7 +50,43 @@ bool Test_GenerateHDWallet() {
     uint32_t account, external_idx, internal_idx;
     TEST_ASSERT(wallet.GetHDWalletInfo(account, external_idx, internal_idx), "GetHDWalletInfo failed");
     TEST_ASSERT(account == 0, "Account should be 0");
-    TEST_ASSERT(external_idx == 1, "External index should be 1 (first address generated)");
+    // STALE EXPECTATION FIXED, and the product is right, not this file.
+    //
+    // This asserted external_idx == 1 ("first address generated"), which was
+    // true until the BUG #115 fix. GenerateHDWallet now PRE-GENERATES
+    // HD_GAP_LIMIT addresses at creation (wallet.cpp:5286-5291) so that the
+    // initial rescan checks all of them, and sets nHDExternalChainIndex =
+    // HD_GAP_LIMIT (wallet.cpp:5316). Measured: expected 1, actual 20 --
+    // off by exactly HD_GAP_LIMIT - 1.
+    //
+    // Expressed as a RELATIONSHIP, not the literal 20. `external_idx == 20`
+    // would silently stop testing anything the day HD_GAP_LIMIT changes: it
+    // would still pass while the wallet pre-generated a different number of
+    // addresses, which is the same class of drift that produced this bug.
+    // HD_GAP_LIMIT itself is private, and this is a test-file-only change, so
+    // the invariant is stated against what the wallet actually produced --
+    // which is the stronger claim anyway: the next index must sit exactly past
+    // the addresses that exist.
+    //
+    // WHY THIS MATTERED: ci.yml excluded this suite six times for
+    // "GetNewHDAddress() hangs in CI (BUG-77) ... blocking on /dev/random".
+    // There is no /dev/random path anywhere in src/ or depends/dilithium/ --
+    // the suite does not hang, it fails in 2 seconds on this line. The
+    // misdiagnosis kept anyone from looking for ~1054 commits, per
+    // missions/security-audit-2026-09/artifacts/audit_wallet_keys.md F2.
+    // RELATIONAL, not a pinned number (a8 review LOW-1, measured): a deliberate
+    // HD_GAP_LIMIT change SURVIVES this assertion while breaking the relation
+    // KILLS it -- so it tests the invariant that must hold rather than the
+    // policy value that is allowed to move. A literal here would redden the
+    // suite on a legitimate change, and a suite that reddens on legitimate
+    // changes is one that gets excluded from CI, which is exactly the history
+    // this file is recovering from.
+    const size_t pregenerated = wallet.GetAddresses().size();
+    TEST_ASSERT(pregenerated > 1,
+                "BUG #115 must pre-generate a gap limit of addresses, not one");
+    TEST_ASSERT(external_idx == pregenerated,
+                "External index must sit exactly past the pre-generated addresses");
+    // Internal is NOT pre-advanced: wallet.cpp:5284 leaves it at 0.
     TEST_ASSERT(internal_idx == 0, "Internal index should be 0");
 
     std::cout << "  Generated mnemonic: " << mnemonic.substr(0, 30) << "..." << std::endl;

@@ -150,11 +150,29 @@ public:
      *                      preserves pre-Phase-3 behaviour for tests that
      *                      don't wire a checker.
      */
+    /**
+     * @param chain_start_work CUMULATIVE chain work at chain_start_hash,
+     *   i.e. work from genesis up to AND INCLUDING that block.
+     *
+     *   LP-10 §2.0 (2026-09-08). This parameter did not exist and the
+     *   accumulator was memset to zero, while chain_start is our LOCAL TIP, not
+     *   genesis. The gate then asked "has this peer supplied a whole threshold's
+     *   worth of NEW work beyond our tip?" instead of "does this chain exceed
+     *   the absolute minimum?" -- false whenever the RECEIVED SUFFIX carries
+     *   less than a full threshold of work, however much our tip already has,
+     *   so PRESYNC
+     *   would never reach REDOWNLOAD and header sync would stall. Upstream seeds
+     *   from chain_start->nChainWork; this restores that.
+     *
+     *   There is deliberately NO DEFAULT. A defaulted zero is exactly the bug,
+     *   and it would reappear silently at any future call site.
+     */
     HeadersSyncState(
         NodeId peer_id,
         const HeadersSyncParams& params,
         const uint256& chain_start_hash,
         int64_t chain_start_height,
+        const uint256& chain_start_work,
         const uint256& minimum_work,
         const ::dilithion::net::IHeaderProofChecker* proof_checker = nullptr
     );
@@ -200,6 +218,25 @@ private:
     //! Starting point for this sync
     const uint256 m_chain_start_hash;
     const int64_t m_chain_start_height;
+
+    //! Cumulative chain work AT the chain start, RETAINED.
+    //!
+    //! LP-10 A-2 / blocker 2. Upstream re-reads this at the PRESYNC->REDOWNLOAD
+    //! transition as `m_chain_start->nChainWork`
+    //! (bitcoin-v28.0/src/headerssync.cpp:170) because it holds `m_chain_start`
+    //! as a POINTER. Our constructor took `chain_start_work` as a VALUE, copied
+    //! it into two accumulators and kept nothing — so by transition time
+    //! `m_current_chain_work` had absorbed every PRESYNC header and the
+    //! chain-start value was UNRECOVERABLE. Keeping it is what makes the fifth
+    //! reseed expressible at all.
+    //!
+    //! ⚠️ PORT SHAPE, recorded because it will bite again: upstream holds
+    //! `m_chain_start` as a pointer and we take values, so EVERY upstream site
+    //! that reads `m_chain_start->X` has no counterpart here unless a member
+    //! holding X exists. That is how the whole reseed block went missing. When
+    //! porting from this file, check for the member before concluding a line was
+    //! ported — an absent member reads exactly like a deliberate omission.
+    const uint256 m_chain_start_work;
 
     //! Minimum chain work to require before accepting headers
     const uint256 m_minimum_required_work;
@@ -263,6 +300,19 @@ private:
      * @param headers Headers to process
      * @return true if all headers valid
      */
+    //! Enter REDOWNLOAD, reseeding every field the phase depends on.
+    //!
+    //! LP-10 A-2 / blocker 2. This exists as ONE method called from BOTH
+    //! transition sites deliberately. Upstream performs a five-field reseed at
+    //! this transition (bitcoin-v28.0/src/headerssync.cpp:166-172); our port
+    //! dropped it, and we had TWO places that set the state, so a fix pasted into
+    //! one would have left the other — the sibling-divergence shape this mission
+    //! has hit repeatedly. Factoring it makes that recurrence impossible: there
+    //! is no second copy to forget.
+    //!
+    //! NEVER set m_download_state = State::REDOWNLOAD directly. Call this.
+    void EnterRedownloadPhase();
+
     bool ValidateAndStoreHeadersCommitments(const std::vector<CBlockHeader>& headers);
 
     /**
