@@ -2,6 +2,8 @@
 // Distributed under the MIT software license
 
 #include <net/headers_manager.h>
+
+#include <atomic>
 #include <net/net.h>
 #include <net/connman.h>
 #include <net/protocol.h>
@@ -82,6 +84,29 @@ static bool CheckpointCheckHeader(int height, const uint256& headerHash) {
     return true;  // no checkpoint at this height
 }
 
+// LP-10 deliverable 0b: explicit-threshold construction. Delegates to the
+// production constructor so there is exactly ONE initialisation path (a second
+// copy would drift, and the genesis/mapHeaders seeding below is load-bearing),
+// then overrides the one value -- so on THIS path the member is written twice,
+// not once ("write-once" was inaccurate for the delegating constructor).
+// It is not written after construction
+// and read-only afterwards, so no lock is involved here or in the accessor.
+CHeadersManager::CHeadersManager(const uint256& minimum_chain_work)
+    : CHeadersManager()
+{
+    nMinimumChainWork = minimum_chain_work;
+}
+
+uint256 CHeadersManager::GetMinimumChainWork() const
+{
+    // Deliberately NOT taking cs_headers: the field is written ONLY DURING
+    // construction and is immutable afterwards (on the delegating path it is
+    // written twice -- see the constructor above; "write-once" was wrong there
+    // and was wrong here, eight lines apart, in the same edit), and a lock here would be a deadlock hazard for any caller
+    // that already holds it (cs_headers is a non-recursive std::mutex).
+    return nMinimumChainWork;
+}
+
 CHeadersManager::CHeadersManager()
     : nBestHeight(-1)
 {
@@ -96,7 +121,166 @@ CHeadersManager::CHeadersManager()
     // ships VDFHeaderProofChecker; DIL ships RandomXHeaderProofChecker.
     // The HeadersSyncState instances we construct below get a non-owning
     // pointer to this; lifetime: owned by manager, outlives all states.
-    if (Dilithion::g_chainParams && Dilithion::g_chainParams->IsDilV()) {
+    // ⚠️ WHAT THIS SITE USED TO SELECT ON, AND WHY THAT IS NOT THE ANSWER.
+    // It selected on IsDilV(). That was wrong: the comment fifteen lines below
+    // already diagnosed the identical hazard for the genesis-hash key --
+    // "Selecting on IsDilV() alone disagreed with it on TESTNET and REGTEST
+    // (both VDF-from-genesis but network != DILV) ... Route through the shared
+    // dispatcher" -- and that site was repaired while THIS one, two lines above
+    // it, was not, with the explanation sitting between them.
+    //
+    // WHAT IT BROKE: regtest is a VDF chain whose network is not DILV, so it was
+    // handed RandomXHeaderProofChecker, which calls
+    // CheckProofOfWork(header.GetHash(), nBits) on a VDF header. A VDF header's
+    // hash is not mined against a target, so honest regtest VDF headers failed
+    // their proof check.
+    //
+    // ⛔ AND THE OBVIOUS REPAIR -- "route through IsVdfFromGenesis() like the
+    // dispatcher below" -- IS ALSO WRONG. An earlier draft of this very commit
+    // did exactly that. The paragraph that said so has been REMOVED rather than
+    // left standing above its own correction: a superseded instruction carrying
+    // the same ⛔ marker as the rule that replaced it is worse than no comment,
+    // and leaving it here would have been this mission's own sibling defect in
+    // its comment form. The reasoning is preserved below, where it is correct.
+
+    // ⛔ MIRROR THE PRODUCER'S PREDICATE EXACTLY. NOT IsVdfFromGenesis().
+    //
+    // The VDF checker enforces nBits == genesisNBits, and that rule is only
+    // sound where the PRODUCER emits a constant. GetNextWorkRequired's constant
+    // branch is `IsDilV() || IsRegtest()` (pow.cpp:1142-1146) -- TESTNET IS NOT
+    // IN IT. Testnet has vdfActivationHeight = 0 and vdfExclusiveHeight = 0, so
+    // IsVdfFromGenesis() is TRUE for it, but it falls through to ASERT
+    // RETARGETING and its honest headers carry non-genesis nBits.
+    //
+    // Selecting on IsVdfFromGenesis() would therefore hand testnet a checker
+    // whose equality rule its own honest headers violate -- banning honest peers,
+    // the exact defect this class of guard exists to avoid. An earlier draft of
+    // this fix did precisely that; an external seat caught it.
+    //
+    // THE RULE: the checker's predicate must mirror the producer's, because the
+    // checker is asserting a property only the producer can guarantee. Two
+    // predicates verified separately against different things are not the same
+    // predicate.
+    //
+    // ⚠️ TESTNET IS LEFT ON THE RandomX CHECKER AND REMAINS BROKEN — knowingly.
+    // Its VDF headers fail CheckProofOfWork either way, so this change does not
+    // regress it; it declines to swap one breakage for a subtler one. Testnet
+    // headers-sync needs its own rule (equality does not apply under retargeting)
+    // and that is an activation prerequisite, tracked separately.
+    m_uses_vdf_proof_checker =
+        Dilithion::g_chainParams &&
+        (Dilithion::g_chainParams->IsDilV() || Dilithion::g_chainParams->IsRegtest());
+
+    // ⛔ THE TESTNET GAP, MADE MACHINE-ENFORCED INSTEAD OF SILENT.
+    //
+    // Testnet is VDF-from-genesis (vdfActivationHeight = 0, vdfExclusiveHeight
+    // = 0) but is NOT in the producer's constant branch, so NEITHER checker is
+    // correct for it: the VDF checker's nBits-equality rule is violated by its
+    // own honest, ASERT-retargeted headers, and the RandomX checker demands a
+    // hash under target from a header that was never mined against one.
+    //
+    // Selecting the lesser-wrong checker and saying so in a comment is what the
+    // previous draft did. A comment is not a guard — this mission has now had
+    // three claims-in-comments turn out to be stale — so the gap is recorded in
+    // a FLAG that the sync entry point refuses on. If someone arms the gate on
+    // testnet, they get a refusal naming the reason, not a peer-banning header
+    // sync that looks like it works.
+    //
+    // A-3 owns the real rule: a predicate that mirrors ASERT rather than
+    // asserting a constant. Until it exists, this network is unsupported and
+    // says so.
+    // ⛔ F2 — WHY THE REFUSAL IS SUFFICIENT, CENSUSED RATHER THAN ASSERTED.
+    //
+    // A seat's MEDIUM asked the fair question: this flag guards
+    // InitializeDoSProtectedSync, but the constructor above STILL BUILDS a
+    // RandomX checker for testnet. Does anything else reach a header proof check?
+    //
+    // ⛔ THIS BLOCK CITED LINE NUMBERS UNTIL 2026-09-12, AND A SEAT FOUND THEM
+    // STALE. They were measured at a60fe10d and had rotted by 186b2b89 — in a
+    // block that explicitly offers itself as re-runnable evidence, which makes
+    // stale coordinates worse here than anywhere else in this file: they invite
+    // the next reader to check, hand them wrong numbers, and the natural reading
+    // is that the CENSUS is wrong rather than that its citations rotted.
+    //
+    // ⛔ AND ONE OF THE PUBLISHED PATTERNS WAS SELF-CONFIRMING. The old step (1)
+    // grep was `make_unique<VDFHeaderProofChecker>`; the code constructs through
+    // the fully-qualified `::dilithion::net::port::` form, so at 186b2b89 that
+    // pattern matched NOTHING BUT THIS COMMENT'S OWN TEXT. Re-running it would
+    // have "confirmed" the census by finding the census. A check that can only
+    // match its own prose is not a check.
+    //
+    // SO THE EVIDENCE IS NOW THE COMMANDS, NOT THE COORDINATES. Paste any of
+    // these at any sha; a census whose evidence is a grep does not rot, and one
+    // whose evidence is a line number rots silently and on someone else's time.
+    // Outputs shown are from 186b2b89.
+    //
+    //   (1) checker CONSTRUCTION — is the branch above the only one?
+    //         git grep -n "make_unique<.*HeaderProofChecker>" -- src ':!src/test'
+    //       -> TWO code hits, both in the if/else directly above, one per checker.
+    //          Nothing else in non-test code builds either. NO LINE NUMBERS ON
+    //          PURPOSE — see the note at the end. The pattern wildcards the
+    //          namespace, so a re-qualification cannot hide a site the way it hid
+    //          these from the previous version of this census.
+    //
+    //   (2) CheckHeaderProof CALL sites — note `-e`, since `->` parses as a switch:
+    //         git grep -n -e "->CheckHeaderProof(" -- src ':!src/test'
+    //       -> TWO code hits, both in headerssync.cpp, both through m_proof_checker
+    //          inside HeadersSyncState. A proof check REQUIRES a HeadersSyncState.
+    //
+    //   (3) HeadersSyncState CREATION — exactly one site:
+    //         git grep -n "make_shared<HeadersSyncState>" -- src ':!src/test'
+    //       -> ONE code hit, in this file, inside InitializeDoSProtectedSync and
+    //          AFTER the refusal, which returns false before it. So
+    //          ProcessHeadersWithDoSProtection cannot create state — it only looks
+    //          up an existing entry, and the bypass a panel asked about does not
+    //          exist. (Independently censused by COORD, same conclusion.)
+    //
+    //   (4) CALLS to either entry point, definitions and comments excluded:
+    //         git grep -nE "(InitializeDoSProtectedSync|ProcessHeadersWithDoSProtection)\s*\("     //             -- src ':!src/test'     //           | grep -vE ":[0-9]+:[[:space:]]*//"     //           | grep -vE ":[0-9]+:bool CHeadersManager::"     //           | grep -vE "\.h:[0-9]+:"
+    //       -> ZERO code hits. Every remaining non-test hit is a comment or a
+    //          declaration.
+    //
+    //       ⛔ THE FILTER'S FIRST VERSION COULD HIDE THE THING IT COUNTS, and two
+    //       seats found it independently. It excluded any line containing `bool `,
+    //       so a REAL call site written `bool ok = mgr.InitializeDoSProtectedSync(...)`
+    //       would have been filtered out and the ZERO would still have printed.
+    //       Measured on a fixture carrying exactly that line: the old filter kept
+    //       1 of 2 real calls; this one keeps 2 of 2, drops the comment-only line,
+    //       and drops both definitions and the header declaration — and still
+    //       returns ZERO on the tree, so the claim survives the stricter filter.
+    //
+    //       The repair is the shape, not the spelling: exclude COMMENT-ONLY lines
+    //       (anchored `:<lineno>:` then whitespace then `//`), never any line that
+    //       merely CONTAINS a comment or a type name.
+    //
+    //       SECOND instance of one class in this block — the first was a pattern
+    //       that matched only its own comment text. Both are checks whose success
+    //       condition can be satisfied by something other than the claim being
+    //       true. **Hostile-reading your own evidence commands is a separate step
+    //       from writing them**, and in this block it has now paid twice.
+    //
+    // So the testnet checker object the constructor builds is UNREACHABLE twice
+    // over: nothing creates the state that would use it, and if a future caller
+    // tries, the refusal stops it before the state exists.
+    //
+    // ⚠️ TWO NOTES ON READING THE OUTPUT, both learned by getting them wrong here:
+    //   * NO LINE NUMBERS ARE QUOTED ABOVE, only counts and files. Rewriting this
+    //     very comment shifted every line it had just cited — the rot reappeared
+    //     inside the commit that was fixing it. Counts and filenames survive an
+    //     edit; coordinates do not.
+    //   * EACH COMMAND ALSO MATCHES THE LINE OF THIS COMMENT THAT PRINTS IT.
+    //     That is harmless but you must not count it: the claim is about the CODE
+    //     hits. Add `| grep -v "^src/net/headers_manager.cpp:.*//"` if you want
+    //     the commands to exclude their own documentation.
+    //
+    // ⚠️ IF (4) EVER STOPS BEING TRUE — i.e. A-3 wires a real caller — step (4)
+    // is gone and the refusal at that caller becomes the ONLY thing standing
+    // between testnet and a checker that rejects its own honest headers. Re-run
+    // this census then; do not inherit it.
+    m_proof_checker_supports_network =
+        Dilithion::g_chainParams != nullptr &&
+        !(Dilithion::g_chainParams->IsVdfFromGenesis() && !m_uses_vdf_proof_checker);
+    if (m_uses_vdf_proof_checker) {
         m_proof_checker =
             std::make_unique<::dilithion::net::port::VDFHeaderProofChecker>();
     } else {
@@ -216,29 +400,24 @@ bool CHeadersManager::ProcessHeaders(NodeId peer, const std::vector<CBlockHeader
     // DEADLOCK FIX: Get chainstate tip BEFORE acquiring cs_headers
     // This is needed because GetLocatorImpl may be called while holding cs_headers,
     // and we must avoid calling GetTip() (which needs cs_main) while holding cs_headers.
-    CBlockIndex* pTipPreFetched = g_chainstate.GetTip();
-    int chainstateHeightPreFetched = (pTipPreFetched && pTipPreFetched->nHeight > 0) ? pTipPreFetched->nHeight : 0;
-
-    std::lock_guard<std::mutex> lock(cs_headers);
-
-    // Phase 6 PR6.1: per-peer rate limit. Drop the batch if peer is over budget.
-    // v4.1 audit fix (twin of headers_manager.cpp:2495 fix in commit 3c5e0eb):
-    // promote log to always-on WARN. This is one of two twins of the bug that
-    // hid the rate-limit reject from operators during IBD. Always log so the
-    // diagnostic trail is visible without --verbose.
-    if (!headers.empty() && !CheckPeerHeaderRateLimit(peer, headers.size())) {
-        LogPrintf(NET, WARN,
-            "[HeadersManager] Rate-limit reject (Process): peer=%d batch=%zu "
-            "(window limit = %d/%ds)\n",
-            static_cast<int>(peer),
-            headers.size(),
-            Dilithion::g_chainParams ? Dilithion::g_chainParams->nHeaderRateLimitPerWindow : 5000,
-            Dilithion::g_chainParams ? Dilithion::g_chainParams->nHeaderRateWindowSec : 60);
-        return false;
-    }
-    if (g_verbose.load(std::memory_order_relaxed))
-        std::cout << "[HeadersManager] Lock acquired" << std::endl;
-
+    // P2P-16: this site held the released CBlockIndex* across the ENTIRE batch —
+    // a far wider window than GetLocator's, since everything below runs between
+    // the pre-fetch and the eventual GetLocatorImpl call. Resolve to values here
+    // instead; nothing downstream holds a chainstate pointer any more.
+    // ADMISSION CHECKS FIRST (external review r3, G4). These used to run AFTER
+    // the chainstate resolve below, so a batch that was about to be REJECTED
+    // still paid for a full descending walk of the active chain under cs_main.
+    // At DilV's current height (~250k) that resolve walks from the tip down to
+    // the oldest scheduled locator height (118920), i.e. ~131,000 pprev
+    // dereferences with cs_main held - and a peer already over its header
+    // budget could make the node pay that on every rejected batch. None of the
+    // three checks needs the chainstate, so none of them belongs after it.
+    //
+    // The rate-limit check is NOT duplicated up here: it MUTATES the per-peer
+    // window (m_peerHeaderRate), so calling it in both places would count every
+    // batch twice and silently halve the effective limit. It moves into the
+    // cs_headers scope that already exists for the height peek, which adds no
+    // new lock edge - that scope is taken and released before cs_main.
     if (headers.empty()) {
         if (g_verbose.load(std::memory_order_relaxed))
             std::cout << "[HeadersManager] Empty headers, returning true" << std::endl;
@@ -251,6 +430,52 @@ bool CHeadersManager::ProcessHeaders(NodeId peer, const std::vector<CBlockHeader
                       << " > " << MAX_HEADERS_BUFFER << "), returning false" << std::endl;
         return false;
     }
+
+    int headersHeightPreFetched = 0;
+    {
+        std::lock_guard<std::mutex> peek(cs_headers);
+
+        // Phase 6 PR6.1: per-peer rate limit. Drop the batch if peer is over budget.
+        // v4.1 audit fix: promote log to always-on WARN. This is one of two twins
+        // of the bug that hid the rate-limit reject from operators during IBD.
+        // Always log so the diagnostic trail is visible without --verbose.
+        //
+        // headers is known non-empty here, so the old `!headers.empty() &&`
+        // guard is gone. NOT CHANGED, and worth naming rather than leaving
+        // implicit: an EMPTY batch returns above without touching the window, so
+        // empty HEADERS messages are still not counted against the header
+        // budget. That is pre-existing and reasonable - an empty HEADERS is the
+        // normal end-of-chain reply - but it means this budget bounds HEADERS,
+        // not MESSAGES. Whether empty messages need their own bound is a
+        // separate question, and not one to answer inside a lock-order fix.
+        if (!CheckPeerHeaderRateLimit(peer, headers.size())) {
+            LogPrintf(NET, WARN,
+                "[HeadersManager] Rate-limit reject (Process): peer=%d batch=%zu "
+                "(window limit = %d/%ds)\n",
+                static_cast<int>(peer),
+                headers.size(),
+                Dilithion::g_chainParams ? Dilithion::g_chainParams->nHeaderRateLimitPerWindow : 5000,
+                Dilithion::g_chainParams ? Dilithion::g_chainParams->nHeaderRateWindowSec : 60);
+            return false;
+        }
+
+        headersHeightPreFetched = BestHeaderHeightLocked();
+    }
+
+    int chainstateHeightPreFetched = 0;
+    const std::map<int, uint256> chainstateHashesPreFetched =
+        ResolveChainstateHashes(headersHeightPreFetched, &chainstateHeightPreFetched);
+    const int startHeightPreFetched =
+        std::max(chainstateHeightPreFetched, headersHeightPreFetched);
+
+    std::lock_guard<std::mutex> lock(cs_headers);
+
+    // The rate-limit, empty and over-size checks used to sit here. They moved
+    // ABOVE the chainstate resolve (external review r3, G4) so a rejected batch
+    // no longer pays for a chain walk under cs_main. They are deliberately not
+    // repeated here - the rate-limit check mutates the per-peer window.
+    if (g_verbose.load(std::memory_order_relaxed))
+        std::cout << "[HeadersManager] Lock acquired" << std::endl;
 
     if (g_verbose.load(std::memory_order_relaxed))
         std::cout << "[HeadersManager] Processing " << headers.size() << " headers" << std::endl;
@@ -483,11 +708,41 @@ bool CHeadersManager::ProcessHeaders(NodeId peer, const std::vector<CBlockHeader
                     // Track missing parent and request ancestors immediately
                     m_pendingParentRequests.insert(header.hashPrevBlock);
 
+                    // ⚠️ KNOWN COST, NAMED NOT FIXED (external review F5; COORD ruled it
+                    // out of PR #194). This locator is built from startHeightPreFetched,
+                    // which was captured BEFORE this batch was processed. In headers-first
+                    // IBD that means the peer can re-send headers it already sent, and
+                    // those duplicates count against CheckPeerHeaderRateLimit.
+                    //
+                    // The cost is PER SEND, not per round, and that is worse than it
+                    // first reads: this send sits inside the loop over the batch, and
+                    // m_pendingParentRequests dedupes PARENT HASHES, not sends. N
+                    // distinct unknown parents in one batch therefore produce N
+                    // GETHEADERS messages, every one of them carrying the SAME
+                    // pre-batch locator - so the duplicate cost multiplies by the
+                    // number of distinct missing parents, not by the number of
+                    // continuation rounds.
+                    //
+                    // The fix is to defer the send until cs_headers is released and rebuild
+                    // from a fresh GetLocator(). That is NOT a statement move: the
+                    // cs_headers guard taken at the top of ProcessHeaders is
+                    // FUNCTION-scope, this send sits inside the batch loop, and eight
+                    // returns follow it — so it needs the
+                    // collect-then-dispatch shape used by TipNotifyDrain, with every one of
+                    // those returns shown to flush or to not reach the send. A return that
+                    // skips the dispatch silently drops a GETHEADERS, which is the same
+                    // silent-drop class as the F1 bug this PR fixes.
+                    //
+                    // Deferring also removes the cs_headers -> cs_vNodes edge that the
+                    // PushMessage below creates. That edge is the DECLARED order in net.h,
+                    // so it is not an inversion today — but it is worth losing.
+                    // Follow-up PR. Do not attempt it as a one-line change.
+                    //
                     // DEADLOCK FIX: Use GetLocatorImpl directly since we already hold cs_headers.
                     // Calling RequestHeaders() would call GetLocator() which tries to relock cs_headers,
                     // causing a deadlock (std::mutex is not recursive).
                     // Pass pre-fetched tip to avoid cs_main/cs_headers lock inversion.
-                    std::vector<uint256> locator = GetLocatorImpl(uint256(), pTipPreFetched, chainstateHeightPreFetched);
+                    std::vector<uint256> locator = GetLocatorImpl(uint256(), startHeightPreFetched, chainstateHashesPreFetched, chainstateHeightPreFetched);
 
                     // Send GETHEADERS message directly
                     auto* connman = g_node_context.connman.get();
@@ -599,6 +854,24 @@ bool CHeadersManager::ProcessHeaders(NodeId peer, const std::vector<CBlockHeader
 // DoS-Protected Header Sync (Bitcoin Core two-phase)
 // ============================================================================
 
+// Test/diagnostic observable: which PHASE a peer's DoS-protected session is in,
+// or nullopt when it has none.
+//
+// It reports the STATE MACHINE'S OWN FIELD, not a proxy inferred from a return
+// value. ProcessHeadersWithDoSProtection returns `true` both when a sync is
+// progressing and when it has just been terminated by a non-full headers message
+// — the termination sets success = true deliberately, because the headers in that
+// batch were valid. A test reading only the return value therefore cannot see the
+// abort at all, which is how the hardcoded `true` above survived unnoticed.
+std::optional<HeadersSyncState::State>
+CHeadersManager::GetHeadersSyncPhase(NodeId peer) const
+{
+    std::lock_guard<std::mutex> lock(cs_headers);
+    auto it = mapHeadersSyncStates.find(peer);
+    if (it == mapHeadersSyncStates.end() || !it->second) return std::nullopt;
+    return it->second->GetState();
+}
+
 bool CHeadersManager::ProcessHeadersWithDoSProtection(NodeId peer, const std::vector<CBlockHeader>& headers)
 {
     // Phase 6 PR6.1: per-peer rate limit. Same policy as ProcessHeaders.
@@ -619,24 +892,91 @@ bool CHeadersManager::ProcessHeadersWithDoSProtection(NodeId peer, const std::ve
         }
     }
 
-    // Check if peer has active HeadersSyncState
-    auto it = mapHeadersSyncStates.find(peer);
-    if (it == mapHeadersSyncStates.end()) {
+    // LP-10 §2.1b — LOCK DISCIPLINE. Everything below used to touch
+    // mapHeadersSyncStates with NO lock held (the guard above is scoped and
+    // released), while OnPeerDisconnected erases from the same map under
+    // cs_headers on the net thread. A disconnect concurrent with the
+    // ProcessNextHeaders call below destroyed the state mid-dereference: a
+    // use-after-free, not merely a race. Fixed before wiring, not after,
+    // because wiring this into the live header path is what would have made it
+    // reachable.
+    //
+    // The shape: take a SHARED reference under the lock, drop the lock, then do
+    // the expensive call. A concurrent erase now only drops the map's
+    // reference; the local one keeps the object alive for the duration.
+    std::shared_ptr<HeadersSyncState> sync_state;
+    {
+        std::lock_guard<std::mutex> lock(cs_headers);
+        auto it = mapHeadersSyncStates.find(peer);
+        if (it == mapHeadersSyncStates.end()) {
+            // No DoS-protected session for this peer.
+            // NOTE: ProcessHeaders takes cs_headers itself and cs_headers is a
+            // NON-RECURSIVE std::mutex, so it must be called AFTER this scope
+            // closes -- never from inside it.
+            sync_state = nullptr;
+        } else {
+            sync_state = it->second;
+            if (!sync_state || sync_state->GetState() == HeadersSyncState::State::FINAL) {
+                // Erase-by-key is SAFE HERE, unlike the two sites further down:
+                // cs_headers has been held continuously since the find() two
+                // lines above, so no other thread can have replaced the entry.
+                // The A-1 compare-and-erase is needed only where the lock was
+                // RELEASED across the expensive call. Recorded so this site is
+                // neither "fixed" unnecessarily nor copied as a pattern to the
+                // sites where it is wrong.
+                mapHeadersSyncStates.erase(peer);
+                sync_state = nullptr;
+            }
+        }
+    }
+    if (!sync_state) {
         return ProcessHeaders(peer, headers);
     }
 
-    HeadersSyncState* sync_state = it->second.get();
-    if (!sync_state || sync_state->GetState() == HeadersSyncState::State::FINAL) {
-        mapHeadersSyncStates.erase(peer);
-        return ProcessHeaders(peer, headers);
-    }
+    // Process through HeadersSyncState. Deliberately OUTSIDE cs_headers: this
+    // validates headers and is expensive, and holding the global header lock
+    // across it would serialise the header path. Safe now only because
+    // sync_state is a shared_ptr taken above.
+    // ⛔ LP-10 F5 / D-1, THE CALLER'S HALF — this argument was hardcoded `true`.
+    //
+    // `full_headers_available` is the SYNC-TERMINATION SIGNAL: a NON-full headers
+    // message means the peer has nothing more to give (PRESYNC) or is declining to
+    // re-serve the chain it claimed (REDOWNLOAD), and HeadersSyncState aborts the
+    // sync on it. Passing a constant `true` told it every message was full, so
+    // BOTH aborts were unreachable from the only caller that exists — the signal
+    // was restored inside the state machine and still could not fire.
+    //
+    // Fixing the callee alone would have been the "wired" mistake in its purest
+    // form: a correct check no production path can reach.
+    //
+    // Core v28.0 net_processing.cpp:2787 derives it exactly this way:
+    //     ProcessNextHeaders(headers, headers.size() == MAX_HEADERS_RESULTS)
+    // A peer that fills the message to the protocol maximum has more to send; any
+    // shorter answer is the end of what it has.
+    const bool full_headers_message =
+        (headers.size() == Consensus::MAX_HEADERS_RESULTS);
 
-
-    // Process through HeadersSyncState
-    auto result = sync_state->ProcessNextHeaders(headers, true);
+    auto result = sync_state->ProcessNextHeaders(headers, full_headers_message);
 
     if (!result.success) {
-        mapHeadersSyncStates.erase(peer);
+        std::lock_guard<std::mutex> lock(cs_headers);
+        // LP-10 A-1 (H-3 / invariant I6): COMPARE-AND-ERASE, never erase by key.
+        //
+        // The lock was RELEASED for the expensive ProcessNextHeaders call above.
+        // In that window another thread can disconnect this peer (erasing S1) and
+        // re-initialise it (creating S2). An erase by NodeId here would then
+        // destroy S2 -- a session this thread never processed, whose owner is
+        // still using it. The §2.1b shared_ptr keeps S2's MEMORY alive, so this
+        // is not a use-after-free and TSan cannot see it: it is a silent, wrong
+        // DESTRUCTION of live session state. The A-9 harness drove this exact
+        // interleaving 24,002 times under TSan and correctly reported clean.
+        //
+        // MEASURED (A-1): erase-by-key destroyed 44 of 44 sessions in the ABA
+        // window; compare-and-erase destroyed 0 of 74 windows hit.
+        auto it = mapHeadersSyncStates.find(peer);
+        if (it != mapHeadersSyncStates.end() && it->second == sync_state) {
+            mapHeadersSyncStates.erase(it);
+        }
         return false;
     }
 
@@ -692,9 +1032,17 @@ bool CHeadersManager::ProcessHeadersWithDoSProtection(NodeId peer, const std::ve
 
     }
 
-    // Check if sync is complete
+    // Check if sync is complete. Erase under the lock: this is a map mutation,
+    // and it previously ran unlocked (LP-10 §2.1b).
     if (sync_state->GetState() == HeadersSyncState::State::FINAL) {
-        mapHeadersSyncStates.erase(peer);
+        std::lock_guard<std::mutex> lock(cs_headers);
+        // LP-10 A-1 (H-3 / invariant I6): COMPARE-AND-ERASE. Same reasoning as
+        // the !result.success site above -- this is its SIBLING, and fixing one
+        // without the other is the shape this mission has hit repeatedly.
+        auto it = mapHeadersSyncStates.find(peer);
+        if (it != mapHeadersSyncStates.end() && it->second == sync_state) {
+            mapHeadersSyncStates.erase(it);
+        }
     }
 
     return true;
@@ -737,6 +1085,32 @@ bool CHeadersManager::ShouldUseDoSProtection(NodeId peer) const
 
 bool CHeadersManager::InitializeDoSProtectedSync(NodeId peer, const uint256& minimum_work)
 {
+    // Refuse before any state is created. See m_proof_checker_supports_network
+    // in the constructor: on a VDF-from-genesis network outside the producer's
+    // constant branch (testnet today) neither checker is correct, and starting a
+    // DoS-protected sync there would reject every honest header.
+    if (!m_proof_checker_supports_network) {
+        // ⚠️ LOG ONCE PER PROCESS, NOT PER CALL (seat LOW, F4). The REFUSAL stays
+        // per-call and unconditional — only the log is deduplicated. On an armed
+        // node every inbound peer would otherwise emit an identical WARN, turning a
+        // configuration fact that cannot change for the life of the process into
+        // per-peer log spam that buries whatever else is happening.
+        //
+        // atomic exchange rather than a plain bool: this becomes reachable from
+        // more than one thread once the gate is wired, and the cost of being
+        // correct here is one word.
+        static std::atomic<bool> already_logged{false};
+        if (!already_logged.exchange(true)) {
+            LogPrintf(NET, WARN,
+                "[HeadersManager] DoS-protected header sync REFUSED (logged once "
+                "per process; first refusal was peer=%d): no correct proof checker "
+                "exists for this network (VDF from genesis, but difficulty "
+                "retargets). A-3 owns the retargeting rule.\n",
+                static_cast<int>(peer));
+        }
+        return false;
+    }
+
     std::lock_guard<std::mutex> lock(cs_headers);
 
     // Don't reinitialize if already exists
@@ -758,12 +1132,57 @@ bool CHeadersManager::InitializeDoSProtectedSync(NodeId peer, const uint256& min
         chainStartHeight = 0;
     }
 
+    // LP-10 §2.0: the CUMULATIVE work at the chain start must be handed to
+    // HeadersSyncState, or its accumulator starts at zero while its start point
+    // is our local tip -- see the constructor comment. Read it from mapHeaders,
+    // which stores "accumulated PoW from genesis" per header.
+    //
+    // NOTE ON LOCKING: we already hold cs_headers (taken at the top of this
+    // function) and it is a NON-RECURSIVE std::mutex, so this must NOT call
+    // GetBestHeaderChainWork() -- that takes cs_headers itself and would
+    // self-deadlock. Read the map directly. (LP-10 red-team BLOCKER-3 names the
+    // wider lock discipline problem on this path; this is one instance of it.)
+    uint256 chainStartWork;
+    auto itWork = mapHeaders.find(chainStartHash);
+    if (itWork != mapHeaders.end()) {
+        chainStartWork = itWork->second.chainWork;
+    } else if (chainStartHeight == 0) {
+        // Genesis is not necessarily in mapHeaders (it is not received over the
+        // wire). Its cumulative work is its own block work.
+        // NOT `g_chainParams ? genesisNBits : 0`. A zero nBits has a zero
+        // mantissa, and ComputeChainWork SATURATES to MAX work on that -- so the
+        // IsNull() fail-closed check below would PASS and PRESYNC would start
+        // already above any threshold. That is fail-OPEN wearing a fail-closed
+        // comment, in the one function whose whole point is refusing to seed
+        // wrong. Found by two external seats. Leave chainStartWork null instead
+        // and let the refusal below fire.
+        if (Dilithion::g_chainParams != nullptr) {
+            chainStartWork = ::dilithion::consensus::ComputeChainWork(
+                Dilithion::g_chainParams->genesisNBits);
+        }
+    }
+
+    // FAIL CLOSED. Passing zero for an unknown start would silently reinstate
+    // the exact defect §2.0 exists to remove, and it would present as a stalled
+    // sync rather than an error. Refusing to start DoS-protected sync leaves the
+    // peer on the ordinary path instead of on a gate that cannot pass.
+    if (chainStartWork.IsNull()) {
+        LogPrintf(NET, WARN,
+            "[HeadersManager] DoS-protected sync NOT started for peer=%d: no chain work "
+            "known for start hash %s at height %lld. Refusing to seed the PRESYNC "
+            "accumulator with zero.\n",
+            static_cast<int>(peer), chainStartHash.GetHex().c_str(),
+            static_cast<long long>(chainStartHeight));
+        return false;
+    }
+
     // Create the state — Phase 3: pass the chain-agnostic proof checker.
-    auto state = std::make_unique<HeadersSyncState>(
+    auto state = std::make_shared<HeadersSyncState>(  // LP-10 §2.1b: shared, see the map decl
         peer,
         params,
         chainStartHash,
         chainStartHeight,
+        chainStartWork,     // LP-10 §2.0: was implicitly zero
         minimum_work,
         m_proof_checker.get()
     );
@@ -1042,7 +1461,7 @@ void CHeadersManager::OnBlockActivated(const CBlockHeader& header, const uint256
     }
 }
 
-void CHeadersManager::BulkLoadHeaders(const std::vector<CBlockIndex*>& chain)
+void CHeadersManager::BulkLoadHeaders(const std::vector<ActiveChainHeader>& chain)
 {
     std::lock_guard<std::mutex> lock(cs_headers);
 
@@ -1052,10 +1471,15 @@ void CHeadersManager::BulkLoadHeaders(const std::vector<CBlockIndex*>& chain)
 
     const HeaderWithChainWork* pprev = nullptr;
 
-    for (const auto* pindex : chain) {
-        const uint256& hash = pindex->GetBlockHash();
-        const CBlockHeader& header = pindex->header;
-        int height = pindex->nHeight;
+    // P2P-16 F2: values, not pointers. These used to be CBlockIndex* that the
+    // caller walked from GetTip() with cs_main RELEASED and this function then
+    // dereferenced under cs_headers — the released-pointer shape, in the very TU
+    // the P2P-16 guard watches. CChainState::GetActiveChainHeaders() now does
+    // the walk under cs_main and hands over copies.
+    for (const ActiveChainHeader& entry : chain) {
+        const uint256& hash = entry.hash;
+        const CBlockHeader& header = entry.header;
+        int height = entry.height;
 
         // Calculate chain work from parent
         uint256 chainWork = CalculateChainWork(header, pprev);
@@ -1084,9 +1508,9 @@ void CHeadersManager::BulkLoadHeaders(const std::vector<CBlockIndex*>& chain)
 
     // Set best header to the tip (last element)
     if (!chain.empty()) {
-        const CBlockIndex* tip = chain.back();
-        hashBestHeader = tip->GetBlockHash();
-        nBestHeight = tip->nHeight;
+        const ActiveChainHeader& tip = chain.back();
+        hashBestHeader = tip.hash;
+        nBestHeight = tip.height;
         InvalidateBestChainCache();
     }
 
@@ -1094,6 +1518,153 @@ void CHeadersManager::BulkLoadHeaders(const std::vector<CBlockIndex*>& chain)
         std::cout << "  [OK] Bulk-loaded " << chain.size()
                   << " headers (height 0 to " << nBestHeight << ")" << std::endl;
 }
+
+// P2P-16 helper. The heights a locator walk visits, given a start height.
+//
+// SINGLE SOURCE OF TRUTH for the step schedule: the caller uses this to decide
+// which heights to resolve from the chainstate (by value, under cs_main), and
+// GetLocatorImpl walks the same schedule and looks the answers up by height. If
+// these two ever disagreed, the Impl would silently fall back to a null hash, so
+// they are deliberately not two copies of the same loop.
+//
+// The cap is 64, not the locator's 32. The Impl's 32 is a cap on ENTRIES, and a
+// height that resolves to nothing adds no entry while still consuming a step, so
+// the number of heights VISITED can exceed the number of entries.
+//
+// Why 64 is enough, corrected: this used to say "doubling reaches genesis from
+// height 10^7 in ~34 steps". The count is about right, the REASON was wrong -
+// [measured] a start of 10^7 yields 33 heights and stops at 1611384, having
+// never reached genesis. The schedule terminates because the doubling
+// OVERSHOOTS zero, not because it arrives at it. The conclusion survives the
+// correction: ~33 heights worst case against a cap of 64 is a comfortable
+// superset, and this stays a bounded pre-resolve.
+// Forward declaration: ResolveChainstateHashes below calls this, and the
+// definition sits further down next to GetLocator, where the walk it mirrors
+// lives. Declaring rather than reordering keeps the schedule and the walk
+// adjacent in the file.
+static std::vector<int> LocatorHeightPattern(int startHeight);
+
+int CHeadersManager::BestHeaderHeightLocked() const
+{
+    // Caller holds cs_headers. Extracted from GetLocatorImpl so the two P2P-16
+    // call sites and the Impl agree on what "headers height" means instead of
+    // each re-deriving it.
+    if (hashBestHeader.IsNull()) return 0;
+    auto it = mapHeaders.find(hashBestHeader);
+    return (it != mapHeaders.end()) ? it->second.height : 0;
+}
+
+std::map<int, uint256> CHeadersManager::ResolveChainstateHashes(int headersHeight,
+                                                                int* chainstateHeightOut) const
+{
+    // P2P-16. ONE cs_main acquisition (inside ResolveLocatorHashes), values out.
+    // Only the heights the locator walk can actually reach at or below the
+    // chainstate tip are asked for — above that the walk uses headers-manager
+    // data, which is safe under cs_headers.
+    std::map<int, uint256> resolved;
+
+    // ONE cs_main acquisition, and now the comment is true. This used to probe
+    // for the tip height, release, then resolve — TWO acquisitions, with the tip
+    // free to move in between, under a comment claiming they were coherent. That
+    // is the same false-invariant defect as the dropped-entry bug this row fixed,
+    // one level down, and it was caught by the same reviewer for the same reason.
+    //
+    // The schedule is passed IN so the chainstate stays ignorant of locator
+    // semantics while the resolver and the walk keep exactly one definition of
+    // which heights matter.
+    std::vector<int> heights;
+    int tipHeight = 0;
+    const std::vector<uint256> hashes =
+        g_chainstate.ResolveLocatorHashes(headersHeight, &LocatorHeightPattern, heights, tipHeight);
+
+    // F3: the RESOLVER distinguishes -1 (no tip at all) from 0 (a genesis-only
+    // chain, which is a real chain whose genesis entry must still reach the
+    // locator). Collapsing the two is how a height-0 chainstate silently
+    // produced an empty locator.
+    //
+    // ⚠️ THIS LINE RE-COLLAPSES THEM, deliberately and only here: the locator
+    // API downstream speaks in heights where 0 is the floor, so "no tip" is
+    // reported to it as height 0. The distinction is preserved where it matters
+    // (inside ResolveLocatorHashes, which returns -1 and an empty vector, so a
+    // no-tip chainstate contributes NO entries rather than a bogus genesis
+    // entry). This remap is the wrapper's own behaviour, not the resolver's, and
+    // p2p16_wrapper_agrees_with_one_resolver_snapshot pins it.
+    if (chainstateHeightOut) *chainstateHeightOut = (tipHeight < 0) ? 0 : tipHeight;
+
+    // Contract check, kept: mismatched vectors would attribute hashes to the
+    // WRONG heights, which is worse than an empty locator.
+    if (hashes.size() != heights.size()) {
+        std::cerr << "[HeadersManager] WARN: ResolveLocatorHashes returned "
+                  << hashes.size() << " hashes for " << heights.size()
+                  << " heights — contract violated, locator degraded to empty"
+                  << " rather than risk mis-attributing hashes (P2P-16)" << std::endl;
+        return resolved;
+    }
+
+    for (size_t k = 0; k < heights.size(); ++k) {
+        if (!hashes[k].IsNull()) resolved[heights[k]] = hashes[k];
+    }
+    return resolved;
+}
+
+static std::vector<int> LocatorHeightPattern(int startHeight)
+{
+    std::vector<int> heights;
+    // startHeight == 0 is a real chain (genesis only) and must still yield the
+    // genesis entry — external review, PR #194. Only a NEGATIVE start is empty.
+    if (startHeight < 0) return heights;
+
+    // ⚠️ GENESIS IS ALMOST NEVER EMITTED, and the 64-entry cap is not what stops
+    // it. [censused, every start 0..200000 against this exact loop] genesis is
+    // emitted if and only if
+    //     startHeight <= 10   OR   startHeight == 8 + 2^m  (m >= 2)
+    // i.e. exactly {0..10} and {12, 16, 24, 40, 72, 136, 264, 520, 1032, 2056,
+    // 4104, 8200, 16392, 32776, 65544, 131080, ...}. 27 values below 200000.
+    // Ten unit steps land on startHeight-10, after which the step doubles
+    // (2,4,8,...), so 0 is hit only when startHeight-10 is one less than a power
+    // of two; otherwise `height` skips past 0, goes negative, and the loop exits
+    // on `height >= 0` having never emitted it. Oldest entry by start: 11->1,
+    // 13->1, 25->1, 100->28, 1000->480, 250000->118920, 10^7->1611384. The cap
+    // is never reached (33 entries at 10^7), so it is not the cause.
+    //
+    // ⚠️ AN EARLIER VERSION OF THIS COMMENT SAID "if and only if startHeight <=
+    // 10". That was FALSE - 12 reaches genesis - and it was false because it was
+    // read off a SAMPLE {0,1,5,10,11,13,25,100,1000,250000,10^7} that happened
+    // to skip 12. The set above is a census. A boundary is not a measurement
+    // until every value on both sides of it has been checked.
+    //
+    // Consequence: a peer whose fork point lies BELOW the oldest entry cannot
+    // find a common ancestor from this locator. Bitcoin Core's locator always
+    // terminates at genesis for exactly that reason.
+    //
+    // NOT introduced by PR #194 and deliberately NOT changed by it: origin/main's
+    // GetLocatorImpl runs a structurally identical loop (same `while (height >= 0)`,
+    // same `if (height == 0) break;`, same doubling), so this is pre-existing
+    // wire behaviour, not a regression from the P2P-16 refactor. Appending
+    // genesis would change what every locator this node emits puts on the wire.
+    // That belongs in its own change with its own review — not folded into a
+    // lock-order fix.
+
+    int height = startHeight;
+    int step = 1;
+    int nStep = 0;
+    while (height >= 0) {
+        heights.push_back(height);
+        if (height == 0) break;
+        if (nStep >= 10) step *= 2;
+        height -= step;
+        nStep++;
+        if (heights.size() >= 64) break;
+    }
+    return heights;
+}
+
+namespace hdrtest {
+std::vector<int> LocatorHeightPatternForTest(int startHeight)
+{
+    return LocatorHeightPattern(startHeight);
+}
+}  // namespace hdrtest
 
 std::vector<uint256> CHeadersManager::GetLocator(const uint256& hashTip)
 {
@@ -1112,30 +1683,73 @@ std::vector<uint256> CHeadersManager::GetLocator(const uint256& hashTip)
     // GetLocatorImpl holds cs_headers, and calling GetTip() under it would take
     // cs_main beneath cs_headers. Hoisting it keeps that edge out.
     //
-    // ⚠️ RESIDUAL, NOT FIXED HERE (red-team H-2 / port-review L9): pTip is a raw
-    // CBlockIndex* obtained from a take-and-release accessor, and the walk below
-    // (GetAncestor, pprev/pskip) dereferences it with cs_main NOT held — the same
-    // released-pointer class this contract fixes at one call site and scopes OUT
-    // for the other ~205 (dilithion-strategy 794e27b,
-    // missions/lp10-chainstate-pointer-api/CENSUS_both_producers.tsv). It is
-    // LP10's class and its root cause is upstream of the call sites: runtime
-    // eviction exists only because nMinimumChainWork was zeroed. Recorded here
-    // so the next reader does not mistake this line for audited-safe.
-    CBlockIndex* pTip = g_chainstate.GetTip();
-    int chainstateHeight = (pTip && pTip->nHeight > 0) ? pTip->nHeight : 0;
+    // ✅ RESIDUAL NOW FIXED (register P2P-16). This block used to read "RESIDUAL,
+    // NOT FIXED HERE" and describe the walk below dereferencing a released
+    // CBlockIndex*. Both external cross-family seats on the merged P2P-14/15 diff
+    // independently rated that reachable TODAY — an inbound peer drives locator
+    // construction while the header thread can evict the index — so it is fixed
+    // rather than left disclosed. A comment saying "not audited-safe" is not a
+    // mitigation; it is a note that the defect is known.
+    //
+    // The fix is values, not a wider lock: taking cs_main under cs_headers is the
+    // exact inversion P2P-14/15 closed, so the DATA leaves the lock instead of the
+    // pointer. See ResolveChainstateHashes() above.
+    //
+    // STILL TRUE, and still LP10 A-5's: the ~205-site released-pointer CLASS
+    // (dilithion-strategy 794e27b,
+    // missions/lp10-chainstate-pointer-api/CENSUS_both_producers.tsv), whose root
+    // cause is upstream — runtime eviction exists only because nMinimumChainWork
+    // was zeroed. A-5 removes the trigger; this row removed one live instance.
+    // P2P-16: resolve the chainstate side to VALUES before cs_headers is taken.
+    // The height we start from is max(chainstate, headers), and the headers half
+    // needs cs_headers — so read it in its own short scope, release, then do the
+    // one cs_main resolve, then take cs_headers for the real work. At no point
+    // is cs_main held under cs_headers, which is the constraint P2P-14/15 left.
+    int headersHeight = 0;
+    {
+        std::lock_guard<std::mutex> peek(cs_headers);
+        headersHeight = BestHeaderHeightLocked();
+    }
+
+    // ONE snapshot: the start, the chainstate height and the hashes are captured
+    // together and threaded through as a coherent triple. GetLocatorImpl must NOT
+    // re-derive any of them — see the banner there (external review, PR #194).
+    int chainstateHeight = 0;
+    const std::map<int, uint256> chainstateHashes =
+        ResolveChainstateHashes(headersHeight, &chainstateHeight);
+    const int startHeight = std::max(chainstateHeight, headersHeight);
 
     std::lock_guard<std::mutex> lock(cs_headers);
-    return GetLocatorImpl(hashTip, pTip, chainstateHeight);
+    return GetLocatorImpl(hashTip, startHeight, chainstateHashes, chainstateHeight);
 }
 
-std::vector<uint256> CHeadersManager::GetLocatorImpl(const uint256& hashTip, CBlockIndex* pTip, int chainstateHeight) const
+std::vector<uint256> CHeadersManager::GetLocatorImpl(const uint256& hashTip,
+                                                     int startHeight,
+                                                     const std::map<int, uint256>& chainstateHashes,
+                                                     int chainstateHeight) const
 {
     // NOTE: Caller MUST hold cs_headers lock
     // This is the implementation of GetLocator without lock acquisition.
+    //
+    // hashTip IS INTENTIONALLY UNUSED, and removing it would be the wrong fix.
+    // BUG #178 (Part 2) made the locator ALWAYS exponential and never rooted at
+    // a caller-supplied hash: rooting it there meant a peer that does not have
+    // that hash falls back to genesis instead of finding the fork point. The
+    // caller-supplied start still takes effect — RequestHeaders PREPENDS it to
+    // the finished locator (see the prepend just after the GetLocator call), so
+    // the peer tries it first and keeps the exponential tail as fallback. The
+    // parameter is kept so that call path reads coherently end to end.
     // Used by internal functions that already hold the lock to avoid deadlock.
     //
-    // DEADLOCK FIX: pTip and chainstateHeight must be obtained BEFORE
-    // acquiring cs_headers to avoid lock order inversion with cs_main.
+    // DEADLOCK FIX: the chainstate data must be obtained BEFORE acquiring
+    // cs_headers to avoid lock order inversion with cs_main. P2P-16: it is now
+    // obtained as VALUES (height->hash), so there is nothing here whose target
+    // can be freed while this runs.
+
+    // Says to the compiler what the comment above says to the reader, and
+    // silences -Wunused-parameter without removing a parameter the caller
+    // path still needs to read coherently.
+    (void)hashTip;
 
     std::vector<uint256> locator;
     locator.reserve(32);  // Pre-allocate for efficiency
@@ -1151,62 +1765,59 @@ std::vector<uint256> CHeadersManager::GetLocatorImpl(const uint256& hashTip, CBl
     // 3. For heights > chainstate: use headers_manager best chain hashes
     //
     // This ensures we don't re-request headers while maintaining fork safety.
-    // Note: pTip and chainstateHeight are pre-fetched before cs_headers lock.
+    //
+    // ⚠️ QUALIFIED (external review F5). That "don't re-request" property holds
+    // for the locator GetLocator() builds fresh. It does NOT hold for the
+    // continuation send inside ProcessHeaders, which passes a start captured
+    // before its batch was processed and so CAN re-request up to a batch per
+    // round during headers-first IBD. See the note at that call site; the
+    // deferred-send fix is a follow-up PR, not this one.
+    // Note: chainstateHashes and chainstateHeight are resolved BY VALUE before
+    // the cs_headers lock (P2P-16) — no chainstate pointer survives into here.
 
     // Get headers_manager's best header height
-    int headersHeight = 0;
-    if (!hashBestHeader.IsNull()) {
-        auto it = mapHeaders.find(hashBestHeader);
-        if (it != mapHeaders.end()) {
-            headersHeight = it->second.height;
+    // ⛔ DO NOT RE-DERIVE THE START HERE. External review, PR #194, convergent
+    // HIGH: this used to recompute headersHeight under cs_headers and walk its
+    // own loop from max(chainstateHeight, that). The caller had already resolved
+    // chainstateHashes against the start it PEEKED a moment earlier, so whenever
+    // the header height advanced in between — which is every advancing batch
+    // during IBD — the two walks visited different heights, every lookup below
+    // the chainstate tip missed, and locator entries were SILENTLY DROPPED.
+    //
+    // The start is now captured ONCE by the caller and threaded in, and the walk
+    // below iterates the SAME LocatorHeightPattern() used to build the map. One
+    // walk, one source of truth. That is what the helper's own comment claimed
+    // and what this function then quietly violated across the lock boundary.
+
+    // Start from the HIGHER of the two (the caller resolved that as startHeight).
+    //
+    // ⚠️ The "to avoid re-requesting headers" half of this line was removed
+    // because it is FALSE at one of the two call sites. It holds for the locator
+    // GetLocator() builds fresh. It does NOT hold for the continuation send in
+    // ProcessHeaders, which passes a start captured BEFORE its batch was
+    // processed - see the KNOWN COST note at that call site. Leaving the claim
+    // here made the code assert the opposite of the note two hundred lines up.
+    for (int height : LocatorHeightPattern(startHeight)) {
+        uint256 hashAtHeight;
+
+        if (height <= chainstateHeight) {
+            // P2P-16: resolved BY VALUE under cs_main before this lock was taken.
+            // A miss behaves exactly as GetAncestor() returning nullptr did.
+            auto it = chainstateHashes.find(height);
+            if (it != chainstateHashes.end()) {
+                hashAtHeight = it->second;
+            }
+        } else {
+            hashAtHeight = GetBestChainHashAtHeight(height);
+        }
+
+        if (!hashAtHeight.IsNull()) {
+            locator.push_back(hashAtHeight);
+            if (locator.size() >= 32) break;
         }
     }
 
-    // Start from the HIGHER of the two to avoid re-requesting headers
-    int startHeight = std::max(chainstateHeight, headersHeight);
-
-    if (startHeight > 0) {
-        int height = startHeight;
-        int step = 1;
-        int nStep = 0;
-
-        while (height >= 0) {
-            uint256 hashAtHeight;
-
-            // Use chainstate for heights it covers (verified fork-safe)
-            if (pTip && height <= chainstateHeight) {
-                CBlockIndex* pBlock = pTip->GetAncestor(height);
-                if (pBlock) {
-                    hashAtHeight = pBlock->GetBlockHash();
-                }
-            } else {
-                // Above chainstate: use headers_manager's best chain RandomX hashes
-                // BUG FIX: GetBestChainHashAtHeight now returns RandomX hash, not SHA256
-                hashAtHeight = GetBestChainHashAtHeight(height);
-            }
-
-            if (!hashAtHeight.IsNull()) {
-                locator.push_back(hashAtHeight);
-            }
-
-            // Stop at genesis
-            if (height == 0)
-                break;
-
-            // Exponential backoff after 10 entries
-            if (nStep >= 10) {
-                step *= 2;
-            }
-
-            height -= step;
-            nStep++;
-
-            // Limit total locator size (safety check)
-            if (locator.size() >= 32) {
-                break;
-            }
-        }
-
+    {
         if (!locator.empty()) {
             return locator;
         }
@@ -1471,6 +2082,9 @@ void CHeadersManager::OnPeerDisconnected(NodeId peer)
 
     mapPeerStates.erase(peer);
     mapPeerStartHeight.erase(peer);  // BUG #62: Clean up peer height tracking
+    // Erase-by-key is CORRECT and DELIBERATE here: on disconnect we want to drop
+    // whatever session currently exists for this NodeId, regardless of identity.
+    // This is the one site where the A-1 compare-and-erase would be WRONG.
     mapHeadersSyncStates.erase(peer);  // Clean up DoS protection state
     m_peerHeaderRate.erase(peer);  // Phase 6 PR6.1 fix-up (subagent v1.5+ BLOCKER): prevent monotonic
                                    // memory leak under Bitcoin-level peer churn
@@ -3152,6 +3766,19 @@ bool CHeadersManager::StartValidationThread()
         if (g_verbose.load(std::memory_order_relaxed))
             std::cout << "[HeadersManager] Header processor thread started" << std::endl;
 
+        // ⚠️ DECLARED AFTER THE SPAWNS SUCCEED, NOT BEFORE THEM. A declaration made
+        // before a std::thread constructor that then THROWS leaves a name nobody will
+        // ever answer for, and the startup census refuses to start the node over a
+        // thread that does not exist — a false positive that bricks a node. Declaring
+        // after the spawn is safe in the other direction: a thread that checkpoints
+        // before its declaration lands is simply already in the registered set, and
+        // the census only ever asks for declared-minus-registered.
+        // The hash-worker pool declares its size: one worker's checkpoint must not
+        // stand in for its siblings (the registry counts threads, not names).
+        g_chainstate.DeclareEpochParticipant("headers-validation",
+                                             m_hash_workers.size());
+        g_chainstate.DeclareEpochParticipant("headers-processor");
+
         return true;
     } catch (const std::exception& e) {
         m_validation_running.store(false);
@@ -3282,19 +3909,51 @@ void CHeadersManager::ValidationWorkerThread()
     while (m_validation_running.load()) {
         // Check if paused for fork recovery - wait until unpaused
         if (m_processing_paused.load()) {
+            // ⚠️ THE PAUSE PATH PINNED ONLINE FOR AS LONG AS THE PAUSE LASTED,
+            // and "never the duration of a wait" was false here. A fork recovery can
+            // hold this pause open indefinitely; the loop then spins 10 ms at a time
+            // with this thread's epoch frozen at its last checkpoint, pinning every
+            // entry unlinked meanwhile. It holds nothing in this branch -- it has not
+            // dequeued anything -- so it should not be in the calculation at all.
+            // Scoped to the sleep, so the next iteration re-enters before it can
+            // dequeue.
+            //
+            // (Round-4 panel named ONE of these. There are TWO, in
+            // ValidationWorkerThread and HeaderProcessorThread, with identical
+            // bodies -- the sibling was found by grepping the shape rather than
+            // fixing the line that was reported.)
+            EpochOfflineScope offline(&g_chainstate);
             std::this_thread::sleep_for(std::chrono::milliseconds(10));
             continue;
         }
 
         PendingValidation pending;
 
+        // DEFERRED-RECLAMATION CHECKPOINT — before the wait, not after the work.
+        // At the loop top this thread has finished the previous unit and started
+        // no new one, so it holds no CBlockIndex*. Publishing here means a thread
+        // that then sleeps (idle node, empty queue) pins NOTHING while it sleeps;
+        // the pin is one unit of work, never the duration of a wait.
+        g_chainstate.EpochCheckpoint("headers-validation");
+
         // Wait for work
         {
             std::unique_lock<std::mutex> lock(m_validation_mutex);
 
-            m_validation_cv.wait(lock, [this] {
-                return !m_validation_running.load() || !m_validation_queue.empty() || m_processing_paused.load();
-            });
+            {
+                // OFFLINE FOR THE DURATION OF THE WAIT. Checkpointing before the wait
+                // publishes an epoch that then FREEZES while this thread is parked, pinning
+                // every entry unlinked afterwards -- a server asleep in accept() for an hour
+                // pins an hour of evictions, which is what made the design note's "parked
+                // threads pin nothing" false. Going offline removes this thread from the
+                // quiescent-state calculation entirely, exactly as an exited thread is
+                // removed; the scope re-enters on EVERY exit path, before anything is
+                // resolved.
+                EpochOfflineScope offline(&g_chainstate);
+                m_validation_cv.wait(lock, [this] {
+                    return !m_validation_running.load() || !m_validation_queue.empty() || m_processing_paused.load();
+                });
+            }
 
             if (!m_validation_running.load()) {
                 break;
@@ -3387,8 +4046,29 @@ void CHeadersManager::HeaderProcessorThread()
         std::cout << "[HeadersManager] Header processor thread started" << std::endl;
 
     while (m_processor_running.load()) {
+        // DEFERRED-RECLAMATION CHECKPOINT — before the wait, not after the work.
+        // At the loop top this thread has finished the previous unit and started
+        // no new one, so it holds no CBlockIndex*. Publishing here means a thread
+        // that then sleeps (idle node, empty queue) pins NOTHING while it sleeps;
+        // the pin is one unit of work, never the duration of a wait.
+        g_chainstate.EpochCheckpoint("headers-processor");
+
         // Check if paused for fork recovery - wait until unpaused
         if (m_processing_paused.load()) {
+            // ⚠️ THE PAUSE PATH PINNED ONLINE FOR AS LONG AS THE PAUSE LASTED,
+            // and "never the duration of a wait" was false here. A fork recovery can
+            // hold this pause open indefinitely; the loop then spins 10 ms at a time
+            // with this thread's epoch frozen at its last checkpoint, pinning every
+            // entry unlinked meanwhile. It holds nothing in this branch -- it has not
+            // dequeued anything -- so it should not be in the calculation at all.
+            // Scoped to the sleep, so the next iteration re-enters before it can
+            // dequeue.
+            //
+            // (Round-4 panel named ONE of these. There are TWO, in
+            // ValidationWorkerThread and HeaderProcessorThread, with identical
+            // bodies -- the sibling was found by grepping the shape rather than
+            // fixing the line that was reported.)
+            EpochOfflineScope offline(&g_chainstate);
             std::this_thread::sleep_for(std::chrono::milliseconds(10));
             continue;
         }
@@ -3399,9 +4079,35 @@ void CHeadersManager::HeaderProcessorThread()
         {
             std::unique_lock<std::mutex> lock(m_raw_queue_mutex);
 
-            m_raw_queue_cv.wait(lock, [this] {
-                return !m_processor_running.load() || !m_raw_header_queue.empty() || m_processing_paused.load();
-            });
+            // ⚠️ AN IDLE PROCESSOR PINNED THE WHOLE GRAVEYARD (round-7 F45). The
+            // PAUSE path a few lines above goes offline across its sleep; this
+            // wait -- the one a HEALTHY, IDLE node sits in essentially all the
+            // time -- did not. So a node with no headers arriving kept this
+            // thread's epoch frozen at its last loop-top checkpoint, and
+            // DrainGraveyard's minimum froze with it: nothing unlinked during the
+            // idle period could ever be freed. That is the exact shape of the
+            // parked-participant defect the round-1 panel found in the RPC server
+            // (47.60 MB and climbing over 15 s), reached by a different door, and
+            // the proof's own wiring table disclosed the gap with a "—" rather
+            // than closing it.
+            //
+            // ⚠️ POINTER-FREE IS NOT PIN-FREE. This thread holds nothing here --
+            // it has not dequeued anything yet -- and that is precisely why the
+            // old reasoning felt safe and was wrong: a thread pins by its
+            // PUBLISHED EPOCH, not by holding a pointer.
+            //
+            // No inverse-scope subtlety: this predicate reads two atomics and a
+            // queue emptiness flag, and resolves no CBlockIndex*, so the plain
+            // offline scope is correct here (compare the wait-* RPC handlers,
+            // whose predicates DO resolve and therefore need EpochOnlineWindow).
+            // The scope is braced to the WAIT, not to the enclosing block, so the
+            // thread is back online before it can dequeue anything.
+            {
+                EpochOfflineScope offline(&g_chainstate);
+                m_raw_queue_cv.wait(lock, [this] {
+                    return !m_processor_running.load() || !m_raw_header_queue.empty() || m_processing_paused.load();
+                });
+            }
 
             if (!m_processor_running.load()) {
                 break;

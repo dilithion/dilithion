@@ -476,7 +476,7 @@ BOOST_RPC_WEBSOCKET_TEST_SOURCE := src/test/rpc_websocket_tests.cpp
 # Targets
 # ============================================================================
 
-.PHONY: all clean install help tests test depends check-tip-notify-drain
+.PHONY: all clean install help tests test depends check-tip-notify-drain check-headers-manager-pointer
 .DEFAULT_GOAL := all
 
 # P2P-14/15 structural guard. Asserts the tip-notification drain invariant that
@@ -486,8 +486,45 @@ BOOST_RPC_WEBSOCKET_TEST_SOURCE := src/test/rpc_websocket_tests.cpp
 # restores the deadlock with every test still green.
 #
 # Wired here deliberately: a check nobody runs is not a check.
+# P2P-16 structural guard. Asserts that no released chainstate pointer can
+# enter the headers manager: GetTip() releases cs_main before returning, so a
+# CBlockIndex* it hands back can be freed by eviction while the locator walk is
+# still using it — a peer-triggerable use-after-free. The repair cannot be "hold
+# cs_main longer" (that is the inversion P2P-14/15 closed), so the data leaves
+# the lock as values instead, and this check keeps it that way.
+#
+# Wired here for the same reason as its sibling above: a guard nobody runs is a
+# file. It is a sub-second grep.
+check-headers-manager-pointer:
+	@bash scripts/check-headers-manager-no-chainstate-pointer.sh
+
 check-tip-notify-drain:
 	@bash scripts/check-tip-notify-drain.sh
+
+# DEFERRED-RECLAMATION GUARDS. Same rule as the two above: a guard nobody runs is
+# a file. Both are sub-second and run BEFORE the suites, because if a thread_local
+# grew a destructor or a participant started blocking online, the suites will
+# still be green and still be wrong.
+#
+# ⚠️ EACH RUNS ITS OWN SELF-TEST FIRST. A guard whose fixtures are not exercised
+# is a guard that can quietly stop discriminating -- both of these have failed
+# their own fixtures during development (the thread_local one accepted a NEGATED
+# static_assert; the participant one accepted a scope that had already closed),
+# and in both cases the fixtures caught it before the tree did. Running the
+# fixtures on every invocation is what keeps that true.
+check-thread-local-guard:
+	@bash scripts/check_thread_local_guard.sh --self-test
+	@bash scripts/check_thread_local_guard.sh
+
+check-participant-waits:
+	@bash scripts/check_participant_waits.sh --self-test
+	@bash scripts/check_participant_waits.sh
+
+# Pins the CALLER of the socket timeouts, which no unit test can reach without a
+# live server. See the script header for why a mutation arm was tried and discarded.
+check-http-socket-timeouts:
+	@bash scripts/check_http_socket_timeouts.sh --self-test
+	@bash scripts/check_http_socket_timeouts.sh
 
 # P2P-14/15 TSan lock-inversion gate — MANUAL, Linux-only, ~4 min.
 #
@@ -634,7 +671,20 @@ endif
 # `make dilithion-node` runs earlier in that job and drags libzmq in.
 $(TEST_SUITES_ALL): | libzmq
 
-.PHONY: tests tests-build tests-fast tests-full
+.PHONY: tests tests-build tests-fast tests-full check-thread-local-guard check-participant-waits check-http-socket-timeouts
+
+# A-010 review LOW (a8, 2026-09-08): scripts/census_test_mains.sh had ZERO
+# callers -- an orphaned script inside the change that registers orphaned
+# suites. Giving it a target is the whole point: a diagnostic nobody can invoke
+# by name is one nobody runs.
+#
+# Not a roster row: it censuses SOURCE, it is not a test binary, and it must
+# never gate a PR. `make census-mains` is the documented way to re-derive the
+# assert()-behind-an-abort exposure after any roster change.
+.PHONY: census-mains
+census-mains:
+	@bash scripts/census_test_mains.sh --summary
+
 
 tests-build: $(TEST_SUITES_ALL)
 	@echo "$(COLOR_GREEN)✓ All test suites built (NOT run — use 'make tests')$(COLOR_RESET)"
@@ -646,13 +696,15 @@ tests: tests-build
 # wired into the target CI actually runs because a guard with zero callers is
 # not a guard — it is a file. It runs FIRST: it is a sub-second grep, and if the
 # drain invariant is broken there is no point running the suites.
-tests-fast: check-tip-notify-drain $(TEST_SUITES_FAST)
+tests-fast: check-tip-notify-drain check-headers-manager-pointer check-thread-local-guard check-participant-waits check-http-socket-timeouts $(TEST_SUITES_FAST)
+	@bash scripts/check_roster_completeness.sh
+	@bash scripts/test_run_with_hang_capture.sh
 	@bash scripts/test_run_test_suites_timeout.sh
 	@bash scripts/test_run_test_suites_staleness.sh
 	@bash scripts/test_run_test_suites_args.sh
 	@bash scripts/run_test_suites.sh fast
 
-tests-full: check-tip-notify-drain $(TEST_SUITES_FULL)
+tests-full: check-tip-notify-drain check-headers-manager-pointer check-thread-local-guard check-participant-waits check-http-socket-timeouts $(TEST_SUITES_FULL)
 	@bash scripts/run_test_suites.sh full
 
 phase1_test: $(CORE_OBJECTS) $(OBJ_DIR)/test/phase1_simple_test.o $(DILITHIUM_OBJECTS) $(CHIAVDF_OBJECTS)
@@ -863,6 +915,63 @@ chain_selector_tests: $(CORE_OBJECTS) $(OBJ_DIR)/test/chain_selector_tests.o $(D
 	@$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS) $(LIBS)
 	@echo "$(COLOR_GREEN)✓ chain_selector_tests built successfully$(COLOR_RESET)"
 
+# Measures graveyard peak occupancy and drain cost at the ingress ceiling, so the
+# design note can carry observations instead of arithmetic.
+graveyard_occupancy_bench: $(CORE_OBJECTS) $(OBJ_DIR)/tools/graveyard_occupancy_bench.o $(DILITHIUM_OBJECTS) $(CHIAVDF_OBJECTS)
+	@echo "$(COLOR_BLUE)[LINK]$(COLOR_RESET) $@"
+	@$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS) $(LIBS)
+	@echo "$(COLOR_GREEN)✓ graveyard_occupancy_bench built successfully$(COLOR_RESET)"
+
+evict_cost_bench: $(CORE_OBJECTS) $(OBJ_DIR)/tools/evict_cost_bench.o $(DILITHIUM_OBJECTS) $(CHIAVDF_OBJECTS)
+	@echo "$(COLOR_BLUE)[LINK]$(COLOR_RESET) $@"
+	@$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS) $(LIBS)
+	@echo "$(COLOR_GREEN)â evict_cost_bench built successfully$(COLOR_RESET)"
+
+# THE MEMORY-SAFETY VERDICT for deferred reclamation, and it is only a verdict
+# under -fsanitize=address. Two of its three arms MUST CRASH; scripts/asan_uaf_arms.sh
+# is the driver that enforces that, and a plain build of this target proves only that
+# the fixture reaches the free -- not that the memory is safe.
+# A PAIRED CONTROL WHOSE PASS IS A PROCESS ABORT: it opens an illegal nested
+# EpochOfflineScope and must die on the ConsensusInvariant. Run by
+# scripts/red_arms_pr198_r1_folds.sh as the positive control for the inverted F13 arm.
+epoch_nest_probe: $(CORE_OBJECTS) $(OBJ_DIR)/test/epoch_nest_probe.o $(DILITHIUM_OBJECTS) $(CHIAVDF_OBJECTS)
+	@echo "$(COLOR_BLUE)[LINK]$(COLOR_RESET) $@"
+	@$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS) $(LIBS)
+	@echo "$(COLOR_GREEN)✓ epoch_nest_probe built successfully$(COLOR_RESET)"
+
+blockindex_uaf_asan_arm: $(CORE_OBJECTS) $(OBJ_DIR)/test/blockindex_uaf_asan_arm.o $(DILITHIUM_OBJECTS) $(CHIAVDF_OBJECTS)
+	@echo "$(COLOR_BLUE)[LINK]$(COLOR_RESET) $@"
+	@$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS) $(LIBS)
+	@echo "$(COLOR_GREEN)✓ blockindex_uaf_asan_arm built successfully$(COLOR_RESET)"
+
+# The bound on an HTTP worker's ONLINE window (round-8 F48). Links the real
+# CHttpServer so the arm exercises the production ApplyClientSocketTimeouts rather
+# than a copy of it.
+http_socket_timeout_tests: $(CORE_OBJECTS) $(OBJ_DIR)/test/http_socket_timeout_tests.o $(DILITHIUM_OBJECTS) $(CHIAVDF_OBJECTS)
+	@echo "$(COLOR_BLUE)[LINK]$(COLOR_RESET) $@"
+	@$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS) $(LIBS)
+	@echo "$(COLOR_GREEN)✓ http_socket_timeout_tests built successfully$(COLOR_RESET)"
+
+deferred_reclamation_tests: $(CORE_OBJECTS) $(OBJ_DIR)/test/deferred_reclamation_tests.o $(DILITHIUM_OBJECTS) $(CHIAVDF_OBJECTS)
+	@echo "$(COLOR_BLUE)[LINK]$(COLOR_RESET) $@"
+	@$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS) $(LIBS)
+	@echo "$(COLOR_GREEN)✓ deferred_reclamation_tests built successfully$(COLOR_RESET)"
+
+leaf_index_invariant_tests: $(CORE_OBJECTS) $(OBJ_DIR)/test/leaf_index_invariant_tests.o $(DILITHIUM_OBJECTS) $(CHIAVDF_OBJECTS)
+	@echo "$(COLOR_BLUE)[LINK]$(COLOR_RESET) $@"
+	@$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS) $(LIBS)
+	@echo "$(COLOR_GREEN)✓ leaf_index_invariant_tests built successfully$(COLOR_RESET)"
+
+queue_parent_pin_publication_tests: $(CORE_OBJECTS) $(OBJ_DIR)/test/queue_parent_pin_publication_tests.o $(DILITHIUM_OBJECTS) $(CHIAVDF_OBJECTS)
+	@echo "$(COLOR_BLUE)[LINK]$(COLOR_RESET) $@"
+	@$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS) $(LIBS)
+	@echo "$(COLOR_GREEN)✓ queue_parent_pin_publication_tests built successfully$(COLOR_RESET)"
+
+regtest_cap_rejection_tests: $(CORE_OBJECTS) $(OBJ_DIR)/test/regtest_cap_rejection_tests.o $(DILITHIUM_OBJECTS) $(CHIAVDF_OBJECTS)
+	@echo "$(COLOR_BLUE)[LINK]$(COLOR_RESET) $@"
+	@$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS) $(LIBS)
+	@echo "$(COLOR_GREEN)✓ regtest_cap_rejection_tests built successfully$(COLOR_RESET)"
+
 # v4.1 mandatory upgrade — checkpoint enforcement tests (Phase 1 + Phase 2
 # startup validator + lifetime-miner snapshot assertion semantics).
 v4_1_checkpoint_enforcement_tests: $(CORE_OBJECTS) $(OBJ_DIR)/test/v4_1_checkpoint_enforcement_tests.o $(DILITHIUM_OBJECTS) $(CHIAVDF_OBJECTS)
@@ -1055,6 +1164,50 @@ genesis_all_networks_tests: $(CORE_OBJECTS) $(OBJ_DIR)/test/genesis_all_networks
 	@echo "$(COLOR_GREEN)✓ genesis_all_networks_tests built successfully$(COLOR_RESET)"
 
 # Phase 5 Day 5: regtest mode scaffold smoke test.
+# LP-10 A-9 (2026-09-08): TSan harness, concurrent-disconnect UAF. Build with
+# make TSAN=1 headerssync_disconnect_race_tsan  (Linux/WSL only; not MSYS2).
+headerssync_disconnect_race_tsan: $(CORE_OBJECTS) $(OBJ_DIR)/test/headerssync_disconnect_race_tsan.o $(DILITHIUM_OBJECTS) $(CHIAVDF_OBJECTS)
+	@echo "$(COLOR_BLUE)[LINK]$(COLOR_RESET) $@"
+	@$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS) $(LIBS)
+	@echo "$(COLOR_GREEN)✓ headerssync_disconnect_race_tsan built successfully$(COLOR_RESET)"
+
+# LP-10 deliverable 0b (2026-09-08): gate arming + armed-value reaches the gate.
+headerssync_gate_arming_tests: $(CORE_OBJECTS) $(OBJ_DIR)/test/headerssync_gate_arming_tests.o $(DILITHIUM_OBJECTS) $(CHIAVDF_OBJECTS)
+	@echo "$(COLOR_BLUE)[LINK]$(COLOR_RESET) $@"
+	@$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS) $(LIBS)
+	@echo "$(COLOR_GREEN)✓ headerssync_gate_arming_tests built successfully$(COLOR_RESET)"
+
+# LP-10 §2.0 (2026-09-08): PRESYNC accumulator seeding.
+headerssync_accumulator_seeding_tests: $(CORE_OBJECTS) $(OBJ_DIR)/test/headerssync_accumulator_seeding_tests.o $(DILITHIUM_OBJECTS) $(CHIAVDF_OBJECTS)
+	@echo "$(COLOR_BLUE)[LINK]$(COLOR_RESET) $@"
+	@$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS) $(LIBS)
+	@echo "$(COLOR_GREEN)✓ headerssync_accumulator_seeding_tests built successfully$(COLOR_RESET)"
+
+headerssync_work_bound_tests: $(CORE_OBJECTS) $(OBJ_DIR)/test/headerssync_work_bound_tests.o $(DILITHIUM_OBJECTS) $(CHIAVDF_OBJECTS)
+	@echo "$(COLOR_BLUE)[LINK]$(COLOR_RESET) $@"
+	@$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS) $(LIBS)
+	@echo "$(COLOR_GREEN)✓ headerssync_work_bound_tests built successfully$(COLOR_RESET)"
+
+headerssync_termination_tests: $(CORE_OBJECTS) $(OBJ_DIR)/test/headerssync_termination_tests.o $(DILITHIUM_OBJECTS) $(CHIAVDF_OBJECTS)
+	@echo "$(COLOR_BLUE)[LINK]$(COLOR_RESET) $@"
+	@$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS) $(LIBS)
+	@echo "$(COLOR_GREEN)✓ headerssync_termination_tests built successfully$(COLOR_RESET)"
+
+# LP-10 (2026-09-07): KAT pinning nMinimumChainWork + the work UNITS.
+minimum_chain_work_kat_tests: $(CORE_OBJECTS) $(OBJ_DIR)/test/minimum_chain_work_kat_tests.o $(DILITHIUM_OBJECTS) $(CHIAVDF_OBJECTS)
+	@echo "$(COLOR_BLUE)[LINK]$(COLOR_RESET) $@"
+	@$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS) $(LIBS)
+	@echo "$(COLOR_GREEN)✓ minimum_chain_work_kat_tests built successfully$(COLOR_RESET)"
+
+vdf_checker_nbits_equality_tests: $(CORE_OBJECTS) $(OBJ_DIR)/test/vdf_checker_nbits_equality_tests.o $(DILITHIUM_OBJECTS) $(CHIAVDF_OBJECTS)
+	@echo "$(COLOR_BLUE)[LINK]$(COLOR_RESET) $@"
+	@$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS) $(LIBS)
+	@echo "$(COLOR_GREEN)✓ vdf_checker_nbits_equality_tests built successfully$(COLOR_RESET)"
+proof_checker_selection_tests: $(CORE_OBJECTS) $(OBJ_DIR)/test/proof_checker_selection_tests.o $(DILITHIUM_OBJECTS) $(CHIAVDF_OBJECTS)
+	@echo "$(COLOR_BLUE)[LINK]$(COLOR_RESET) $@"
+	@$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS) $(LIBS)
+	@echo "$(COLOR_GREEN)✓ proof_checker_selection_tests built successfully$(COLOR_RESET)"
+
 regtest_chainparams_smoke: $(CORE_OBJECTS) $(OBJ_DIR)/test/regtest_chainparams_smoke.o $(DILITHIUM_OBJECTS) $(CHIAVDF_OBJECTS)
 	@echo "$(COLOR_BLUE)[LINK]$(COLOR_RESET) $@"
 	@$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS) $(LIBS)
@@ -1079,11 +1232,6 @@ dna_history_test: $(CORE_OBJECTS) $(OBJ_DIR)/digital_dna/dna_history_test.o $(DI
 	@echo "$(COLOR_BLUE)[LINK]$(COLOR_RESET) $@"
 	@$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS) $(LIBS)
 	@echo "$(COLOR_GREEN)✓ dna_history_test built successfully$(COLOR_RESET)"
-
-dna_monitor_test: $(CORE_OBJECTS) $(OBJ_DIR)/digital_dna/dna_monitor_test.o $(DILITHIUM_OBJECTS) $(CHIAVDF_OBJECTS)
-	@echo "$(COLOR_BLUE)[LINK]$(COLOR_RESET) $@"
-	@$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS) $(LIBS)
-	@echo "$(COLOR_GREEN)✓ dna_monitor_test built successfully$(COLOR_RESET)"
 
 verification_test: $(CORE_OBJECTS) $(OBJ_DIR)/digital_dna/verification_test.o $(DILITHIUM_OBJECTS) $(CHIAVDF_OBJECTS)
 	@echo "$(COLOR_BLUE)[LINK]$(COLOR_RESET) $@"
@@ -1208,6 +1356,7 @@ BOOST_TEST_OBJECTS := $(OBJ_DIR)/test/test_dilithion.o \
 	$(OBJ_DIR)/test/wf1_host_endian_differential_test.o \
 	$(OBJ_DIR)/test/miner_nonce_write_tests.o \
 	$(OBJ_DIR)/test/chain_tips_cache_invalidation_tests.o \
+	$(OBJ_DIR)/test/block_index_getancestor_skip_tests.o \
 	$(CRYPTO_PROPERTY_OBJECTS)
 
 # Link test objects + full library (CORE_OBJECTS) to avoid hand-picked object drift
@@ -1339,6 +1488,39 @@ $(OBJ_DIR)/test \
 $(OBJ_DIR)/test/fuzz:
 	@mkdir -p $@
 
+# ASSERTS MUST SURVIVE IN TEST OBJECTS, WHATEVER CXXFLAGS ARRIVES.
+#
+# Raised by the external panel (kimi): "confirm no CI leg defines NDEBUG for the
+# assert-based suites." Confirmed — NDEBUG appears nowhere in this Makefile or in
+# .github/workflows/, and ci.yml states that matrix.build_type sets no compiler
+# flags. So the answer today is "none".
+#
+# It is true by luck, though, and that is the part worth fixing. CXXFLAGS is
+# assigned with `?=`, so a CI job, a distro packager, or `make CXXFLAGS=...` can
+# replace it wholesale — and 23 of the standalone suites are hand-written mains
+# whose ONLY checks are assert(). Under -DNDEBUG every one of them compiles to a
+# no-op, runs in milliseconds, and EXITS 0. The roster would report them green.
+# That is a silent, total loss of coverage with a passing result, which is the
+# exact failure shape this branch keeps turning up.
+#
+# `-UNDEBUG` last on the command line makes the property hold by construction
+# instead of by inspection. Scoped to test objects only: whether production
+# builds keep asserts is a separate policy decision and is not changed here.
+#
+# ⚠️ `override` IS THE LOAD-BEARING WORD, and its absence made the first version
+# of this line useless against the very vector the comment above names. A
+# variable set on the command line beats every assignment in the makefile,
+# INCLUDING a target-specific `+=`. Measured:
+#
+#   sub:          CXXFLAGS += -UNDEBUG   ->  make CXXFLAGS=cmdline  =>  "cmdline"
+#   sub2: override CXXFLAGS += -UNDEBUG  ->  make CXXFLAGS=cmdline  =>  "cmdline -UNDEBUG"
+#
+# So without `override`, `make CXXFLAGS=-DNDEBUG` silently dropped the -UNDEBUG
+# and voided all 23 assert-only suites — the exact scenario two paragraphs up.
+# A guard that does not cover the case its own comment cites is worse than none,
+# because the comment stops anyone looking again.
+$(OBJ_DIR)/test/%.o: override CXXFLAGS += -UNDEBUG
+
 # Compile C++ source files
 $(OBJ_DIR)/%.o: src/%.cpp | $(OBJ_DIR)/attestation $(OBJ_DIR)/consensus $(OBJ_DIR)/consensus/port $(OBJ_DIR)/core $(OBJ_DIR)/crypto $(OBJ_DIR)/db $(OBJ_DIR)/dfmp $(OBJ_DIR)/index $(OBJ_DIR)/kernel $(OBJ_DIR)/miner $(OBJ_DIR)/net $(OBJ_DIR)/net/port $(OBJ_DIR)/node $(OBJ_DIR)/primitives $(OBJ_DIR)/rpc $(OBJ_DIR)/wallet $(OBJ_DIR)/util $(OBJ_DIR)/api $(OBJ_DIR)/vdf $(OBJ_DIR)/digital_dna $(OBJ_DIR)/script $(OBJ_DIR)/policy $(OBJ_DIR)/tools $(OBJ_DIR)/x402 $(OBJ_DIR)/zmq $(OBJ_DIR)/test
 	@echo "$(COLOR_BLUE)[CXX]$(COLOR_RESET)  $<"
@@ -1440,7 +1622,39 @@ libzmq-clean:
 
 # Include auto-generated header dependency files (-MMD -MP)
 # These ensure that changing any .h file triggers recompilation of all .cpp files that include it
--include $(wildcard $(OBJ_DIR)/**/*.d $(OBJ_DIR)/*.d)
+# ⚠️ `$(wildcard .../**/*.d)` DOES NOT RECURSE, AND THE MISS IS SILENT.
+#
+# GNU make's $(wildcard) is glob, not globstar: `**` behaves as a single `*`, so
+# `$(OBJ_DIR)/**/*.d` matched exactly ONE directory level, so everything two
+# levels deep was invisible to it:
+#     build/obj/consensus/port/   (1 file: chain_selector_impl)
+#     build/obj/net/port/         (4 files)
+#
+# Measured twice on differently-populated trees: 153 .d present / 148 matched,
+# and 155 / 150. The TOTAL moves with how much has been built, so the durable
+# fact is not a ratio — it is that these two directories were never covered, and
+# they are second-level only because of where the port adapters live.
+#
+# Those objects therefore had NO header dependency tracking at all. Editing a
+# header they include did not rebuild them, and because nothing reports the miss
+# the result is not a build error but a MIXED-LAYOUT BINARY: two objects compiled
+# against different definitions of the same class, linked together.
+#
+# HOW IT PRESENTS, because it does not look like a build problem. Adding two
+# members to CChainState rebuilt chain.o and left chain_selector_impl.o at its
+# previous layout. The next run threw
+#     terminate called after throwing an instance of 'std::system_error'
+#       what():  Invalid argument
+# from a std::lock_guard inside ChainSelectorAdapter::ProcessNewHeader — a mutex
+# error with no mutex bug, because that object was locking cs_main at the wrong
+# offset. Time was spent suspecting threading before object mtimes were compared.
+#
+# `find` is used instead of `wildcard` because it actually recurses. Verified by
+# positive control: touch src/consensus/chain.h, and
+# build/obj/consensus/port/chain_selector_impl.o now rebuilds (its mtime moves);
+# before this change it did not.
+DEPFILES := $(shell find $(OBJ_DIR) -name '*.d' 2>/dev/null)
+-include $(DEPFILES)
 
 # ============================================================================
 # Utility Targets
@@ -1991,3 +2205,4 @@ print-%:
 	@echo '$*=$($*)'
 
 .PHONY: print-% fuzz fuzz_sha3 fuzz_transaction fuzz_block fuzz_compactsize fuzz_network_message fuzz_address fuzz_difficulty fuzz_subsidy fuzz_merkle run_fuzz coverage coverage-html coverage-clean
+

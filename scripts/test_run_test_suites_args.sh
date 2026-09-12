@@ -283,6 +283,24 @@ case "$out" in
 esac
 
 echo
+echo "== a NOBUILD row must leave the BUILD LIST, not just the run =="
+# Learned on this branch, from CI. A quarantined row is still BUILT so it cannot
+# rot -- but four_node_test is a PHONY whose recipe RUNS a live 4-node mesh, so
+# "building" it executed the harness in CI and failed the full-tier leg. NOBUILD
+# is what keeps such a row counted in the register while out of the build list.
+out="$(drive_list 'fast|fake_suite|60|NOBUILD: building this would do something|')"
+case "$out" in
+  *fake_suite*) fail "a NOBUILD row reached the build list" "$out" ;;
+  *)            chk "a NOBUILD row is excluded from --list" yes yes ;;
+esac
+# ...and it must still be COUNTED, or NOBUILD becomes a way to hide a row.
+out="$(drive 0 'fast|fake_suite|60|NOBUILD: building this would do something|' 'fast|other_suite|60||')"
+case "$out" in
+  *"quarantined=1"*) chk "a NOBUILD row is still counted as quarantined" yes yes ;;
+  *) fail "NOBUILD row vanished from the counts" "$out" ;;
+esac
+
+echo
 echo "== the real roster in this tree must itself be valid =="
 # Every arm above runs against synthetic rows. This one runs the validator over
 # the roster that actually ships.

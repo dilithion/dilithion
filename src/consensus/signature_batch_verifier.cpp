@@ -188,12 +188,40 @@ void CSignatureBatchVerifier::WorkerThread() {
             // Tripwire (A-003 defense-in-depth): the count must be > 0 here — one
             // worker dequeues each task exactly once, and Add() incremented before
             // enqueue. A zero here would mean a double-dequeue / double-decrement
-            // regression, which would otherwise wrap size_t and hang Wait()
-            // forever (silent validator-thread DoS). Guard the decrement so the
-            // underflow protection holds in release builds (NDEBUG) too, not just
-            // debug: if the count is already zero, log loudly and skip the
-            // fetch_sub rather than wrapping size_t. The load is under
+            // regression, which would otherwise wrap size_t and hang THIS
+            // SESSION'S Wait() forever: that waiter blocks until pending_count
+            // reaches 0, and a wrapped count never will. Scope matters — it stalls
+            // the thread waiting on THIS batch and the validation behind it, not
+            // every future Wait() in the process. The load is under
             // complete_mutex so it is consistent with the fetch_sub that follows.
+            //
+            // ⚠️ WHICH OF THE TWO STATEMENTS BELOW ACTUALLY RUNS DEPENDS ON THE
+            // BUILD, AND THIS COMMENT USED TO IMPLY THE WRONG ONE. It said the
+            // guard holds "in release builds (NDEBUG) too, not just debug", which
+            // reads as though a release build of this repo defines NDEBUG.
+            // Makefile:1396-1401 records the check that was actually run: NDEBUG
+            // appears nowhere in that Makefile or in .github/workflows/, and
+            // ci.yml sets no compiler flags from matrix.build_type — so no CI leg
+            // and no plain `make` defines it. That is the demonstrated scope, and
+            // the Makefile is explicit that it holds "by luck" rather than by
+            // construction, which is why this comment does not promise more. In
+            // any build that does not define NDEBUG, the assert() below is live
+            // and ABORTS THE PROCESS; the std::cerr line is unreachable there, and
+            // the abort is the right outcome — it beats wrapping a size_t and
+            // stalling this session's waiter.
+            //
+            // The log-and-skip branch is NOT dead code, though. `make
+            // CXXFLAGS=-DNDEBUG` is an unsanctioned but perfectly possible
+            // invocation, and #129's `$(OBJ_DIR)/test/%.o: override CXXFLAGS +=
+            // -UNDEBUG` (Makefile:1428) protects TEST objects only — a
+            // command-line NDEBUG still compiles the assert out of the production
+            // objects, and this file is one of them. In that build the runtime
+            // check is the ONLY thing standing between a double-decrement and a
+            // silent validator-thread DoS, so it stays.
+            //
+            // In short: the assert is the guard for every build we ship, the
+            // runtime branch is the guard for a build we do not. Both are
+            // deliberate; neither is theatre.
             if (session->pending_count.load() == 0) {
                 assert(false && "CBatchSession pending_count underflow (double-decrement?)");
                 std::cerr << "[SignatureVerifier] ERROR: pending_count underflow "

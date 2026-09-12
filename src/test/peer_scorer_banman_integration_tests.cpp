@@ -21,6 +21,7 @@
 #include <net/banman.h>
 #include <net/protocol.h>
 #include <net/port/addrman_v2.h>  // PHASE-2.5-ADDRMAN-BIAS: dynamic_cast target
+#include <net/port/maybe_punish_node.h>
 
 #include <cassert>
 #include <cstdlib>
@@ -311,6 +312,64 @@ void test_env_var_off_disables_scoring()
     std::cout << " OK\n";
 }
 
+
+// 9. THE PRODUCTION HEADER-REJECT PATH, WHICH HAD NO TEST AT ALL.
+//
+//    Measured 2026-09-10 (F4 census): CPeerManager::MisbehaveHeaders is called
+//    from exactly one place in the tree, net.cpp:1856, and was referenced by no
+//    test. It is ALSO the only production consumer of the HeaderRejectReason
+//    weight table — maybe_punish_node.h's MaybePunishNodeForHeaders wrapper is
+//    not on any production path, despite that file's header having claimed for
+//    months that it was "WIRED ... via the CPeerManager::MisbehaveHeaders
+//    forwarder". So every arm that pinned the weights pinned them on a path
+//    production does not take.
+//
+//    This test takes the production path. It asserts the SCORE that a peer
+//    actually accumulates, not the number the table returns.
+void test_misbehave_headers_scores_only_the_scored_reasons()
+{
+    std::cout << "  test_misbehave_headers_scores_only_the_scored_reasons..." << std::flush;
+
+    using ::dilithion::net::port::HeaderRejectReason;
+    using ::dilithion::net::port::HeaderRejectWeight;
+    using ::dilithion::net::port::kAllHeaderRejectReasons;
+
+    int scored = 0, unscored = 0;
+
+    for (HeaderRejectReason reason : kAllHeaderRejectReasons) {
+        // A fresh manager per reason: scores accumulate, and a shared one would
+        // make the honest-signal assertion depend on iteration order.
+        CPeerManager pm("");
+        auto peer = pm.AddPeer(MakeAddrV4(0x01020304));  // 1.2.3.4 (routable)
+        assert(peer != nullptr);
+        assert(pm.GetMisbehaviorScore(peer->id) == 0);
+
+        pm.MisbehaveHeaders(peer->id, reason);
+
+        const int expected = HeaderRejectWeight(reason);
+        assert(pm.GetMisbehaviorScore(peer->id) == expected);
+
+        if (expected == 0) {
+            ++unscored;
+            // An honest-emittable signal, or one that is our own fault, must
+            // leave the peer entirely untouched -- not merely below threshold.
+            auto post = pm.GetPeer(peer->id);
+            assert(post != nullptr);
+            assert(!post->IsBanned());
+        } else {
+            ++scored;
+        }
+    }
+
+    // NON-VACUITY, both directions. Without these, a forwarder that scored
+    // NOTHING would satisfy every assertion above, and so would one that had
+    // quietly lost half its reasons.
+    assert(scored == 4);
+    assert(unscored == 5);
+
+    std::cout << " OK\n";
+}
+
 // ============================================================================
 // main
 // ============================================================================
@@ -329,8 +388,9 @@ int main()
         test_misbehavior_increments_addrman_attempts();
         test_misbehavior_signals_addrman();
         test_env_var_off_disables_scoring();
+        test_misbehave_headers_scores_only_the_scored_reasons();
 
-        std::cout << "\n=== All Phase 2 Integration Tests Passed (8 tests) ==="
+        std::cout << "\n=== All Phase 2 Integration Tests Passed (9 tests) ==="
                   << std::endl;
         return 0;
     } catch (const std::exception& e) {

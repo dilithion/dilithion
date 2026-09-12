@@ -9,6 +9,12 @@
 #include <ctime>
 #include <cmath>
 
+// Deferred reclamation: this thread resolves CBlockIndex*, so it checkpoints.
+// g_chainstate is defined in src/core/globals.cpp and declared per-TU (the idiom
+// used by headers_manager.cpp / block_processing.cpp / tx_index.cpp).
+#include <consensus/chain.h>
+extern CChainState g_chainstate;
+
 CCachedChainStats::CCachedChainStats() = default;
 
 CCachedChainStats::~CCachedChainStats() {
@@ -23,6 +29,7 @@ bool CCachedChainStats::Start(UpdateCallback callback) {
     m_callback = std::move(callback);
     m_shutdown.store(false);
     m_running.store(true);
+    g_chainstate.DeclareEpochParticipant("cached-stats");
     m_thread = std::thread(&CCachedChainStats::UpdateThread, this);
 
     std::cout << "[CachedStats] Started background update thread (interval: "
@@ -48,6 +55,14 @@ void CCachedChainStats::Stop() {
 
 void CCachedChainStats::UpdateThread() {
     while (!m_shutdown.load()) {
+        // DEFERRED-RECLAMATION CHECKPOINT — loop top, before the callback and the
+        // sleep. The injected callback resolves the tip and walks up to 20 pprev
+        // links (see the node binaries' cached_stats.Start lambda), so this thread
+        // holds index pointers — and it runs on EVERY node, unconditionally, once
+        // a second. Nothing in this file mentions CBlockIndex, which is exactly
+        // why it was missed: the resolve is inside an injected callback.
+        g_chainstate.EpochCheckpoint("cached-stats");
+
         try {
             // Get current state from callback
             UpdateData data = m_callback();
@@ -72,8 +87,21 @@ void CCachedChainStats::UpdateThread() {
             std::cerr << "[CachedStats] Unknown update error" << std::endl;
         }
 
-        // Sleep for interval
-        std::this_thread::sleep_for(std::chrono::milliseconds(UPDATE_INTERVAL_MS));
+        // ⚠️ OFFLINE ACROSS THE SLEEP (round-8 F46). One second is a small pin
+        // next to the miner's two minutes -- and it is a pin on EVERY node,
+        // FOREVER, because this updater runs at 1 Hz for the life of the process.
+        // It spends essentially all of its time here, so the epoch it published
+        // before the sleep is the one that caps DrainGraveyard's minimum for
+        // essentially all of that time. A small pin held permanently is not a
+        // small problem, and the rule has to be uniform or the next reader has to
+        // re-derive where the line is.
+        //
+        // Safe by construction: the update above has returned, so nothing resolved
+        // in this round is still live, and the loop re-enters before the next one.
+        {
+            EpochOfflineScope offline(&g_chainstate);
+            std::this_thread::sleep_for(std::chrono::milliseconds(UPDATE_INTERVAL_MS));
+        }
     }
 }
 

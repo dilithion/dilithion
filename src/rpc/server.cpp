@@ -602,6 +602,12 @@ bool CRPCServer::Start() {
 
     // Start server thread
     m_running = true;
+    if (m_chainstate) {
+        m_chainstate->DeclareEpochParticipant("rpc-accept");
+        // The request-handling pool declares its size: every worker resolves index
+        // pointers, so one worker's checkpoint must not certify the pool.
+        m_chainstate->DeclareEpochParticipant("rpc-worker", m_threadPoolSize);
+    }
     m_serverThread = std::thread(&CRPCServer::ServerThread, this);
 
     // RPC-002: Start worker thread pool
@@ -765,6 +771,17 @@ bool CRPCServer::InitializePermissions(const std::string& configPath,
 }
 
 void CRPCServer::ServerThread() {
+    // REGISTER AT ENTRY, THEN GO OFFLINE WHILE BLOCKED.
+    //
+    // ⚠️ THE OFFLINE SCOPE ALONE DOES NOT REGISTER THIS THREAD. A name reaches
+    // the registry on its first NAMED checkpoint, and the scope's checkpoint is in
+    // its DESTRUCTOR — which runs only when the wait RETURNS. On an idle node no
+    // request ever arrives, so this thread would never register and the startup
+    // census would refuse to start the node. Registering here, once, before the
+    // first block, is what makes the census a statement about threads that EXIST
+    // rather than threads that have been handed work.
+    if (m_chainstate) m_chainstate->EpochCheckpoint("rpc-accept");
+
     // Phase 1.1: Wrap thread entry point in try/catch to prevent silent crashes
     try {
         while (m_running) {
@@ -775,7 +792,25 @@ void CRPCServer::ServerThread() {
         // release-store of INVALID_SOCKET. Loading inside the accept() call
         // argument list would be a second, independent read.
         const int listenSock = m_serverSocket.load(std::memory_order_acquire);
-        int clientSocket = accept(listenSock, (struct sockaddr*)&clientAddr, &clientLen);
+
+        // DEFERRED-RECLAMATION CHECKPOINT — immediately BEFORE accept(), which is
+        // the long block COORD asked about. RPC has no "iteration": it is
+        // request/response, and accept() can wait indefinitely for a connection.
+        // At this instant the previous request is finished and the next has not
+        // arrived, so the thread holds no CBlockIndex*. Checkpointing HERE means
+        // an idle RPC server pins NOTHING for the hours it may sit in accept();
+        // checkpointing after the request instead would be equivalent here, but
+        // stating it at the blocking call makes the reason explicit — a thread
+        // waiting on I/O is holding nothing, so it should say so before it waits.
+        int clientSocket;
+        {
+        // OFFLINE WHILE BLOCKED. accept() can wait indefinitely; an epoch
+        // published just before it FREEZES for the whole wait and pins every
+        // entry unlinked meanwhile. The scope re-enters before the request is
+        // handled, which is the first thing that can resolve a pointer.
+            EpochOfflineScope offline(m_chainstate);
+            clientSocket = accept(listenSock, (struct sockaddr*)&clientAddr, &clientLen);
+        }
 
         if (clientSocket == INVALID_SOCKET) {
             if (m_running) {
@@ -789,7 +824,21 @@ void CRPCServer::ServerThread() {
 
         // Phase 3: Perform SSL handshake if SSL is enabled
         if (m_ssl_enabled && m_ssl_wrapper) {
-            SSL* ssl = m_ssl_wrapper->AcceptSSL(clientSocket);
+            // OFFLINE ACROSS THE HANDSHAKE. accept() returning puts this thread back
+            // online, and the handshake that follows is a full round trip with a
+            // remote peer that can stall for as long as the peer likes — pinning
+            // every eviction meanwhile. It holds no CBlockIndex* by construction:
+            // it moves bytes. POINTER-FREE IS NOT THE SAME AS PIN-FREE, which is
+            // the whole of this finding.
+            // ⚠️ BRACED TO THE HANDSHAKE ITSELF. Declared at the top of the
+            // if-block, this scope covered the error handling, the logging and the
+            // socket teardown too — everything up to the closing brace. Offline
+            // must mean "blocked in this one call", not "somewhere in this branch".
+            SSL* ssl = nullptr;
+            {
+                EpochOfflineScope offline(m_chainstate);
+                ssl = m_ssl_wrapper->AcceptSSL(clientSocket);
+            }
             if (!ssl) {
                 // SSL handshake failed
                 std::cerr << "[RPC-SSL] SSL handshake failed: "
@@ -839,14 +888,41 @@ void CRPCServer::WorkerThread() {
         while (m_running) {
         int clientSocket = INVALID_SOCKET;
 
+        // DEFERRED-RECLAMATION CHECKPOINT — before the wait, not after the work.
+        //
+        // ⚠️ THIS IS THE THREAD THAT ACTUALLY RESOLVES BLOCK INDICES, not the
+        // accept thread. RPC methods run HERE, on the worker pool; the accept
+        // thread only hands a socket over. Checkpointing the accept thread alone
+        // would have left every request-handling thread a non-participant, which
+        // pins the whole graveyard for the process lifetime.
+        //
+        // At the loop top this worker has finished the previous request and taken
+        // no new one, so it holds no CBlockIndex*. The pin bound is therefore ONE
+        // REQUEST — and that includes the response write, because HandleClient
+        // does the socket write itself. That write is bounded: SO_SNDTIMEO is set
+        // to 10s per connection (RPC-017 slowloris hardening, below), so a slow
+        // client extends the pin by seconds, not indefinitely.
+        if (m_chainstate) m_chainstate->EpochCheckpoint("rpc-worker");
+
         // Wait for work or shutdown
         {
             std::unique_lock<std::mutex> lock(m_queueMutex);
 
             // Wait until there's work in the queue or we're shutting down
-            m_queueCV.wait(lock, [this] {
-                return !m_running || !m_clientQueue.empty();
-            });
+            {
+                // OFFLINE FOR THE DURATION OF THE WAIT. Checkpointing before the wait
+                // publishes an epoch that then FREEZES while this thread is parked, pinning
+                // every entry unlinked afterwards -- a server asleep in accept() for an hour
+                // pins an hour of evictions, which is what made the design note's "parked
+                // threads pin nothing" false. Going offline removes this thread from the
+                // quiescent-state calculation entirely, exactly as an exited thread is
+                // removed; the scope re-enters on EVERY exit path, before anything is
+                // resolved.
+                EpochOfflineScope offline(m_chainstate);
+                m_queueCV.wait(lock, [this] {
+                    return !m_running || !m_clientQueue.empty();
+                });
+            }
 
             // Check if we're shutting down
             if (!m_running && m_clientQueue.empty()) {
@@ -943,6 +1019,23 @@ void CRPCServer::HandleClient(int clientSocket) {
     
     // Phase 3: Helper lambda for reading (works with both plain and SSL sockets)
     auto socket_read = [this, ssl](int socket_fd, void* buffer, int size) -> int {
+        // OFFLINE ACROSS THE READ (round-8 F47, found by the guard's one-hop pass).
+        // This is the RPC server's ONE read funnel and it blocks for as long as the
+        // client takes to send its request, so a slow or stalled client held an
+        // rpc-worker ONLINE for the whole of it.
+        //
+        // The WRITE side of this server was funnelled and wired rounds ago; the read
+        // side was not, and nothing looked -- the write side being done made the pair
+        // feel finished. That is the same "a fix aimed at a site leaves siblings"
+        // shape, with the sibling being the opposite direction of the same funnel.
+        //
+        // Safe here: this reads REQUEST bytes, before dispatch, so no handler has
+        // resolved anything yet -- the same argument as http_server's recv.
+        //
+        // The scope covers BOTH branches deliberately: SSLRead blocks exactly as
+        // recv does, and scoping only the plain branch would leave every TLS client
+        // pinning.
+        EpochOfflineScope offline(m_chainstate);
         if (ssl && m_ssl_wrapper) {
             return m_ssl_wrapper->SSLRead(ssl, buffer, size);
         } else {
@@ -952,6 +1045,22 @@ void CRPCServer::HandleClient(int clientSocket) {
     
     // Phase 3: Helper lambda for writing (works with both plain and SSL sockets)
     auto socket_write = [this, ssl](int socket_fd, const void* buffer, int size) -> int {
+        // OFFLINE ACROSS THE WRITE. Every RPC response leaves through here, and a
+        // slow client stalls the send for up to SO_SNDTIMEO (10 s per call, set
+        // below) — during which an online worker pins every eviction. The response
+        // is a fully-built buffer by this point and no CBlockIndex* is live on this
+        // stack (see the handler census in the quiescence proof), so there is
+        // nothing to hold across it.
+        //
+        // ⚠️ THIS IS A CONTRACT, NOT A PROPERTY OF THE CODE. Nothing prevents a
+        // caller from holding a resolved CBlockIndex* across this write; the claim
+        // that none does rests on a census of today's handlers (each returns a
+        // built std::string, and every write happens in a caller frame), not on
+        // anything the compiler or this scope enforces. A handler that ever streams
+        // a response while walking the chain breaks it, and the breakage is silent
+        // — the offline publication would then be a lie for the duration of the
+        // write. Reviewed per site in the quiescence proof's scope-site table.
+        EpochOfflineScope offline(m_chainstate);
         if (ssl && m_ssl_wrapper) {
             return m_ssl_wrapper->SSLWrite(ssl, buffer, size);
         } else {
@@ -10141,10 +10250,39 @@ uint256 TraverseAndExtract(int height,
 // the chainstate's outer try/catch already protects the loop, but we keep
 // the body trivial so even pathological CV state cannot raise.
 void CRPCServer::NotifyBlockTipChanged() {
-    // No need to acquire the mutex for notify_all -- waiters re-check their
-    // predicate under the mutex on wake, and notify_all has well-defined
-    // memory ordering w.r.t. wait_for. Avoids contention if many block
-    // connects fire in quick succession during IBD.
+    // ⚠️ THIS NOTIFY CAN BE LOST, AND THE COMMENT HERE USED TO DENY IT. It said
+    // "no need to acquire the mutex ... waiters re-check their predicate under the
+    // mutex on wake", which is true of a waiter that IS parked and false of one that
+    // is not yet. A waiter evaluates its predicate, sees no tip change, and then
+    // parks; a notify_all landing in that gap -- between the predicate returning
+    // false and the wait actually beginning -- reaches nobody. (It also said
+    // `wait_for`; the waits are `wait_until`.)
+    //
+    // THE BOUND, stated rather than implied: a waiter that misses a wake sleeps
+    // until the NEXT OBSERVED NOTIFICATION -- typically the next block connect --
+    // or until its own wait deadline (the caller's timeout, capped at 300 s by
+    // ResolveWaitTimeoutMs), SUBJECT TO SCHEDULING AND MUTEX-REACQUISITION DELAYS.
+    // The qualifier is not pedantry: "wakes on the next block" would be a latency
+    // GUARANTEE, and neither the condition variable nor the scheduler offers one.
+    // What IS guaranteed is the direction -- a waitfornewblock can return LATE,
+    // never WRONG, because it re-reads the tip on wake and reports the truth.
+    // Latency, not correctness. (Round-6 F36 asked for the wording; the previous
+    // version overstated the bound in the same way the comment above it once
+    // overstated the absence of the gap.)
+    //
+    // WHY THE OBVIOUS FIX IS NOT APPLIED HERE. Taking g_wait_cluster_mtx in this
+    // callback would close the gap -- and this callback fires from ConnectTip's
+    // m_blockConnectCallbacks loop WITH cs_main HELD, while the wait-* predicates
+    // take g_wait_cluster_mtx and then cs_main (via get_tip()). Adding the mutex
+    // here creates exactly the AB-BA that does not exist today. The correct fix is
+    // to defer the notify past the cs_main release (a post-drain notify) and take
+    // the mutex there, which changes the block-connect notify path -- consensus
+    // adjacent, and its own review. FILED, not smuggled into a reclamation PR.
+    //
+    // ⚠️ AND THIS DELTA MARGINALLY WIDENS THE GAP, which is the honest reason to
+    // prioritise that filed fix: the wait-* predicates now run an EpochOnlineWindow,
+    // whose destructor quiesces between the predicate returning false and the park.
+    // A few more instructions in the window that was already there.
     g_wait_cluster_cv.notify_all();
 }
 
@@ -10192,10 +10330,27 @@ std::string CRPCServer::RPC_WaitForNewBlock(const std::string& params) {
                     std::chrono::milliseconds(timeout_ms);
 
     std::unique_lock<std::mutex> lock(g_wait_cluster_mtx);
-    g_wait_cluster_cv.wait_until(lock, deadline, [&]() {
-        return g_wait_cluster_shutdown.load(std::memory_order_relaxed) ||
-               get_tip().first != initial.first;
-    });
+    // OFFLINE FOR THE PARK, ONLINE FOR THE PREDICATE. This wait blocks for up to
+    // the caller's timeout — 300 s for the wait-* RPCs — and an online worker pins
+    // every eviction for that whole period while holding only copied data. The
+    // predicate is the only part that resolves anything (get_tip() calls GetTip and
+    // immediately copies out {hash, height}), so the predicate is the only part
+    // that goes online. Wrapping the whole wait offline instead would make every
+    // predicate evaluation a resolve-while-offline.
+    // ⚠️ BRACED TO THE WAIT, AND THE FIRST VERSION WAS NOT. A function-scoped
+    // offline scope stays alive through everything after the wait — including the
+    // `get_tip()` below, which RESOLVES. Every non-shutdown return was therefore a
+    // resolve-while-offline: safe (it re-enters under cs_main) but a false alarm on
+    // the very counter added to find real ones, which is worse than no counter. The
+    // scope must end exactly where the blocking call ends.
+    {
+        EpochOfflineScope offline_park(&g_chainstate);
+        g_wait_cluster_cv.wait_until(lock, deadline, [&]() {
+            EpochOnlineWindow online(&g_chainstate);
+            return g_wait_cluster_shutdown.load(std::memory_order_relaxed) ||
+                   get_tip().first != initial.first;
+        });
+    }   // re-entered HERE, before anything below resolves
     auto current = get_tip();
     return FormatTipResponse(current.first, current.second);
 }
@@ -10224,10 +10379,27 @@ std::string CRPCServer::RPC_WaitForBlock(const std::string& params) {
                     std::chrono::milliseconds(timeout_ms);
 
     std::unique_lock<std::mutex> lock(g_wait_cluster_mtx);
-    g_wait_cluster_cv.wait_until(lock, deadline, [&]() {
-        return g_wait_cluster_shutdown.load(std::memory_order_relaxed) ||
-               get_tip().first == wanted;
-    });
+    // OFFLINE FOR THE PARK, ONLINE FOR THE PREDICATE. This wait blocks for up to
+    // the caller's timeout — 300 s for the wait-* RPCs — and an online worker pins
+    // every eviction for that whole period while holding only copied data. The
+    // predicate is the only part that resolves anything (get_tip() calls GetTip and
+    // immediately copies out {hash, height}), so the predicate is the only part
+    // that goes online. Wrapping the whole wait offline instead would make every
+    // predicate evaluation a resolve-while-offline.
+    // ⚠️ BRACED TO THE WAIT, AND THE FIRST VERSION WAS NOT. A function-scoped
+    // offline scope stays alive through everything after the wait — including the
+    // `get_tip()` below, which RESOLVES. Every non-shutdown return was therefore a
+    // resolve-while-offline: safe (it re-enters under cs_main) but a false alarm on
+    // the very counter added to find real ones, which is worse than no counter. The
+    // scope must end exactly where the blocking call ends.
+    {
+        EpochOfflineScope offline_park(&g_chainstate);
+        g_wait_cluster_cv.wait_until(lock, deadline, [&]() {
+            EpochOnlineWindow online(&g_chainstate);
+            return g_wait_cluster_shutdown.load(std::memory_order_relaxed) ||
+                   get_tip().first == wanted;
+        });
+    }   // re-entered HERE, before anything below resolves
     auto current = get_tip();
     return FormatTipResponse(current.first, current.second);
 }
@@ -10255,10 +10427,27 @@ std::string CRPCServer::RPC_WaitForBlockHeight(const std::string& params) {
                     std::chrono::milliseconds(timeout_ms);
 
     std::unique_lock<std::mutex> lock(g_wait_cluster_mtx);
-    g_wait_cluster_cv.wait_until(lock, deadline, [&]() {
-        return g_wait_cluster_shutdown.load(std::memory_order_relaxed) ||
-               get_tip().second >= target;
-    });
+    // OFFLINE FOR THE PARK, ONLINE FOR THE PREDICATE. This wait blocks for up to
+    // the caller's timeout — 300 s for the wait-* RPCs — and an online worker pins
+    // every eviction for that whole period while holding only copied data. The
+    // predicate is the only part that resolves anything (get_tip() calls GetTip and
+    // immediately copies out {hash, height}), so the predicate is the only part
+    // that goes online. Wrapping the whole wait offline instead would make every
+    // predicate evaluation a resolve-while-offline.
+    // ⚠️ BRACED TO THE WAIT, AND THE FIRST VERSION WAS NOT. A function-scoped
+    // offline scope stays alive through everything after the wait — including the
+    // `get_tip()` below, which RESOLVES. Every non-shutdown return was therefore a
+    // resolve-while-offline: safe (it re-enters under cs_main) but a false alarm on
+    // the very counter added to find real ones, which is worse than no counter. The
+    // scope must end exactly where the blocking call ends.
+    {
+        EpochOfflineScope offline_park(&g_chainstate);
+        g_wait_cluster_cv.wait_until(lock, deadline, [&]() {
+            EpochOnlineWindow online(&g_chainstate);
+            return g_wait_cluster_shutdown.load(std::memory_order_relaxed) ||
+                   get_tip().second >= target;
+        });
+    }   // re-entered HERE, before anything below resolves
     auto current = get_tip();
     return FormatTipResponse(current.first, current.second);
 }
