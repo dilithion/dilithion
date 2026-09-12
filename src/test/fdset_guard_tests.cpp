@@ -9,9 +9,6 @@
 //   I1. FD_SET / FD_ISSET are only ever reached with sock < FD_SETSIZE (POSIX).
 //       A descriptor at/above it is refused by every select() wrapper and
 //       reported as an error on that socket — never indexed.
-//   I2. CRPCServer::m_clientQueue.size() <= MAX_PENDING_RPC_CLIENTS at all
-//       times; accepts beyond it are closed immediately and counted
-//       (getrpcinfo.dropped_accepts); Stop() closes what is still queued.
 //
 // The POSIX cases reproduce the M-30 abort: with -D_FORTIFY_SOURCE=2 (the
 // default CXXFLAGS) glibc's FD_SET expands to __fdelt_chk, which calls
@@ -24,7 +21,6 @@
 #include <net/sock.h>
 #include <net/socket.h>
 #include <net/connman.h>
-#include <rpc/auth.h>
 
 #include <atomic>
 #include <chrono>
@@ -158,6 +154,28 @@ BOOST_AUTO_TEST_CASE(fdsetadd_refuses_what_fd_set_cannot_hold)
     // static_asserts it. The count guard refuses the (FD_SETSIZE+1)th socket
     // instead of letting winsock drop it silently.
     BOOST_CHECK(FD_SETSIZE >= 1024);
+
+    // ⛔ IsFdSelectable ITSELF, on Windows. Review found this function had ZERO
+    // Windows coverage: a wrong-but-plausible guard -- always-true, or a
+    // POSIX-shaped `sock < FD_SETSIZE` applied to a SOCKET -- passed every
+    // test, because nothing called it and the fill loop below only uses
+    // synthetic handles 1..FD_SETSIZE.
+    //
+    // On Win32 a SOCKET is a HANDLE, not a bitmap index, so capacity is the
+    // only limit and a LARGE handle must be accepted. That assertion is what
+    // kills the POSIX-shaped mutant; the INVALID_SOCKET one kills always-true.
+    const SOCKET kLargeHandle = static_cast<SOCKET>(FD_SETSIZE + 4096);
+    BOOST_CHECK(!IsFdSelectable(INVALID_SOCKET));
+    BOOST_CHECK(IsFdSelectable(kLargeHandle));
+    BOOST_CHECK(IsFdSelectable(static_cast<SOCKET>(1)));
+
+    // A large handle into an EMPTY set: accepted, and actually present.
+    fd_set big_set;
+    FD_ZERO(&big_set);
+    BOOST_CHECK(FdSetAdd(kLargeHandle, &big_set));
+    BOOST_CHECK_EQUAL(big_set.fd_count, 1u);
+    BOOST_CHECK(FD_ISSET(kLargeHandle, &big_set));
+
     BOOST_CHECK(!FdSetAdd(INVALID_SOCKET, &set));
     for (unsigned i = 0; i < static_cast<unsigned>(FD_SETSIZE); ++i) {
         BOOST_REQUIRE(FdSetAdd(static_cast<SOCKET>(i + 1), &set));
@@ -342,16 +360,8 @@ BOOST_AUTO_TEST_CASE(csocket_recvall_and_connect_refuse_high_fd)
 #endif // !_WIN32
 
 // ---------------------------------------------------------------------------
-// I2 — the RPC accept queue is bounded
-// ---------------------------------------------------------------------------
-// ⛔ TWO CASES ARE DEFERRED WITH THE FIX THEY COVER, NOT DELETED:
-//   rpc_accept_queue_caps_at_max_pending_and_counts_drops
-//   getrpcinfo_exposes_queue_bound_and_drop_counter
-// They exercise the RPC accept-queue bound (BKL-30 / P-04), which is NOT in
-// this PR -- its half of 12006c7a edits CRPCServer::Stop(), and main has since
-// REORDERED that teardown, so the original review does not transfer. They also
-// cannot compile here: they call MAX_PENDING_RPC_CLIENTS, GetDroppedAccepts,
-// GetPendingClientCount, SetThreadPoolSize and GetMaxPendingClients, none of
-// which exist on main. They land with the accept-queue PR (row FDSET-B).
+// ⛔ The two RPC accept-queue cases that stood here are DEFERRED with the
+// fix they cover (see the strategy repo, row FDSET-B) -- not deleted, and
+// not merely uncompilable here. Their subject is a different change.
 
 BOOST_AUTO_TEST_SUITE_END()

@@ -38,8 +38,6 @@ void CRPCPermissions::InitializeMethodPermissions() {
     m_methodPermissions["getrawtransaction"]  = readBlockchain;
     m_methodPermissions["decoderawtransaction"] = readBlockchain;
     m_methodPermissions["getnetworkinfo"]     = readBlockchain;
-    // BKL-30: RPC-server health counters (read-only; no wallet/admin data).
-    m_methodPermissions["getrpcinfo"]         = readBlockchain;
     m_methodPermissions["getpeerinfo"]        = readBlockchain;
     // T1.B-2 (testmempoolaccept BC v28.0 port): read-only-equivalent. Does NOT
     // mutate mempool (CTxMemPool::TestAccept is const + lock-protected). PR #39
