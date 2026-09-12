@@ -233,6 +233,16 @@ IDNARegistry::RegisterResult DNARegistryDB::append_sample(const DigitalDNA& dna)
         // entry writes go through the same helpers as register_identity, minus
         // the Sybil-flag log (this is a receiver-side acceptance path, not a
         // miner's first registration).
+        // NOTE (fresh-pass MEDIUM, H-1 adjacency) — this branch creates a
+        // permanent, sender-keyed registry entry, and the gate for it is NOT
+        // here. Creating on first sample is this function's DOCUMENTED contract
+        // (src/test/dna_propagation_tests.cpp, append_sample_unregistered_registers,
+        // asserts SUCCESS for exactly this case), and the registry has no peer
+        // context to rate-limit with. A gate added here was tried and reverted:
+        // it reddened 9 tests in dna_propagation_tests, which is the contract
+        // saying no.
+        // The gate belongs at the call sites, which hold peer_id — see the
+        // comment above the mapped fast path in dilithion-node.cpp / dilv-node.cpp.
         std::array<uint8_t, 20> zero_mik{};
         auto data = dna.serialize();
         std::string value(data.begin(), data.end());
@@ -438,8 +448,16 @@ std::vector<std::pair<DigitalDNA, SimilarityScore>> DNARegistryDB::find_similar(
 SimilarityScore DNARegistryDB::compare(const DigitalDNA& a, const DigitalDNA& b) const {
     SimilarityScore score;
 
-    // Core v2.0 dimensions (always available)
-    score.latency_similarity = calculate_latency_similarity(a.latency, b.latency);
+    // Core v2.0 dimensions.
+    // Latency is scored only when the two fingerprints share at least one
+    // comparable seed — see SimilarityScore::has_latency. This path and
+    // DigitalDNARegistry::compare must stay in step: they feed the SAME
+    // compute_combined_score, so a gate applied in one and not the other means
+    // the persistent registry and the in-memory one disagree about a Sybil.
+    score.has_latency = LatencyFingerprint::comparable_seed_count(a.latency, b.latency) > 0;
+    score.latency_similarity = score.has_latency
+        ? calculate_latency_similarity(a.latency, b.latency)
+        : 0.0;
     score.timing_similarity = calculate_timing_similarity(a.timing, b.timing);
     score.perspective_similarity = calculate_perspective_similarity(a.perspective, b.perspective);
 

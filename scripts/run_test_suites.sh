@@ -293,6 +293,8 @@ fast|bug_003_block_size_tests|180||
 fast|dfmp_heat_overflow_tests|300||
 fast|mik_registration_persistence_tests|300||
 fast|dna_propagation_tests|300||
+fast|dna_serialization_test|300||
+fast|dna_detection_test|300||
 fast|chainstate_integrity_tests|300||
 fast|reorg_wal_crash_injection_tests|300||
 fast|wallet_persistence_tests|300||

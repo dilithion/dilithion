@@ -138,8 +138,33 @@ bool NodeContext::Init(const std::string& datadir, CChainState* chainstate_ptr) 
         if (dna_registry->Open(dna_path)) {
             LogPrintf(ALL, INFO, "DNA registry opened (%zu identities) at %s",
                       dna_registry->count(), dna_path.c_str());
-            // Sybil defense Phase 2A: reject identities with DNA score >= 0.92
-            dna_registry->SetEnforceDNADedup(true);
+            // DNA registration is ADVISORY-ONLY (flag-and-store, never reject) per the
+            // 2026-06-12 DNA review. Score-based similarity rejection false-positives
+            // honest co-located miners (same datacenter / VPS SKU), AND dropping rejected
+            // identities blinds the clustering tripwire DNA is meant to feed. The
+            // Phase-2A rejection code path (DNARegistryDB::register_identity ->
+            // SYBIL_REJECTED when is_same_identity()) is RETAINED but DISABLED here; it is
+            // to be re-armed only via a deliberate Will/Zach decision.
+            //
+            // PROVENANCE: advisory-only is recorded in commit 878e58df's message as
+            // "Disposition (Will)" and has NO row in
+            // dilithion-strategy/00-context/DECISION_REGISTER.md. Treat it as
+            // **PROPOSED** until a D- row exists — a commit message is not a
+            // ratification, and this comment must not become the evidence for a
+            // decision nobody can point at. (Contrast the sibling default in this
+            // PR, `shared_heat = false`, which cites D-DIL-2026-09-08-1.)
+            //
+            // DIVERGENCE TO RECORD, against `dnaHashEnforcementHeight`
+            // (999999999 = disabled on all three networks, chainparams.cpp:164/373/565):
+            // this flag makes the REGISTRY advisory, and the consensus-side DNA hash
+            // equality check (chain.cpp:1439, vdf_validation.cpp:617) is separately
+            // inert only because that height is unreachable. The two are independent
+            // switches over the same identity data, and they point opposite ways the
+            // moment the height is armed: consensus would begin REJECTING blocks on a
+            // DNA mismatch while the registry that feeds the operator's picture of who
+            // is who still only flags. Whoever arms dnaHashEnforcementHeight must
+            // re-read this line and decide both switches together, not one of them.
+            dna_registry->SetEnforceDNADedup(false);
         } else {
             LogPrintf(ALL, WARN, "Failed to open DNA registry at %s", dna_path.c_str());
             dna_registry.reset();  // Non-fatal, DNA is advisory
