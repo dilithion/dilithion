@@ -107,9 +107,10 @@ static uint32_t FileVersion(const std::string& path) {
 // Derive the master seed+chaincode the wallet stores from a mnemonic.
 static bool DeriveSeedChaincode(const std::string& mnemonic,
                                 std::vector<uint8_t>& seedOut,
-                                std::vector<uint8_t>& chaincodeOut) {
+                                std::vector<uint8_t>& chaincodeOut,
+                                const std::string& bip39Passphrase = "") {
     uint8_t bip39seed[64];
-    if (!CMnemonic::ToSeed(mnemonic, "", bip39seed)) return false;
+    if (!CMnemonic::ToSeed(mnemonic, bip39Passphrase, bip39seed)) return false;
     CHDExtendedKey master;
     DeriveMaster(bip39seed, master);
     memory_cleanse(bip39seed, 64);
@@ -293,7 +294,33 @@ static bool BuildLegacyV6Wallet(const std::string& path,
                                 // and the master-key FALLBACK arm (wallet.cpp ~5747)
                                 // recovers the plaintext — exercising the fallback arm's
                                 // path into the identity guard. Default false ⇒ Step-1.
-                                bool encryptMnemonicUnderMasterKey = false) {
+                                bool encryptMnemonicUnderMasterKey = false,
+                                // LP-7 (WALLET-LP7-MIGRATION-NEVER-COMPLETES) test
+                                // hook: when true, search for a mnemonic IV whose
+                                // resulting master-key ciphertext ALSO unpads
+                                // cleanly under the seed-derived obfuscation key,
+                                // so migration arm 1 spuriously ACCEPTS garbage.
+                                // Requires encryptMnemonicUnderMasterKey. This
+                                // CONSTRUCTS the 0.3825% condition instead of
+                                // waiting for it, which is what makes the
+                                // regression test deterministic rather than a
+                                // 1-in-260 flake. Default false.
+                                bool forceArm1SpuriousAcceptance = false,
+                                // The wallet's seed derives from the mnemonic AND
+                                // this passphrase, so MnemonicReDerivesSeed(m, "")
+                                // FAILS and migration DEFERS. That is the cohort no
+                                // fixture covered: a master-key mnemonic together
+                                // with a BIP39 passphrase, which is exactly where a
+                                // per-arm passphrase-handling regression would
+                                // strand wallets the same way LP-7 did.
+                                const std::string& bip39Passphrase = "",
+                                // INVERSE of forceArm1SpuriousAcceptance: keep arm 1
+                                // CORRECT and make the MASTER-key decrypt (arm 2)
+                                // unpad by chance. Nothing should ever reach arm 2
+                                // here, so this fixture is green on correct code and
+                                // red on any variant that decrypts every arm and
+                                // keeps the last plaintext.
+                                bool forceArm2SpuriousAcceptance = false) {
     // --- 1. Use a real CWallet to mint a consistent HD wallet, then read out the
     //        pieces we need (mnemonic, seed, chaincode, default address). ---
     std::string scratch = path + ".scratch";
@@ -315,12 +342,12 @@ static bool BuildLegacyV6Wallet(const std::string& path,
     std::remove(scratch.c_str());
 
     std::vector<uint8_t> seed, chaincode;
-    if (!DeriveSeedChaincode(mnemonic, seed, chaincode)) return false;
+    if (!DeriveSeedChaincode(mnemonic, seed, chaincode, bip39Passphrase)) return false;
 
     CHDExtendedKey master;
     {
         uint8_t bip39seed[64];
-        if (!CMnemonic::ToSeed(mnemonic, "", bip39seed)) return false;
+        if (!CMnemonic::ToSeed(mnemonic, bip39Passphrase, bip39seed)) return false;
         DeriveMaster(bip39seed, master);
         memory_cleanse(bip39seed, 64);
     }
@@ -359,18 +386,112 @@ static bool BuildLegacyV6Wallet(const std::string& path,
         DeriveEncryptionKey(hdSeed, "mnemonic", obfKey);
         memory_cleanse(hdSeed.data(), hdSeed.size());
     }
-    std::vector<uint8_t> mnIV;
-    if (!GenerateIV(mnIV)) return false;
-    CCrypter mnCrypter;
-    if (!mnCrypter.SetKey(obfKey, mnIV)) return false;
     // LP-7 (F1): optionally encrypt garbage plaintext instead of the real mnemonic,
     // so the fixed binary's Step-1 decrypt round-trips (padding-valid) to non-BIP39
     // bytes — the exact precondition F1 must catch and abort on.
     const std::string& mnSource = mnemonicPlaintextOverride.empty()
                                       ? mnemonic : mnemonicPlaintextOverride;
     std::vector<uint8_t> mnemonicBytes(mnSource.begin(), mnSource.end());
+    std::vector<uint8_t> mnIV;
     std::vector<uint8_t> mnCipher;
-    if (!mnCrypter.Encrypt(mnemonicBytes, mnCipher)) return false;
+
+    if (forceArm1SpuriousAcceptance) {
+        // CONSTRUCT the arm-pre-emption condition rather than wait for it.
+        //
+        // Migration arm 1 decrypts the mnemonic slot with the seed-derived
+        // obfuscation key. For this master-key fixture that key is WRONG, and
+        // AES-CBC + PKCS#7 accepts a wrong-key block whenever the trailing bytes
+        // happen to unpad cleanly — measured at 765/200,000 = 0.3825% against the
+        // real CCrypter::Decrypt. That is why the pre-existing sub-case (A) fails
+        // roughly 1 run in 260: it rolls this die and usually wins.
+        //
+        // The IV is the free parameter. CBC chains forward from it, so a different
+        // IV gives a completely different ciphertext — including its LAST block,
+        // which is the one that decides padding validity under the wrong key. So
+        // resample the IV until the wrong-key decrypt accepts. Expected ~255 tries;
+        // the bound below is ~780x that, and a miss FAILS the build of the fixture
+        // rather than quietly producing an ordinary wallet that would make the test
+        // vacuously green.
+        if (!encryptMnemonicUnderMasterKey) return false;  // obfKey must be the WRONG key
+
+        std::vector<uint8_t> arm1Key(WALLET_CRYPTO_KEY_SIZE);
+        {
+            std::vector<uint8_t> hdSeed(master.seed, master.seed + 32);
+            DeriveEncryptionKey(hdSeed, "mnemonic", arm1Key);
+            memory_cleanse(hdSeed.data(), hdSeed.size());
+        }
+
+        // Cleanse arm1Key on EVERY exit, not just the successful one: the
+        // GenerateIV / SetKey / Encrypt early returns inside the loop each left a
+        // derived key in a dead local (external panel). A destructor covers all of
+        // them, including any added later.
+        struct KeyScrub {
+            std::vector<uint8_t>* k;
+            ~KeyScrub() noexcept { if (k != nullptr && !k->empty()) memory_cleanse(k->data(), k->size()); }
+        } arm1KeyScrub{&arm1Key};
+
+        const int kMaxIVSearch = 200000;
+        bool forced = false;
+        for (int attempt = 0; attempt < kMaxIVSearch && !forced; ++attempt) {
+            mnIV.clear();
+            mnCipher.clear();
+            if (!GenerateIV(mnIV)) return false;
+            CCrypter c;
+            if (!c.SetKey(obfKey, mnIV)) return false;
+            if (!c.Encrypt(mnemonicBytes, mnCipher)) return false;
+
+            CCrypter wrongKeyProbe;
+            std::vector<uint8_t> garbage;
+            if (wrongKeyProbe.SetKey(arm1Key, mnIV) &&
+                wrongKeyProbe.Decrypt(mnCipher, garbage)) {
+                forced = true;
+            }
+            if (!garbage.empty()) memory_cleanse(garbage.data(), garbage.size());
+        }
+        if (!forced) return false;   // arm1Key is scrubbed by KeyScrub on every path
+    }
+
+    if (forceArm2SpuriousAcceptance) {
+        // MIRROR of the above. Arm 1 stays CORRECT (obfuscation-key mnemonic, the
+        // default), and we search for an IV whose ciphertext ALSO unpads under the
+        // MASTER key -- so arm 2 would return garbage IF anything ever ran it.
+        //
+        // On correct code arm 1 verifies and the loop breaks, so arm 2 never runs and
+        // this fixture is green. It goes RED on the plausible variant the panel
+        // named: decrypt every arm, keep the LAST successful plaintext, verify once.
+        // That variant would newly strand the common HD-first cohort at ~0.38%, and
+        // the existing fixtures cannot see it because they make arm 2 the CORRECT arm.
+        if (encryptMnemonicUnderMasterKey) return false;   // arm 1 must be the correct arm
+
+        std::vector<uint8_t> mkKey(vMasterKeyPlain.begin(), vMasterKeyPlain.end());
+        const int kMaxSearch = 200000;
+        bool forced2 = false;
+        std::vector<uint8_t> candidateIV;
+        for (int attempt = 0; attempt < kMaxSearch && !forced2; ++attempt) {
+            candidateIV.clear();
+            if (!GenerateIV(candidateIV)) return false;
+            CCrypter c;
+            std::vector<uint8_t> ct;
+            if (!c.SetKey(obfKey, candidateIV)) return false;
+            if (!c.Encrypt(mnemonicBytes, ct)) return false;
+
+            CCrypter mkProbe;
+            std::vector<uint8_t> mkOut;
+            if (mkProbe.SetKey(mkKey, candidateIV) && mkProbe.Decrypt(ct, mkOut)) {
+                mnIV = candidateIV;
+                mnCipher = ct;
+                forced2 = true;
+            }
+            if (!mkOut.empty()) memory_cleanse(mkOut.data(), mkOut.size());
+        }
+        memory_cleanse(mkKey.data(), mkKey.size());
+        if (!forced2) return false;
+    } else {
+        if (!GenerateIV(mnIV)) return false;
+        CCrypter mnCrypter;
+        if (!mnCrypter.SetKey(obfKey, mnIV)) return false;
+        if (!mnCrypter.Encrypt(mnemonicBytes, mnCipher)) return false;
+    }
 
     // --- 4. Assemble the body (everything after the [Salt]). ---
     std::vector<uint8_t> hmacSalt(WALLET_FILE_SALT_SIZE);  // 32 bytes (NOT the 16-byte IV size)
@@ -2715,6 +2836,290 @@ static void Test_F1_AbortOnValidButWrongMnemonic() {
 //       byte-for-byte preserved at v6. Proves the identity guard catches a wrong
 //       phrase recovered through the fallback arm too (not only Step-1).
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// LP-7 PREMISE KAT — a wrong-key AES-CBC + PKCS#7 decrypt CAN succeed, and here
+// is one that does, frozen byte-for-byte.
+//
+// The arm-pre-emption regression test above proves the MIGRATION survives a
+// spurious arm-1 acceptance. This proves the thing that makes such acceptances
+// exist at all, at the CCrypter level, with no wallet involved. Neither test
+// substitutes for the other: break the padding assumption and this one goes red
+// while the migration test stays green, because the migration test constructs
+// its own condition and would simply search longer.
+//
+// PROVENANCE. These bytes are the FIRST spurious acceptance emitted by
+// src/tools/lp7_armprobe.cpp at its fixed seed 0xA8107 (iteration 87 of a
+// 200,000-attempt run that measured 765 acceptances = 0.3825%, against a
+// strict-PKCS#7 prediction of 0.3922%). Every byte is generated by that probe's
+// own mt19937_64. NOTHING HERE IS WALLET MATERIAL and nothing here is a secret:
+// re-running the probe reproduces the triple exactly.
+//
+// CAVEAT ON THAT REPRODUCIBILITY, so it is not read as stronger than it is: the
+// probe is NOT built by the Makefile (src/tools/* is not in any *_SOURCES list,
+// and it defines its own main()). Reproducing the triple is a MANUAL step using
+// the recipe in the probe's own header. Nothing re-derives these bytes on every
+// build, so what actually protects them is the four assertions below -- they are
+// the machine-checked half, and the probe is the provenance, not the guard.
+//
+// WHAT IT PINS:
+//   1. the fixture is well-formed  — the RIGHT key returns the phrase;
+//   2. THE PREMISE                 — the WRONG key is ACCEPTED, not rejected;
+//   3. the safety property         — the wrong key does NOT return the phrase;
+//   4. the exact garbage           — so a change in padding handling is visible
+//                                    as a diff, not as a silently different rate.
+// ---------------------------------------------------------------------------
+static std::vector<uint8_t> HexToBytes(const std::string& hex) {
+    std::vector<uint8_t> out;
+    out.reserve(hex.size() / 2);
+    for (size_t i = 0; i + 1 < hex.size(); i += 2) {
+        out.push_back(static_cast<uint8_t>(std::stoul(hex.substr(i, 2), nullptr, 16)));
+    }
+    return out;
+}
+
+static void Test_LP7_WrongKeyAcceptanceKAT() {
+    std::cout << COLOR_BLUE "\n[Test 2e-5] LP-7 premise KAT: a wrong-key PKCS#7 decrypt is ACCEPTED\n" COLOR_RESET;
+
+    const std::string kPhrase =
+        "abandon abandon abandon abandon abandon abandon abandon abandon "
+        "abandon abandon abandon abandon abandon abandon abandon abandon "
+        "abandon abandon abandon abandon abandon abandon abandon art";
+
+    const std::vector<uint8_t> realKey = HexToBytes(
+        "28bb00760aea5af852d63236880d916a985f328555b01212385fcca20ff8326a");
+    const std::vector<uint8_t> wrongKey = HexToBytes(
+        "6cc53ca2114c47b6127a2e8daeea8284403fdc65c14b5d5462ce2aa2a10d023f");
+    const std::vector<uint8_t> iv = HexToBytes("fe1e0d23dae25bd04fdcf6e22b917331");
+    const std::vector<uint8_t> ciphertext = HexToBytes(
+        "567d920082a23d94c523707a2bd7bf581bd7d2487312516323ab2e71fbae8c13"
+        "1c5df4c5b427a1123e2bec9fe3afb3f59fa1811c775d20fae380b5b1058e43ba"
+        "88e453f424dd50e368128046ccfab911c1cc53c0f118608562141eb78a7ed93e"
+        "a4e76e1f5c82ca5c08ba33bfd4288dab690954b47e611b733a1779473fe31bb5"
+        "d86ddc0f7c3dc1483361bfdf37b76d5dbde34220519a1a2e2541efd51e65dcd0"
+        "d525017286b2c3c7a71065fdf1631639e7338dd6a1c32d95ded719508edfb4d0");
+    const std::vector<uint8_t> expectedGarbage = HexToBytes(
+        "62e2bb5554bf0dade6dfdbdbb02275dc893e7381261c5ca14e437591b611c705"
+        "23efdc06ae8e7bf70bb7d605488795f94319f023b51abd5da2d7500929c8d6d0"
+        "273eb0e937603a9802dd7e318695155efee290310c598522eac68f6f9f10dc03"
+        "04c0e693748e6f40f44553a91161fb0013cf6612d08d59b695fc9743c6812cb7"
+        "90e61b67ebae181048282dc68c5c2b475a33f1058e0a555461f66878720d3d04"
+        "1c5b9e771ff2b3aa6b16af030ae406ad39df5e4e3fb64351568201aaff75fc");
+
+    CHECK(realKey.size() == WALLET_CRYPTO_KEY_SIZE && wrongKey.size() == WALLET_CRYPTO_KEY_SIZE,
+          "KAT fixture decoded: both keys are the right length");
+
+    // (1) The fixture is well-formed: the RIGHT key returns the phrase.
+    {
+        CCrypter c;
+        std::vector<uint8_t> out;
+        const bool ok = c.SetKey(realKey, iv) && c.Decrypt(ciphertext, out);
+        CHECK(ok, "KAT (1): the CORRECT key decrypts the fixture");
+        CHECK(std::string(out.begin(), out.end()) == kPhrase,
+              "KAT (1): the correct key returns exactly the pinned phrase (fixture is sound)");
+    }
+
+    // (2)-(4) The premise, and the safety property that must hold with it.
+    {
+        CCrypter c;
+        std::vector<uint8_t> out;
+        const bool accepted = c.SetKey(wrongKey, iv) && c.Decrypt(ciphertext, out);
+        CHECK(accepted,
+              "KAT (2) THE PREMISE: the WRONG key is ACCEPTED \u2014 AES-CBC + PKCS#7 unpads "
+              "cleanly by chance (measured 765/200,000 = 0.3825%)");
+        CHECK(std::string(out.begin(), out.end()) != kPhrase,
+              "KAT (3) SAFETY: the wrong key does NOT reproduce the phrase");
+        CHECK(out == expectedGarbage,
+              "KAT (4): the accepted garbage is byte-for-byte what the probe recorded "
+              "(191 bytes; the plaintext is 187)");
+        CHECK(!CMnemonic::Validate(std::string(out.begin(), out.end())),
+              "KAT (5): the accepted garbage is not even syntactically BIP39 \u2014 which is "
+              "why the identity guard catches it, and why arm 2 must still be tried");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// WALLET-LP7-MIGRATION-NEVER-COMPLETES — a spurious arm-1 decrypt pre-empts the
+// correct arm, permanently.
+//
+// THE DEFECT. The v7 seed migration gated its second decrypt arm on the first
+// arm's DECRYPT failing, not on the recovered phrase VERIFYING:
+//     decOk = <obfuscation-key decrypt>
+//     if (!decOk) { decOk = <master-key decrypt>; }
+//     verified = MnemonicReDerivesSeed(...)
+//     if (!verified) { DEFER }              // no path back to arm 2
+// For a legacy wallet whose mnemonic sits under the MASTER key, arm 1 runs with
+// the wrong key. When that wrong-key decrypt happens to unpad cleanly (0.3825%,
+// measured), decOk is true holding GARBAGE, arm 2 never runs, the identity guard
+// correctly rejects, and migration defers. Key, IV and ciphertext are FIXED for a
+// given wallet, so this recurs on EVERY future unlock: that wallet can never
+// migrate and its seed stays unencrypted at rest — the condition LP-7 exists to
+// close — while the log promises a retry that cannot succeed.
+//
+// WHY THIS TEST IS DETERMINISTIC. It does not wait for the 0.3825% event; the
+// fixture CONSTRUCTS it by searching for a mnemonic IV whose ciphertext also
+// unpads under the wrong key, and the builder FAILS if it cannot. So the
+// precondition is asserted, not assumed — a fixture that silently degraded into
+// an ordinary wallet would fail here rather than pass vacuously.
+//
+// RED BEFORE THE FIX: the file stays at v6, the plaintext seed survives, and the
+// migration defers forever. GREEN AFTER: arm 1 is tried, its output fails to
+// verify, and the loop falls through to arm 2, which verifies and migrates.
+// ---------------------------------------------------------------------------
+static void Test_LP7_Arm1SpuriousAcceptanceDoesNotPreemptArm2() {
+    std::cout << COLOR_BLUE "\n[Test 2e-4] LP-7: a spurious arm-1 decrypt must NOT pre-empt the correct arm\n" COLOR_RESET;
+
+    const std::string path = "lp7_arm_preemption.dat";
+    const std::string pass = "LP7ArmPreempt!2026";
+    std::remove(path.c_str());
+
+    LegacyV6Result legacy;
+    const bool built = BuildLegacyV6Wallet(path, pass, legacy,
+                                           /*mnemonicPlaintextOverride=*/"",
+                                           /*encryptMnemonicUnderMasterKey=*/true,
+                                           /*forceArm1SpuriousAcceptance=*/true);
+    // PRECONDITION, not a result: the fixture must actually be one on which arm 1
+    // spuriously accepts. If this fails the rest of the test proves nothing.
+    CHECK(built,
+          "PRECONDITION: built a master-key wallet on which arm 1 SPURIOUSLY ACCEPTS "
+          "(wrong-key decrypt unpads cleanly)");
+    if (!built) {
+        std::remove(path.c_str());
+        return;
+    }
+
+    std::string exported;
+    {
+        CWallet w;
+        w.SetWalletFile(path);  // autosave on
+        CHECK(w.Load(path), "Loaded the arm-pre-emption fixture");
+        CHECK(w.Unlock(pass), "Unlock succeeds");
+        CHECK(w.ExportMnemonic(exported), "ExportMnemonic works after migration");
+    }
+
+    // THE LOAD-BEARING ASSERTIONS. Each of these is RED on the pre-fix binary.
+    CHECK(exported == legacy.mnemonic,
+          "LOAD-BEARING: the CORRECT mnemonic is recovered via arm 2 even though arm 1 "
+          "decrypted successfully first");
+    CHECK(FileVersion(path) == WALLET_FILE_VERSION_7,
+          "LOAD-BEARING: file promoted to v7 \u2014 migration COMPLETED despite the spurious "
+          "arm-1 acceptance (pre-fix: deferred forever)");
+    {
+        std::vector<uint8_t> bytes = ReadFileBytes(path);
+        CHECK(!Contains(bytes, legacy.seed.data(), legacy.seed.size()),
+              "LOAD-BEARING: plaintext seed ABSENT post-migration \u2014 the seed is finally "
+              "encrypted at rest, which is the whole point of LP-7");
+    }
+
+    std::remove(path.c_str());
+}
+
+// ---------------------------------------------------------------------------
+// COVERAGE HOLE 1 (external panel): THE INVERSE FIXTURE.
+//
+// Every arm-pre-emption fixture so far makes ARM 2 the correct arm. That leaves a
+// plausible wrong implementation green: "decrypt every arm, keep the LAST
+// successful plaintext, verify once at the end". Under that variant the common
+// HD-first cohort -- whose mnemonic is under the OBFUSCATION key, i.e. arm 1 --
+// would be newly stranded whenever arm 2 spuriously unpads, at the measured
+// ~0.3825%. The happy-path tests would flake at that rate and be read as noise,
+// which is exactly how the original defect survived.
+//
+// So: arm 1 CORRECT, arm 2 CONSTRUCTED to unpad. On correct code arm 1 verifies
+// and the loop breaks before arm 2 is ever constructed, so this is green. Under
+// last-decrypt-wins, arm 2's garbage overwrites the verified phrase and migration
+// defers -- RED.
+// ---------------------------------------------------------------------------
+static void Test_LP7_Arm2MustNotRunOnceArm1Verifies() {
+    std::cout << COLOR_BLUE "\n[Test 2e-6] LP-7: arm 2 must not run at all once arm 1 verifies\n" COLOR_RESET;
+
+    const std::string path = "lp7_arm2_never_runs.dat";
+    const std::string pass = "LP7Arm2Never!2026";
+    std::remove(path.c_str());
+
+    LegacyV6Result legacy;
+    const bool built = BuildLegacyV6Wallet(path, pass, legacy,
+                                           /*mnemonicPlaintextOverride=*/"",
+                                           /*encryptMnemonicUnderMasterKey=*/false,
+                                           /*forceArm1SpuriousAcceptance=*/false,
+                                           /*bip39Passphrase=*/"",
+                                           /*forceArm2SpuriousAcceptance=*/true);
+    CHECK(built,
+          "PRECONDITION: arm 1 is the CORRECT arm, and arm 2 is constructed to unpad "
+          "by chance if anything ever runs it");
+    if (!built) { std::remove(path.c_str()); return; }
+
+    std::string exported;
+    {
+        CWallet w;
+        w.SetWalletFile(path);
+        CHECK(w.Load(path), "Loaded the inverse fixture");
+        CHECK(w.Unlock(pass), "Unlock succeeds");
+        CHECK(w.ExportMnemonic(exported), "ExportMnemonic works after migration");
+    }
+    CHECK(exported == legacy.mnemonic,
+          "LOAD-BEARING: the CORRECT phrase survived — arm 2's garbage never "
+          "overwrote it (RED under decrypt-every-arm-keep-the-last)");
+    CHECK(FileVersion(path) == WALLET_FILE_VERSION_7,
+          "LOAD-BEARING: migration COMPLETED via arm 1");
+    std::remove(path.c_str());
+}
+
+// ---------------------------------------------------------------------------
+// COVERAGE HOLE 2 (external panel): THE PASSPHRASE COHORT.
+//
+// No fixture combined a MASTER-KEY-encrypted mnemonic WITH a BIP39 passphrase --
+// and that is precisely the cohort where a per-arm passphrase-handling regression
+// strands wallets exactly as LP-7 did. A variant that applies the passphrase retry
+// to arm 1 only, or that drops the empty-passphrase attempt once a passphrase is
+// supplied, passes every other fixture in this file.
+//
+// This one exercises both halves together: recovery must come from arm 2 (master
+// key) AND verification must come from the supplied passphrase.
+// ---------------------------------------------------------------------------
+static void Test_LP7_MasterKeyArmWithBip39Passphrase() {
+    std::cout << COLOR_BLUE "\n[Test 2e-7] LP-7: master-key arm AND a BIP39 passphrase, together\n" COLOR_RESET;
+
+    const std::string path = "lp7_masterkey_passphrase.dat";
+    const std::string pass = "LP7MkPP!2026";
+    const char* kPP = "TREZOR";
+    std::remove(path.c_str());
+
+    LegacyV6Result legacy;
+    const bool built = BuildLegacyV6Wallet(path, pass, legacy,
+                                           /*mnemonicPlaintextOverride=*/"",
+                                           /*encryptMnemonicUnderMasterKey=*/true,
+                                           /*forceArm1SpuriousAcceptance=*/false,
+                                           /*bip39Passphrase=*/kPP);
+    CHECK(built, "Built a legacy wallet: mnemonic under the MASTER key AND a BIP39 passphrase");
+    if (!built) { std::remove(path.c_str()); return; }
+
+    // Without the passphrase the identity check cannot pass, so migration must DEFER
+    // and preserve — the fail-closed half.
+    {
+        CWallet w;
+        w.SetWalletFile(path);
+        CHECK(w.Load(path), "Loaded the passphrase-cohort fixture");
+        CHECK(w.Unlock(pass), "Unlock without the BIP39 passphrase succeeds");
+        CHECK(FileVersion(path) == WALLET_FILE_VERSION_6,
+              "LOAD-BEARING: migration DEFERRED — no passphrase, so nothing verifies");
+    }
+
+    // With it, arm 2 must recover the phrase AND the supplied passphrase must verify it.
+    {
+        CWallet w;
+        w.SetWalletFile(path);
+        CHECK(w.Load(path), "Reloaded");
+        CHECK(w.Unlock(pass, 0, kPP), "Unlock WITH the BIP39 passphrase succeeds");
+        CHECK(FileVersion(path) == WALLET_FILE_VERSION_7,
+              "LOAD-BEARING: migration COMPLETED — arm 2 recovered it and the supplied "
+              "passphrase verified it, both halves together");
+        std::string exported;
+        CHECK(w.ExportMnemonic(exported), "ExportMnemonic works post-migration");
+        CHECK(exported == legacy.mnemonic, "LOAD-BEARING: the correct phrase, not a different one");
+    }
+    std::remove(path.c_str());
+}
+
 static void Test_F1_MasterKeyFallbackArm() {
     std::cout << COLOR_BLUE "\n[Test 2e-3] F1 FOLD (LOW-3): master-key fallback decrypt arm reaches the identity guard\n" COLOR_RESET;
 
@@ -3395,6 +3800,10 @@ int main() {
     Test_F1_AbortOnInvalidMnemonic();
     Test_F1_AbortOnValidButWrongMnemonic();          // MED-1: valid-but-wrong, migration path
     Test_F1_MasterKeyFallbackArm();                  // LOW-3: master-key fallback decrypt arm
+    Test_LP7_WrongKeyAcceptanceKAT();                     // frozen premise: a wrong-key PKCS#7 decrypt IS accepted
+    Test_LP7_Arm1SpuriousAcceptanceDoesNotPreemptArm2();
+    Test_LP7_Arm2MustNotRunOnceArm1Verifies();        // inverse: arm 2 must not run at all
+    Test_LP7_MasterKeyArmWithBip39Passphrase();       // master-key arm + BIP39 passphrase  // arm pre-emption: spurious arm-1 decrypt must not strand the wallet
     Test_F1_ValidMnemonicStillMigrates();
     Test_NeedsSeedMigrationSurfaced();
     Test_V7PlaintextSeedArtifactMigrates();
