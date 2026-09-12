@@ -54,6 +54,10 @@ struct CConnmanOptions {
  */
 class CConnman {
 public:
+    // BKL-30 test seam: fdset_guard_tests.cpp reaches SocketEventsSelect()
+    // without starting threads or a peer manager.
+    friend struct CConnmanFdSetTestAccess;
+
     CConnman();
     ~CConnman();
 

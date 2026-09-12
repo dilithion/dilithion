@@ -22,6 +22,7 @@
 extern CChainState g_chainstate;
 #include <util/time.h>
 #include <util/logging.h>
+#include <util/fdset_guard.h>
 #include <util/strencodings.h>  // For strprintf
 
 #include <algorithm>
@@ -155,6 +156,16 @@ bool CConnman::Start(CPeerManager& peer_mgr, CNetMessageProcessor& msg_proc, con
         bool is_ipv6 = false;
         if (!CSock::CreateListenSocket(m_options.nListenPort, "", m_listen_socket, is_ipv6)) {
             LogPrintf(NET, ERROR, "[CConnman] Failed to create listen socket\n");
+            return false;
+        }
+
+        // BKL-30: the listen socket sits in every select() set for the life of
+        // the process; refuse to start if it can never be waited on.
+        if (!IsFdSelectable(static_cast<fdset_sock_t>(m_listen_socket))) {
+            LogPrintf(NET, ERROR, "[CConnman] Listen socket descriptor %lld >= FD_SETSIZE %d - cannot be polled; "
+                      "raise the open-file limit\n",
+                      static_cast<long long>(m_listen_socket), static_cast<int>(FD_SETSIZE));
+            CSock::Close(m_listen_socket);
             return false;
         }
 
@@ -1356,6 +1367,23 @@ void CConnman::SocketHandler() {
                 break;  // No more pending connections
             }
 
+            // BKL-30: a descriptor at/above FD_SETSIZE can never be waited on by
+            // this select() loop; admitting it would either abort the process
+            // (glibc fortify) or leave a peer the loop cannot see. Refuse it
+            // here, while we still own it outright and nothing references it.
+            if (!IsFdSelectable(static_cast<fdset_sock_t>(client_fd))) {
+                static std::atomic<uint64_t> s_refusals{0};
+                const uint64_t n = ++s_refusals;
+                if (ShouldLogRefusal(n)) {
+                    LogPrintf(NET, ERROR, "[CConnman] Refusing inbound: descriptor %lld >= FD_SETSIZE %d - "
+                              "the process is at its open-file limit (refusal #%llu)\n",
+                              static_cast<long long>(client_fd), static_cast<int>(FD_SETSIZE),
+                              static_cast<unsigned long long>(n));
+                }
+                CSock::Close(client_fd);
+                continue;
+            }
+
             // Set non-blocking
             if (!CSock::SetNonBlocking(client_fd)) {
                 LogPrintf(NET, ERROR, "[CConnman] SocketHandler: Failed to set non-blocking\n");
@@ -1592,44 +1620,65 @@ bool CConnman::SocketEventsSelect(std::set<int>& recv_set, std::set<int>& send_s
     FD_ZERO(&fd_error);
 
     int max_fd = 0;
-
-    for (int sock : recv_set) {
-        FD_SET(sock, &fd_recv);
-        if (sock > max_fd) max_fd = sock;
-    }
-    for (int sock : send_set) {
-        FD_SET(sock, &fd_send);
-        if (sock > max_fd) max_fd = sock;
-    }
-    for (int sock : error_set) {
-        FD_SET(sock, &fd_error);
-        if (sock > max_fd) max_fd = sock;
+    size_t n_added = 0;
+    // BKL-30: sockets an fd_set cannot hold (see util/fdset_guard.h). They are
+    // handed back as error-ready so SocketHandler marks them for disconnect;
+    // they are never FD_SET (UB) nor FD_ISSET (also UB).
+    std::set<int> unselectable;
+    auto add_all = [&](const std::set<int>& src, fd_set* dst) {
+        for (int sock : src) {
+            if (!FdSetAdd(static_cast<fdset_sock_t>(sock), dst)) {
+                unselectable.insert(sock);
+                continue;
+            }
+            ++n_added;
+            if (sock > max_fd) max_fd = sock;
+        }
+    };
+    add_all(recv_set, &fd_recv);
+    add_all(send_set, &fd_send);
+    add_all(error_set, &fd_error);
+    if (!unselectable.empty()) {
+        static std::atomic<uint64_t> s_refusals{0};
+        const uint64_t n = ++s_refusals;
+        if (ShouldLogRefusal(n)) {
+            LogPrintf(NET, ERROR, "[CConnman] SocketEventsSelect: %zu socket(s) with descriptor >= FD_SETSIZE (%d) "
+                      "cannot be waited on; marking them for disconnect (refusal #%llu)\n",
+                      unselectable.size(), static_cast<int>(FD_SETSIZE),
+                      static_cast<unsigned long long>(n));
+        }
     }
 
     struct timeval timeout;
     timeout.tv_sec = SELECT_TIMEOUT_MS / 1000;
     timeout.tv_usec = (SELECT_TIMEOUT_MS % 1000) * 1000;
 
-    int result = select(max_fd + 1, &fd_recv, &fd_send, &fd_error, &timeout);
+    int result = 0;
+    if (n_added > 0) {
+        result = select(max_fd + 1, &fd_recv, &fd_send, &fd_error, &timeout);
+    }
 
-    if (result <= 0) {
+    if (result < 0 || (result == 0 && unselectable.empty())) {
         recv_set.clear();
         send_set.clear();
         error_set.clear();
         return false;
     }
 
-    // Update sets to only include ready sockets
+    // Update sets to only include ready sockets (never FD_ISSET an unselectable one)
     std::set<int> ready_recv, ready_send, ready_error;
-    for (int sock : recv_set) {
-        if (FD_ISSET(sock, &fd_recv)) ready_recv.insert(sock);
+    if (result > 0) {
+        for (int sock : recv_set) {
+            if (!unselectable.count(sock) && FD_ISSET(sock, &fd_recv)) ready_recv.insert(sock);
+        }
+        for (int sock : send_set) {
+            if (!unselectable.count(sock) && FD_ISSET(sock, &fd_send)) ready_send.insert(sock);
+        }
+        for (int sock : error_set) {
+            if (!unselectable.count(sock) && FD_ISSET(sock, &fd_error)) ready_error.insert(sock);
+        }
     }
-    for (int sock : send_set) {
-        if (FD_ISSET(sock, &fd_send)) ready_send.insert(sock);
-    }
-    for (int sock : error_set) {
-        if (FD_ISSET(sock, &fd_error)) ready_error.insert(sock);
-    }
+    for (int sock : unselectable) ready_error.insert(sock);
 
     recv_set = std::move(ready_recv);
     send_set = std::move(ready_send);
