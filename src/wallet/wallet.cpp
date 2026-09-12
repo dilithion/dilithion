@@ -5923,6 +5923,15 @@ bool CWallet::MigrateToEncryptedSeedV7Unlocked(bool* persistedToDisk,
             }
         }
     } rollbackGuard{rollback};
+    // ⚠️ ON THE std::function WRAPPER (external panel, noted not blocking): type
+    // erasure is a weaker "cannot fail" story than calling the noexcept lambda
+    // directly, and that is fair. What it costs is bounded and it is bounded HERE:
+    // std::function's only throwing operation is CONSTRUCTION (it may allocate),
+    // and that happens on the line above -- BEFORE any member has been mutated, so
+    // a failure there aborts the migration with nothing to roll back. Invoking it
+    // afterwards allocates nothing, and the target is declared noexcept. The
+    // alternative (a templated scope guard at file scope) buys a stronger static
+    // story for a wider blast radius, so it is deliberately not taken here.
 
 
     // --- Step 1: recover + re-encrypt the mnemonic under the master key ---
@@ -6054,11 +6063,21 @@ bool CWallet::MigrateToEncryptedSeedV7Unlocked(bool* persistedToDisk,
         //
         // An environment variable read for presence is a boolean whose falsey values
         // all mean true.
+        // ⛔ CASE-INSENSITIVE, because the previous token set was arbitrary:
+        // "true" and "TRUE" enabled it while "True", "ON" and "Yes" silently did
+        // NOT. For an ordinary verbosity flag that is a papercut; for a switch that
+        // emits an ORACLE BIT about whether the operator's BIP39 passphrase was
+        // correct, an operator who believes they turned it on and did not -- or who
+        // believes they turned it off and did not -- is the failure that matters.
+        // The accepted set is now explicit and closed, and unrecognised values are
+        // OFF rather than truthy-by-presence.
         const bool lp7diag = [] {
             const char* v = std::getenv("DILITHION_LP7_DIAG");
             if (v == nullptr) return false;
-            const std::string s(v);
-            return s == "1" || s == "true" || s == "TRUE" || s == "yes" || s == "on";
+            std::string s(v);
+            std::transform(s.begin(), s.end(), s.begin(),
+                           [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+            return s == "1" || s == "true" || s == "yes" || s == "on";
         }();
 
         bool anyArmDecrypted = false;
@@ -6254,9 +6273,39 @@ bool CWallet::MigrateToEncryptedSeedV7Unlocked(bool* persistedToDisk,
                 m_mik->pubkey = vchMIKPubKey;
                 m_mik->identity = DFMP::DeriveIdentityFromMIK(vchMIKPubKey);
             }
+            // ⛔ THE PLAINTEXT MIK MUST NOT SURVIVE THIS SCOPE BY ANY EXIT (external
+            // panel). EncryptMIKPrivKey() can throw, and the clear that followed it
+            // was an ordinary statement -- so an exception left plaintext
+            // mining-identity key material resident, outside migration, contrary to
+            // the invariant this whole change asserts. The rollback lambda does not
+            // cover it either: it restores the MIK flag and the encrypted records,
+            // but m_mik->privkey is not one of the members it touches.
+            //
+            // ⚠️ AND THE OLD CLEAR DID NOT WIPE ANYTHING ON *ANY* PATH, which is
+            // worse than the exception case the panel found. privkey is a
+            // std::vector<uint8_t, SecureAllocator<uint8_t>>, and SecureAllocator
+            // wipes in DEALLOCATE. `clear()` does not deallocate -- it sets size to
+            // zero and keeps the capacity -- so the 4,032 plaintext bytes stayed in
+            // the retained buffer until the vector was destroyed or reallocated.
+            // "It is a secure allocator" was doing load-bearing work that the
+            // allocator does not actually do at that call.
+            //
+            // So: cleanse explicitly, in a destructor, which covers the normal
+            // return, the early return below, and an exception out of
+            // EncryptMIKPrivKey() identically. Non-throwing by construction --
+            // memory_cleanse is noexcept and guards null/zero itself.
+            struct MikPlaintextGuard {
+                DFMP::CMiningIdentityKey* mik;
+                ~MikPlaintextGuard() noexcept {
+                    if (mik != nullptr && !mik->privkey.empty()) {
+                        memory_cleanse(mik->privkey.data(), mik->privkey.size());
+                        mik->privkey.clear();
+                    }
+                }
+            } mikPlaintextGuard{m_mik.get()};
+
             m_mik->privkey.assign(mikPlain.begin(), mikPlain.end());
             bool mikOk = EncryptMIKPrivKey();   // adds MAC under master key
-            m_mik->privkey.clear();
             if (!mikOk) {
                     return false;
             }
