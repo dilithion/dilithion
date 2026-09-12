@@ -243,29 +243,141 @@ bool ChainSelectorAdapter::ProcessNewHeader(const CBlockHeader& header)
     }
 
     // Phase 6 PR6.1 (v1.5 §3.2 + Cursor v1.5+ A1): mapBlockIndex cap with
-    // eviction-by-lowest-work-not-on-best-chain. Per v1.5 contract:
-    // when cap is reached, evict the lowest-work entry that is NOT an
-    // ancestor of the active chain. This makes room for the new header
-    // without rejecting it.
+    // LEAF-ONLY safe eviction. When the cap is reached, evict the lowest-work
+    // UNPINNED LEAF (in-degree 0 in the pprev graph) to make room for the new
+    // header without rejecting it.
     //
-    // Eviction safety: CChainState::EvictLowestWorkNotOnBestChain holds
-    // cs_main and removes the evicted entry from m_setBlockIndexCandidates
-    // before erasing it from mapBlockIndex (no UAF on chain_selector
-    // pointers).
+    // Eviction safety (the v4.5.0-pull fix): CChainState::
+    // EvictLowestWorkLeafNotPinned holds cs_main and frees ONLY a leaf — an
+    // entry that no surviving entry references via a raw pprev pointer — and
+    // never an entry in the pinned set (active chain + reorg candidates and
+    // their ancestors). The prior "lowest-work-not-on-best-chain" policy could
+    // free an interior fork node whose higher-work child still pointed at it
+    // via pprev → use-after-free on the next chain walk. The leaf invariant
+    // makes that structurally impossible. It also drops the evicted node from
+    // m_setBlockIndexCandidates before the unique_ptr destroys it.
     //
-    // Fail-closed fallback: at extreme cap saturation where ALL entries
-    // are on the active chain (cap < active chain height — unreachable
-    // at production sizes: DIL=500K cap vs ~24K chain height), eviction
-    // returns false and we reject the new header. This is a safety net
-    // for misconfigured caps, not the primary path.
+    // THE CAP IS ADVISORY. Eviction failure must NEVER reject a header.
+    //
+    // This used to fail closed, justified as "pathological, unreachable at
+    // production cap sizes: DIL/DilV=500K cap vs ~24K chain height". That
+    // argument was wrong, and dangerously so: it asserted unreachability about a
+    // MONOTONICALLY INCREASING quantity. It is a countdown, not an invariant.
+    //
+    // Why it is a countdown. The pinned set (chain.cpp, clause (a)) pins every
+    // ancestor of the active tip back to genesis, and mapBlockIndex is erased at
+    // exactly one site — the evictor, which cannot touch a pinned entry. So
+    // mapBlockIndex.size() >= activeChainHeight + 1 always. At active height
+    // ~= cap, EVERY entry is an active-chain ancestor and therefore pinned,
+    // no evictable leaf exists, and eviction returns false permanently. Failing
+    // closed there halts the node at height 500,000 — forever, on a timer.
+    //
+    // Nodes configured with a different cap would keep following the chain, so
+    // failing closed also breaks the "different caps still converge on the same
+    // best chain" property the cap's consensus-neutrality rests on.
+    //
+    // Advisory is the right shape regardless of the ceiling: this cap exists to
+    // bound memory under FORK SPAM, where evictable leaves are exactly what the
+    // map is full of and eviction succeeds. When it fails, the map is full of
+    // things we must not evict — and refusing to extend the chain is a strictly
+    // worse outcome than exceeding a soft memory target.
     if (Dilithion::g_chainParams) {
         const int cap = Dilithion::g_chainParams->nMapBlockIndexCap;
         if (cap > 0 && m_chainstate.GetBlockIndexSize() >= static_cast<size_t>(cap)) {
-            if (!m_chainstate.EvictLowestWorkNotOnBestChain()) {
-                return false;
+            // Make room for exactly one new header: evict down to cap-1.
+            //
+            // ⚠️ ONE ENTRY, NOT A BATCH — a cap/64 batch was implemented, MEASURED,
+            // and reverted, and the measurement is the point.
+            //
+            // The amortisation argument was that the per-call REBUILD dominates,
+            // so draining N entries costs about what draining one costs and can be
+            // spread over the next N headers. IT IS FALSE for this implementation:
+            // EvictLowestWorkLeafNotPinned rescans the WHOLE map to select each
+            // victim, so a batch of B costs O(B x n), not O(n).
+            //
+            // Measured, n=100,000 (src/tools/evict_cost_bench.cpp):
+            //     B=1  ->  94.7 ms       B=10 -> 263.6 ms
+            //     B=20 -> 539.1 ms       B=40 -> 846.3 ms
+            // ~19 ms of extra cs_main hold per extra entry. So batching tops out
+            // near a 5x amortised win — and buys it by turning many short stalls
+            // into one very long one. At the 500K production cap, cap/64 is ~7,800
+            // evictions inside a SINGLE unbroken cs_main hold, i.e. minutes of held
+            // lock. That is far worse for liveness than the per-header cost it was
+            // meant to fix, so it is not shipped.
+            //
+            // What DID ship from that work: the O(1) early-out at the top of
+            // EvictLowestWorkLeafNotPinned, which removes the attacker-relevant
+            // all-pinned steady state outright (665 ms -> 0 ms, 55 MB -> 0 KB,
+            // measured). The remaining cost applies only when there ARE evictable
+            // leaves, and removing it needs the O(n) victim selection gone —
+            // incremental in-degree or an evictable-leaf side index, which is a
+            // #193 deliverable with its own contract, not a fold-time change.
+            const size_t target_max = static_cast<size_t>(cap) - 1;
+            // TEST THE OUTCOME, NOT THE RETURN VALUE (external panel, kimi).
+            //
+            // This used to be `if (!EvictLowestWorkLeafNotPinned(target_max))`.
+            // That function returns `evicted_any` — TRUE if it freed at least one
+            // entry — NOT "reached target_max". So the case this message exists to
+            // report, "we evicted something and are STILL over the cap", returned
+            // true and logged NOTHING. The arm was silent in exactly the state it
+            // was written to announce, and loud only in the narrower case where
+            // nothing at all could be freed.
+            //
+            // The sibling check in block_validation_queue.cpp already did this
+            // correctly by re-reading the size. Two sites, one predicate, and only
+            // one of them right — so this is the same "a fix aimed at a site leaves
+            // siblings" shape, with the sibling being the one left wrong.
+            m_chainstate.EvictLowestWorkLeafNotPinned(target_max);
+            if (m_chainstate.GetBlockIndexSize() >= static_cast<size_t>(cap)) {
+                // Rate-limited: at or over cap this fires on every insert, and the
+                // steady state past the height ceiling is "every insert".
+                static std::atomic<uint64_t> s_overCapLogged{0};
+                const uint64_t n = s_overCapLogged.fetch_add(1, std::memory_order_relaxed);
+                if (n == 0 || (n % 10000) == 0) {
+                    // The wording tracks the PREDICATE. It used to say "no
+                    // evictable unpinned leaf remains", which was true of the old
+                    // `!evicted_any` condition and is NOT true of this one: we may
+                    // have freed several leaves and still be at or over the cap.
+                    // Fixing a condition and leaving the message describing the old
+                    // one just moves the wrong claim from the code into the log.
+                    std::cerr << "[ChainSelector] NOTE: mapBlockIndex is still at or over "
+                              << "the " << cap << "-entry cap after eviction (size "
+                              << m_chainstate.GetBlockIndexSize() << "); the remaining "
+                              << "entries are pinned — active-chain ancestors and reorg "
+                              << "candidates are never evicted. Continuing WITHOUT "
+                              << "enforcing the cap — it is advisory and must never gate "
+                              << "chain progress. Memory use exceeds the target. "
+                              << "Occurrence " << (n + 1) << "." << std::endl;
+                }
+                // Deliberately fall through and accept the header.
             }
         }
     }
+
+    // PR #129 HIGH-1: everything from here to AddBlockIndex runs under ONE cs_main
+    // acquisition.
+    //
+    // Without this guard, `pprev` below is a raw CBlockIndex* living on this
+    // thread's stack across a lock release: GetBlockIndex takes cs_main and gives
+    // it back, and AddBlockIndex re-takes it. In that window a concurrent
+    // EvictLowestWorkLeafNotPinned — on the header-validation worker, or on the
+    // validation-queue worker, whose eviction call site PR #129 itself adds — can
+    // free `pprev`. It is eligible by construction: the child is not inserted yet
+    // so its in-degree is 0, header-only entries never reach
+    // BLOCK_VALID_TRANSACTIONS so they are never candidates, and the lowest-work
+    // unpinned leaf is precisely what eviction picks. We would then deref freed
+    // memory at IsInvalid()/nHeight/nChainWork below and, far worse, STORE the
+    // dangling pointer into mapBlockIndex at AddBlockIndex — the v4.5.0
+    // interior-node dangle, rebuilt through a new door, in the PR whose entire
+    // premise is closing that class.
+    //
+    // The critical section ends at insertion, not at the last deref: once the
+    // child is in the map, pprev has in-degree >= 1 and is no longer an evictable
+    // leaf. cs_main is recursive, so the nested acquisitions below are no-ops.
+    //
+    // Deliberately opened AFTER the advisory-cap eviction above: that call takes
+    // cs_main itself and there is no pointer to protect yet.
+    CChainState::MainLockGuard main_lock(m_chainstate);
 
     // Locate parent. A null hashPrevBlock means genesis (height 0, no parent).
     CBlockIndex* pprev = nullptr;

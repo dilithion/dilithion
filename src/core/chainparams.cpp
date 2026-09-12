@@ -616,8 +616,49 @@ ChainParams ChainParams::DilV() {
     params.nOutboundFullRelayTarget = 8;
     params.nOutboundBlockRelayTarget = 4;
 
-    // Phase 6 PR6.1: mapBlockIndex cap — DilV is 5M (10× DIL) because
-    // its 60s blocks produce headers ~4× faster than DIL's 240s.
+    // Phase 6 PR6.1: mapBlockIndex cap.
+    //
+    // ⚠️ DELIBERATELY LEFT AT 5,000,000 IN THIS PR. An earlier revision lowered it
+    // to 500,000 and that change has been REMOVED, not deferred: it rides in the
+    // sibling PR that fixes the four unguarded resolve→deref sites, because the
+    // cap must not move ahead of the fix that makes the movement safe.
+    //
+    // THE REASONING, and note the correction in it. Lowering the cap does NOT
+    // create the hazard and it does not remove it either: eviction is
+    // attacker-triggerable by header spam at ANY cap size, so the
+    // resolve→deref→write→AddBlockIndex race at block_processing.cpp:1094→1287
+    // and the three node-file sites is live at 5M exactly as it is at 500K. What
+    // the cap sets is the PRICE of the trigger — roughly 2.1 GB of attacker
+    // headers at 5M versus ~210 MB at 500K. Shipping the reduction here would
+    // have made a live, unfixed UAF class an order of magnitude cheaper to
+    // reach, in the same change whose header comment advertises the class as
+    // closed. That is the combination worth refusing.
+    //
+    // No memory-ceiling claim is made here on purpose. The cap is ADVISORY
+    // (chain_selector_impl.cpp / block_validation_queue.cpp both fall through
+    // when eviction cannot reach the target), so it is a target, not a bound,
+    // and the pinned set is the real floor. "500K caps that surface at ~210 MB"
+    // was the old wording and it overstated a soft target as a ceiling.
+    //
+    // WHEN THE SIBLING PR LOWERS IT, these are the grounds that must be re-argued
+    // on their own merits rather than inherited: attack headroom, the
+    // eviction-scan cost per over-cap insert, and the honest-path saturation
+    // horizon — DilV's 45s blocks reach a 500K cap in ~8.7 months against DIL's
+    // ~3.8 years at the identical number, so "matching DIL's 500K" is not a
+    // justification. Past saturation the eviction scan runs once per connected
+    // block as steady state; measure that wall-time on a chain near the cap
+    // before relying on it.
+    //
+    // Eviction safety (see EvictLowestWorkLeafNotPinned, consensus/chain.cpp):
+    // eviction frees ONLY unpinned leaf entries (in-degree 0 in the pprev
+    // graph) — never an interior node that a surviving fork descendant still
+    // references via pprev. Pinned set = active-chain ancestors +
+    // m_setBlockIndexCandidates and all their pprev ancestors. This is NOT a
+    // consensus rule and does not cause divergence: an evicted leaf header is
+    // re-obtainable via PEER RE-ANNOUNCEMENT — if that fork ever becomes the
+    // most-work chain, peers re-feed its headers/blocks and the node re-derives
+    // the index (matching chain.h EvictLowestWorkLeafNotPinned). The cap bounds
+    // memory; it never changes which chain is valid.
     params.nMapBlockIndexCap = 5000000;
 
     // VDF: active from genesis — DilV is a VDF-only chain

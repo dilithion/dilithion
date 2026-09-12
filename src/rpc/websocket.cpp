@@ -17,6 +17,12 @@
 // OpenSSL for SHA-1 (required for WebSocket accept key)
 #include <openssl/sha.h>
 
+// Deferred reclamation: this thread resolves CBlockIndex*, so it checkpoints.
+// g_chainstate is defined in src/core/globals.cpp and declared per-TU (the idiom
+// used by headers_manager.cpp / block_processing.cpp / tx_index.cpp).
+#include <consensus/chain.h>
+extern CChainState g_chainstate;
+
 #ifdef _WIN32
     #include <winsock2.h>
     #include <ws2tcpip.h>
@@ -93,6 +99,7 @@ bool CWebSocketServer::Start() {
     }
 
     m_running = true;
+    g_chainstate.DeclareEpochParticipant("websocket-server");
     m_server_thread = std::thread(&CWebSocketServer::ServerThread, this);
     
     return true;
@@ -135,10 +142,34 @@ void CWebSocketServer::Stop() {
 }
 
 void CWebSocketServer::ServerThread() {
+    // REGISTER AT ENTRY, THEN GO OFFLINE WHILE BLOCKED.
+    //
+    // ⚠️ THE OFFLINE SCOPE ALONE DOES NOT REGISTER THIS THREAD. A name reaches
+    // the registry on its first NAMED checkpoint, and the scope's checkpoint is in
+    // its DESTRUCTOR — which runs only when the wait RETURNS. On an idle node no
+    // request ever arrives, so this thread would never register and the startup
+    // census would refuse to start the node. Registering here, once, before the
+    // first block, is what makes the census a statement about threads that EXIST
+    // rather than threads that have been handed work.
+    g_chainstate.EpochCheckpoint("websocket-server");
+
     while (m_running) {
+        // DEFERRED-RECLAMATION CHECKPOINT — before accept(), which can wait
+        // indefinitely. This thread handles the client inline and reaches
+        // ExecuteRPC, i.e. the entire RPC handler table, so it resolves index
+        // pointers. Checkpointing here means an idle websocket listener pins
+        // nothing for the hours it may sit in accept(); pin bound is one request.
         struct sockaddr_storage clientAddr;
         socklen_t clientLen = sizeof(clientAddr);
-        int clientSocket = accept(m_server_socket, (struct sockaddr*)&clientAddr, &clientLen);
+        int clientSocket;
+        {
+        // OFFLINE WHILE BLOCKED. accept() can wait indefinitely; an epoch
+        // published just before it FREEZES for the whole wait and pins every
+        // entry unlinked meanwhile. The scope re-enters before the request is
+        // handled, which is the first thing that can resolve a pointer.
+            EpochOfflineScope offline(&g_chainstate);
+            clientSocket = accept(m_server_socket, (struct sockaddr*)&clientAddr, &clientLen);
+        }
 
         if (clientSocket == INVALID_SOCKET) {
             if (m_running) {
@@ -406,6 +437,12 @@ bool CWebSocketServer::WriteFrame(WebSocketConnection& connection, const std::st
 }
 
 int CWebSocketServer::SocketRead(WebSocketConnection& connection, void* buffer, int size) {
+    // OFFLINE ACROSS THE READ, symmetric with SocketWrite. HandleClient blocks here
+    // for the whole life of a client connection waiting for the next frame, and an
+    // online thread pins every eviction for that entire time -- unbounded, since a
+    // client may simply never send. Reads hold no CBlockIndex* by construction: they
+    // fill a byte buffer. (Round-4 panel, grok: the read side was wired nowhere.)
+    EpochOfflineScope offline(&g_chainstate);
     if (connection.is_ssl && connection.ssl && m_ssl_wrapper) {
         return m_ssl_wrapper->SSLRead(connection.ssl, buffer, size);
     } else {
@@ -414,6 +451,13 @@ int CWebSocketServer::SocketRead(WebSocketConnection& connection, void* buffer, 
 }
 
 int CWebSocketServer::SocketWrite(WebSocketConnection& connection, const void* buffer, int size) {
+    // OFFLINE ACROSS THE WRITE, the same rule as the RPC server's socket_write: a
+    // slow client stalls the send and an online thread pins every eviction for the
+    // duration. Every websocket response leaves through here, which is why this one
+    // helper covers the write side. Same CONTRACT as the RPC site and with the same
+    // limit: it rests on no caller holding a resolved CBlockIndex* across the
+    // write, which is a census of today's callers, not an enforced property.
+    EpochOfflineScope offline(&g_chainstate);
     if (connection.is_ssl && connection.ssl && m_ssl_wrapper) {
         return m_ssl_wrapper->SSLWrite(connection.ssl, buffer, size);
     } else {

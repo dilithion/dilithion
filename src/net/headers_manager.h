@@ -17,6 +17,7 @@
 #include <queue>
 #include <set>
 #include <thread>
+#include <optional>
 #include <vector>
 #include <atomic>
 
@@ -40,6 +41,17 @@ typedef int NodeId;
 namespace NetProtocol {
     class CGetHeadersMessage;
 }
+
+// Test-only view of the locator height schedule (PR #194 regression test).
+// The schedule is the single source of truth shared by the map-resolver and the
+// walk; exposing it lets a test pin "one walk, not two" directly.
+// P2P-16 F2: BulkLoadHeaders takes the active chain BY VALUE. Forward-declared
+// rather than including consensus/chain.h, which would pull the chainstate into
+// every TU that sees this header; an incomplete type is fine for a
+// const-reference parameter in a declaration.
+struct ActiveChainHeader;
+
+namespace hdrtest { std::vector<int> LocatorHeightPatternForTest(int startHeight); }
 
 /**
  * @class CHeadersManager
@@ -106,6 +118,16 @@ public:
      * @return true if headers processed successfully
      */
     bool ProcessHeadersWithDoSProtection(NodeId peer, const std::vector<CBlockHeader>& headers);
+
+    /**
+     * @brief Which phase a peer's DoS-protected session is in, or nullopt if none.
+     *
+     * Reports the state machine's own field rather than a proxy. Needed because
+     * ProcessHeadersWithDoSProtection returns true BOTH for a progressing sync and
+     * for one just terminated by a non-full headers message, so its return value
+     * cannot distinguish them.
+     */
+    std::optional<HeadersSyncState::State> GetHeadersSyncPhase(NodeId peer) const;
 
     /**
      * @brief Check if peer should use DoS-protected header sync
@@ -277,17 +299,30 @@ public:
      *
      * @param chain Blocks from genesis (front) to tip (back)
      */
-    void BulkLoadHeaders(const std::vector<CBlockIndex*>& chain);
+    void BulkLoadHeaders(const std::vector<ActiveChainHeader>& chain);
 
     /**
      * @brief Generate block locator for sync
      *
-     * Bitcoin Core exponential backoff algorithm:
-     * - Start from tip
-     * - Go back: 1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024...
-     * - Always include genesis
+     * Exponential backoff, in the shape of Bitcoin Core's:
+     * - Start from the tip (or the headers height, whichever is higher)
+     * - Ten single-height steps, then double: 1,1,...,1, 2, 4, 8, 16, ...
+     * - Stop at 32 entries
      *
-     * @param hashTip Starting point (usually best header)
+     * NOT "always include genesis" - that line was here and it is FALSE.
+     * [censused, every start 0..200000] genesis is emitted if and only if
+     * startHeight <= 10 OR startHeight == 8 + 2^m for m >= 2 - that is {0..10}
+     * and {12, 16, 24, 40, 72, 136, 264, ...}, 27 values below 200000. For every
+     * other start the doubling steps past zero and the loop exits without ever
+     * emitting it (start 1000 stops at 480; start 250000 stops at 118920).
+     * A peer whose fork point lies below the oldest entry cannot find a common
+     * ancestor from this locator. That is PRE-EXISTING behaviour, identical on
+     * origin/main, and changing it changes what goes on the wire - see the note
+     * at LocatorHeightPattern.
+     *
+     * @param hashTip Caller's preferred starting point. NOT used to root the
+     *        walk (BUG #178 Part 2 — see GetLocatorImpl); RequestHeaders
+     *        prepends it to the returned locator.
      * @return Vector of block hashes for locator
      */
     std::vector<uint256> GetLocator(const uint256& hashTip);
@@ -475,6 +510,27 @@ public:
      * @param peer Peer ID
      */
     void OnPeerDisconnected(NodeId peer);
+
+    //! Which proof checker this manager selected for the configured chain.
+    //!
+    //! Reports the DECISION, not the object, so it stays meaningful if the
+    //! concrete checker types ever change. Exists because the selection was
+    //! cross-wired — it keyed on IsDilV(), which is false on testnet and regtest
+    //! even though both are VDF-from-genesis — and a defect nothing can observe
+    //! is a defect nothing can regression-test. The alternative was asserting on
+    //! a proxy, which would not have caught the original bug either.
+    bool UsesVdfProofChecker() const { return m_uses_vdf_proof_checker; }
+
+    /**
+     * @brief False when NO correct proof checker exists for this network.
+     *
+     * True for DIL (RandomX) and for the VDF chains whose producer emits a
+     * constant nBits (DilV, regtest). FALSE for a VDF-from-genesis network that
+     * RETARGETS — testnet today — where the VDF checker's equality rule and the
+     * RandomX checker's hash-under-target rule are both wrong.
+     * InitializeDoSProtectedSync refuses when this is false.
+     */
+    bool ProofCheckerSupportsNetwork() const { return m_proof_checker_supports_network; }
 
     /**
      * @brief Check if we should fetch headers from this peer
@@ -721,12 +777,79 @@ private:
      * DEADLOCK FIX: The chainstate tip must be obtained BEFORE acquiring cs_headers
      * to avoid cs_headers/cs_main deadlock. Pass the pre-fetched tip here.
      *
-     * @param hashTip Starting point for locator (unused, uses best chain)
-     * @param pTip Pre-fetched chainstate tip (obtained before cs_headers lock)
+     * @param hashTip UNUSED, on purpose. BUG #178 (Part 2): the locator is
+     *        always exponential and never rooted at a caller hash, because a
+     *        peer lacking that hash would fall back to genesis instead of
+     *        finding the fork point. RequestHeaders prepends the caller's start
+     *        to the finished locator instead. Kept so the call path reads
+     *        coherently; see the note in GetLocatorImpl.
+     * @param chainstateHashes P2P-16: height->hash for the chainstate side,
+     *        resolved BY VALUE under cs_main before cs_headers was taken. This
+     *        used to be a raw CBlockIndex* from GetTip(), which releases cs_main
+     *        before returning — the walk then dereferenced it with no lock while
+     *        the header thread could evict that index (use-after-free).
      * @param chainstateHeight Pre-fetched chainstate height
      * @return Vector of block hashes for locator
      */
-    std::vector<uint256> GetLocatorImpl(const uint256& hashTip, CBlockIndex* pTip, int chainstateHeight) const;
+public:
+    /**
+     * TEST-ONLY forwarder to GetLocatorImpl (PR #194 regression test).
+     *
+     * The defect being pinned is WIRING, not arithmetic: the walk must consume
+     * the start it is GIVEN and look its chainstate entries up in the map the
+     * caller resolved for that start. A test that exercises the height-schedule
+     * function alone cannot see that — mine did not, and its RED arm survived.
+     * This reaches the real code path.
+     */
+    std::vector<uint256> GetLocatorImplForTest(const uint256& hashTip,
+                                               int startHeight,
+                                               const std::map<int, uint256>& chainstateHashes,
+                                               int chainstateHeight) const
+    {
+        std::lock_guard<std::mutex> lock(cs_headers);
+        return GetLocatorImpl(hashTip, startHeight, chainstateHashes, chainstateHeight);
+    }
+
+    /**
+     * TEST-ONLY forwarder to ResolveChainstateHashes (external review r3, G8).
+     *
+     * The resolver-side regression tests go straight to
+     * CChainState::ResolveLocatorHashes on a LOCAL chainstate, which leaves this
+     * wrapper - the thing production actually calls - unpinned. This forwarder
+     * lets one test assert the wrapper agrees with a single snapshot of the
+     * resolver on the SAME chainstate, which is what makes the no-tip remap and
+     * the null-dropping machine-held rather than comment-held.
+     */
+    std::map<int, uint256> ResolveChainstateHashesForTest(int headersHeight,
+                                                          int* chainstateHeightOut) const
+    {
+        return ResolveChainstateHashes(headersHeight, chainstateHeightOut);
+    }
+
+private:
+    std::vector<uint256> GetLocatorImpl(const uint256& hashTip,
+                                        int startHeight,
+                                        const std::map<int, uint256>& chainstateHashes,
+                                        int chainstateHeight) const;
+
+    /**
+     * P2P-16 helper. Best-header height. CALLER MUST HOLD cs_headers.
+     *
+     * Named "...Locked" so a future reader cannot call it from an unlocked
+     * context by accident — the two P2P-16 call sites take a short cs_headers
+     * scope purely to ask this, then release before touching cs_main.
+     */
+    int BestHeaderHeightLocked() const;
+
+    /**
+     * P2P-16 helper. Resolve the chainstate half of a locator to VALUES.
+     *
+     * Takes NO lock itself and MUST be called with cs_headers NOT held: it goes
+     * to the chainstate, which takes cs_main, and cs_main under cs_headers is
+     * the inversion P2P-14/15 closed.
+     */
+    std::map<int, uint256> ResolveChainstateHashes(int headersHeight,
+                                                   int* chainstateHeightOut) const;
 
     /**
      * @struct PeerSyncState
@@ -822,7 +945,10 @@ private:
     //
     // Window + limit live in chainparams (Cursor v1.5+ per-spec fix B1):
     //   * ChainParams.nHeaderRateWindowSec       (default 60)
-    //   * ChainParams.nHeaderRateLimitPerWindow  (default 1000)
+    //   * ChainParams.nHeaderRateLimitPerWindow  (default 5000, chainparams.h)
+    //     NB: this comment said "default 1000" and had done since the v4.1 bump
+    //     to 5000. Re-derived from chainparams.h rather than trusted - the same
+    //     class of stale doc the rest of this PR has been correcting.
     // SSOT: per-chain tunable, no longer hardcoded here.
     struct PeerHeaderRate {
         int64_t window_start_unix_sec = 0;
@@ -839,11 +965,26 @@ private:
     // Bug #46 Fix: Minimum chain work for DoS protection
     uint256 nMinimumChainWork;              ///< Reject chains below this work threshold
 
-    // Phase 3: chain-agnostic proof checker. Owned here; non-owning
-    // pointer passed to each HeadersSyncState. Picked at construction time
-    // based on g_chainParams (RandomXHeaderProofChecker for DIL,
-    // VDFHeaderProofChecker for DilV).
+    // Phase 3: chain-agnostic proof checker. Owned here; non-owning pointer
+    // passed to each HeadersSyncState. Picked at construction time.
+    //
+    // ⚠️ NOT "VDFHeaderProofChecker for DilV" — that was this comment until
+    // 2026-09-11 and it named the defect, not the rule. The selection MIRRORS THE
+    // PRODUCER: the VDF checker is chosen exactly where GetNextWorkRequired emits
+    // a CONSTANT nBits, i.e. its branch `IsDilV() || IsRegtest()`
+    // (pow.cpp:1142-1146). Regtest is a VDF chain whose network is not DILV, so
+    // the old DilV-only wording left it on the RandomX checker, which demands a
+    // hash under target from a header never mined against one.
+    //
+    // Do not "simplify" this to IsVdfFromGenesis(): testnet satisfies that and
+    // RETARGETS, so the VDF checker's nBits-equality rule would reject its own
+    // honest headers. See m_proof_checker_supports_network — such a network is
+    // refused outright rather than handed either checker.
     std::unique_ptr<::dilithion::net::IHeaderProofChecker> m_proof_checker;
+
+    //! Records which branch the constructor's checker selection took.
+    bool m_uses_vdf_proof_checker{false};
+    bool m_proof_checker_supports_network{false};
 
     // Bug #150 Fix: Best chain cache for fork-safe height lookups
     mutable std::map<int, uint256> m_bestChainCache;  ///< Height -> Hash on best chain
