@@ -304,6 +304,40 @@ void test_production_validators_reject_both_classes()
     //   2. an HONEST control must make best-header work ADVANCE. Without it, a build
     //      in which ProcessHeaders silently did nothing at all would pass every
     //      assertion here.
+    // ⛔ ZERO BOUND — THE REGTEST/TESTNET CONFIGURATION, AND THE ONE THAT PROVES THE
+    // SATURATION GUARD IS WIRED AT ALL.
+    //
+    // CONFIRMED BY FIXTURE MUTATION before this arm existed: removing the saturation
+    // guard from BOTH production validators left the whole suite PASSING, because the
+    // 2^200 bound below rejects saturated work anyway. So every arm in this file was
+    // consistent with the saturation guard never having been wired.
+    //
+    // With a ZERO bound the magnitude predicate is inert by design, so saturation is
+    // the ONLY guard — which is exactly the configuration regtest and testnet run.
+    {
+        uint256 zeroBound; std::memset(zeroBound.data, 0, 32);
+        CHeadersManager z(zeroBound);
+
+        // The inflation class is ACCEPTED here, and that is correct, not a bug: the
+        // bound is what rejects it and the bound is inert. Asserted so the arm states
+        // the exposure rather than leaving it implied.
+        Check("ZERO-BOUND: inflated nBits is ACCEPTED when the bound is inert "
+              "(the class is unguarded on a zero-bound network)",
+              z.QuickValidateHeader(HeaderWithNBits(0x01000001u), nullptr));
+
+        // ⛔ But saturation must STILL be rejected — this is the arm that dies if the
+        // saturation guard is removed from the validators.
+        Check("ZERO-BOUND: zero-mantissa is STILL REJECTED with an inert bound "
+              "(saturation is the only guard here)",
+              !z.QuickValidateHeader(HeaderWithNBits(0x1e000000u), nullptr));
+        Check("ZERO-BOUND: zero-mantissa is STILL REJECTED by ValidateHeader with a known parent",
+              !z.ValidateHeader(ChildOf(0x1e000000u), &genesisHeader));
+
+        // And an honest header still passes, so the arm is not "reject everything".
+        Check("ZERO-BOUND: honest nBits still accepted",
+              z.QuickValidateHeader(HeaderWithNBits(0x1d00ffffu), nullptr));
+    }
+
     {
         // The control FIRST: if this does not advance, every "did not advance" below
         // proves nothing, and the arm says so by failing here rather than passing
@@ -312,9 +346,12 @@ void test_production_validators_reject_both_classes()
         const uint256 ctrl_before = ctrl.GetBestHeaderChainWork();
         ctrl.ProcessHeaders(7, std::vector<CBlockHeader>{ChildOf(0x1d00ffffu)});
         const uint256 ctrl_after = ctrl.GetBestHeaderChainWork();
+        // ADVANCED, not merely CHANGED. `memcmp != 0` would also be satisfied by work
+        // going DOWN, which is not the property being relied on below.
         Check("PROD/Process CONTROL: an HONEST parented header ADVANCES best-header "
               "work (without this, the 'did not advance' arms below are vacuous)",
-              std::memcmp(ctrl_before.data, ctrl_after.data, 32) != 0);
+              ::dilithion::consensus::ChainWorkGreaterOrEqual(ctrl_after, ctrl_before) &&
+                  std::memcmp(ctrl_before.data, ctrl_after.data, 32) != 0);
     }
 
     for (uint32_t nBits : {0x1e000000u, 0x01000001u}) {
@@ -349,15 +386,23 @@ void test_mask_matches_the_producer_and_is_pinned()
     using ::dilithion::consensus::NBitsUsableForWork;
     using ::dilithion::consensus::ComputeChainWork;
 
-    // Bit 23 set, no other mantissa bits: 0x007FFFFF would REJECT this. It must be
-    // ACCEPTED, because ComputeChainWork treats it as mantissa 0x800000 and returns
-    // LESS work than an honest header — measured, not argued.
-    Check("MASK: 0x1d800000 (bit 23 only) is accepted", NBitsUsableForWork(0x1d800000u));
-    Check("MASK: 0x1d800000 does not saturate", !IsSaturated(ComputeChainWork(0x1d800000u)));
-
-    // Bit 16 set only: 0x0000FFFF and 0x000000FF would both REJECT this.
-    Check("MASK: 0x1d010000 (bit 16 only) is accepted", NBitsUsableForWork(0x1d010000u));
-    Check("MASK: 0x1d010000 does not saturate", !IsSaturated(ComputeChainWork(0x1d010000u)));
+    // ⛔ EVERY ONE OF THE 24 MANTISSA BITS, not four hand-picked vectors.
+    //
+    // The previous version tested bit 23 and bit 16 only, and review found that
+    // 0x0081FFFF passes both while still wrongly rejecting mantissas of bits 17-22.
+    // Hand-picked vectors can only refute the masks someone thought of; this loop
+    // refutes EVERY mask narrower than the producer's, because a narrower mask must
+    // drop at least one bit and that bit's arm then fails.
+    //
+    // This is the whole input space for the property, so it is exhaustive rather than
+    // sampled — the point review made about hand-picked vectors, taken to its end.
+    for (int bit = 0; bit < 24; ++bit) {
+        const uint32_t nBits = 0x1d000000u | (1u << bit);
+        Check("MASK: every isolated mantissa bit is accepted (a narrower mask fails here)",
+              NBitsUsableForWork(nBits));
+        Check("MASK: an isolated mantissa bit does not saturate",
+              !IsSaturated(ComputeChainWork(nBits)));
+    }
 
     // And the boundary the mask exists for is still rejected.
     Check("MASK: 0x1e000000 (zero mantissa) is still rejected",
@@ -390,9 +435,16 @@ void test_single_header_bound_direct()
     uint256 lowByte; std::memset(lowByte.data, 0, 32); lowByte.data[0] = 0x01;
     Check("BOUND: non-zero in byte 0 is not treated as a zero bound",
           !SingleHeaderWorkIsWithinBound(0x1d00ffffu, lowByte));
+    // ⛔ THIS ARM USED HONEST WORK AND WAS NON-DISCRIMINATING. Honest work (~2^76) is
+    // below 2^248 whether byte 31 is scanned or the bound is wrongly treated as zero,
+    // so an `i < 31` off-by-one passed it unchanged — review found that, and the
+    // previous comment claimed the case was covered. SATURATED work is the only input
+    // that separates the two: it is ABOVE 2^248, so it is rejected only if byte 31 is
+    // actually scanned; treat the bound as zero and the inert path accepts it.
     uint256 highByte; std::memset(highByte.data, 0, 32); highByte.data[31] = 0x01;
-    Check("BOUND: non-zero in byte 31 is not treated as a zero bound (honest work is below it)",
-          SingleHeaderWorkIsWithinBound(0x1d00ffffu, highByte));
+    Check("BOUND: byte 31 IS scanned — saturated work is rejected against a "
+          "bound that is non-zero only in its top byte",
+          !SingleHeaderWorkIsWithinBound(0x1e000000u, highByte));
 
     // EQUALITY: single work EXACTLY equal to the bound must be REJECTED (>= not >).
     const uint256 honestWork = ComputeChainWork(0x1d00ffffu);
@@ -408,6 +460,27 @@ void test_single_header_bound_direct()
     // ⛔ THE PRODUCTION PARAMETER, not a test constant. Arm 4 injects exactly 2^200,
     // so a hardcoded 2^200 substituted for the parameter would pass it. This uses the
     // chain's real nMinimumChainWork against its real genesisNBits.
+    // ⛔ A NETWORK WITH A NON-ZERO BOUND, because main() runs Regtest where
+    // nMinimumChainWork == 0 and the arm below therefore only ever exercised the
+    // INERT path — asserting the accept direction and nothing else. Any constant
+    // between honest work and the inflation class passed it, and arm 4 injects
+    // exactly 2^200 so it could not catch a hardcoded substitution either.
+    // This uses a REAL ChainParams whose bound is non-zero, so the reject direction
+    // is exercised against a value nothing in this file chose.
+    {
+        const Dilithion::ChainParams dilv = Dilithion::ChainParams::DilV();
+        bool nonZero = false;
+        for (int i = 0; i < 32; ++i) if (dilv.nMinimumChainWork.data[i] != 0) { nonZero = true; break; }
+        Check("BOUND/prod: the DilV parameters carry a NON-ZERO nMinimumChainWork "
+              "(if this fails the arm below is inert and proves nothing)", nonZero);
+        if (nonZero) {
+            Check("BOUND/prod: an inflated header is REJECTED against the real DilV bound",
+                  !SingleHeaderWorkIsWithinBound(0x01000001u, dilv.nMinimumChainWork));
+            Check("BOUND/prod: the real DilV genesisNBits is ACCEPTED against the real bound",
+                  SingleHeaderWorkIsWithinBound(dilv.genesisNBits, dilv.nMinimumChainWork));
+        }
+    }
+
     if (Dilithion::g_chainParams != nullptr) {
         const uint256 prodBound = Dilithion::g_chainParams->nMinimumChainWork;
         const uint32_t prodNBits = Dilithion::g_chainParams->genesisNBits;

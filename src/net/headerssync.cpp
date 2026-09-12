@@ -53,7 +53,9 @@ namespace {
 // purpose: a stale reference becomes a COMPILE ERROR rather than resolving to a
 // hidden second copy, which is how the original instance of this defect hid.
 
-// ⛔ AND SATURATION WAS NEVER THE WHOLE PROBLEM. The guard above closes exactly
+// ⛔ AND SATURATION WAS NEVER THE WHOLE PROBLEM. The saturation predicate
+// (dilithion::consensus::NBitsUsableForWork, in chain_work.h -- no longer a guard
+// 'above' this comment, since the local copy was deleted) closes exactly
 // one shape and leaves an equally large hole open, MEASURED against
 // ComputeChainWork rather than reasoned about:
 //
