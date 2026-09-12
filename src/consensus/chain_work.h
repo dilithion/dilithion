@@ -48,8 +48,18 @@ namespace dilithion::consensus {
 // The predicate lives HERE, beside the saturation it guards, rather than being
 // re-implemented at each caller: the previous round of this fix guarded three
 // sites in the dormant header-sync path and MISSED BOTH LIVE SITES, because the
-// sibling census was scoped to the wrong files. A guard at the producer cannot
-// be scoped to the wrong files.
+// sibling census was scoped to the wrong files.
+//
+// ⛔ PLACING IT AT THE PRODUCER REMOVES THE RE-IMPLEMENTATION RISK. IT DOES NOT BY
+// ITSELF ESTABLISH COVERAGE, and an earlier version of this comment claimed it did
+// ("a guard at the producer cannot be scoped to the wrong files"). A predicate
+// applies only where a CALLER INVOKES IT, so this file's coverage claim is exactly
+// the call sites listed and no wider.
+//
+// ⚠️ WHEN EXTENDING IT, ENUMERATE THE CONSUMERS OF ComputeChainWork, NOT THE
+// VALIDATORS. That is the population, and scoping to the validators instead is the
+// same mistake as the sibling census above -- one level up, and it is why the
+// coverage read as settled.
 inline bool NBitsUsableForWork(uint32_t nBits)
 {
     // The mantissa test subsumes `nBits == 0`; both are stated because every

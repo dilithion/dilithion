@@ -97,7 +97,7 @@ namespace {
 // this file's DoS-protected sync path and from NO production caller. The live
 // header path in headers_manager.cpp needed the same bound and could not see it.
 // It is now beside ComputeChainWork -- the saturation and inflation it guards --
-// and BOTH paths call the one definition. No forwarder is left here on purpose: a
+// and both of this file's sync paths call the one definition. No forwarder is left here on purpose: a
 // forwarding stub is how the previous instance of this defect hid, and a name that
 // resolves to nothing is a compile error rather than a silent miss.
 

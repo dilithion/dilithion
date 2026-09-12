@@ -1261,7 +1261,7 @@ bool CHeadersManager::ValidateHeader(const CBlockHeader& header, const CBlockHea
     //
     // The bound already existed and was reachable from NOTHING in production: it lived
     // in headerssync.cpp's anonymous namespace, serving only the DoS-protected sync
-    // path, which has no production caller. This is the live path.
+    // path, which has no production caller. This is the header-validation path.
     //
     // Inert when nMinimumChainWork is zero (regtest/testnet), so it cannot reject
     // honest headers on an unconfigured chain.
