@@ -400,6 +400,103 @@ bool BoundIsZero(const uint256& b)
     return true;
 }
 
+// ⛔ TEST-LOCAL AND INDEPENDENT OF `ChainWorkGreaterOrEqual` ON PURPOSE.
+//
+// Property 2 previously computed its oracle with the very function it was checking, so
+// a mutation of that function moved BOTH SIDES of the iff together and the property
+// passed over all 35840 pairs (measured: MUTANT G, which only the hand-picked equality
+// arm caught). A property is only as strong as an ORACLE INDEPENDENT OF ITS SUBJECT;
+// generation multiplies the INPUTS, never the oracle.
+//
+// Re-derived rather than copied: one compare per byte instead of the production two,
+// so a transcription-level defect does not reproduce identically here.
+bool LocalWorkGE(const uint256& a, const uint256& b)
+{
+    for (int i = 31; i >= 0; --i) {
+        if (a.data[i] != b.data[i]) return a.data[i] > b.data[i];
+    }
+    return true;  // exactly equal counts as "reaches"
+}
+
+// ⛔ AND THE OTHER SHARED DEPENDENCY: NOTHING IN THE TREE PINNED `ComputeChainWork`'s
+// ABSOLUTE OUTPUT. Property 2 calls it on both sides too, so a uniform scaling of the
+// normal path would pass all 35840 pairs — honest work sits near 2^72 and the inflation
+// class near 2^255, leaving ~180 bits of headroom around any bound in the space, and the
+// saturation output is unaffected by a magnitude bug.
+//
+// These vectors were derived from the DOCUMENTED algorithm in an independent
+// implementation (Python big-integers, written from the header's spec comment), not read
+// off this function's output. ⚠️ STATED PLAINLY: that pins TRANSCRIPTION — byte order,
+// the byte position, the clamp, the quotient — and it shares the SPEC. It is not
+// independent evidence that the specified formula is the right one to use.
+struct WorkKAT { uint32_t nBits; const char* what; unsigned char expect[32]; };
+
+
+// ---------------------------------------------------------------------------
+// KAT — `ComputeChainWork`'s ABSOLUTE OUTPUT, which no other arm in the tree pins.
+// ---------------------------------------------------------------------------
+void test_compute_chain_work_kats()
+{
+    std::cout << "  test_compute_chain_work_kats..." << std::flush;
+    using ::dilithion::consensus::ComputeChainWork;
+
+    static const WorkKAT kats[] = {
+        {0x1d00ffffu, "honest DIL/DilV genesis nBits",
+         {0x00, 0x00, 0x00, 0x01, 0x00, 0x01, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+          0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}},
+        {0x1b0404cbu, "a harder honest target",
+         {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x4c, 0x76, 0xab, 0xb3, 0x3f, 0x00, 0x00, 0x00, 0x00, 0x00,
+          0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}},
+        {0x1e01fffeu, "an easy honest target",
+         {0x00, 0x00, 0x00, 0x80, 0x00, 0x80, 0x00, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+          0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}},
+        {0x1d800000u, "mantissa bit 23 only (the mask boundary)",
+         {0x00, 0x00, 0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+          0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}},
+        {0x01000001u, "the exponent-inflation class",
+         {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+          0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xff}},
+        {0x03000001u, "same class, different exponent",
+         {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+          0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xff, 0xff, 0xff}},
+    };
+
+    for (const WorkKAT& k : kats) {
+        const uint256 got = ComputeChainWork(k.nBits);
+        const bool ok = std::memcmp(got.data, k.expect, 32) == 0;
+        if (!ok) {
+            // Print the delta rather than only failing, so a mismatch is diagnosable in
+            // one run instead of costing a rebuild to inspect.
+            std::cout << "\n    [KAT MISMATCH] nBits=0x" << std::hex << k.nBits << std::dec
+                      << " (" << k.what << ")\n      expect:";
+            for (int i = 31; i >= 0; --i) std::cout << " " << std::hex << (int)k.expect[i];
+            std::cout << "\n      got   :";
+            for (int i = 31; i >= 0; --i) std::cout << " " << std::hex << (int)(unsigned char)got.data[i];
+            std::cout << std::dec << std::flush;
+        }
+        Check("KAT: ComputeChainWork matches the independently derived value", ok);
+    }
+
+    // ⛔ THE INTENDED PRODUCTION CONFIGURATION, PINNED SEPARATELY FROM ANY ARM THAT USES IT.
+    //
+    // The bound space carries the real DilV nMinimumChainWork, and Property 2 skips the
+    // non-vacuity assertion for an inert bound — so if DilV's parameter were ever reset to
+    // zero, that entry would go quietly inert and the arm would still pass. The parameter
+    // is USED as an input and USED as the decision about what to expect, which means it
+    // cannot police itself. This assertion is about the CONFIGURATION, not the predicate.
+    Check("CONFIG: the DilV parameters carry a NON-ZERO nMinimumChainWork (if this fails, "
+          "every arm that uses it silently exercises the inert path)",
+          !BoundIsZero(Dilithion::ChainParams::DilV().nMinimumChainWork));
+
+    // The saturation output is a KAT too, and it is the one the guard exists for.
+    uint256 sat = ComputeChainWork(0x1e000000u);
+    bool allFF = true;
+    for (int i = 0; i < 32; ++i) if ((unsigned char)sat.data[i] != 0xFF) { allFF = false; break; }
+    Check("KAT: a zero mantissa saturates to exactly 0xFF..FF", allFF);
+
+    std::cout << " OK (" << (sizeof(kats) / sizeof(kats[0])) + 1 << " vectors)" << std::endl;
+}
+
 // ---------------------------------------------------------------------------
 // PROPERTY 1 — SATURATION IFF ZERO MANTISSA, over the whole space.
 // Replaces nothing; it is the invariant the saturation predicate is defined by, and
@@ -454,7 +551,10 @@ void test_property_bound_rejects_iff_work_reaches_it()
                 // every header.
                 Check("PROPERTY: a zero bound is inert for EVERY nBits", within);
             } else {
-                const bool reaches = ChainWorkGreaterOrEqual(ComputeChainWork(nBits), b.value);
+                // ⛔ LocalWorkGE, NOT ChainWorkGreaterOrEqual. See its comment: the
+                // previous version computed this oracle with the subject's own
+                // comparator, so a mutation moved both sides together.
+                const bool reaches = LocalWorkGE(ComputeChainWork(nBits), b.value);
                 Check("PROPERTY: rejection IFF single-header work reaches the bound",
                       within == !reaches);
                 if (!within) { ++rejHere; ++rejected; }
@@ -468,7 +568,27 @@ void test_property_bound_rejects_iff_work_reaches_it()
                   "(otherwise that bound proves nothing)", rejHere > 0);
         }
     }
-    std::cout << " OK (" << checked << " pairs, " << rejected << " rejections)" << std::endl;
+
+    // ⛔ AN EQUALITY PAIR CONSTRUCTED ON PURPOSE, FOR EVERY nBits IN THE SPACE.
+    //
+    // The mantissa x exponent x bound grid does NOT guarantee a case where work is
+    // EXACTLY equal to the bound, so even with an independent oracle the property could
+    // not separate `>=` from `>`. Building the bound FROM each nBits's own work
+    // guarantees the equality case exists for all 7168 of them, rather than relying on
+    // one hand-picked vector to carry the boundary.
+    long eq = 0;
+    for (uint32_t nBits : space) {
+        const uint256 own = ComputeChainWork(nBits);
+        if (BoundIsZero(own)) continue;  // cannot build an equality bound from zero work
+        Check("PROPERTY: work EXACTLY equal to the bound is REJECTED (>= not >), "
+              "for every nBits in the space",
+              !SingleHeaderWorkIsWithinBound(nBits, own));
+        ++eq;
+    }
+    Check("PROPERTY: the equality sweep actually ran (non-vacuity)", eq > 0);
+
+    std::cout << " OK (" << checked << " pairs, " << rejected << " rejections, "
+              << eq << " equality cases)" << std::endl;
 }
 
 // ---------------------------------------------------------------------------
@@ -508,11 +628,38 @@ void test_property_saturation_guard_is_wired_with_inert_bound()
                   !z.ValidateHeader(c, &genesisHeader));
         }
     }
+    // ⛔ THE ARM MUST PROVE ITS OWN SETUP, OR MUTANT E RE-ENTERS THROUGH IT.
+    //
+    // Everything above rejects zero-mantissa headers. If the manager IGNORED or
+    // SUBSTITUTED the injected bound, they would still be rejected — BY THE BOUND — and
+    // this arm would pass with the saturation guard deleted from both validators, which
+    // is the exact masking it was written to remove. Asserting "the bound I injected is
+    // zero" is not enough: the question is whether the manager USES it.
+    //
+    // An INFLATED BUT NON-SATURATING nBits settles it. Its work (~2^255) is above any
+    // real bound and below saturation, so it is accepted ONLY if the bound is genuinely
+    // inert inside the manager. This also states the exposure out loud: on a zero-bound
+    // network the inflation class IS unguarded, because the bound is what rejects it.
+    Check("PROPERTY/WIRED SETUP: an INFLATED non-saturating nBits is ACCEPTED under the "
+          "injected zero bound — proves the manager actually honours an inert bound, so "
+          "the rejections above are the saturation guard and not the bound",
+          z.QuickValidateHeader(HeaderWithNBits(0x01000001u), nullptr));
+
     // The honest side, so the arm is not "reject everything with an inert bound".
+    // ⛔ BOTH VALIDATORS, not just Quick: the poison above goes through both, so a
+    // mutation rejecting every known-parent header under a zero bound would otherwise
+    // pass here — the honest controls could not see it.
     for (uint32_t nBits : {0x1d00ffffu, 0x1e01fffeu, 0x1b0404cbu}) {
         ++honestCases;
-        Check("PROPERTY/WIRED: honest nBits still ACCEPTED with an inert bound",
+        Check("PROPERTY/WIRED: honest nBits still ACCEPTED by QuickValidateHeader with an inert bound",
               z.QuickValidateHeader(HeaderWithNBits(nBits), nullptr));
+
+        CBlockHeader honestChild = HeaderWithNBits(nBits);
+        honestChild.hashPrevBlock = genesisHeader.GetHash();
+        honestChild.nTime = genesisHeader.nTime + 100;
+        Check("PROPERTY/WIRED: honest nBits still ACCEPTED by ValidateHeader with a KNOWN "
+              "parent and an inert bound",
+              z.ValidateHeader(honestChild, &genesisHeader));
     }
     Check("PROPERTY/WIRED: the space contained zero-mantissa cases to drive",
           zeroMantissaCases > 0);
@@ -664,6 +811,7 @@ int main()
     test_production_validators_reject_both_classes();
     test_mask_matches_the_producer_and_is_pinned();
     test_single_header_bound_direct();
+    test_compute_chain_work_kats();
     test_property_saturation_iff_zero_mantissa();
     test_property_bound_rejects_iff_work_reaches_it();
     test_property_saturation_guard_is_wired_with_inert_bound();
