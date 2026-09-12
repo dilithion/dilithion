@@ -120,6 +120,82 @@ inline bool ChainWorkGreaterOrEqual(const uint256& a, const uint256& b)
     return true;  // equal
 }
 
+// ============================================================================
+// SingleHeaderWorkIsWithinBound — THE SECOND PREDICATE, AND IT ANSWERS A
+// DIFFERENT QUESTION FROM NBitsUsableForWork. Do not merge the two.
+// ============================================================================
+//
+// ⛔ TWO PREDICATES, TWO CONTRACTS. Conflating them is what let an external panel
+// AND this change's own author miss a live hole, so they are stated apart:
+//
+//   NBitsUsableForWork(nBits)
+//     CONTRACT: "this nBits does not trip ComputeChainWork's SATURATION branch."
+//     Nothing more. It is NOT "usable for work accounting" in a general sense and
+//     it is NOT "a valid difficulty target" — it is exactly the negation of the
+//     `mantissa == 0` test inside ComputeChainWork, which is why its mask must BE
+//     that function's mask (see its own comment).
+//
+//   SingleHeaderWorkIsWithinBound(nBits, minimum_required_work)
+//     CONTRACT: "one header's work contribution does not on its own reach the
+//     configured chain-work threshold." That is a bound on MAGNITUDE, and it is
+//     the only one of the two that closes the EXPONENT-INFLATION class.
+//
+// ⛔ WHY BOTH ARE NEEDED, MEASURED RATHER THAN ARGUED (probe over ComputeChainWork,
+// reimplementing its body verbatim so the probe cannot drift from the subject):
+//
+//   nBits        mantissa   top set byte   NBitsUsableForWork
+//   0x1d00ffff   0x00ffff   9              pass   <- honest DIL/DilV
+//   0x1e000000   0x000000   31 (saturated) REJECT <- the saturation class
+//   0x01000001   0x000001   31             pass   <- ⛔ ~2^248 work, ONE header
+//   0x00000001   0x000001   31             pass   <- same class
+//   0x03000001   0x000001   31             pass   <- same class
+//
+// A SMALL `size` byte puts the quotient at the top of the 256-bit word without the
+// mantissa ever being zero. **The saturation guard passes every one of those.** Only
+// a bound on the resulting magnitude rejects them, which is this predicate.
+//
+// ⚠️ AND THE SIGN-BIT CASES ARE RECORDED AS *MEASURED, NOT A VECTOR*, so the next
+// reader does not re-raise them: an external panel proposed masking 0x007FFFFF on the
+// grounds that bit 23 is the compact sign bit. Measured, 0x1d800000 / 0x1e800000 /
+// 0x1d80ffff produce top set byte 7-8 against an honest header's 9 — they claim LESS
+// work than a legitimate header, so rejecting them would reject the innocent. And
+// ComputeChainWork has no sign handling at all: its mantissa is the full 24 bits.
+// The panel was right about the EXAMPLE (0x01000001) and wrong about the MECHANISM.
+//
+// HOISTED HERE FROM headerssync.cpp's anonymous namespace, where it was reachable
+// from the dormant DoS-protected sync path and from NO production caller
+// (`grep SingleHeaderWorkIsWithinBound src/net/headers_manager.cpp` = 0). A guard
+// that exists, is reviewed, and is called by nothing is the defect this file's other
+// predicate was written to fix — the same shape, one class over.
+inline bool SingleHeaderWorkIsWithinBound(uint32_t nBits,
+                                          const uint256& minimum_required_work)
+{
+    // A zero bound means no gate is configured (test callers, and any caller before
+    // nMinimumChainWork is set). Bounding against zero would reject EVERY header, so
+    // the check is inert rather than fail-closed: this guards the gate's arithmetic,
+    // and with no gate there is nothing to inflate.
+    bool bound_is_zero = true;
+    for (int i = 0; i < 32; ++i) {
+        if (minimum_required_work.data[i] != 0) { bound_is_zero = false; break; }
+    }
+    if (bound_is_zero) return true;
+
+    const uint256 single = ComputeChainWork(nBits);
+    // ⚠️ READ THE SENSE CAREFULLY — BOTH SENSES ARE SPELLED OUT BECAUSE THIS COMMENT
+    // ONCE LED A REVIEWER TO A FALSE HIGH.
+    //
+    // The function is named for what it RETURNS, not for what it rejects:
+    //   returns TRUE  <=> single-header work is BELOW the minimum  (within bound, fine)
+    //   returns FALSE <=> single-header work REACHES the minimum   (the hazard)
+    // and every caller rejects on the NEGATION:
+    //   if (!SingleHeaderWorkIsWithinBound(...)) { reject; }
+    //
+    // `>=` and not `>` inside the negation, because a header that EXACTLY meets the
+    // minimum satisfies the gate on its own — the thing being prevented — so it must
+    // land on the FALSE side.
+    return !ChainWorkGreaterOrEqual(single, minimum_required_work);
+}
+
 }  // namespace dilithion::consensus
 
 #endif  // DILITHION_CONSENSUS_CHAIN_WORK_H

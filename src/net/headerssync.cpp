@@ -86,40 +86,15 @@ bool NBitsIsSaneForWorkAccounting(uint32_t nBits)
 // ComputeChainWork has no such decode, and giving it one is a consensus change
 // that belongs in its own review. Until then a malformed-but-small-work nBits
 // still passes here — it just cannot inflate the gate.
-bool SingleHeaderWorkIsWithinBound(uint32_t nBits, const uint256& minimum_required_work)
-{
-    // A zero bound means no gate is configured (test callers, and any caller
-    // before nMinimumChainWork is set). Bounding against zero would reject every
-    // header, so the check is inert rather than fail-closed here: this function
-    // guards the gate's arithmetic, and with no gate there is nothing to inflate.
-    bool bound_is_zero = true;
-    for (int i = 0; i < 32; ++i) {
-        if (minimum_required_work.data[i] != 0) { bound_is_zero = false; break; }
-    }
-    if (bound_is_zero) return true;
-
-    const uint256 single = ::dilithion::consensus::ComputeChainWork(nBits);
-    // ⚠️ READ THE SENSE CAREFULLY — BOTH SENSES ARE SPELLED OUT BECAUSE THIS
-    // COMMENT ONCE LED A REVIEWER TO A FALSE HIGH.
-    //
-    // The function is named for what it RETURNS, not for what it rejects:
-    //   returns TRUE  <=> single-header work is BELOW the minimum   (within bound, fine)
-    //   returns FALSE <=> single-header work REACHES the minimum    (the hazard)
-    // and every caller rejects on the NEGATION: `if (!SingleHeaderWorkIsWithinBound(...))`.
-    //
-    // `>=` and not `>` inside the negation, because a header that EXACTLY meets the
-    // minimum satisfies the gate on its own — which is the thing being prevented, so
-    // it must land on the FALSE side.
-    //
-    // The previous comment stated only the rejection half ("a single header that
-    // exactly meets the minimum satisfies the gate on its own") directly above a
-    // `return !...`, and an external seat reading carefully mapped that sentence onto
-    // the return value and raised a HIGH for an inverted bound. The guard was correct;
-    // the COMMENT was ambiguous. A comment that leads a careful reviewer to invent a
-    // blocker is a defect in the comment, and the proof that it was ambiguous is that
-    // it happened.
-    return !::dilithion::consensus::ChainWorkGreaterOrEqual(single, minimum_required_work);
-}
+// ⛔ SingleHeaderWorkIsWithinBound MOVED to src/consensus/chain_work.h.
+//
+// It used to live here, in this anonymous namespace, which made it reachable from
+// this file's DoS-protected sync path and from NO production caller. The live
+// header path in headers_manager.cpp needed the same bound and could not see it.
+// It is now beside ComputeChainWork -- the saturation and inflation it guards --
+// and BOTH paths call the one definition. No forwarder is left here on purpose: a
+// forwarding stub is how the previous instance of this defect hid, and a name that
+// resolves to nothing is a compile error rather than a silent miss.
 
 }  // namespace
 
@@ -531,7 +506,8 @@ bool HeadersSyncState::ValidateAndProcessSingleHeader(const CBlockHeader& header
     }
 
     // 3. Basic sanity checks
-    if (!SingleHeaderWorkIsWithinBound(header.nBits, m_minimum_required_work)) {
+    if (!::dilithion::consensus::SingleHeaderWorkIsWithinBound(
+            header.nBits, m_minimum_required_work)) {
         std::cerr << "[HeadersSyncState] PRESYNC: single-header work reaches the "
                      "minimum-chain-work gate on its own, nBits 0x"
                   << std::hex << header.nBits << std::dec << std::endl;
@@ -563,7 +539,8 @@ bool HeadersSyncState::ValidateAndStoreRedownloadedHeader(const CBlockHeader& he
     // PRESYNC had the weak `nBits == 0` guard and this path had nothing, so a
     // saturating nBits rejected in phase 1 would have been accepted in phase 2 --
     // a guard present at one site and absent at its sibling.
-    if (!SingleHeaderWorkIsWithinBound(header.nBits, m_minimum_required_work)) {
+    if (!::dilithion::consensus::SingleHeaderWorkIsWithinBound(
+            header.nBits, m_minimum_required_work)) {
         std::cerr << "[HeadersSyncState] REDOWNLOAD: single-header work reaches the "
                      "minimum-chain-work gate on its own, nBits 0x"
                   << std::hex << header.nBits << std::dec << std::endl;
