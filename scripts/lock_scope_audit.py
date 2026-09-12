@@ -371,7 +371,15 @@ def main(argv):
 
     targets = []
     for dirpath, _dirs, files in os.walk(os.path.join(root, 'src')):
-        if os.sep + 'test' in dirpath:
+        # Match a PATH COMPONENT, not a substring. `os.sep + 'test' in dirpath`
+        # is a substring test, so a future `src/testutils` (or any src/test*)
+        # would be silently EXCLUDED from the audit while looking scanned.
+        # [measured] not a live miss today: the only src/ directory containing
+        # "test" is src/attestation, which does NOT match os.sep+'test' and IS
+        # scanned (1 .cpp). The exclusion currently lands on src/test and its
+        # children only, which is correct. This closes the class rather than
+        # waiting for the directory that trips it.
+        if 'test' in dirpath.replace('/', os.sep).split(os.sep):
             continue
         for f in files:
             # F8 (external panel round 1): this excluded by BASENAME, so ANY file

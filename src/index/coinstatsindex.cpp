@@ -606,11 +606,30 @@ bool CCoinStatsIndex::WriteBlock(const CBlock& block, int height, const uint256&
                            // is atomic and unique_lock's destructor is a no-op.
         }
         lock.lock();  // retake for the m_running / m_db work below
-        // Re-validating after the re-take is unnecessary today and the reason is
-        // the same gate: no EraseBlock and no callback-driven WriteBlock can run
-        // while the sync thread is inside this window, because IsSynced() is
-        // still false — so neither m_corrupted nor height contiguity can have
-        // moved under us. If the gate ever changes, re-check BOTH here.
+        // WHY THERE IS NO RE-VALIDATION AFTER THE RETAKE, stated per member because
+        // the panel asked for it per member (Init retakes and re-checks, and this
+        // mirrors Init's unlock/lock dance but deliberately not its re-check):
+        //
+        //   m_corrupted, height contiguity, m_running
+        //       cannot have moved: no EraseBlock and no callback-driven WriteBlock
+        //       can run while the sync thread is inside this window, because
+        //       IsSynced() is still false. The same gate that makes the inversion
+        //       latent makes this window exclusive.
+        //   m_db
+        //       is only ever reset by ~CCoinStatsIndex, and the destructor is now
+        //       excluded from this window on every reachable path by the quiesce in
+        //       BOTH node binaries' shutdown and exception handlers.
+        //
+        // ⛔ AND A POST-RETAKE `if (!m_db)` CHECK IS NOT THE PROTECTION AND MUST NOT
+        // BE MISTAKEN FOR IT. If the object were freed, `lock.lock()` on the line
+        // above would already have touched a mutex inside freed memory — before any
+        // such check could run. The quiesce is the protection; a null-check would
+        // only close the narrower null-deref half and would read as if it closed
+        // more. Init's re-check answers a different question (did state advance
+        // during a long init), not a lifetime one.
+        //
+        // If the IsSynced() gate ever changes, re-check m_corrupted AND contiguity
+        // here; if the quiesce is ever weakened, the fix is the quiesce, not a check.
     }
 
     CoinStats parent = m_running;

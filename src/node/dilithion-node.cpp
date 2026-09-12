@@ -9344,19 +9344,40 @@ load_genesis_block:  // Bug #29: Label for automatic retry after blockchain wipe
         //
         // ⚠️ NOT a post-retake `if (!m_db)` re-check: locking a mutex inside a freed
         // object happens BEFORE any such check could run.
+        // ⚠️ AN ATTEMPT IS NOT A BARRIER (panel round 2, rated BLOCKER by one seat).
+        // The first version of this fix called Shutdown(), swallowed any exception,
+        // and tore down anyway. Shutdown() being IDEMPOTENT is not the same as
+        // Shutdown() having SUCCEEDED: if it throws before the producers have
+        // drained, a swallowed exception is the only thing standing between us and
+        // the use-after-free.
+        //
+        // So the drain is VERIFIED, and when it cannot be verified WE DO NOT
+        // DESTROY. release() hands over ownership without running the destructor --
+        // the index is deliberately LEAKED. The process is already unwinding a fatal
+        // error and is about to exit, so a leaked index costs nothing; destroying one
+        // that a callback may still be inside is a use-after-free in the middle of
+        // error handling.
+        bool indexQuiesced = false;
         try {
             g_node_context.Shutdown();
+            indexQuiesced = true;
         } catch (...) {
-            // Already unwinding a failure; do not mask it with a second one.
+            indexQuiesced = false;   // barrier NOT established -- see the release below
         }
         // PR-7G R3: release tx_index before chainParams cleanup so the
         // reindex thread (which reads g_chainstate.GetBlocksAtHeight /
         // GetBlockIndex) is joined before any global it depends on can
         // be torn down by the static destructor sequence. Mirrors the
         // normal-shutdown ordering at line 7725.
-        g_tx_index.reset();
-        // PR-BA-2: same R3 ordering applies to coinstatsindex.
-        g_coin_stats_index.reset();
+        if (indexQuiesced) {
+            g_tx_index.reset();
+            // PR-BA-2: same R3 ordering applies to coinstatsindex.
+            g_coin_stats_index.reset();
+        } else {
+            // Barrier not established -- LEAK RATHER THAN DESTROY. See above.
+            (void)g_tx_index.release();
+            (void)g_coin_stats_index.release();
+        }
 
         // Cleanup on error (P0-5 FIX: use load/store for atomic)
         auto* relay_mgr = g_tx_relay_manager.load();
@@ -9433,15 +9454,36 @@ load_genesis_block:  // Bug #29: Label for automatic retry after blockchain wipe
         //
         // ⚠️ NOT a post-retake `if (!m_db)` re-check: locking a mutex inside a freed
         // object happens BEFORE any such check could run.
+        // ⚠️ AN ATTEMPT IS NOT A BARRIER (panel round 2, rated BLOCKER by one seat).
+        // The first version of this fix called Shutdown(), swallowed any exception,
+        // and tore down anyway. Shutdown() being IDEMPOTENT is not the same as
+        // Shutdown() having SUCCEEDED: if it throws before the producers have
+        // drained, a swallowed exception is the only thing standing between us and
+        // the use-after-free.
+        //
+        // So the drain is VERIFIED, and when it cannot be verified WE DO NOT
+        // DESTROY. release() hands over ownership without running the destructor --
+        // the index is deliberately LEAKED. The process is already unwinding a fatal
+        // error and is about to exit, so a leaked index costs nothing; destroying one
+        // that a callback may still be inside is a use-after-free in the middle of
+        // error handling.
+        bool indexQuiesced = false;
         try {
             g_node_context.Shutdown();
+            indexQuiesced = true;
         } catch (...) {
-            // Already unwinding a failure; do not mask it with a second one.
+            indexQuiesced = false;   // barrier NOT established -- see the release below
         }
         // PR-7G R3: release tx_index before chainParams cleanup. See the
         // matching note in the std::exception catch above.
-        g_tx_index.reset();
-        g_coin_stats_index.reset();
+        if (indexQuiesced) {
+            g_tx_index.reset();
+            g_coin_stats_index.reset();
+        } else {
+            // Barrier not established -- LEAK RATHER THAN DESTROY. See above.
+            (void)g_tx_index.release();
+            (void)g_coin_stats_index.release();
+        }
 
         // Cleanup on error (P0-5 FIX: use load/store for atomic)
         auto* relay_mgr = g_tx_relay_manager.load();

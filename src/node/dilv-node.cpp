@@ -8853,13 +8853,52 @@ load_genesis_block:  // Bug #29: Label for automatic retry after blockchain wipe
         #endif
         std::cerr << "===========================================================" << std::endl;
 
+        // ⛔ QUIESCE BEFORE RELEASING THE INDEX, AND FAIL SAFE IF WE CANNOT.
+        //
+        // ⚠️ THIS BINARY WAS MISSED BY THE FIRST VERSION OF THIS FIX, and all three
+        // panel seats found it independently. dilv-node registers the SAME index
+        // callbacks as dilithion-node (WriteBlock/EraseBlock, see coinstatsindex's
+        // own header), so when the narrowed lock in SHARED index code dropped the
+        // destructor-blocking guarantee, BOTH binaries lost it and only one got it
+        // back. Right mechanism, wrong extent: the population is "binaries that
+        // register the index callbacks", and it has exactly two members --
+        // enumerated, not assumed (a third file resets the index,
+        // src/test/coinstatsindex_integration_tests.cpp, but it has zero threads and
+        // zero callbacks, so no WriteBlock can be in flight there).
+        //
+        // The hazard: Stop() joins m_sync_thread only and never takes m_mutex, so the
+        // destructor can take m_mutex, free m_db and destroy the object while a
+        // callback-thread WriteBlock sits in the unlock window -- which then calls
+        // lock.lock() on a mutex inside a freed object.
+        //
+        // ⚠️ AN ATTEMPT IS NOT A BARRIER. Shutdown() being IDEMPOTENT is not the same
+        // as Shutdown() having SUCCEEDED: if it throws before the producers have
+        // drained, a swallowed exception would be the only thing between us and the
+        // use-after-free. So the drain is VERIFIED, and when it cannot be verified WE
+        // DO NOT DESTROY -- release() hands over ownership without running the
+        // destructor, deliberately leaking. The process is already unwinding a fatal
+        // error and about to exit; a leaked index costs nothing, while destroying one
+        // a callback may still be inside is a UAF in the middle of error handling.
+        bool indexQuiesced = false;
+        try {
+            g_node_context.Shutdown();
+            indexQuiesced = true;
+        } catch (...) {
+            indexQuiesced = false;   // barrier NOT established -- see the release below
+        }
         // PR-7G R3: release tx_index before chainParams cleanup so the
         // reindex thread (which reads g_chainstate.GetBlocksAtHeight /
         // GetBlockIndex) is joined before any global it depends on can
         // be torn down by the static destructor sequence. Mirrors the
         // normal-shutdown ordering at line 7368.
-        g_tx_index.reset();
-        g_coin_stats_index.reset();
+        if (indexQuiesced) {
+            g_tx_index.reset();
+            g_coin_stats_index.reset();
+        } else {
+            // Barrier not established -- LEAK RATHER THAN DESTROY. See above.
+            (void)g_tx_index.release();
+            (void)g_coin_stats_index.release();
+        }
 
         // Cleanup on error (P0-5 FIX: use load/store for atomic)
         auto* relay_mgr = g_tx_relay_manager.load();
@@ -8912,10 +8951,49 @@ load_genesis_block:  // Bug #29: Label for automatic retry after blockchain wipe
         #endif
         std::cerr << "===========================================================" << std::endl;
 
+        // ⛔ QUIESCE BEFORE RELEASING THE INDEX, AND FAIL SAFE IF WE CANNOT.
+        //
+        // ⚠️ THIS BINARY WAS MISSED BY THE FIRST VERSION OF THIS FIX, and all three
+        // panel seats found it independently. dilv-node registers the SAME index
+        // callbacks as dilithion-node (WriteBlock/EraseBlock, see coinstatsindex's
+        // own header), so when the narrowed lock in SHARED index code dropped the
+        // destructor-blocking guarantee, BOTH binaries lost it and only one got it
+        // back. Right mechanism, wrong extent: the population is "binaries that
+        // register the index callbacks", and it has exactly two members --
+        // enumerated, not assumed (a third file resets the index,
+        // src/test/coinstatsindex_integration_tests.cpp, but it has zero threads and
+        // zero callbacks, so no WriteBlock can be in flight there).
+        //
+        // The hazard: Stop() joins m_sync_thread only and never takes m_mutex, so the
+        // destructor can take m_mutex, free m_db and destroy the object while a
+        // callback-thread WriteBlock sits in the unlock window -- which then calls
+        // lock.lock() on a mutex inside a freed object.
+        //
+        // ⚠️ AN ATTEMPT IS NOT A BARRIER. Shutdown() being IDEMPOTENT is not the same
+        // as Shutdown() having SUCCEEDED: if it throws before the producers have
+        // drained, a swallowed exception would be the only thing between us and the
+        // use-after-free. So the drain is VERIFIED, and when it cannot be verified WE
+        // DO NOT DESTROY -- release() hands over ownership without running the
+        // destructor, deliberately leaking. The process is already unwinding a fatal
+        // error and about to exit; a leaked index costs nothing, while destroying one
+        // a callback may still be inside is a UAF in the middle of error handling.
+        bool indexQuiesced = false;
+        try {
+            g_node_context.Shutdown();
+            indexQuiesced = true;
+        } catch (...) {
+            indexQuiesced = false;   // barrier NOT established -- see the release below
+        }
         // PR-7G R3: release tx_index before chainParams cleanup. See the
         // matching note in the std::exception catch above.
-        g_tx_index.reset();
-        g_coin_stats_index.reset();
+        if (indexQuiesced) {
+            g_tx_index.reset();
+            g_coin_stats_index.reset();
+        } else {
+            // Barrier not established -- LEAK RATHER THAN DESTROY. See above.
+            (void)g_tx_index.release();
+            (void)g_coin_stats_index.release();
+        }
 
         // Cleanup on error (P0-5 FIX: use load/store for atomic)
         auto* relay_mgr = g_tx_relay_manager.load();
