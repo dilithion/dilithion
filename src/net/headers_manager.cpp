@@ -1239,8 +1239,34 @@ bool CHeadersManager::ValidateHeader(const CBlockHeader& header, const CBlockHea
     }
 
     // 3. Check difficulty transition (simplified - full implementation would check retarget logic)
-    // For now, just check bits are within reasonable range
-    if (header.nBits == 0) {
+    //
+    // ⛔ nBits must be usable for WORK ACCOUNTING, not merely non-zero. The old
+    // `nBits == 0` test missed a zero MANTISSA (0x1e000000: non-zero word, zero
+    // mantissa), and CalculateChainWork below feeds this straight into
+    // ComputeChainWork, which SATURATES to max work on exactly that input.
+    // VDF headers skip CheckProofOfWork (:905), so nothing else constrains nBits
+    // on that path. MEASURED (probe P4): a zero-mantissa VDF sibling overtook an
+    // honest sibling as best header with newWork = 0xffff... Peer-triggerable.
+    if (!::dilithion::consensus::NBitsUsableForWork(header.nBits)) {
+        return false;
+    }
+
+    // 3b. ⛔ AND BOUND THE MAGNITUDE, which the saturation guard above does NOT do.
+    // A SECOND, DIFFERENT PREDICATE — see the two-contract note in chain_work.h.
+    // MEASURED: nBits 0x01000001 has mantissa 1, so it passes the saturation guard,
+    // and ComputeChainWork returns ~2^248 for it because a small `size` byte puts the
+    // quotient at the top of the 256-bit word. 0x00000001 and 0x03000001 are the same
+    // class. One peer header could therefore still claim near-maximum work with the
+    // guard above in place.
+    //
+    // The bound already existed and was reachable from NOTHING in production: it lived
+    // in headerssync.cpp's anonymous namespace, serving only the DoS-protected sync
+    // path, which has no production caller. This is the header-validation path.
+    //
+    // Inert when nMinimumChainWork is zero (regtest/testnet), so it cannot reject
+    // honest headers on an unconfigured chain.
+    if (!::dilithion::consensus::SingleHeaderWorkIsWithinBound(header.nBits,
+                                                               nMinimumChainWork)) {
         return false;
     }
 
@@ -3104,9 +3130,24 @@ bool CHeadersManager::QuickValidateHeader(const CBlockHeader& header, const CBlo
         return false;
     }
 
-    // 2. Check bits are set (non-zero difficulty)
-    if (header.nBits == 0) {
-        std::cerr << "[HeadersManager] Quick validate FAILED: nBits == 0" << std::endl;
+    // 2. Check bits are usable for WORK ACCOUNTING, not merely non-zero.
+    // SIBLING of the ValidateHeader check — same defect, same fix, and the pair
+    // is why the predicate lives in chain_work.h rather than being written twice.
+    if (!::dilithion::consensus::NBitsUsableForWork(header.nBits)) {
+        std::cerr << "[HeadersManager] Quick validate FAILED: nBits unusable for "
+                     "work accounting (zero mantissa saturates ComputeChainWork)"
+                  << std::endl;
+        return false;
+    }
+
+    // 2b. SIBLING of the ValidateHeader magnitude bound — a SECOND predicate, not a
+    // stronger form of the one above. The saturation guard passes 0x01000001 (mantissa
+    // 1) while ComputeChainWork returns ~2^248 for it. Inert on an unconfigured chain.
+    if (!::dilithion::consensus::SingleHeaderWorkIsWithinBound(header.nBits,
+                                                               nMinimumChainWork)) {
+        std::cerr << "[HeadersManager] Quick validate FAILED: single-header work "
+                     "reaches nMinimumChainWork on its own (nBits work inflation)"
+                  << std::endl;
         return false;
     }
 
