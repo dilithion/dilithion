@@ -1183,12 +1183,26 @@ headerssync_accumulator_seeding_tests: $(CORE_OBJECTS) $(OBJ_DIR)/test/headerssy
 	@$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS) $(LIBS)
 	@echo "$(COLOR_GREEN)✓ headerssync_accumulator_seeding_tests built successfully$(COLOR_RESET)"
 
+headerssync_work_bound_tests: $(CORE_OBJECTS) $(OBJ_DIR)/test/headerssync_work_bound_tests.o $(DILITHIUM_OBJECTS) $(CHIAVDF_OBJECTS)
+	@echo "$(COLOR_BLUE)[LINK]$(COLOR_RESET) $@"
+	@$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS) $(LIBS)
+	@echo "$(COLOR_GREEN)✓ headerssync_work_bound_tests built successfully$(COLOR_RESET)"
+
+headerssync_termination_tests: $(CORE_OBJECTS) $(OBJ_DIR)/test/headerssync_termination_tests.o $(DILITHIUM_OBJECTS) $(CHIAVDF_OBJECTS)
+	@echo "$(COLOR_BLUE)[LINK]$(COLOR_RESET) $@"
+	@$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS) $(LIBS)
+	@echo "$(COLOR_GREEN)✓ headerssync_termination_tests built successfully$(COLOR_RESET)"
+
 # LP-10 (2026-09-07): KAT pinning nMinimumChainWork + the work UNITS.
 minimum_chain_work_kat_tests: $(CORE_OBJECTS) $(OBJ_DIR)/test/minimum_chain_work_kat_tests.o $(DILITHIUM_OBJECTS) $(CHIAVDF_OBJECTS)
 	@echo "$(COLOR_BLUE)[LINK]$(COLOR_RESET) $@"
 	@$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS) $(LIBS)
 	@echo "$(COLOR_GREEN)✓ minimum_chain_work_kat_tests built successfully$(COLOR_RESET)"
 
+vdf_checker_nbits_equality_tests: $(CORE_OBJECTS) $(OBJ_DIR)/test/vdf_checker_nbits_equality_tests.o $(DILITHIUM_OBJECTS) $(CHIAVDF_OBJECTS)
+	@echo "$(COLOR_BLUE)[LINK]$(COLOR_RESET) $@"
+	@$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS) $(LIBS)
+	@echo "$(COLOR_GREEN)✓ vdf_checker_nbits_equality_tests built successfully$(COLOR_RESET)"
 proof_checker_selection_tests: $(CORE_OBJECTS) $(OBJ_DIR)/test/proof_checker_selection_tests.o $(DILITHIUM_OBJECTS) $(CHIAVDF_OBJECTS)
 	@echo "$(COLOR_BLUE)[LINK]$(COLOR_RESET) $@"
 	@$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS) $(LIBS)
@@ -2191,3 +2205,4 @@ print-%:
 	@echo '$*=$($*)'
 
 .PHONY: print-% fuzz fuzz_sha3 fuzz_transaction fuzz_block fuzz_compactsize fuzz_network_message fuzz_address fuzz_difficulty fuzz_subsidy fuzz_merkle run_fuzz coverage coverage-html coverage-clean
+
