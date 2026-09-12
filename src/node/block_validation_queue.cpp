@@ -79,6 +79,10 @@ bool CBlockValidationQueue::Start() {
            "pin is absent. Register it in the node wiring before starting the queue.");
 
     m_running.store(true);
+    // Declare the participant BEFORE the spawn, so a thread that starts and never
+    // reaches its checkpoint is a NAMED absence at the startup census rather than
+    // an invisible one. See CChainState::DeclareEpochParticipant.
+    m_chainstate.DeclareEpochParticipant("validation-worker");
     m_worker = std::thread(&CBlockValidationQueue::ValidationWorker, this);
     return true;
 }
@@ -385,12 +389,41 @@ void CBlockValidationQueue::ValidationWorker() {
         QueuedBlock queued_block;
         bool has_block = false;
 
+        // ── DEFERRED-RECLAMATION CHECKPOINT ──────────────────────────────────
+        // Placed BEFORE the wait, not after the work, and that placement is the
+        // answer to "what does a thread that blocks for a long time pin?".
+        //
+        // At this point the worker has finished the previous block and has not
+        // started the next: it provably holds no CBlockIndex*. Checkpointing HERE
+        // means a worker that then sleeps on the condition variable for minutes —
+        // an idle node, an empty queue — has ALREADY published its epoch and pins
+        // NOTHING while it sleeps. Checkpointing after the wait instead would make
+        // an idle thread hold the graveyard for the whole idle period, which is
+        // exactly backwards: the thread is safest precisely when it is doing
+        // nothing.
+        //
+        // So the pin duration per thread is ONE UNIT OF WORK (here: one
+        // ProcessBlock, bounded by validation plus a LevelDB write), never the
+        // duration of a block on I/O or a wait for input.
+        m_chainstate.EpochCheckpoint("validation-worker");
+
         // Wait for blocks in queue
         {
             std::unique_lock<std::mutex> lock(m_queue_mutex);
-            m_queue_cv.wait(lock, [this] {
-                return !m_queue.empty() || !m_running.load();
-            });
+            {
+                // OFFLINE FOR THE DURATION OF THE WAIT. Checkpointing before the wait
+                // publishes an epoch that then FREEZES while this thread is parked, pinning
+                // every entry unlinked afterwards -- a server asleep in accept() for an hour
+                // pins an hour of evictions, which is what made the design note's "parked
+                // threads pin nothing" false. Going offline removes this thread from the
+                // quiescent-state calculation entirely, exactly as an exited thread is
+                // removed; the scope re-enters on EVERY exit path, before anything is
+                // resolved.
+                EpochOfflineScope offline(&m_chainstate);
+                m_queue_cv.wait(lock, [this] {
+                    return !m_queue.empty() || !m_running.load();
+                });
+            }
 
             if (!m_running.load() && m_queue.empty()) {
                 break;  // Shutting down

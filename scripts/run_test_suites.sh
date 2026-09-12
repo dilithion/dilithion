@@ -129,6 +129,30 @@ set -u
 # Selection 1+3+5 passes 5/5 deterministically and now GATES, where previously
 # the whole file was quarantined and nothing in it ran at all.
 #
+# UNQUARANTINED 2026-09-11: connman_tests. ITS QUARANTINE REASON WAS INVERTED,
+# and that is the part worth recording. It read "SUSPECTED REAL: high-load
+# throughput test loses messages ... Message loss under load in CConnman is not
+# a stale expectation." Measured (Windows/MSYS2): the suite fails 12 of 12 runs,
+# deterministically, popping exactly 1000 of 10000 pushed -- not a flake, so
+# there was never a rate to measure. CNode::PushProcessMsg caps the queue at
+# MAX_PROCESS_QUEUE_SIZE and pops the OLDEST when full ("BUG #275: Cap process
+# queue to prevent OOM from fast senders"). The "message loss" the test detected
+# IS that defence working; the STALE thing was the assertion, which predates the
+# cap and asserted an unbounded lossless queue.
+#
+# So the reason had it exactly backwards, and a maintainer following it would
+# have gone looking for a loss bug in CConnman and removed an OOM defence. The
+# scenario now pins the defence instead of denying it (a cap exists and bites,
+# the survivors are the NEWEST and contiguous, the queue empties, throughput
+# measured over a batch that fits), and a second scenario pins the send queue's
+# OPPOSITE policy -- PushSendMsg drops the NEWEST and keeps the oldest. Neither
+# policy was tested by anything before this change.
+#
+# The lesson, since this is the second quarantine reason found pointing the
+# wrong way: a quarantine reason is an UNVERIFIED HYPOTHESIS until someone runs
+# the thing and reads the code it accuses. "SUSPECTED REAL" is a claim about
+# production code and deserves the same evidence bar as any other.
+#
 # QUARANTINE LIFTED 2026-09-07: rpc_tests. Measured on Linux (WSL Ubuntu-24.04,
 # which is the platform every `runs-on:` in ci.yml uses), N=20 with the
 # exit-code histogram, using scripts/measure_suite_stability.sh:
@@ -245,7 +269,11 @@ fast|peer_scorer_tests|180||
 fast|peer_scorer_banman_integration_tests|180||
 fast|header_proof_checker_tests|180||
 fast|nbits_work_saturation_tests|120||
+fast|vdf_checker_nbits_equality_tests|120||
+fast|proof_checker_selection_tests|120||
 fast|chain_selector_tests|180||
+fast|http_socket_timeout_tests|60||
+fast|deferred_reclamation_tests|180||
 fast|leaf_index_invariant_tests|180||
 fast|queue_parent_pin_publication_tests|180||
 fast|regtest_cap_rejection_tests|180||
@@ -280,6 +308,8 @@ fast|test_passphrase_validator|60|SUSPECTED REAL (policy): 2 of 16 cases -- two 
 fast|chain_case_2_5_equivalence_tests|180|UNTRIAGED: scenario_2 (connect-replacement-fails-then-recovers) now truncates the chain and triggers auto_rebuild instead of recovering (chain_case_2_5_equivalence_tests.cpp:304). Behaviour change in ActivateBestChainStep; needs a chainstate owner to say which side is right.|
 fast|headerssync_gate_arming_tests|120||
 fast|headerssync_accumulator_seeding_tests|120||
+fast|headerssync_work_bound_tests|120||
+fast|headerssync_termination_tests|120||
 fast|minimum_chain_work_kat_tests|120||
 fast|vdf_consensus_test|300||
 fast|vdf_lottery_test|300||
@@ -308,7 +338,7 @@ fast|asert_test|60||
 fast|eda_test|60||
 fast|dna_history_test|120|SUSPECTED REAL, measured on this branch: 2 of ~19 checks fail -- "Update 1 succeeds" and "Update 2 succeeds" (UpdateDNA returns false). The ODD part, and why this needs a DNA owner rather than an expectation bump: every assertion ABOUT the effect of those updates passes -- history has 1 then 2 entries, archived IPS values are right, ordering and persistence across a DB reopen are right. So the write happens and the return value says it did not. Either the return is wrong or the test asserts the wrong contract; both are real. No assert() here, so 2-of-19 is a true count, not a floor.|
 full|integration_tests|600||
-full|connman_tests|600|SUSPECTED REAL: high-load throughput test loses messages (pop_count != NUM_MESSAGES, connman_tests.cpp:552). Message loss under load in CConnman is not a stale expectation.|
+full|connman_tests|600||
 full|tx_relay_tests|600|WINDOWS-ONLY teardown hang (re-scoped 2026-08-15): all 6 tests PASS, then the process never exits on Windows/MSYS2 (exit 124 at 600s; teardown-path, post-J1/F6). LINUX CONFIRMATION DONE: under TSan on Linux (WSL, gcc, -fsanitize=thread) the binary runs all tests AND EXITS CLEANLY, zero data-race warnings -- so the hang is a Windows-specific teardown path (likely winsock/thread-join semantics), not a portable logic bug. Do NOT lift the quarantine on Windows by raising the timeout; needs a Windows-teardown owner. Linux CI can run this suite ungated.|
 full|mining_integration_tests|900|MIXED, ONE SUSPECTED CONSENSUS GAP: (a) coinbase_transaction_creation expects 1 coinbase output and gets 3 -- stale, DFMP splits the coinbase; (b) block_validation_coinbase asserts CheckCoinbase REJECTS a coinbase paying 100 DIL at height 0 and it is ACCEPTED. (b) is a possible missing consensus check and must be triaged by a consensus owner before this quarantine is lifted.|
 full|dfmp_mik_tests|600||

@@ -160,6 +160,67 @@ jobs:
       run: |
         make genesis_gen -j$(nproc)
 
+    - name: Deferred-reclamation structural guards
+      run: |
+        # ⚠️ THESE HELD ONLY ON ONE DEVELOPER'S MACHINE UNTIL NOW (round-8 F52).
+        # Both guards are sh + awk with no build dependency, so Linux runs them
+        # exactly as MSYS2 does -- and the PROPERTIES they hold are toolchain
+        # independent even though the DEFECT that motivated them is Windows-only:
+        #   * thread_local guard: every thread_local trivially destructible with a
+        #     positive static_assert on its own type, checked against an explicit
+        #     inventory. Motivated by MinGW emutls freeing TLS before the C++
+        #     destructors run; the RULE is worth holding everywhere.
+        #   * participant-wait guard: no epoch participant may block while ONLINE.
+        #     Five instances of that were found by hand on this branch before the
+        #     guard existed, and it found two more on its first run.
+        #
+        # EACH RUNS ITS OWN SELF-TEST FIRST, and that is not ceremony: both guards
+        # have failed their own fixtures during development, both times in the
+        # FALSE-OK direction (a NEGATED static_assert accepted; a scope that had
+        # already closed accepted). A guard whose fixtures are never exercised can
+        # stop discriminating without anyone noticing.
+        bash scripts/check_thread_local_guard.sh --self-test
+        bash scripts/check_thread_local_guard.sh
+        bash scripts/check_participant_waits.sh --self-test
+        bash scripts/check_participant_waits.sh
+        bash scripts/check_http_socket_timeouts.sh --self-test
+        bash scripts/check_http_socket_timeouts.sh
+
+    - name: Graveyard drain-cost observation (report-only)
+      run: |
+        # ⚠️ REPORT-ONLY BY DESIGN, and the script header says why at length: a
+        # fixed millisecond gate on a shared runner would fire on noise (measured
+        # 3.4 / 10.7 / 3.6 ms across three identical local runs). What this leg
+        # buys is that F59's operating limit -- "the bench is the gate" -- is a
+        # thing that HAPPENS rather than a thing that was written down.
+        #
+        # DrainGraveyard is O(slots) and slots accrue per thread that ever
+        # participated, so at ~5,760 slots/day the 50 ms redesign threshold is six
+        # to eight weeks of continuous mining away. A number nobody looks at would
+        # decay exactly as fast as the quantity it describes.
+        make graveyard_occupancy_bench -j$(nproc)
+        bash scripts/run_graveyard_bench_ci.sh
+
+    - name: Epoch startup gate (a real node reaches and passes it)
+      run: |
+        # ⚠️ THE CHECK THAT HAD NO AUTOMATED VALUE UNTIL NOW. dilithion-node declares
+        # its epoch participants, checkpoints the main thread, then refuses to start
+        # if any declared thread never checkpointed — and a one-shot
+        # ConsensusInvariant(!IsEpochParticipant()) asserts the main thread has
+        # published no epoch before that point, which sixteen EPOCH-WAIT-EXEMPT
+        # markers rest on. Nothing in CI ran a node past startup, so the assertion
+        # could be deleted or start failing and every suite would stay green. A
+        # review seat said exactly that; this is the leg that answers it.
+        #
+        # SAFETY: isolated temp datadir, non-default ports, mainnet, and NEVER
+        # --relay-only or --generate-seed-key (--relay-only arms the open HIGH about
+        # seed-attestation paths resolving from the chainparams default). Safe here
+        # because an ephemeral runner has no pre-existing node data; the script
+        # REFUSES to run outside CI without an explicit override.
+        bash scripts/ci_node_startup_gate.sh --self-test
+        make dilithion-node -j$(nproc)
+        bash scripts/ci_node_startup_gate.sh
+
     - name: Wallet-preservation guard regression
       run: |
         # An unreadable wallet.dat must never be overwritten by the
@@ -429,6 +490,28 @@ jobs:
         make headers_manager_to_chain_selector_wiring_tests -j$(nproc)
         ASAN_OPTIONS=detect_leaks=0 ./headers_manager_to_chain_selector_wiring_tests
         echo "✅ eviction/UAF regression suite passed under ASan"
+
+    # The memory-safety VERDICT for deferred reclamation. Unlike every other step
+    # in this job, this one requires two of its three arms to CRASH:
+    #
+    #   deferred  -> clean: a pointer resolved before an eviction on another thread
+    #                is still readable. The fix.
+    #   immediate -> heap-use-after-free: the same fixture with deferral off, which
+    #                is what the evictor did before this branch. The defect.
+    #   drained   -> heap-use-after-free: deferral on, but the holder checkpoints
+    #                while still holding, so the drain frees under it. The INVERSE
+    #                CONTROL -- without it, a clean `deferred` arm could mean the
+    #                fixture never reached the free, and every other assertion in
+    #                this branch would be resting on a vacuous green.
+    #
+    # The driver fails the job if a trap arm does NOT trap, and refuses to report a
+    # verdict at all if the binary was built without the sanitizer. No `|| true`.
+    - name: Deferred-reclamation ASan arms (2 of 3 MUST trap)
+      run: |
+        make blockindex_uaf_asan_arm -j$(nproc)
+        # REQUIRE_ASAN=1: if this job's sanitizer flags ever go missing, the driver
+        # must FAIL rather than skip the trap arms and print a tick.
+        REQUIRE_ASAN=1 bash scripts/asan_uaf_arms.sh
 
   sanitizer-ubsan:
     name: UndefinedBehaviorSanitizer
