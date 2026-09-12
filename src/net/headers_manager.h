@@ -17,6 +17,7 @@
 #include <queue>
 #include <set>
 #include <thread>
+#include <optional>
 #include <vector>
 #include <atomic>
 
@@ -117,6 +118,16 @@ public:
      * @return true if headers processed successfully
      */
     bool ProcessHeadersWithDoSProtection(NodeId peer, const std::vector<CBlockHeader>& headers);
+
+    /**
+     * @brief Which phase a peer's DoS-protected session is in, or nullopt if none.
+     *
+     * Reports the state machine's own field rather than a proxy. Needed because
+     * ProcessHeadersWithDoSProtection returns true BOTH for a progressing sync and
+     * for one just terminated by a non-full headers message, so its return value
+     * cannot distinguish them.
+     */
+    std::optional<HeadersSyncState::State> GetHeadersSyncPhase(NodeId peer) const;
 
     /**
      * @brief Check if peer should use DoS-protected header sync

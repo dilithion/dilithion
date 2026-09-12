@@ -201,6 +201,26 @@ jobs:
         make graveyard_occupancy_bench -j$(nproc)
         bash scripts/run_graveyard_bench_ci.sh
 
+    - name: Epoch startup gate (a real node reaches and passes it)
+      run: |
+        # ⚠️ THE CHECK THAT HAD NO AUTOMATED VALUE UNTIL NOW. dilithion-node declares
+        # its epoch participants, checkpoints the main thread, then refuses to start
+        # if any declared thread never checkpointed — and a one-shot
+        # ConsensusInvariant(!IsEpochParticipant()) asserts the main thread has
+        # published no epoch before that point, which sixteen EPOCH-WAIT-EXEMPT
+        # markers rest on. Nothing in CI ran a node past startup, so the assertion
+        # could be deleted or start failing and every suite would stay green. A
+        # review seat said exactly that; this is the leg that answers it.
+        #
+        # SAFETY: isolated temp datadir, non-default ports, mainnet, and NEVER
+        # --relay-only or --generate-seed-key (--relay-only arms the open HIGH about
+        # seed-attestation paths resolving from the chainparams default). Safe here
+        # because an ephemeral runner has no pre-existing node data; the script
+        # REFUSES to run outside CI without an explicit override.
+        bash scripts/ci_node_startup_gate.sh --self-test
+        make dilithion-node -j$(nproc)
+        bash scripts/ci_node_startup_gate.sh
+
     - name: Wallet-preservation guard regression
       run: |
         # An unreadable wallet.dat must never be overwritten by the
