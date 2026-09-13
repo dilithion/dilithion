@@ -119,25 +119,30 @@ CBlockHeader MakeHeader(uint32_t nBits, const uint256& prev, bool vdf = false)
 //
 // The bound refuses a header whose OWN work reaches the threshold, so it is only
 // honest while nMinimumChainWork exceeds a single block's work at the chain's
-// HARDEST difficulty. At 1,000 genesis-blocks — my first guess — the control arm
-// below failed: 0x1b0404cb is a plausible harder difficulty worth ~16,600
-// genesis blocks, so one honest header of it cleared a 1,000-block threshold and
-// the bound refused an honest header. That is the honest-ban class, caught by
-// this suite's own control rather than in review.
+// HARDEST REACHABLE difficulty. My first threshold, 1,000 units, made the arm
+// below fail on 0x1b0404cb, and that failure forced this measurement.
 //
-// Sweeping the crossover (tool: a threshold ramp against ComputeChainWork) gives
-// the separation the bound actually relies on:
+// ⛔ CORRECTED 2026-09-13 — 0x1b0404cb IS NOT A REACHABLE DIFFICULTY ON ANY
+// DILITHION NETWORK. An earlier revision of this comment described it as a real,
+// reachable difficulty. That was never measured, and it is false: every retarget
+// path clamps at MIN_DIFFICULTY_BITS = 0x1d00ffff, the hardest target any network
+// can emit, and consensus enforces nBits == GetNextWorkRequired, so no honest
+// header carries 0x1b0404cb (it is a Bitcoin fixture). The failure at 1,000 units
+// was therefore not an honest-ban. The vector is kept for a different reason —
+// see the arm.
 //
-//   nBits        refused while the threshold is below …
-//   0x1e01fffe   1 genesis-block of work        (DIL mainnet genesis)
-//   0x1d00ffff   2 genesis-blocks               (DilV/testnet genesis)
-//   0x1b0404cb   16,308 genesis-blocks          (a hard but REAL difficulty)
-//   0x00000001   still refused at 2,000,000     (the abusive shape)
+// Crossovers, ramping the threshold in integer multiples of one unit =
+// work(0x1d00ffff) = 2^72 exactly, against ComputeChainWork:
 //
-// Two orders of magnitude of daylight between the hardest realistic header and
-// the abusive one, so the bound discriminates rather than merely fires. 200,000
-// sits ~12x above the hard-difficulty crossover and ~10x below the abusive one's
-// floor.
+//   nBits        refused while the threshold is below …   reachable?
+//   0x1e01fffe   1 unit (ramp granularity; true 1/512)     DIL mainnet genesis
+//   0x1d00ffff   2 units                                   yes: the hardest any network emits
+//   0x1b0404cb   16,308 units (16,307.4 measured)          NO: synthetic, see the arm
+//   0x00000001   still refused at 2,000,000                no: the abusive shape
+//
+// The honest crossover is 2 units. This suite's 200,000-unit threshold sits five
+// orders of magnitude above it and 10x below the abusive floor, so the bound
+// discriminates rather than merely fires.
 //
 // ⛔ ACTIVATION PREREQUISITE, WRITTEN HERE BECAUSE THIS IS WHERE IT IS PROVABLE:
 // whoever sets nMinimumChainWork must keep it above one block's work at the
@@ -246,13 +251,21 @@ void test_a_single_header_cannot_reach_the_gate()
 
     // THE HOLE, three encodings of it. Each yields ~2^255 work from one header
     // and each was accepted by the mantissa guard alone.
-    REQUIRE(!PresyncAcceptsHeader(0x00000001, /*vdf=*/false, /*inject_checker=*/true));
-    REQUIRE(!PresyncAcceptsHeader(0x00000002, /*vdf=*/false, /*inject_checker=*/true));
-    REQUIRE(!PresyncAcceptsHeader(0x01000001, /*vdf=*/false, /*inject_checker=*/true));
+    // vdf=true, DELIBERATELY — keep it, even though THESE vectors could never flake. They are
+    // REFUSED inside ValidateAndProcessSingleHeader (by the single-header work bound) before
+    // ValidateAndStoreHeadersCommitments reaches the commitment hash, so as non-VDF headers they
+    // never threw. They are flipped ONLY to keep this arm single-variable against its partner,
+    // test_an_honest_header_still_passes_the_same_bound, which accepts — and as non-VDF DID throw "RandomX VM
+    // not initialized" (this binary never creates a VM). Reverting these alone breaks the pairing.
+    REQUIRE(!PresyncAcceptsHeader(0x00000001, /*vdf=*/true, /*inject_checker=*/true));
+    REQUIRE(!PresyncAcceptsHeader(0x00000002, /*vdf=*/true, /*inject_checker=*/true));
+    REQUIRE(!PresyncAcceptsHeader(0x01000001, /*vdf=*/true, /*inject_checker=*/true));
 
-    // The shape blocker 1 already closed, re-pinned here so that a rewrite of
-    // either guard cannot quietly drop the other.
-    REQUIRE(!PresyncAcceptsHeader(0x1e000000, /*vdf=*/false, /*inject_checker=*/true));
+    // The shape blocker 1 already closed, re-pinned here. ⚠️ It pins the BOUND only: at this
+    // 200,000-unit threshold saturated work is refused by the single-header work bound BEFORE the
+    // mantissa guard runs, so this vector cannot detect a deleted mantissa guard.
+    // test_zero_mantissa_is_refused_even_with_no_threshold covers that guard, with the bound inert.
+    REQUIRE(!PresyncAcceptsHeader(0x1e000000, /*vdf=*/true, /*inject_checker=*/true));
 
     std::cout << " OK" << std::endl;
 }
@@ -265,11 +278,30 @@ void test_an_honest_header_still_passes_the_same_bound()
     std::cout << "  test_an_honest_header_still_passes_the_same_bound..." << std::flush;
 
     // Same threshold, same checker, same message shape — only nBits differs.
-    REQUIRE(PresyncAcceptsHeader(0x1d00ffff, /*vdf=*/false, /*inject_checker=*/true));
-    // And a harder-but-real difficulty — the arm that failed on my first
-    // threshold and forced the measurement above. Without it this suite would
-    // pin the bound only against the one difficulty the chain launched at.
-    REQUIRE(PresyncAcceptsHeader(0x1b0404cb, /*vdf=*/false, /*inject_checker=*/true));
+    // vdf=true, DELIBERATELY — do not return to MakeHeader's default. HeadersSyncState draws its
+    // commitment offset at random per state and hashes an accepted header when it lands on that
+    // slot (ValidateAndStoreHeadersCommitments). A NON-VDF header hashes through RandomX, and this
+    // binary never initializes a RandomX VM, so a non-VDF vector threw "RandomX VM not initialized"
+    // in 5 of 1,000 runs. With the proof checker injected, header type is incidental to the bound.
+    REQUIRE(PresyncAcceptsHeader(0x1d00ffff, /*vdf=*/true, /*inject_checker=*/true));
+    // ⛔ A SYNTHETIC MAGNITUDE PROBE, NOT A REACHABLE DIFFICULTY. DO NOT SWAP IT FOR
+    // A PRODUCIBLE nBits.
+    //
+    // 0x1b0404cb is reachable on no Dilithion network (see the table above), and an
+    // earlier revision of this comment was wrong to call it real. Its purpose
+    // survives, though not the one that comment gave: this is the suite's ONLY
+    // accept-direction vector anywhere near the threshold. The vector above is 1
+    // unit; this one is ~16,307 against 200,000, so it pins the MAGNITUDE of the
+    // comparison and not merely its direction.
+    //
+    // MEASURED 2026-09-13, MUTANT_M (the bound compared against bound / 256, an
+    // effective threshold of ~781 units): the 0x1d00ffff REQUIRE above PASSED and
+    // this one FAILED. The 1-unit vector cannot see that error and this one can,
+    // so swapping it for a producible value deletes the only arm that catches it.
+    // Resolution, derived rather than run: it catches an error that pushes the
+    // effective threshold below ~16,307 units (more than ~12x); a smaller error
+    // passes both vectors.
+    REQUIRE(PresyncAcceptsHeader(0x1b0404cb, /*vdf=*/true, /*inject_checker=*/true));
 
     std::cout << " OK" << std::endl;
 }
@@ -291,7 +323,12 @@ void test_a_zero_threshold_bounds_nothing()
     // 0x00000001 is refused above under a real threshold; with no gate to
     // inflate, the work bound has nothing to say and the mantissa guard still
     // does its own job on 0x1e000000 (asserted separately below).
-    std::vector<CBlockHeader> batch{MakeHeader(0x00000001, ChainStartHash())};
+    // vdf=true, DELIBERATELY — do not return to MakeHeader's default. HeadersSyncState draws its
+    // commitment offset at random per state and hashes an accepted header when it lands on that
+    // slot (ValidateAndStoreHeadersCommitments). A NON-VDF header hashes through RandomX, and this
+    // binary never initializes a RandomX VM, so a non-VDF vector threw "RandomX VM not initialized"
+    // in 5 of 1,000 runs. With the proof checker injected, header type is incidental to the bound.
+    std::vector<CBlockHeader> batch{MakeHeader(0x00000001, ChainStartHash(), /*vdf=*/true)};
     REQUIRE(state.ProcessNextHeaders(batch, false).success);
 
     std::cout << " OK" << std::endl;
@@ -311,7 +348,13 @@ void test_zero_mantissa_is_refused_even_with_no_threshold()
                            /*chain_start_work=*/uint256(),
                            /*minimum_work=*/uint256(), &checker);
 
-    std::vector<CBlockHeader> batch{MakeHeader(0x1e000000, ChainStartHash())};
+    // vdf=true, DELIBERATELY — keep it, even though THESE vectors could never flake. They are
+    // REFUSED inside ValidateAndProcessSingleHeader (by NBitsUsableForWork, the mantissa guard) before
+    // ValidateAndStoreHeadersCommitments reaches the commitment hash, so as non-VDF headers they
+    // never threw. They are flipped ONLY to keep this arm single-variable against its partner,
+    // test_a_zero_threshold_bounds_nothing, which accepts — and as non-VDF DID throw "RandomX VM
+    // not initialized" (this binary never creates a VM). Reverting these alone breaks the pairing.
+    std::vector<CBlockHeader> batch{MakeHeader(0x1e000000, ChainStartHash(), /*vdf=*/true)};
     REQUIRE(!state.ProcessNextHeaders(batch, false).success);
 
     std::cout << " OK" << std::endl;
@@ -332,9 +375,12 @@ void test_a_vdf_header_without_a_checker_is_refused()
 
     REQUIRE(!PresyncAcceptsHeader(0x1d00ffff, /*vdf=*/true, /*inject_checker=*/false));
 
-    // THE DISCRIMINATING HALF, twice over. The same VDF header passes once a
-    // checker is present — so this pins "refuse the UNCHECKED case", not "refuse
-    // VDF". And a non-VDF header still takes the legacy fallback unharmed.
+    // THE DISCRIMINATING HALF. The same VDF header passes once a checker is present — so
+    // this pins "refuse the UNCHECKED case", not "refuse VDF".
+    // ⚠️ NOT TESTED HERE: the no-checker NON-VDF fallback (the `else if (!header.IsVDFBlock())`
+    // PoW branch in ValidateAndProcessSingleHeader). That branch hashes through RandomX and this
+    // binary never initializes a RandomX VM, so a non-VDF no-checker vector would throw rather
+    // than exercise it.
     REQUIRE(PresyncAcceptsHeader(0x1d00ffff, /*vdf=*/true,  /*inject_checker=*/true));
 
     std::cout << " OK" << std::endl;
