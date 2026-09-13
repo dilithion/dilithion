@@ -251,17 +251,20 @@ void test_a_single_header_cannot_reach_the_gate()
 
     // THE HOLE, three encodings of it. Each yields ~2^255 work from one header
     // and each was accepted by the mantissa guard alone.
-    // vdf=true, DELIBERATELY — do not return to MakeHeader's default. HeadersSyncState draws its
-    // commitment offset at random per state and hashes an accepted header when it lands on that
-    // slot (ValidateAndStoreHeadersCommitments). A NON-VDF header hashes through RandomX, and this
-    // binary never initializes a RandomX VM, so a non-VDF vector threw "RandomX VM not initialized"
-    // in 5 of 1,000 runs. With the proof checker injected, header type is incidental to the bound.
+    // vdf=true, DELIBERATELY — keep it, even though THESE vectors could never flake. They are
+    // REFUSED inside ValidateAndProcessSingleHeader (by the single-header work bound) before
+    // ValidateAndStoreHeadersCommitments reaches the commitment hash, so as non-VDF headers they
+    // never threw. They are flipped ONLY to keep this arm single-variable against its partner,
+    // test_an_honest_header_still_passes_the_same_bound, which accepts — and as non-VDF DID throw "RandomX VM
+    // not initialized" (this binary never creates a VM). Reverting these alone breaks the pairing.
     REQUIRE(!PresyncAcceptsHeader(0x00000001, /*vdf=*/true, /*inject_checker=*/true));
     REQUIRE(!PresyncAcceptsHeader(0x00000002, /*vdf=*/true, /*inject_checker=*/true));
     REQUIRE(!PresyncAcceptsHeader(0x01000001, /*vdf=*/true, /*inject_checker=*/true));
 
-    // The shape blocker 1 already closed, re-pinned here so that a rewrite of
-    // either guard cannot quietly drop the other.
+    // The shape blocker 1 already closed, re-pinned here. ⚠️ It pins the BOUND only: at this
+    // 200,000-unit threshold saturated work is refused by the single-header work bound BEFORE the
+    // mantissa guard runs, so this vector cannot detect a deleted mantissa guard.
+    // test_zero_mantissa_is_refused_even_with_no_threshold covers that guard, with the bound inert.
     REQUIRE(!PresyncAcceptsHeader(0x1e000000, /*vdf=*/true, /*inject_checker=*/true));
 
     std::cout << " OK" << std::endl;
@@ -345,11 +348,12 @@ void test_zero_mantissa_is_refused_even_with_no_threshold()
                            /*chain_start_work=*/uint256(),
                            /*minimum_work=*/uint256(), &checker);
 
-    // vdf=true, DELIBERATELY — do not return to MakeHeader's default. HeadersSyncState draws its
-    // commitment offset at random per state and hashes an accepted header when it lands on that
-    // slot (ValidateAndStoreHeadersCommitments). A NON-VDF header hashes through RandomX, and this
-    // binary never initializes a RandomX VM, so a non-VDF vector threw "RandomX VM not initialized"
-    // in 5 of 1,000 runs. With the proof checker injected, header type is incidental to the bound.
+    // vdf=true, DELIBERATELY — keep it, even though THESE vectors could never flake. They are
+    // REFUSED inside ValidateAndProcessSingleHeader (by NBitsUsableForWork, the mantissa guard) before
+    // ValidateAndStoreHeadersCommitments reaches the commitment hash, so as non-VDF headers they
+    // never threw. They are flipped ONLY to keep this arm single-variable against its partner,
+    // test_a_zero_threshold_bounds_nothing, which accepts — and as non-VDF DID throw "RandomX VM
+    // not initialized" (this binary never creates a VM). Reverting these alone breaks the pairing.
     std::vector<CBlockHeader> batch{MakeHeader(0x1e000000, ChainStartHash(), /*vdf=*/true)};
     REQUIRE(!state.ProcessNextHeaders(batch, false).success);
 
@@ -371,9 +375,12 @@ void test_a_vdf_header_without_a_checker_is_refused()
 
     REQUIRE(!PresyncAcceptsHeader(0x1d00ffff, /*vdf=*/true, /*inject_checker=*/false));
 
-    // THE DISCRIMINATING HALF, twice over. The same VDF header passes once a
-    // checker is present — so this pins "refuse the UNCHECKED case", not "refuse
-    // VDF". And a non-VDF header still takes the legacy fallback unharmed.
+    // THE DISCRIMINATING HALF. The same VDF header passes once a checker is present — so
+    // this pins "refuse the UNCHECKED case", not "refuse VDF".
+    // ⚠️ NOT TESTED HERE: the no-checker NON-VDF fallback (the `else if (!header.IsVDFBlock())`
+    // PoW branch in ValidateAndProcessSingleHeader). That branch hashes through RandomX and this
+    // binary never initializes a RandomX VM, so a non-VDF no-checker vector would throw rather
+    // than exercise it.
     REQUIRE(PresyncAcceptsHeader(0x1d00ffff, /*vdf=*/true,  /*inject_checker=*/true));
 
     std::cout << " OK" << std::endl;
