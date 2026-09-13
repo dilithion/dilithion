@@ -237,8 +237,25 @@ set -u
 #   14 PASS   -> registered live (12 fast, 1 full, 1 was already the selftest)
 #    1 FAIL   -> hd_wallet_standalone_tests, diagnosed, fixed in PR #187
 #    1 NOBUILD-> difficulty_determinism_test does not link
-#    1 vacuous-> batch_verifier_race_tests passes without TSan and proves nothing
+#    1 vacuous-> batch_verifier_race_tests "passes without TSan and proves nothing"
+#                -- ⛔ WRONG, and lifted 2026-09-13; see the note below.
 #    1 hang   -> batch_verifier_race_control, BY DESIGN, see below
+#
+# QUARANTINE LIFTED 2026-09-13: batch_verifier_race_tests. ITS REASON WAS INVERTED
+# (the third this week, after connman_tests and chain_case_2_5). The row said the
+# race "is only observable under -fsanitize=thread, so a plain PASS would report
+# coverage it does not have". Measured at origin/main 911e6e9c (Linux/WSL, g++ 13.3):
+#   pre-fix control, TSAN=1 build : 0 TSan reports; hangs (killed at 180s)
+#   pre-fix control, plain build  : hangs (killed at 60s)
+#   fixed suite, plain            : 3/3 PASS, ~1s     fixed suite, TSAN=1: 10/10 PASS, 0 reports
+# TSan is silent because the pre-fix shared batch state is std::atomic plus a
+# mutex-guarded string: a LOGIC race (cross-batch contamination, size_t underflow,
+# Wait() never wakes), with no unsynchronised access for TSan to report. The
+# harness's own oracle and hang ARE the detector, so a plain PASS is real coverage.
+# The TSan-instrumentation positive control (a 5-line racy program) did report
+# (rc 66), so the silence is the race's class, not a broken sanitizer.
+# Anti-vacuity is enforced in ci.yml (build-and-test, gcc/Release): the pre-fix
+# control must NOT pass, or the step fails.
 #
 # TWO TARGETS ARE DELIBERATELY NOT ROSTERED, and both would be wrong to add:
 #
@@ -249,6 +266,7 @@ set -u
 #     control for the census instrument: 0.03s CPU over 114s wall is
 #     unambiguously blocked, which is what licenses calling
 #     wallet_encryption_at_rest_tests (71.5s CPU over 75s wall) real work.
+#     It IS run -- by a ci.yml step that requires it to hang or fail, never pass.
 #
 #   genesis_gen -- a TOOL that generates a genesis block, not a gated test.
 #
@@ -346,7 +364,7 @@ full|net_tests|600|NOBUILD: source no longer compiles. References a removed glob
 full|randomx_mode_test|1800||
 full|large_pages_optin_test|2100||
 full|wallet_encryption_at_rest_tests|300||
-full|batch_verifier_race_tests|300|TSAN-ONLY, and this is a vacuity quarantine rather than a failure. It PASSES without TSan (exit 0, 3.69s CPU) -- which is the problem: the race it exists to catch is only observable under -fsanitize=thread, so a plain PASS here would report coverage it does not have. Run it as the `batch_verifier_race_tests:` recipe documents: make TSAN=1 batch_verifier_race_tests. Its paired control batch_verifier_race_control is deliberately NOT rostered -- see the comment above the roster.|
+fast|batch_verifier_race_tests|60||
 full|four_node_test|900|NOBUILD: this target is not a binary at all -- it is a PHONY whose recipe RUNS scripts/four_node_local.sh, standing up a live 4-node regtest mesh (smoke 10 180). That matters mechanically, not just descriptively: a quarantined row is still BUILT so it cannot rot, and "building" this one EXECUTES the mesh. Rostering it without NOBUILD made the CI build step run a 4-node harness and fail (Makefile:1154, Error 2, full-tier leg) -- caught by CI on the first push, which is the system working. NOBUILD keeps it COUNTED in the register while excluding it from --list, so nothing builds or runs it. Run it deliberately: make four_node_test.|
 '
 

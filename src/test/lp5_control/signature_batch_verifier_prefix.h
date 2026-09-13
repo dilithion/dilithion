@@ -13,10 +13,12 @@
 // harness is a real discriminator, not a no-op that would pass on anything.
 //
 // Provenance: `git show bb933d53:src/consensus/signature_batch_verifier.h`.
-// The ONLY edits relative to that source are:
-//   - the include guard renamed (…_PREFIX_H) so it can coexist in-tree with the
-//     fixed header without a redefinition clash;
-//   - this provenance banner.
+// CODE IDENTICAL; COMMENTS STRIPPED. Relative to that source:
+//   - the include guard is renamed (…_PREFIX_H) so it can coexist in-tree with
+//     the fixed header without a redefinition clash -- the only code change;
+//   - the original doc comments were stripped and this provenance banner added.
+// (Measured 2026-09-13: with comments and blank lines removed from both, the
+//  only differing lines are the two include-guard lines.)
 // The class shape, the shared per-batch members (m_pending_count /
 // m_batch_failed / m_first_error / m_complete_*), and the sessionless
 // BeginBatch()/Add()/Wait() signatures are EXACTLY the pre-fix code — that

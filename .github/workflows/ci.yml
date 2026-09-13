@@ -392,6 +392,50 @@ jobs:
       run: |
         make tests-fast -j$(nproc)
 
+    # ------------------------------------------------------------------
+    # LP-5 race harness anti-vacuity. batch_verifier_race_tests runs in the fast
+    # tier above; its PASS only means something while the SAME harness still
+    # catches the pre-fix verifier. batch_verifier_race_control is that harness
+    # built against a verbatim copy of the pre-fix verifier (bb933d53). It must
+    # HANG (killed -> 137) or report a mismatch (1). If it ever exits 0, the
+    # harness can no longer see the defect it exists for and the suite's PASS
+    # is vacuous -- so this step fails.
+    # Not a TSan job, deliberately: the pre-fix race is a logic race over
+    # std::atomic + a mutex, and TSan measured 0 reports on the control.
+    #
+    # An exit code alone is NOT evidence the race ran: the harness can exit 1
+    # in setup (pool self-verify) and 137 also comes from any external SIGKILL
+    # (OOM). So both codes additionally require "running 8 threads" (the race
+    # loop was entered), and 1 also requires "RESULT: FAIL". stdbuf -oL keeps
+    # that progress line from being lost when the hang is SIGKILLed.
+    #
+    # Step logic verified locally (2026-09-13), five arms: FIXED build -> fail;
+    # real pre-fix control (hangs in the loop) -> pass; stub exiting 1 in setup
+    # -> fail; stub hanging in setup (137 before the loop) -> fail; stub reporting
+    # RESULT: FAIL after entering the loop -> pass.
+    # ------------------------------------------------------------------
+    - name: LP-5 race harness still discriminates (pre-fix control must not pass)
+      if: matrix.compiler == 'gcc' && matrix.build_type == 'Release'
+      run: |
+        make batch_verifier_race_control -j$(nproc)
+        set +e
+        timeout -s KILL 60 stdbuf -oL ./batch_verifier_race_control > race_control.out 2>&1
+        rc=$?
+        set -e
+        tail -5 race_control.out
+        echo "control rc=$rc"
+        ran=0; grep -q 'running 8 threads' race_control.out && ran=1
+        case "$rc" in
+          137)
+            if [ "$ran" = 1 ]; then echo "control discriminates: hung inside the race loop (rc=137)"
+            else echo "::error::control killed (rc=137) BEFORE reaching the race loop -- setup hang or external kill (OOM?), not the race"; exit 1; fi ;;
+          1)
+            if [ "$ran" = 1 ] && grep -q 'RESULT: FAIL' race_control.out; then echo "control discriminates: race loop reported a mismatch (rc=1)"
+            else echo "::error::control exited 1 without a race-loop RESULT: FAIL -- it failed in setup, not on the race"; exit 1; fi ;;
+          *)
+            echo "::error::batch_verifier_race_control rc=$rc -- the LP-5 harness no longer detects the pre-fix race"; exit 1 ;;
+        esac
+
     - name: Upload standalone suite logs
       if: always() && matrix.compiler == 'gcc' && matrix.build_type == 'Release'
       uses: actions/upload-artifact@v7
@@ -540,17 +584,32 @@ jobs:
       run: |
         echo "CC=clang" >> $GITHUB_ENV
         echo "CXX=clang++" >> $GITHUB_ENV
-        echo "CFLAGS=-fsanitize=undefined -fno-omit-frame-pointer -g" >> $GITHUB_ENV
-        echo "CXXFLAGS=-fsanitize=undefined -fno-omit-frame-pointer -g -std=c++17" >> $GITHUB_ENV
+        # -fno-sanitize-recover=undefined makes a UBSan finding FATAL. UBSan's default is to report
+        # and continue with exit 0, so without it this job could not fail on undefined behaviour
+        # even with no `|| true` on the test step. Measured on both compilers the test binary uses:
+        # g++ builds the project objects (Makefile `CXX := g++` overrides CXX above), clang++ builds
+        # RandomX.
+        echo "CFLAGS=-fsanitize=undefined -fno-sanitize-recover=undefined -fno-omit-frame-pointer -g" >> $GITHUB_ENV
+        echo "CXXFLAGS=-fsanitize=undefined -fno-sanitize-recover=undefined -fno-omit-frame-pointer -g -std=c++17" >> $GITHUB_ENV
         echo "LDFLAGS=-fsanitize=undefined" >> $GITHUB_ENV
+        # RandomX flags live in one variable because the RandomX build AND the positive control use
+        # them, so the control cannot drift from what is actually built.
+        #
+        # -fno-sanitize=function: clang's function-type check reads 8 bytes before every indirect
+        # call target. RandomX calls its JIT-compiled program through a pointer to the first byte
+        # of a freshly mapped page, so when the page before it is unmapped that read faults (every
+        # fault address ended in ...ff8). It crashed test_dilithion after 187 of 730 test cases on
+        # the runs measured. Runtime-generated code carries no type signature, so the check cannot
+        # be satisfied there. Every other UBSan check stays on for RandomX.
+        echo "RANDOMX_UBSAN_FLAGS=-fsanitize=undefined -fno-sanitize=function -fno-sanitize-recover=undefined -fno-omit-frame-pointer" >> $GITHUB_ENV
 
     - name: Build RandomX
       run: |
         cd depends/randomx
         mkdir -p build
         cd build
-        cmake .. -DCMAKE_C_FLAGS="-fsanitize=undefined -fno-omit-frame-pointer" \
-                 -DCMAKE_CXX_FLAGS="-fsanitize=undefined -fno-omit-frame-pointer"
+        cmake .. -DCMAKE_C_FLAGS="$RANDOMX_UBSAN_FLAGS" \
+                 -DCMAKE_CXX_FLAGS="$RANDOMX_UBSAN_FLAGS"
         make -j$(nproc)
 
     - name: Build Dilithium library
@@ -572,20 +631,30 @@ jobs:
         fi
         cd depends/dilithium/ref
         make clean || true
-        CFLAGS="-fsanitize=undefined -fno-omit-frame-pointer -O2 -DDILITHIUM_MODE=3" make -j$(nproc)
+        CFLAGS="-fsanitize=undefined -fno-sanitize-recover=undefined -fno-omit-frame-pointer -O2 -DDILITHIUM_MODE=3" make -j$(nproc)
 
     - name: Build with UBSan
       run: |
         make clean
         make test_dilithion -j$(nproc)
 
+    # Proves this job CAN fail before trusting its verdict. It compiles one line of undefined
+    # behaviour with the same compilers and flags as the build above and requires the UB arm to
+    # exit non-zero and a clean arm to pass, on both g++ and clang++. If a flag change ever makes
+    # UBSan non-fatal again, this step goes red instead of the test step quietly reading green.
+    - name: UBSan positive control (the job must be able to fail)
+      run: bash scripts/ci/ubsan_positive_control.sh
+
     - name: Run UBSan Tests
       run: |
         # Phase 8: Run tests with UBSan to detect undefined behavior
         # Skip HD wallet tests - BUG-77 (GetNewHDAddress hangs)
+        #
+        # No `|| true`. With -fno-sanitize-recover=undefined a UBSan finding aborts the binary,
+        # so this exit code is the verdict, and the positive control above proves it can go red.
         echo "Running tests with UndefinedBehaviorSanitizer..."
-        ./test_dilithion --log_level=test_suite --report_level=short --run_test='!wallet_hd_tests:!rpc_hd_wallet_tests:!hd_wallet_standalone_tests' || true
-        echo "✅ UBSan tests completed (check output above for undefined behavior)"
+        ./test_dilithion --log_level=test_suite --report_level=short --run_test='!wallet_hd_tests:!rpc_hd_wallet_tests:!hd_wallet_standalone_tests'
+        echo "UBSan tests passed with no undefined behaviour reported."
 
   sanitizer-tsan:
     name: ThreadSanitizer (Data Races)
