@@ -476,7 +476,7 @@ BOOST_RPC_WEBSOCKET_TEST_SOURCE := src/test/rpc_websocket_tests.cpp
 # Targets
 # ============================================================================
 
-.PHONY: all clean install help tests test depends check-tip-notify-drain check-headers-manager-pointer
+.PHONY: all clean install help tests test depends check-tip-notify-drain check-headers-manager-pointer check-no-private-mutex-across-chainstate
 .DEFAULT_GOAL := all
 
 # P2P-14/15 structural guard. Asserts the tip-notification drain invariant that
@@ -495,6 +495,13 @@ BOOST_RPC_WEBSOCKET_TEST_SOURCE := src/test/rpc_websocket_tests.cpp
 #
 # Wired here for the same reason as its sibling above: a guard nobody runs is a
 # file. It is a sub-second grep.
+# P2P-17 structural guard. No class may hold its own mutex across a call into
+# the chainstate: every chainstate accessor takes cs_main, and block
+# connect/disconnect callbacks already create the cs_main -> <private mutex>
+# edge, so the reverse direction completes an AB-BA. Sub-second static audit.
+check-no-private-mutex-across-chainstate:
+	@bash scripts/check-no-private-mutex-across-chainstate.sh
+
 check-headers-manager-pointer:
 	@bash scripts/check-headers-manager-no-chainstate-pointer.sh
 
@@ -696,7 +703,7 @@ tests: tests-build
 # wired into the target CI actually runs because a guard with zero callers is
 # not a guard — it is a file. It runs FIRST: it is a sub-second grep, and if the
 # drain invariant is broken there is no point running the suites.
-tests-fast: check-tip-notify-drain check-headers-manager-pointer check-thread-local-guard check-participant-waits check-http-socket-timeouts $(TEST_SUITES_FAST)
+tests-fast: check-tip-notify-drain check-headers-manager-pointer check-no-private-mutex-across-chainstate check-thread-local-guard check-participant-waits check-http-socket-timeouts $(TEST_SUITES_FAST)
 	@bash scripts/check_roster_completeness.sh
 	@bash scripts/test_run_with_hang_capture.sh
 	@bash scripts/test_run_test_suites_timeout.sh
@@ -704,7 +711,7 @@ tests-fast: check-tip-notify-drain check-headers-manager-pointer check-thread-lo
 	@bash scripts/test_run_test_suites_args.sh
 	@bash scripts/run_test_suites.sh fast
 
-tests-full: check-tip-notify-drain check-headers-manager-pointer check-thread-local-guard check-participant-waits check-http-socket-timeouts $(TEST_SUITES_FULL)
+tests-full: check-tip-notify-drain check-headers-manager-pointer check-no-private-mutex-across-chainstate check-thread-local-guard check-participant-waits check-http-socket-timeouts $(TEST_SUITES_FULL)
 	@bash scripts/run_test_suites.sh full
 
 phase1_test: $(CORE_OBJECTS) $(OBJ_DIR)/test/phase1_simple_test.o $(DILITHIUM_OBJECTS) $(CHIAVDF_OBJECTS)

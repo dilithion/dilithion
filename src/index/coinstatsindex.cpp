@@ -439,7 +439,10 @@ bool CCoinStatsIndex::ComputeBlockStats(const CBlock& block,
 }
 
 bool CCoinStatsIndex::WriteBlock(const CBlock& block, int height, const uint256& block_hash) {
-    std::lock_guard<std::mutex> lock(m_mutex);
+    // P2P-17: unique_lock, not lock_guard, because the main-chain pre-check below
+    // calls into the chainstate (which takes cs_main) and m_mutex MUST NOT be held
+    // across that call. See the comment at the unlock site.
+    std::unique_lock<std::mutex> lock(m_mutex);
 
     if (!m_db) return false;
 
@@ -479,6 +482,106 @@ bool CCoinStatsIndex::WriteBlock(const CBlock& block, int height, const uint256&
     // record. Detect by comparing the just-supplied block's hashPrevBlock
     // against the canonical main-chain hash at height-1.
     if (height > 0) {
+        // P2P-17 FIX — a LATENT AB-BA. Severity corrected on review, and the
+        // correction matters: this is not a live deadlock.
+        //
+        // This block calls into the chainstate, and both GetBlocksAtHeight
+        // (chain.cpp) and GetBlockIndex take cs_main. Holding m_mutex across
+        // them created the second half of a cycle:
+        //
+        //   edge 1  cs_main -> m_mutex :  ActivateBestChain holds cs_main at
+        //           function scope, DisconnectTip fires the block-disconnect
+        //           callbacks with it STILL held (cs_main is recursive, so an
+        //           inner scope ending does not release it), and the registered
+        //           callback calls EraseBlock, which takes m_mutex.
+        //   edge 2  m_mutex -> cs_main :  m_sync_thread -> SyncLoop ->
+        //           WalkBlockRange -> WriteBlock, holding m_mutex here, and
+        //           WalkBlockRange holds no cs_main at all.
+        //
+        // Two threads, opposite orders — but NOT concurrently reachable today.
+        // Edge 1 exists only through the node-registered callbacks
+        // (dilithion-node.cpp:3480/:3489, dilv-node.cpp:3302/:3311) and EVERY one
+        // is gated on IsSynced(); edge 2 runs only from SyncLoop, which finishes
+        // before IsSynced() opens. The two edges are TEMPORALLY EXCLUSIVE, by the
+        // same gate relied on below. I originally filed this as live: I used the
+        // gate to argue the unlock window was safe and then failed to apply it to
+        // reachability, which is the asymmetry to avoid — a gate that protects
+        // you also constrains your finding.
+        //
+        // It is still worth fixing, and for a reason that outlasts the gate: the
+        // exclusion is an EMERGENT property of two IsSynced() checks in a
+        // different file. Add a third caller, widen the gate, or make the live
+        // path fire during catch-up, and the cycle is real with nothing to catch
+        // it. Releasing m_mutex across the query makes the inversion
+        // STRUCTURALLY IMPOSSIBLE rather than gate-dependent.
+        //
+        // THE DISCIPLINE ALREADY EXISTED ONE FUNCTION AWAY: Init() in this file
+        // uses unique_lock and unlock()s before every chainstate call, and
+        // tx_index.cpp:520 spells out the same rule ("GetTip() acquires cs_main
+        // internally (R1). We do NOT hold m_mutex"). WriteBlock is the sibling
+        // that missed it — which is why the fix is to match them, not invent.
+        //
+        // WHY THE UNLOCK WINDOW IS SAFE, and this is the part worth checking if
+        // you change either caller: WriteBlock has exactly two callers and they
+        // are MUTUALLY EXCLUSIVE. The live connect-callback path is gated on
+        // IsSynced(), and m_synced is stored true exactly once, at SyncLoop's
+        // final `return`. So the sync thread has exited before the callback can
+        // ever call in. No second WriteBlock can observe the window and fold
+        // onto a stale m_running. If a third caller is ever added, or the
+        // IsSynced() gate is removed, re-examine this: m_running is read AFTER
+        // the window.
+        //
+        // [!] THE TEARDOWN PREMISE - F10, external panel round 2. This window
+        // also depends on something the whole-body lock_guard used to supply BY
+        // CONSTRUCTION, and which was written down nowhere until now.
+        //
+        // ~CCoinStatsIndex calls Stop(), then takes m_mutex, then m_db.reset().
+        // Stop() joins m_sync_thread ONLY and does not take m_mutex. So the
+        // destructor can acquire this mutex WHILE a callback-thread WriteBlock is
+        // sitting in one of these unlock windows, free m_db and destroy the
+        // object - and the callback thread then calls lock.lock() on a mutex
+        // inside a freed object. Under the old whole-body guard the destructor
+        // simply blocked until WriteBlock returned. That protection is gone, and
+        // this comment is where it has to be replaced.
+        //
+        // THE PREMISE: nothing may destroy this index while a block-connect
+        // callback can still fire. The callbacks are never unregistered (the only
+        // clear is in chain.cpp, outside the shutdown sequence), so quiescing the
+        // callback SOURCE is the only thing that holds it.
+        //
+        // [measured, dilithion-node.cpp] the index is reset at four sites, named by
+        // IDENTITY rather than by line number -- the earlier version of this comment
+        // cited lines that were already six off, which is exactly how a comment
+        // decays into a confident wrong answer:
+        //
+        //   * the pre-registration reset in the reindex/startup path
+        //         - safe BY ORDER: the callback is not registered yet
+        //   * the normal-shutdown reset, which follows g_node_context.Shutdown()
+        //         - QUIESCED: that call stops the validation queue and connman, so
+        //           no callback can still be in flight
+        //   * the reset in `catch (const std::exception&)` in main()
+        //   * the reset in `catch (...)` in main()
+        //         - these two were NOT quiesced, and this change made that
+        //           reachable. Both now call g_node_context.Shutdown() first.
+        //
+        // ⛔ WHY IT MATTERED, and it is the general lesson rather than this bug:
+        // THE OLD WHOLE-BODY LOCK WAS DOING TWO JOBS. Mutual exclusion, and -- as an
+        // unstated side effect of its SCOPE -- keeping ~CCoinStatsIndex out until the
+        // callback finished, because the destructor takes the same mutex. Narrowing
+        // the lock to fix the inversion silently dropped the second job, because
+        // nothing had ever named it. Stop() joins m_sync_thread only and never takes
+        // m_mutex, so without the quiesce the destructor could free m_db while a
+        // callback-thread WriteBlock sat in this very unlock window.
+        //
+        // ANY TIME YOU SHORTEN A LOCK'S SCOPE, ask what the long scope was
+        // incidentally guaranteeing -- lifetime, ordering, back-pressure. None of
+        // those are written down anywhere.
+        //
+        // AND a post-retake `if (!m_db) return false;` must NOT stand in for this
+        // argument: re-checking m_db after the retake closes only the null-deref
+        // half. The freed-object half - locking a mutex that no longer exists -
+        // happens BEFORE any such check could run.
+        lock.unlock();
         const std::vector<uint256> prev_hashes =
             g_chainstate.GetBlocksAtHeight(height - 1);
         uint256 expected_prev;
@@ -499,8 +602,34 @@ bool CCoinStatsIndex::WriteBlock(const CBlock& block, int height, const uint256&
                       << "... (likely reorg during reindex) -- setting "
                       << "corrupt flag and refusing write" << std::endl;
             m_corrupted.store(true);
-            return false;
+            return false;  // returning with m_mutex released is fine: m_corrupted
+                           // is atomic and unique_lock's destructor is a no-op.
         }
+        lock.lock();  // retake for the m_running / m_db work below
+        // WHY THERE IS NO RE-VALIDATION AFTER THE RETAKE, stated per member because
+        // the panel asked for it per member (Init retakes and re-checks, and this
+        // mirrors Init's unlock/lock dance but deliberately not its re-check):
+        //
+        //   m_corrupted, height contiguity, m_running
+        //       cannot have moved: no EraseBlock and no callback-driven WriteBlock
+        //       can run while the sync thread is inside this window, because
+        //       IsSynced() is still false. The same gate that makes the inversion
+        //       latent makes this window exclusive.
+        //   m_db
+        //       is only ever reset by ~CCoinStatsIndex, and the destructor is now
+        //       excluded from this window on every reachable path by the quiesce in
+        //       BOTH node binaries' shutdown and exception handlers.
+        //
+        // ⛔ AND A POST-RETAKE `if (!m_db)` CHECK IS NOT THE PROTECTION AND MUST NOT
+        // BE MISTAKEN FOR IT. If the object were freed, `lock.lock()` on the line
+        // above would already have touched a mutex inside freed memory — before any
+        // such check could run. The quiesce is the protection; a null-check would
+        // only close the narrower null-deref half and would read as if it closed
+        // more. Init's re-check answers a different question (did state advance
+        // during a long init), not a lifetime one.
+        //
+        // If the IsSynced() gate ever changes, re-check m_corrupted AND contiguity
+        // here; if the quiesce is ever weakened, the fix is the quiesce, not a check.
     }
 
     CoinStats parent = m_running;

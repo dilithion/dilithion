@@ -2052,6 +2052,69 @@ std::optional<CBlockTemplate> BuildMiningTemplate(CBlockchainDB& blockchain, CWa
     return CBlockTemplate(block, hashTarget, nHeight, version);
 }
 
+// D-1 (external review of #197): this body used to be an anonymous lambda
+// inside main(). The lock-scope auditor keys its allowlist on (file, function,
+// call, mutex), and main() here runs from its opening line to end of file, so
+// EVERY lambda inside main() shares the key "main" - a NEW chainstate call
+// under g_pendingMinerWinsMutex in a different lambda (a miner-thread one, say)
+// would inherit this entry's classification and pass silently. Naming the
+// function gives the allowlist a key that means one specific body.
+//
+// This is the ONLY reason it is a named function; the behaviour is unchanged.
+// PRECONDITION (F5, external panel round 1): call this ONLY from a
+// block-connect callback, i.e. with cs_main ALREADY HELD by the caller.
+//
+// The lock-scope allowlist entries for the two g_chainstate calls below rest
+// entirely on that: they take g_pendingMinerWinsMutex and then reach cs_main,
+// which is one half of an AB-BA — safe ONLY because the sole caller already owns
+// cs_main (it is recursive), so no thread can supply the opposite order. Call
+// this from anywhere that does not hold cs_main and the tuples in
+// scripts/lock_scope_audit.py stop describing the truth while still matching.
+//
+// F13 - what passes BY DESIGN, stated correctly (the first version of this note
+// was wrong). Adding another chainstate call inside this body does NOT pass: an
+// extra call of an allowed shape exceeds its expected count and fails, and a
+// call of a different shape is unclassified and fails. What genuinely passes is
+//   (1) MOVING these lines around WITHIN this function - the tuple is unchanged;
+//   (2) adding a CALLER that violates the cs_main precondition above - the
+//       auditor sees a call site's lock scope, never its callers.
+// (2) is the one that matters, and it is why the precondition is stated here
+// rather than left implicit: interprocedural reachability is a review question,
+// not a grep one.
+static void SettlePendingMinerWinsOnConnect(int height)
+{
+    std::lock_guard<std::mutex> lock(g_pendingMinerWinsMutex);
+    auto it = g_pendingMinerWins.begin();
+    while (it != g_pendingMinerWins.end()) {
+        if (it->height >= height) { ++it; continue; }  // not yet settled
+
+        CBlockIndex* tip    = g_chainstate.GetTip();
+        CBlockIndex* ourIdx = g_chainstate.GetBlockIndex(it->blockHash);
+        bool isCanonical = false;
+        if (ourIdx && tip) {
+            CBlockIndex* ancestor = tip->GetAncestor(it->height);
+            isCanonical = (ancestor == ourIdx);
+        }
+
+        if (isCanonical) {
+            std::cout << std::endl
+                      << "======================================" << std::endl
+                      << "  BLOCK CONFIRMED!" << std::endl
+                      << "  Height: " << it->height << std::endl
+                      << "======================================" << std::endl;
+        } else {
+            std::cout << std::endl
+                      << "======================================" << std::endl
+                      << "  BLOCK NOT SELECTED" << std::endl
+                      << "  Another miner's block won at height "
+                      << it->height << "." << std::endl
+                      << "  This is normal - better luck next block!" << std::endl
+                      << "======================================" << std::endl;
+        }
+        it = g_pendingMinerWins.erase(it);
+    }
+}
+
 int main(int argc, char* argv[]) {
     // FIRST local in main, so it is the LAST thing destroyed on the way out.
     // This node starts RandomX FULL-mode init in a background thread on any host
@@ -6198,38 +6261,10 @@ load_genesis_block:  // Bug #29: Label for automatic retry after blockchain wipe
         // ancestor of the new tip at its height (a reorg displaced it), we fire
         // BLOCK ORPHANED instead.
         // =========================================================================
-        g_chainstate.RegisterBlockConnectCallback([](const CBlock& /*block*/, int height, const uint256& /*hash*/) {
-            std::lock_guard<std::mutex> lock(g_pendingMinerWinsMutex);
-            auto it = g_pendingMinerWins.begin();
-            while (it != g_pendingMinerWins.end()) {
-                if (it->height >= height) { ++it; continue; }  // not yet settled
-
-                CBlockIndex* tip    = g_chainstate.GetTip();
-                CBlockIndex* ourIdx = g_chainstate.GetBlockIndex(it->blockHash);
-                bool isCanonical = false;
-                if (ourIdx && tip) {
-                    CBlockIndex* ancestor = tip->GetAncestor(it->height);
-                    isCanonical = (ancestor == ourIdx);
-                }
-
-                if (isCanonical) {
-                    std::cout << std::endl
-                              << "======================================" << std::endl
-                              << "  BLOCK CONFIRMED!" << std::endl
-                              << "  Height: " << it->height << std::endl
-                              << "======================================" << std::endl;
-                } else {
-                    std::cout << std::endl
-                              << "======================================" << std::endl
-                              << "  BLOCK NOT SELECTED" << std::endl
-                              << "  Another miner's block won at height "
-                              << it->height << "." << std::endl
-                              << "  This is normal - better luck next block!" << std::endl
-                              << "======================================" << std::endl;
-                }
-                it = g_pendingMinerWins.erase(it);
-            }
-        });
+        g_chainstate.RegisterBlockConnectCallback(
+            [](const CBlock& /*block*/, int height, const uint256& /*hash*/) {
+                SettlePendingMinerWinsOnConnect(height);
+            });
         std::cout << "  [OK] Deferred mining-outcome callback registered" << std::endl;
 
         // Digital DNA: Behavioral profile + trust scoring block hook
@@ -9285,14 +9320,64 @@ load_genesis_block:  // Bug #29: Label for automatic retry after blockchain wipe
         #endif
         std::cerr << "===========================================================" << std::endl;
 
+        // ⛔ QUIESCE BEFORE RELEASING THE INDEX. This is the blocker the independent
+        // read found, and it is a regression THIS PR would otherwise introduce.
+        //
+        // Before this change, WriteBlock held m_mutex for its whole body, so
+        // ~CCoinStatsIndex simply BLOCKED until the callback returned. That was never
+        // designed — it was an unstated side effect of the lock's scope. Narrowing
+        // the lock to fix the inversion silently dropped it, because nothing named
+        // it. Stop() joins m_sync_thread only and never takes m_mutex, so the
+        // destructor can now take m_mutex, free m_db and destroy the object while a
+        // callback-thread WriteBlock sits in the unlock window — which then calls
+        // lock.lock() on a mutex inside a freed object.
+        //
+        // The normal shutdown path is already safe because g_node_context.Shutdown()
+        // runs first and stops the validation queue and connman, so no callback can
+        // still be in flight. These EXCEPTION paths did not, and a use-after-free
+        // reachable only on the shutdown-exception path is strictly worse than the
+        // latent inversion this PR exists to close.
+        //
+        // Shutdown() is idempotent by construction — every action is guarded by
+        // `if (ptr)` and nulls the pointer — so calling it here is safe even when the
+        // exception arrived after a partial shutdown.
+        //
+        // ⚠️ NOT a post-retake `if (!m_db)` re-check: locking a mutex inside a freed
+        // object happens BEFORE any such check could run.
+        // ⚠️ AN ATTEMPT IS NOT A BARRIER (panel round 2, rated BLOCKER by one seat).
+        // The first version of this fix called Shutdown(), swallowed any exception,
+        // and tore down anyway. Shutdown() being IDEMPOTENT is not the same as
+        // Shutdown() having SUCCEEDED: if it throws before the producers have
+        // drained, a swallowed exception is the only thing standing between us and
+        // the use-after-free.
+        //
+        // So the drain is VERIFIED, and when it cannot be verified WE DO NOT
+        // DESTROY. release() hands over ownership without running the destructor --
+        // the index is deliberately LEAKED. The process is already unwinding a fatal
+        // error and is about to exit, so a leaked index costs nothing; destroying one
+        // that a callback may still be inside is a use-after-free in the middle of
+        // error handling.
+        bool indexQuiesced = false;
+        try {
+            g_node_context.Shutdown();
+            indexQuiesced = true;
+        } catch (...) {
+            indexQuiesced = false;   // barrier NOT established -- see the release below
+        }
         // PR-7G R3: release tx_index before chainParams cleanup so the
         // reindex thread (which reads g_chainstate.GetBlocksAtHeight /
         // GetBlockIndex) is joined before any global it depends on can
         // be torn down by the static destructor sequence. Mirrors the
         // normal-shutdown ordering at line 7725.
-        g_tx_index.reset();
-        // PR-BA-2: same R3 ordering applies to coinstatsindex.
-        g_coin_stats_index.reset();
+        if (indexQuiesced) {
+            g_tx_index.reset();
+            // PR-BA-2: same R3 ordering applies to coinstatsindex.
+            g_coin_stats_index.reset();
+        } else {
+            // Barrier not established -- LEAK RATHER THAN DESTROY. See above.
+            (void)g_tx_index.release();
+            (void)g_coin_stats_index.release();
+        }
 
         // Cleanup on error (P0-5 FIX: use load/store for atomic)
         auto* relay_mgr = g_tx_relay_manager.load();
@@ -9345,10 +9430,60 @@ load_genesis_block:  // Bug #29: Label for automatic retry after blockchain wipe
         #endif
         std::cerr << "===========================================================" << std::endl;
 
+        // ⛔ QUIESCE BEFORE RELEASING THE INDEX. This is the blocker the independent
+        // read found, and it is a regression THIS PR would otherwise introduce.
+        //
+        // Before this change, WriteBlock held m_mutex for its whole body, so
+        // ~CCoinStatsIndex simply BLOCKED until the callback returned. That was never
+        // designed — it was an unstated side effect of the lock's scope. Narrowing
+        // the lock to fix the inversion silently dropped it, because nothing named
+        // it. Stop() joins m_sync_thread only and never takes m_mutex, so the
+        // destructor can now take m_mutex, free m_db and destroy the object while a
+        // callback-thread WriteBlock sits in the unlock window — which then calls
+        // lock.lock() on a mutex inside a freed object.
+        //
+        // The normal shutdown path is already safe because g_node_context.Shutdown()
+        // runs first and stops the validation queue and connman, so no callback can
+        // still be in flight. These EXCEPTION paths did not, and a use-after-free
+        // reachable only on the shutdown-exception path is strictly worse than the
+        // latent inversion this PR exists to close.
+        //
+        // Shutdown() is idempotent by construction — every action is guarded by
+        // `if (ptr)` and nulls the pointer — so calling it here is safe even when the
+        // exception arrived after a partial shutdown.
+        //
+        // ⚠️ NOT a post-retake `if (!m_db)` re-check: locking a mutex inside a freed
+        // object happens BEFORE any such check could run.
+        // ⚠️ AN ATTEMPT IS NOT A BARRIER (panel round 2, rated BLOCKER by one seat).
+        // The first version of this fix called Shutdown(), swallowed any exception,
+        // and tore down anyway. Shutdown() being IDEMPOTENT is not the same as
+        // Shutdown() having SUCCEEDED: if it throws before the producers have
+        // drained, a swallowed exception is the only thing standing between us and
+        // the use-after-free.
+        //
+        // So the drain is VERIFIED, and when it cannot be verified WE DO NOT
+        // DESTROY. release() hands over ownership without running the destructor --
+        // the index is deliberately LEAKED. The process is already unwinding a fatal
+        // error and is about to exit, so a leaked index costs nothing; destroying one
+        // that a callback may still be inside is a use-after-free in the middle of
+        // error handling.
+        bool indexQuiesced = false;
+        try {
+            g_node_context.Shutdown();
+            indexQuiesced = true;
+        } catch (...) {
+            indexQuiesced = false;   // barrier NOT established -- see the release below
+        }
         // PR-7G R3: release tx_index before chainParams cleanup. See the
         // matching note in the std::exception catch above.
-        g_tx_index.reset();
-        g_coin_stats_index.reset();
+        if (indexQuiesced) {
+            g_tx_index.reset();
+            g_coin_stats_index.reset();
+        } else {
+            // Barrier not established -- LEAK RATHER THAN DESTROY. See above.
+            (void)g_tx_index.release();
+            (void)g_coin_stats_index.release();
+        }
 
         // Cleanup on error (P0-5 FIX: use load/store for atomic)
         auto* relay_mgr = g_tx_relay_manager.load();

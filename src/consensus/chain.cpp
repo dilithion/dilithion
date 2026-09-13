@@ -4053,11 +4053,56 @@ bool CChainState::DisconnectTip(CBlockIndex* pindex, bool force_skip_utxo) {
     // P2P-14/15 fixed for the TIP callback — a consumer that takes its own
     // lock here creates a cs_main → <consumer lock> edge.
     //
-    // The behaviour is NOT changed here: rerouting the block connect/disconnect
-    // callback families through a deferred drain is a separate contract with
-    // its own consumers (wallet, txindex, coinstatsindex, ZMQ) to audit. Only
-    // the false claim is removed, so nobody builds on it. The wallet's own
-    // cs_wallet does not make the ordering safe — it is what would deadlock.
+    // ⚠️ STATUS UPDATED 2026-09-10 — read this instead of assuming a fix landed.
+    //
+    // P2P-14/15 corrected the false CLAIM above. It did NOT change the routing,
+    // and the routing is NOT going to change: a deferred drain was considered
+    // for these two families and REJECTED. The tip drain works because its
+    // payload is an 80-byte CBlockHeader; these callbacks carry a whole CBlock,
+    // so deferring them would buffer blocks proportional to REORG DEPTH — an
+    // attacker-influenced memory cost, i.e. spending a memory lever to close a
+    // lock-order class. Callbacks therefore keep firing with cs_main HELD, on
+    // purpose, and that is now a documented property rather than an oversight.
+    //
+    // THE REVERSE EDGE IS GUARDED — and F4 (external panel round 1) is right
+    // that the previous wording ("THE CLASS IS CLOSED ... tree-wide") claimed
+    // more than a grep can prove, so here is exactly what it proves.
+    //
+    // cs_main -> <consumer lock> only deadlocks if something supplies
+    // <consumer lock> -> cs_main. scripts/check-no-private-mutex-across-chainstate.sh
+    // fails the build on that reverse edge, wired into tests-fast/tests-full
+    // (register P2P-17 was exactly such an edge and is fixed).
+    //
+    // WHAT IT PROVES: over every non-test .cpp, a per-line TEXTUAL scan finds no
+    // UNCLASSIFIED site where a private mutex is visibly held across a call to a
+    // CChainState accessor that takes cs_main. Receiver-agnostic; the accessor
+    // list is generated from chain.cpp + chain.h, not hand-written.
+    //
+    // WHAT IT DOES NOT PROVE, and these are review's job, not the guard's:
+    //   * INTERPROCEDURAL reach - a helper that takes the lock, or one that
+    //     reaches the chainstate on your behalf, is invisible to it;
+    //   * a lock taken with a bare `m.lock()`, or behind a macro;
+    //   * a conditional `unlock()`, which it reads as unconditional;
+    //   * anything in a file it does not scan.
+    // Those limits are enumerated at the head of scripts/lock_scope_audit.py.
+    // F13: they are DOCUMENTED, not pinned - no fixture exercises the split-line
+    // call, the conditional unlock, the bare m.lock() or the helper-reached call,
+    // because each is a case the matcher deliberately does not handle. The
+    // fixtures in lock_scope_audit_selftest.py pin what it DOES handle. Do not
+    // read "there are fixtures" as "these limits are covered".
+    //
+    // So the rule for anyone adding a consumer here: your callback runs with
+    // cs_main HELD. Take your own lock if you must, but you may NOT hold it
+    // across a call that takes cs_main — directly OR through a helper. The guard
+    // catches the direct spelling; the indirect one is on you and your reviewer.
+    //
+    // Residual, so the guarantee is not over-read. The guard matches a call through
+    // ANY receiver now (`g_chainstate.`, `m_chainstate->`, a `CChainState&` bound to
+    // some other name) - [censused] 332 accessor calls in production .cpp, 234 on the
+    // global and 98 through another receiver. What it still cannot see: a call reached
+    // through a HELPER this file invokes, a macro-wrapped lock, a conditional
+    // `unlock()`, or a lock taken with a bare `m.lock()`. Those limits are listed at
+    // the head of scripts/lock_scope_audit.py rather than implied here.
     for (size_t i = 0; i < m_blockDisconnectCallbacks.size(); ++i) {
         try {
             m_blockDisconnectCallbacks[i](block, disconnectHeight, disconnectHash);
