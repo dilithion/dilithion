@@ -1404,7 +1404,9 @@ asert_test:
 # LP-5 batch-verifier concurrency race + differential harness (CRITICAL-1/MED-2)
 # Links only the verifier object + Dilithium primitives (no full CORE_OBJECTS):
 # the race lives entirely in CSignatureBatchVerifier's per-batch state.
-# Build under ThreadSanitizer on Linux:  make TSAN=1 batch_verifier_race_tests
+# TSan does NOT detect this race (a logic race over std::atomic + a mutex; 0 TSan
+# reports on the pre-fix control, measured 2026-09-13). The harness itself is the
+# detector: the control below hangs, plain or TSan. No sanitizer build is needed.
 # ============================================================================
 batch_verifier_race_tests: $(OBJ_DIR)/consensus/signature_batch_verifier.o $(OBJ_DIR)/test/batch_verifier_race_tests.o $(DILITHIUM_OBJECTS)
 	@echo "$(COLOR_BLUE)[LINK]$(COLOR_RESET) $@"
