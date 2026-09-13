@@ -86,8 +86,45 @@ as a suite whose tests BROKE).
   so a green regtest header test proves nothing about it.)
 - **Mainnet params abort** the harness with `RandomX VM not initialized`.
 
+## Second edge: `cs_headers` -> `g_validation_mutex` — CONSTRUCTED as a STALL
+
+**Not a deadlock, and this is not claimed as one.** `crypto/randomx_hash.cpp` holds no net symbol
+and no callback registry, so `g_validation_mutex -> cs_headers` cannot exist — the edge is one-way.
+TSan reports only *cycles*, so it is the wrong instrument here; the load-bearing claim is latency,
+and latency is what is measured.
+
+`p2p14_headers_randomx_stall_tsan_tests`, n=200 headers, same tree and toolchain:
+
+| arm | `ProcessHeaders` wall | max stall of a thread that only wants `cs_headers` | cache |
+|---|---|---|---|
+| `unwarmed` (mirrors `ProcessHeaders:331`) | 3305 ms | **3,305,860 µs — 3.31 s** | 0 -> 200 |
+| `prewarmed` (mirrors `QueueHeadersForValidation:2789`) | 6 ms | 6,227 µs | 200 before |
+
+**531x.** The probe thread does nothing but call `GetHeaderCount()` (`headers_manager.cpp:1496`),
+which only takes `cs_headers` and returns a map size — it contributes no work of its own. So the
+headers lock is held continuously for 3.3 seconds while RandomX hashes are computed under it, on
+the message-handling path.
+
+The only difference between the arms is **where `GetHash()` is called** — which is exactly the
+difference between the two production paths:
+
+    QueueHeadersForValidation:2789   parallel pre-warm OUTSIDE the lock  -> cache HIT
+    ProcessHeaders:331               no pre-warm                          -> cache MISS
+    ProcessHeadersWithDoSProtection:649  no pre-warm                      -> cache MISS
+
+and `QueueHeadersForValidation:2536` falls back to `ProcessHeaders` when the validation thread is
+not running — i.e. onto the unwarmed path.
+
+Evidence: [`stall_n200.txt`](stall_n200.txt). Run: `N=200 scripts/run_p2p14_headers_stall.sh`.
+
+**Honest bounds on that number.** It is RandomX *light* mode; validation mode differs. It is 200
+headers, chosen so the figure is measured rather than extrapolated — production batches run to
+`MAX_HEADERS_RESULTS = 2000`, and this harness takes the batch size as `argv[2]` so anyone can
+measure that directly instead of multiplying. The reachability guard (`fHashCached` flipping
+0 -> 200 inside `ProcessHeaders`) is what makes the timing meaningful rather than a machine-speed
+anecdote.
+
 ## Scope
 
-`cs_headers <-> cs_main` is CONSTRUCTED. The separate `cs_headers -> g_validation_mutex` edge
-(via `header.GetHash()` -> `randomx_hash_fast`) is **not** constructed and remains labelled
-inspection-plus-argument.
+Both edges are now constructed: `cs_headers <-> cs_main` as a **deadlock** (the registered arm
+hangs), and `cs_headers -> g_validation_mutex` as a **multi-second stall** (one-way, no cycle).
