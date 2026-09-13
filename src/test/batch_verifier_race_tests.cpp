@@ -24,9 +24,16 @@
 // CONTROL vs FIX (A-010): on the pre-fix code (shared global batch state) this
 // harness reliably reports a differential mismatch and/or hangs on a size_t
 // underflow. On the fixed code (per-batch session) every iteration matches the
-// oracle and the run completes. Build under ThreadSanitizer on Linux
-// (make TSAN=1 batch_verifier_race_tests) to additionally flag the data race
-// on the control and confirm clean on the fix.
+// oracle and the run completes.
+//
+// ThreadSanitizer does NOT see this race (measured 2026-09-13, origin/main
+// 911e6e9c, Linux g++ 13.3): the pre-fix shared state is std::atomic plus a
+// mutex-guarded string, so the defect is a LOGIC race with no unsynchronised
+// access. Under make TSAN=1 the control produced 0 TSan reports and hung; the
+// plain control hangs identically, and the fixed suite passes plain and under
+// TSan. The harness's oracle and hang are the detector — no sanitizer needed.
+// CI runs the fixed suite in the fast tier and requires this control to hang
+// inside the race loop (ci.yml, "LP-5 race harness still discriminates").
 //
 // ONE SOURCE, BOTH VARIANTS (A-010 evidence is auditable, not a separate file):
 // this file compiles against EITHER verifier from the same source via a
