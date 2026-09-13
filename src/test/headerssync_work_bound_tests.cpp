@@ -251,13 +251,18 @@ void test_a_single_header_cannot_reach_the_gate()
 
     // THE HOLE, three encodings of it. Each yields ~2^255 work from one header
     // and each was accepted by the mantissa guard alone.
-    REQUIRE(!PresyncAcceptsHeader(0x00000001, /*vdf=*/false, /*inject_checker=*/true));
-    REQUIRE(!PresyncAcceptsHeader(0x00000002, /*vdf=*/false, /*inject_checker=*/true));
-    REQUIRE(!PresyncAcceptsHeader(0x01000001, /*vdf=*/false, /*inject_checker=*/true));
+    // vdf=true, DELIBERATELY — do not return to MakeHeader's default. HeadersSyncState draws its
+    // commitment offset at random per state and hashes an accepted header when it lands on that
+    // slot (ValidateAndStoreHeadersCommitments). A NON-VDF header hashes through RandomX, and this
+    // binary never initializes a RandomX VM, so a non-VDF vector threw "RandomX VM not initialized"
+    // in 5 of 1,000 runs. With the proof checker injected, header type is incidental to the bound.
+    REQUIRE(!PresyncAcceptsHeader(0x00000001, /*vdf=*/true, /*inject_checker=*/true));
+    REQUIRE(!PresyncAcceptsHeader(0x00000002, /*vdf=*/true, /*inject_checker=*/true));
+    REQUIRE(!PresyncAcceptsHeader(0x01000001, /*vdf=*/true, /*inject_checker=*/true));
 
     // The shape blocker 1 already closed, re-pinned here so that a rewrite of
     // either guard cannot quietly drop the other.
-    REQUIRE(!PresyncAcceptsHeader(0x1e000000, /*vdf=*/false, /*inject_checker=*/true));
+    REQUIRE(!PresyncAcceptsHeader(0x1e000000, /*vdf=*/true, /*inject_checker=*/true));
 
     std::cout << " OK" << std::endl;
 }
@@ -270,7 +275,12 @@ void test_an_honest_header_still_passes_the_same_bound()
     std::cout << "  test_an_honest_header_still_passes_the_same_bound..." << std::flush;
 
     // Same threshold, same checker, same message shape — only nBits differs.
-    REQUIRE(PresyncAcceptsHeader(0x1d00ffff, /*vdf=*/false, /*inject_checker=*/true));
+    // vdf=true, DELIBERATELY — do not return to MakeHeader's default. HeadersSyncState draws its
+    // commitment offset at random per state and hashes an accepted header when it lands on that
+    // slot (ValidateAndStoreHeadersCommitments). A NON-VDF header hashes through RandomX, and this
+    // binary never initializes a RandomX VM, so a non-VDF vector threw "RandomX VM not initialized"
+    // in 5 of 1,000 runs. With the proof checker injected, header type is incidental to the bound.
+    REQUIRE(PresyncAcceptsHeader(0x1d00ffff, /*vdf=*/true, /*inject_checker=*/true));
     // ⛔ A SYNTHETIC MAGNITUDE PROBE, NOT A REACHABLE DIFFICULTY. DO NOT SWAP IT FOR
     // A PRODUCIBLE nBits.
     //
@@ -288,7 +298,7 @@ void test_an_honest_header_still_passes_the_same_bound()
     // Resolution, derived rather than run: it catches an error that pushes the
     // effective threshold below ~16,307 units (more than ~12x); a smaller error
     // passes both vectors.
-    REQUIRE(PresyncAcceptsHeader(0x1b0404cb, /*vdf=*/false, /*inject_checker=*/true));
+    REQUIRE(PresyncAcceptsHeader(0x1b0404cb, /*vdf=*/true, /*inject_checker=*/true));
 
     std::cout << " OK" << std::endl;
 }
@@ -310,7 +320,12 @@ void test_a_zero_threshold_bounds_nothing()
     // 0x00000001 is refused above under a real threshold; with no gate to
     // inflate, the work bound has nothing to say and the mantissa guard still
     // does its own job on 0x1e000000 (asserted separately below).
-    std::vector<CBlockHeader> batch{MakeHeader(0x00000001, ChainStartHash())};
+    // vdf=true, DELIBERATELY — do not return to MakeHeader's default. HeadersSyncState draws its
+    // commitment offset at random per state and hashes an accepted header when it lands on that
+    // slot (ValidateAndStoreHeadersCommitments). A NON-VDF header hashes through RandomX, and this
+    // binary never initializes a RandomX VM, so a non-VDF vector threw "RandomX VM not initialized"
+    // in 5 of 1,000 runs. With the proof checker injected, header type is incidental to the bound.
+    std::vector<CBlockHeader> batch{MakeHeader(0x00000001, ChainStartHash(), /*vdf=*/true)};
     REQUIRE(state.ProcessNextHeaders(batch, false).success);
 
     std::cout << " OK" << std::endl;
@@ -330,7 +345,12 @@ void test_zero_mantissa_is_refused_even_with_no_threshold()
                            /*chain_start_work=*/uint256(),
                            /*minimum_work=*/uint256(), &checker);
 
-    std::vector<CBlockHeader> batch{MakeHeader(0x1e000000, ChainStartHash())};
+    // vdf=true, DELIBERATELY — do not return to MakeHeader's default. HeadersSyncState draws its
+    // commitment offset at random per state and hashes an accepted header when it lands on that
+    // slot (ValidateAndStoreHeadersCommitments). A NON-VDF header hashes through RandomX, and this
+    // binary never initializes a RandomX VM, so a non-VDF vector threw "RandomX VM not initialized"
+    // in 5 of 1,000 runs. With the proof checker injected, header type is incidental to the bound.
+    std::vector<CBlockHeader> batch{MakeHeader(0x1e000000, ChainStartHash(), /*vdf=*/true)};
     REQUIRE(!state.ProcessNextHeaders(batch, false).success);
 
     std::cout << " OK" << std::endl;
