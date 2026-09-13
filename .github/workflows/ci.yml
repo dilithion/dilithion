@@ -402,22 +402,38 @@ jobs:
     # is vacuous -- so this step fails.
     # Not a TSan job, deliberately: the pre-fix race is a logic race over
     # std::atomic + a mutex, and TSan measured 0 reports on the control.
-    # Step logic verified locally both ways (2026-09-13): pointed at the FIXED
-    # build it exits 1; pointed at the real control it exits 0 (rc 137).
+    #
+    # An exit code alone is NOT evidence the race ran: the harness can exit 1
+    # in setup (pool self-verify) and 137 also comes from any external SIGKILL
+    # (OOM). So both codes additionally require "running 8 threads" (the race
+    # loop was entered), and 1 also requires "RESULT: FAIL". stdbuf -oL keeps
+    # that progress line from being lost when the hang is SIGKILLed.
+    #
+    # Step logic verified locally (2026-09-13), five arms: FIXED build -> fail;
+    # real pre-fix control (hangs in the loop) -> pass; stub exiting 1 in setup
+    # -> fail; stub hanging in setup (137 before the loop) -> fail; stub reporting
+    # RESULT: FAIL after entering the loop -> pass.
     # ------------------------------------------------------------------
     - name: LP-5 race harness still discriminates (pre-fix control must not pass)
       if: matrix.compiler == 'gcc' && matrix.build_type == 'Release'
       run: |
         make batch_verifier_race_control -j$(nproc)
         set +e
-        timeout -s KILL 60 ./batch_verifier_race_control > race_control.out 2>&1
+        timeout -s KILL 60 stdbuf -oL ./batch_verifier_race_control > race_control.out 2>&1
         rc=$?
         set -e
         tail -5 race_control.out
         echo "control rc=$rc"
+        ran=0; grep -q 'running 8 threads' race_control.out && ran=1
         case "$rc" in
-          137|1) echo "control discriminates (rc=$rc)";;
-          *) echo "::error::batch_verifier_race_control rc=$rc -- the LP-5 harness no longer detects the pre-fix race"; exit 1;;
+          137)
+            if [ "$ran" = 1 ]; then echo "control discriminates: hung inside the race loop (rc=137)"
+            else echo "::error::control killed (rc=137) BEFORE reaching the race loop -- setup hang or external kill (OOM?), not the race"; exit 1; fi ;;
+          1)
+            if [ "$ran" = 1 ] && grep -q 'RESULT: FAIL' race_control.out; then echo "control discriminates: race loop reported a mismatch (rc=1)"
+            else echo "::error::control exited 1 without a race-loop RESULT: FAIL -- it failed in setup, not on the race"; exit 1; fi ;;
+          *)
+            echo "::error::batch_verifier_race_control rc=$rc -- the LP-5 harness no longer detects the pre-fix race"; exit 1 ;;
         esac
 
     - name: Upload standalone suite logs
