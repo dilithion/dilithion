@@ -1337,7 +1337,21 @@ BOOST_AUTO_TEST_CASE(reindex_outer_loop_catches_tip_advance) {
             prev_idx->pnext = raw;
             prev_idx = raw;
         }
-        g_chainstate.SetTipForTest(prev_idx);
+        // SetTip, not SetTipForTest: the sync thread is already running and reads the
+        // tip via GetTip() under cs_main, so this write must take cs_main too
+        // (SetTipForTest assigns pindexTip unlocked -- a data race under TSan).
+        //
+        // ⚠️ THIS LOCK ALSO HIDES A RACE IT DOES NOT FIX. The `pnext = raw` writes
+        // above stay unlocked (cs_main is private), and WalkBlockRange reads pnext
+        // WITHOUT cs_main (tx_index.cpp:622, IsOnMainChain). Taking cs_main here
+        // gives TSan a happens-before edge (write -> unlock -> the walk thread's
+        // next lock -> read), so that report disappears too. Measured: the unfixed
+        // test shows both reports 5/5; this line shows 0/5; a probe with the
+        // original unlocked SetTipForTest plus one extra GetTip() shows the
+        // pindexTip report but not the pnext report. A clean TSan run of this test
+        // says NOTHING about the production race -- that is tracked as
+        // TX-INDEX-UNLOCKED-PNEXT-READ and needs its own arm.
+        g_chainstate.SetTip(prev_idx);
     }
 
     // The outer loop must catch the tip advance. Wait for IsSynced.
