@@ -3,6 +3,7 @@
 
 #include <net/socket.h>
 #include <net/sock.h>
+#include <util/fdset_guard.h>
 #include <cstring>
 
 #ifdef _WIN32
@@ -169,7 +170,12 @@ bool CSocket::Connect(const std::string& host, uint16_t port, int timeout_ms) {
         // Wait for connection with timeout
         fd_set write_fds;
         FD_ZERO(&write_fds);
-        FD_SET(sock_fd, &write_fds);
+        // BKL-30: a descriptor at/above FD_SETSIZE cannot be waited on; this
+        // socket is ours, so close it in place and report the connect as failed.
+        if (!FdSetAdd(sock_fd, &write_fds)) {
+            Close();
+            return false;
+        }
 
         struct timeval tv;
         tv.tv_sec = timeout_ms / 1000;
@@ -311,7 +317,10 @@ int CSocket::RecvAll(void* buffer, size_t len) {
         // Wait for data with timeout (30 seconds)
         fd_set read_fds;
         FD_ZERO(&read_fds);
-        FD_SET(sock_fd, &read_fds);
+        // BKL-30: never index an fd_set with a descriptor >= FD_SETSIZE.
+        if (!FdSetAdd(sock_fd, &read_fds)) {
+            return -1;
+        }
 
         struct timeval tv;
         tv.tv_sec = 30;  // 30 second timeout

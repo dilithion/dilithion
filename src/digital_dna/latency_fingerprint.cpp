@@ -1,5 +1,6 @@
 #include "latency_fingerprint.h"
 #include <net/sock.h>
+#include <util/fdset_guard.h>
 
 #include <algorithm>
 #include <cmath>
@@ -68,7 +69,11 @@ double LatencyFingerprintCollector::measure_rtt(const std::string& ip, uint16_t 
         // Wait for connection with timeout
         fd_set write_fds;
         FD_ZERO(&write_fds);
-        FD_SET(sock, &write_fds);
+        // BKL-30: never hand FD_SET a socket it cannot hold.
+        if (!FdSetAdd(sock, &write_fds)) {
+            closesocket(sock);
+            return -1.0;
+        }
 
         struct timeval tv;
         tv.tv_sec = timeout_ms_ / 1000;

@@ -136,6 +136,11 @@ else ifeq ($(UNAME_S),Windows)
     # Windows requires ws2_32 for sockets, bcrypt for secure RNG, and dbghelp for stack traces
     # iphlpapi is required by miniupnpc on Windows
     LIBS += -lws2_32 -lbcrypt -ldbghelp -liphlpapi
+    # BKL-30: winsock's default FD_SETSIZE is 64 - below the node's connection
+    # budget - and FD_SET silently drops sockets past it (the select() loops go
+    # blind). It must be defined before <winsock2.h> in EVERY TU, which only a
+    # command-line -D guarantees; util/fdset_guard.h static_asserts it.
+    CXXFLAGS += -DFD_SETSIZE=1024
     # Use MSYS2 MinGW64 includes - do NOT use MinGW-Builds paths (C:/ProgramData/mingw64)
     # as they lack C11 support (quick_exit, timespec_get)
     INCLUDES += -I depends/leveldb/include -I /mingw64/include -I C:/msys64/mingw64/include
@@ -143,11 +148,21 @@ else ifneq (,$(findstring MINGW,$(UNAME_S)))
     # MinGW/MSYS2 on Windows - use system OpenSSL 3.x from /mingw64
     # iphlpapi is required by miniupnpc on Windows
     LIBS += -lws2_32 -lbcrypt -ldbghelp -liphlpapi
+    # BKL-30: winsock's default FD_SETSIZE is 64 - below the node's connection
+    # budget - and FD_SET silently drops sockets past it (the select() loops go
+    # blind). It must be defined before <winsock2.h> in EVERY TU, which only a
+    # command-line -D guarantees; util/fdset_guard.h static_asserts it.
+    CXXFLAGS += -DFD_SETSIZE=1024
     INCLUDES += -I depends/leveldb/include -I /mingw64/include -I C:/msys64/mingw64/include
 else ifneq (,$(findstring MSYS,$(UNAME_S)))
     # MSYS on Windows - use system OpenSSL 3.x from /mingw64
     # iphlpapi is required by miniupnpc on Windows
     LIBS += -lws2_32 -lbcrypt -ldbghelp -liphlpapi
+    # BKL-30: winsock's default FD_SETSIZE is 64 - below the node's connection
+    # budget - and FD_SET silently drops sockets past it (the select() loops go
+    # blind). It must be defined before <winsock2.h> in EVERY TU, which only a
+    # command-line -D guarantees; util/fdset_guard.h static_asserts it.
+    CXXFLAGS += -DFD_SETSIZE=1024
     INCLUDES += -I depends/leveldb/include -I /mingw64/include -I C:/msys64/mingw64/include
 endif
 
@@ -1361,6 +1376,7 @@ BOOST_TEST_OBJECTS := $(OBJ_DIR)/test/test_dilithion.o \
 	$(OBJ_DIR)/test/miner_nonce_write_tests.o \
 	$(OBJ_DIR)/test/chain_tips_cache_invalidation_tests.o \
 	$(OBJ_DIR)/test/block_index_getancestor_skip_tests.o \
+	$(OBJ_DIR)/test/fdset_guard_tests.o \
 	$(CRYPTO_PROPERTY_OBJECTS)
 
 # Link test objects + full library (CORE_OBJECTS) to avoid hand-picked object drift
