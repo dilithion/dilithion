@@ -49,8 +49,23 @@
 //
 //   1. Connect callback (chain validator). Holds `cs_main`. Calls
 //      `WriteBlock` only when `IsSynced()` is true.
-//   2. Disconnect callback (chain validator). Does NOT hold `cs_main`.
+//   2. Disconnect callback (chain validator). ALSO holds `cs_main` — see below.
 //      Calls `EraseBlock` only when `IsSynced()` is true.
+//
+// ⛔ THIS HEADER PREVIOUSLY SAID THE DISCONNECT CALLBACK DOES **NOT** HOLD
+// `cs_main`. That is false, and the codebase had already retracted it at the
+// disconnect site in `chain.cpp` without correcting the pointers to it:
+//
+//     `cs_main` is a RECURSIVE mutex. `DisconnectTip` is called from
+//     `ActivateBestChain`, which holds it at FUNCTION scope, and an inner scope
+//     ending only decrements the recursion count. So BOTH callback families fire
+//     with `cs_main` HELD. There is no contrast to draw.
+//
+// It is corrected here because it is not cosmetic: anyone modelling this path
+// from the header concludes the disconnect side is lock-free and designs the
+// wrong fix — on the very file whose lock order is being fixed. A correction that
+// lands at the site and not at the places that point to the site has only moved
+// the wrong answer somewhere quieter.
 //   3. Reindex thread (`m_sync_thread`). Spawned by `StartBackgroundSync`.
 //      Reads `g_chainstate` without holding `m_mutex`; acquires `m_mutex`
 //      only inside `WriteBlock`.
