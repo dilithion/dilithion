@@ -692,12 +692,14 @@ jobs:
         # RandomX is built WITHOUT -fsanitize=thread in this job, on purpose.
         #
         # MEASURED (register row TSAN-LEG-SWALLOWS-MINER-TEST-FAILURE): with RandomX
-        # instrumented, the LIGHT-mode hash rate on a 4-core runner is 0.43-0.47 H/s
-        # against 6.9-7.4 H/s uninstrumented, and
+        # instrumented, the hash rate on a 4-core pin is 0.43-0.47 H/s against
+        # 6.9-7.4 H/s uninstrumented (the miner starts LIGHT and auto-upgrades to FULL
+        # once the dataset is ready, 12-17 s in on the runner), and
         # miner_nonce_write_tests/real_miner_submits_blocks_that_validate (6 blocks at
-        # a 1/32 target, 180 s deadline) fails in 5 of 5 runs of this job. TSan on our
-        # own code costs about 1x; the whole ~14x factor is instrumentation of the
-        # third-party hashing loop.
+        # a 1/32 target, 180 s deadline) failed in 5 of 5 measured runs and in 2 of
+        # the 3 main runs of this job before this change (5 of 6 blocks at 181-183 s;
+        # the third passed at 106 s). TSan on our own code costs about 1x; the whole
+        # ~14x factor is instrumentation of the third-party hashing loop.
         #
         # What this gives up: TSan reports a race only when BOTH accesses are
         # instrumented, so there is no race detection on any memory RandomX itself
