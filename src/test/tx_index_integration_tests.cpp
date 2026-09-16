@@ -394,8 +394,9 @@ struct IntegrationFixture {
             prev_idx = raw;
         }
         // SetTip, not SetTipForTest -- HYGIENE, consistent with PR #215/#219,
-        // NOT a measured race. The fixture's CRPCServer (accept thread + worker
-        // pool) is already running when BuildChain runs, but its workers are
+        // NOT a measured race. The fixture's CRPCServer (accept thread, worker
+        // pool and CleanupThread) is already running when BuildChain runs, but
+        // none of them touches the chain while idle and its workers are
         // parked on m_queueCV with no request in flight, so nothing reads the
         // tip concurrently with this write. MEASURED (CI-faithful TSan build,
         // TSAN_OPTIONS=suppress_equal_addresses=0): 0 reports at this line in

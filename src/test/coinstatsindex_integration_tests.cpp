@@ -382,11 +382,16 @@ BOOST_AUTO_TEST_CASE(reindex_outer_loop_catches_tip_advance) {
         //
         // As in #215, this lock also HIDES a race it does not fix: the
         // `prev_idx->pnext = raw` writes above stay unlocked (cs_main is
-        // private) and WalkBlockRange reads pnext WITHOUT cs_main
-        // (IsOnMainChain, coinstatsindex.cpp). Here that read was already
-        // ordered by the Flush() edge, so it never reported in either arm; a
-        // clean TSan run of this test says NOTHING about that reader. It is the
-        // coinstatsindex sibling of TX-INDEX-UNLOCKED-PNEXT-READ.
+        // private) and the walk thread reads pnext WITHOUT cs_main at TWO
+        // sites in coinstatsindex.cpp: WalkBlockRange's main-chain pick
+        // (IsOnMainChain, ~:681) and WriteBlock's H3 parent check (~:488).
+        // Those reads were already ordered here before this change -- each
+        // pnext write for heights kN_initial..kN_initial+kM_extra-2 by the
+        // NEXT iteration's AddBlockIndex (which takes and releases cs_main),
+        // and only the last one by the Flush() edge -- so they never reported
+        // in either arm, and a clean TSan run of this test says NOTHING about
+        // those readers. Both sites are recorded in register row
+        // TX-INDEX-REORG-DURING-REINDEX-MAPS-TXID-TO-ORPHAN.
         //
         // SetTip's invariants hold: every index above went through
         // AddBlockIndex, nHeight >= kN_initial, and nothing in this file reads
