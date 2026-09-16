@@ -393,7 +393,17 @@ struct IntegrationFixture {
             if (prev_idx) prev_idx->pnext = raw;
             prev_idx = raw;
         }
-        if (prev_idx) g_chainstate.SetTipForTest(prev_idx);
+        // SetTip, not SetTipForTest -- HYGIENE, consistent with PR #215/#219,
+        // NOT a measured race. The fixture's CRPCServer (accept thread + worker
+        // pool) is already running when BuildChain runs, but its workers are
+        // parked on m_queueCV with no request in flight, so nothing reads the
+        // tip concurrently with this write. MEASURED (CI-faithful TSan build,
+        // TSAN_OPTIONS=suppress_equal_addresses=0): 0 reports at this line in
+        // 3/3 runs of this suite, before and after the swap. SetTip's
+        // invariants hold: every index went through AddBlockIndex, nHeight >= 0,
+        // and nothing on the getrawtransaction / gettransaction paths these
+        // tests drive reads GetHeight() (which SetTip now keeps current).
+        if (prev_idx) g_chainstate.SetTip(prev_idx);
     }
 };
 
@@ -625,7 +635,16 @@ BOOST_AUTO_TEST_CASE(tc3_reorg_no_negative_confirmations) {
     BOOST_REQUIRE(tip2 != nullptr);
     // Detach pnext at height 2 so the chain ends there.
     tip2->pnext = nullptr;
-    g_chainstate.SetTipForTest(tip2);
+    // SetTip, not SetTipForTest -- HYGIENE, consistent with PR #215/#219, NOT a
+    // measured race. CTxIndex::SyncLoop has already exited on m_synced
+    // (WaitForSync above) and the RPC workers are parked on m_queueCV, so no
+    // thread reads the tip at this line; the request sent below is ordered
+    // after this write by connect()->accept() (which TSan models as
+    // release/acquire; inferred from its fd interceptors, not probed here).
+    // MEASURED (CI-faithful TSan build, suppress_equal_addresses=0): 0 reports
+    // in 3/3 runs, before and after the swap. tip2 is in mapBlockIndex
+    // (GetBlockIndex found it) and nHeight == 2, so SetTip's invariants hold.
+    g_chainstate.SetTip(tip2);
 
     // (a) Active-chain tx (height 1): confirmations must be positive.
     {

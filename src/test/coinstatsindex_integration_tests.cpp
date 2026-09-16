@@ -360,7 +360,38 @@ BOOST_AUTO_TEST_CASE(reindex_outer_loop_catches_tip_advance) {
             prev_idx->pnext = raw;
             prev_idx = raw;
         }
-        g_chainstate.SetTipForTest(prev_idx);
+        // SetTip, not SetTipForTest: the CCoinStatsIndex sync thread started by
+        // StartBackgroundSync() above is mid-walk and re-reads the tip via
+        // GetTip() under cs_main after each pass (SyncLoop, coinstatsindex.cpp),
+        // so this write must take cs_main too; SetTipForTest assigns pindexTip
+        // unlocked. Same pattern as PR #215 (tx_index_tests, this test's
+        // structural twin) and PR #219 (rpc_small_cluster_tests).
+        //
+        // MEASURED (CI-faithful TSan build, TSAN_OPTIONS=suppress_equal_addresses=0
+        // so dedup cannot hide a sibling): the unlocked write in the order this
+        // test had before -- write, then utxo_set.Flush() -- gave 0 reports in
+        // 3/3 runs. That is NOT the absence of a race: Flush() releases cs_utxo
+        // after the write, and the walk thread acquires cs_utxo in
+        // ReadUndoBlock (ComputeBlockStats) before its next GetTip(), so TSan
+        // sees a happens-before edge that is an accident of the test's next
+        // statement. Probe (not committed): the same unlocked write with
+        // Flush() ordered BEFORE it -> 1 report in 3/3 runs, this line
+        // (SetTipForTest, chain.h) vs GetTip() in SyncLoop (coinstatsindex.cpp).
+        // SetTip turns that incidental ordering into a lock; with SetTip the
+        // probe ordering reports 0/3.
+        //
+        // As in #215, this lock also HIDES a race it does not fix: the
+        // `prev_idx->pnext = raw` writes above stay unlocked (cs_main is
+        // private) and WalkBlockRange reads pnext WITHOUT cs_main
+        // (IsOnMainChain, coinstatsindex.cpp). Here that read was already
+        // ordered by the Flush() edge, so it never reported in either arm; a
+        // clean TSan run of this test says NOTHING about that reader. It is the
+        // coinstatsindex sibling of TX-INDEX-UNLOCKED-PNEXT-READ.
+        //
+        // SetTip's invariants hold: every index above went through
+        // AddBlockIndex, nHeight >= kN_initial, and nothing in this file reads
+        // GetHeight() (which SetTip now keeps current) before Cleanup().
+        g_chainstate.SetTip(prev_idx);
         BOOST_REQUIRE(utxo_set.Flush());
     }
 
