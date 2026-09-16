@@ -687,13 +687,37 @@ jobs:
         echo "CXXFLAGS=-fsanitize=thread -fno-omit-frame-pointer -g -std=c++17" >> $GITHUB_ENV
         echo "LDFLAGS=-fsanitize=thread" >> $GITHUB_ENV
 
-    - name: Build RandomX
+    - name: Build RandomX (NOT instrumented)
       run: |
+        # RandomX is built WITHOUT -fsanitize=thread in this job, on purpose.
+        #
+        # MEASURED (register row TSAN-LEG-SWALLOWS-MINER-TEST-FAILURE): with RandomX
+        # instrumented, the hash rate on a 4-core pin is 0.43-0.47 H/s against
+        # 6.9-7.4 H/s uninstrumented (the miner starts LIGHT and auto-upgrades to FULL
+        # once the dataset is ready, 12-17 s in on the runner), and
+        # miner_nonce_write_tests/real_miner_submits_blocks_that_validate (6 blocks at
+        # a 1/32 target, 180 s deadline) failed in 5 of 5 measured runs and in 2 of
+        # the 3 main runs of this job before this change (5 of 6 blocks at 181-183 s;
+        # the third passed at 106 s). TSan on our own code costs about 1x; the whole
+        # ~14x factor is instrumentation of the third-party hashing loop.
+        #
+        # What this gives up: TSan reports a race only when BOTH accesses are
+        # instrumented, so there is no race detection on any memory access RandomX
+        # performs, read OR write — including a race between OUR write and RandomX's
+        # read of the same bytes on another thread. Everything else (src/, the
+        # Dilithium reference objects, libzmq) stays instrumented through the
+        # CFLAGS/CXXFLAGS/LDFLAGS exported above.
+        #
+        # The flags below MUST stay explicit and sanitizer-free: cmake seeds
+        # CMAKE_C_FLAGS/CMAKE_CXX_FLAGS from the CFLAGS/CXXFLAGS in this job's
+        # environment, which carry -fsanitize=thread, so deleting the -D arguments
+        # would silently re-instrument RandomX. The assertion step after the project
+        # build fails the job if that ever happens.
         cd depends/randomx
         mkdir -p build
         cd build
-        cmake .. -DCMAKE_C_FLAGS="-fsanitize=thread -fno-omit-frame-pointer" \
-                 -DCMAKE_CXX_FLAGS="-fsanitize=thread -fno-omit-frame-pointer"
+        cmake .. -DCMAKE_C_FLAGS="-fno-omit-frame-pointer" \
+                 -DCMAKE_CXX_FLAGS="-fno-omit-frame-pointer"
         make -j$(nproc)
 
     - name: Build Dilithium library
@@ -721,6 +745,31 @@ jobs:
       run: |
         make clean
         make test_dilithion -j$(nproc)
+
+    - name: Assert the instrumentation split (RandomX clean, our code instrumented)
+      run: |
+        # Both halves are checked on OBJECT files, which is independent of whether
+        # the TSan runtime ends up linked statically (clang) or dynamically (gcc):
+        # an instrumented object references __tsan_* symbols, an uninstrumented one
+        # never does. A wrong count on either side is a build-configuration failure
+        # of this job, not a test verdict, so this step carries no `|| true`.
+        # The RandomX half is fail-closed: a missing archive or a failing nm is an
+        # error here, never a zero that reads as "clean".
+        rxlib=depends/randomx/build/librandomx.a
+        test -f "$rxlib" || { echo "::error title=TSan split::$rxlib is missing; nothing to assert on"; exit 1; }
+        rxsyms=$(nm "$rxlib") || { echo "::error title=TSan split::nm failed on $rxlib"; exit 1; }
+        rx=$(printf '%s\n' "$rxsyms" | grep -c __tsan || true)
+        ours=$(nm build/obj/miner/controller.o | grep -c __tsan || true)
+        echo "librandomx.a __tsan references: $rx (expected 0)"
+        echo "build/obj/miner/controller.o __tsan references: $ours (expected > 0)"
+        if [ "$rx" -ne 0 ]; then
+          echo "::error title=TSan split::RandomX was built WITH -fsanitize=thread ($rx __tsan references); the miner test deadline will not hold"
+          exit 1
+        fi
+        if [ "$ours" -eq 0 ]; then
+          echo "::error title=TSan split::our miner object carries no __tsan references; this leg is not instrumenting our code"
+          exit 1
+        fi
 
     - name: Run TSan Tests
       run: |
