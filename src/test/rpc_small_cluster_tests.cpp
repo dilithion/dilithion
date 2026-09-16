@@ -436,7 +436,18 @@ BOOST_AUTO_TEST_CASE(waitforblockheight_wakes_on_notify) {
         CBlockIndex* raw = pidx.get();
         g_chainstate.AddBlockIndex(block_hash, std::move(pidx));
         if (auto* prev = g_chainstate.GetTip()) prev->pnext = raw;
-        g_chainstate.SetTipForTest(raw);
+        // SetTip, not SetTipForTest: the main thread is parked in
+        // RPC_WaitForBlockHeight and re-reads the tip via GetTip() under cs_main
+        // every time its cv predicate runs. NotifyBlockTipChanged() deliberately
+        // takes no mutex (an AB-BA with cs_main on the connect path -- see its
+        // comment), so an UNLOCKED write here has no happens-before edge to the
+        // woken waiter's read: TSan reports exactly that pair (this line vs
+        // chain.cpp GetTip) on every main TSan run. The locking SetTip closes it.
+        // Same pattern as PR #215 (tx_index_tests). SetTip's invariants hold:
+        // `raw` went through AddBlockIndex above and nHeight == 2. Unlike #215
+        // the lock hides nothing else: the unlocked `pnext` write above has no
+        // concurrent reader here (the waiter reads only hash and height).
+        g_chainstate.SetTip(raw);
         CRPCServer::NotifyBlockTipChanged();
     });
 
@@ -626,7 +637,15 @@ BOOST_AUTO_TEST_CASE(waitforblockheight_notify_wakes_multiple_waiters) {
     CBlockIndex* raw = pidx.get();
     g_chainstate.AddBlockIndex(block_hash, std::move(pidx));
     if (auto* prev = g_chainstate.GetTip()) prev->pnext = raw;
-    g_chainstate.SetTipForTest(raw);
+    // SetTip, not SetTipForTest: three waiters are parked in
+    // RPC_WaitForBlockHeight and re-read the tip under cs_main on wake, and the
+    // notify below takes no mutex, so this is the same unlocked-write race as
+    // waitforblockheight_wakes_on_notify above. CI's TSan log showed only that
+    // first site because TSan deduplicated the second behind it: measured, this
+    // test run on its own reports the race (3/3), and with the first site fixed
+    // alone the whole suite's single report moves HERE (5/5). A fix aimed at one
+    // site leaves the sibling invisible; both are locked in the same change.
+    g_chainstate.SetTip(raw);
 
     // Single notify_all() should wake all three waiters. notify_one()
     // would only wake one and the other two would time out.
