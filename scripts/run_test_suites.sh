@@ -275,6 +275,31 @@ set -u
 # drops NOBUILD rows. net_tests came out "orphaned" that way while carrying a
 # roster row with a written reason. Compare against the ROSTER, not the derived
 # build list.
+# QUARANTINE LIFTED 2026-09-17: mining_integration_tests. Its reason (b) -- that
+# block_validation_coinbase asserting REJECT for a 100 DIL coinbase at height 0
+# and getting ACCEPT was "a possible missing consensus check" -- is FALSIFIED.
+# CheckCoinbase (src/consensus/validation.cpp) EXEMPTS height 0 by design since
+# 827b1c0f (v4.0.0, 2026-03-28: "Genesis block: pre-funded addresses can exceed
+# normal subsidy", :254-257) and enforces coinbase <= subsidy + fees at every
+# height >= 1 (:282-285). 827b1c0f did not touch the test, which had been
+# correct at height 0 when written (c677b051, 2025-10-27): the roster author saw
+# a real failure and attributed it to the wrong cause. Reason (a) -- expects 1
+# coinbase output, gets 3 -- is the DFMP 3-output rule (:304-307). Both were
+# STALE TESTS, not gaps. Genesis is hash-pinned and the only block without a
+# pprev, so no other block reaches CheckCoinbase at height 0.
+# Measured at origin/main 940d3a95, Windows/MSYS2 g++ 15.2.0, binary newer
+# than HEAD, 0.08s wall:
+#   before: 5/7 -- coinbase_transaction_creation FAIL (expected 1 output, got 3);
+#           block_validation_coinbase FAIL (over-subsidy at height 0 accepted)
+#   after : 7/7 PASS -- value arms re-pointed to height 1 under the mainnet
+#           3-output layout; a NEW height-0 ACCEPT arm pins the exemption
+#   kill 1: delete the value cap (:282-285) -> block_validation_coinbase RED at
+#           "Coinbase one satoshi over subsidy at height 1 should be rejected"
+#   kill 2: delete the genesis exemption (:255-257) -> RED at "Over-subsidy
+#           coinbase at height 0 must be ACCEPTED (genesis exemption)"
+#   validation.cpp sha256-restored after each kill; clean rebuild 7/7.
+# TIER: unchanged (full, 900s). It runs in under 1s, so a fast-tier promotion is
+# open -- a separate, deliberate row change, not folded into the lift.
 ROSTER='
 fast|rpc_auth_tests|120||
 fast|rpc_host_header_tests|60||
@@ -358,7 +383,7 @@ fast|dna_history_test|120|SUSPECTED REAL, measured on this branch: 2 of ~19 chec
 full|integration_tests|600||
 full|connman_tests|600||
 full|tx_relay_tests|600|WINDOWS-ONLY teardown hang (re-scoped 2026-08-15): all 6 tests PASS, then the process never exits on Windows/MSYS2 (exit 124 at 600s; teardown-path, post-J1/F6). LINUX CONFIRMATION DONE: under TSan on Linux (WSL, gcc, -fsanitize=thread) the binary runs all tests AND EXITS CLEANLY, zero data-race warnings -- so the hang is a Windows-specific teardown path (likely winsock/thread-join semantics), not a portable logic bug. Do NOT lift the quarantine on Windows by raising the timeout; needs a Windows-teardown owner. Linux CI can run this suite ungated.|
-full|mining_integration_tests|900|MIXED, ONE SUSPECTED CONSENSUS GAP: (a) coinbase_transaction_creation expects 1 coinbase output and gets 3 -- stale, DFMP splits the coinbase; (b) block_validation_coinbase asserts CheckCoinbase REJECTS a coinbase paying 100 DIL at height 0 and it is ACCEPTED. (b) is a possible missing consensus check and must be triaged by a consensus owner before this quarantine is lifted.|
+full|mining_integration_tests|900||
 full|dfmp_mik_tests|600||
 full|net_tests|600|NOBUILD: source no longer compiles. References a removed global g_peer_manager and calls CNetMessageProcessor::CreateVersionMessage() with a signature that no longer exists. Needs a P2P owner to port the harness forward.|
 full|randomx_mode_test|1800||
