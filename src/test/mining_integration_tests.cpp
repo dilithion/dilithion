@@ -133,8 +133,11 @@ static CTransaction BuildCoinbase(uint32_t nHeight, std::vector<CTxOut> outs) {
 // the rule set that matters. The 2% mining development contribution
 // (MINING_TAX_PERCENT=2, DEV_FUND_SHARE=50; consensus/params.h:49-52) splits
 // 1 DIL into 0.5 DIL Dev Fund + 0.5 DIL Dev Reward; the miner keeps 49 DIL plus
-// all fees. Written as literals, not derived from the constants, so the
-// expectation cannot drift in step with the code under test.
+// all fees. The AMOUNTS are literals, not derived from the constants, so that
+// expectation cannot drift in step with the code under test. The DESTINATIONS
+// (Dev Fund / Dev Reward scripts) are built from the same Consensus::*_PUBKEY_HASH
+// constants the producer and the validator use: a shared-constant match, not
+// an independent pin.
 static const uint64_t kSubsidyH1   = 50 * COIN;
 static const uint64_t kDevFundH1   = COIN / 2;   // 1% of 50 DIL
 static const uint64_t kDevRewardH1 = COIN / 2;   // 1% of 50 DIL
@@ -195,10 +198,11 @@ TEST(coinbase_transaction_creation) {
 
     // Output 0: miner keeps 98% of the subsidy (49 DIL) + 0 fees
     ASSERT_EQ(coinbase1->vout[0].nValue, kMinerH1, "Miner output should be 98% of subsidy");
-    // Output 1: Dev Fund, 1% of subsidy, to the pinned Dev Fund pubkey hash
+    // Output 1: Dev Fund, 1% of subsidy, to the consensus Dev Fund pubkey hash
+    // (shared-constant match, not an independent pin -- see kMinerH1 note)
     ASSERT_EQ(coinbase1->vout[1].nValue, kDevFundH1, "Dev Fund output should be 1% of subsidy");
     ASSERT(coinbase1->vout[1].scriptPubKey == devFundScript, "Dev Fund output should pay DEV_FUND_PUBKEY_HASH");
-    // Output 2: Dev Reward, 1% of subsidy, to the pinned Dev Reward pubkey hash
+    // Output 2: Dev Reward, 1% of subsidy, to the consensus Dev Reward pubkey hash
     ASSERT_EQ(coinbase1->vout[2].nValue, kDevRewardH1, "Dev Reward output should be 1% of subsidy");
     ASSERT(coinbase1->vout[2].scriptPubKey == devRewardScript, "Dev Reward output should pay DEV_REWARD_PUBKEY_HASH");
     // The three outputs sum to exactly the subsidy: the tax is a split, not an addition
