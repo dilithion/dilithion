@@ -702,10 +702,11 @@ jobs:
         # ~14x factor is instrumentation of the third-party hashing loop.
         #
         # What this gives up: TSan reports a race only when BOTH accesses are
-        # instrumented, so there is no race detection on any memory RandomX itself
-        # writes, INCLUDING races between our code and that memory. Everything else
-        # (src/, the Dilithium reference objects, libzmq) stays instrumented through
-        # the CFLAGS/CXXFLAGS/LDFLAGS exported above.
+        # instrumented, so there is no race detection on any memory access RandomX
+        # performs, read OR write — including a race between OUR write and RandomX's
+        # read of the same bytes on another thread. Everything else (src/, the
+        # Dilithium reference objects, libzmq) stays instrumented through the
+        # CFLAGS/CXXFLAGS/LDFLAGS exported above.
         #
         # The flags below MUST stay explicit and sanitizer-free: cmake seeds
         # CMAKE_C_FLAGS/CMAKE_CXX_FLAGS from the CFLAGS/CXXFLAGS in this job's
@@ -752,7 +753,12 @@ jobs:
         # an instrumented object references __tsan_* symbols, an uninstrumented one
         # never does. A wrong count on either side is a build-configuration failure
         # of this job, not a test verdict, so this step carries no `|| true`.
-        rx=$(nm depends/randomx/build/librandomx.a | grep -c __tsan || true)
+        # The RandomX half is fail-closed: a missing archive or a failing nm is an
+        # error here, never a zero that reads as "clean".
+        rxlib=depends/randomx/build/librandomx.a
+        test -f "$rxlib" || { echo "::error title=TSan split::$rxlib is missing; nothing to assert on"; exit 1; }
+        rxsyms=$(nm "$rxlib") || { echo "::error title=TSan split::nm failed on $rxlib"; exit 1; }
+        rx=$(printf '%s\n' "$rxsyms" | grep -c __tsan || true)
         ours=$(nm build/obj/miner/controller.o | grep -c __tsan || true)
         echo "librandomx.a __tsan references: $rx (expected 0)"
         echo "build/obj/miner/controller.o __tsan references: $ours (expected > 0)"
