@@ -5,6 +5,9 @@
 // See: docs/developer/LIBEVENT-NETWORKING-PORT-PLAN.md
 
 #include <net/sock.h>
+#include <util/fdset_guard.h>
+#include <util/logging.h>
+#include <atomic>
 
 #ifdef _WIN32
 #include <winsock2.h>
@@ -113,15 +116,25 @@ int CSock::Wait(socket_t sock, int events, std::chrono::milliseconds timeout) {
     FD_ZERO(&fd_send);
     FD_ZERO(&fd_error);
 
-    if (events & static_cast<int>(SocketEvent::RECV)) {
-        FD_SET(sock, &fd_recv);
+    // BKL-30 (M-30): a descriptor at/above FD_SETSIZE must never be indexed
+    // into an fd_set (UB; SIGABRT via __fdelt_chk under -D_FORTIFY_SOURCE=2).
+    // Refuse it as an error on this socket. The caller owns `sock` and closes
+    // it on -1; closing here would hand back a dangling number and invite a
+    // double close of whatever descriptor gets that number next.
+    if (!IsFdSelectable(sock)) {
+        static std::atomic<uint64_t> s_refusals{0};
+        const uint64_t n = ++s_refusals;
+        if (ShouldLogRefusal(n)) {
+            LogPrintf(NET, ERROR, "[CSock] Wait: refusing socket %lld - descriptor >= FD_SETSIZE (%d); "
+                      "the process is at its open-file limit (refusal #%llu)\n",
+                      static_cast<long long>(sock), static_cast<int>(FD_SETSIZE),
+                      static_cast<unsigned long long>(n));
+        }
+        return -1;
     }
-    if (events & static_cast<int>(SocketEvent::SEND)) {
-        FD_SET(sock, &fd_send);
-    }
-    if (events & static_cast<int>(SocketEvent::ERR)) {
-        FD_SET(sock, &fd_error);
-    }
+    if ((events & static_cast<int>(SocketEvent::RECV)) && !FdSetAdd(sock, &fd_recv)) return -1;
+    if ((events & static_cast<int>(SocketEvent::SEND)) && !FdSetAdd(sock, &fd_send)) return -1;
+    if ((events & static_cast<int>(SocketEvent::ERR)) && !FdSetAdd(sock, &fd_error)) return -1;
 
     struct timeval tv;
     tv.tv_sec = static_cast<long>(timeout.count() / 1000);
@@ -157,61 +170,78 @@ int CSock::WaitMany(std::set<socket_t>& recv_set, std::set<socket_t>& send_set,
     FD_ZERO(&fd_error);
 
     socket_t max_fd = 0;
-
-    for (socket_t sock : recv_set) {
-        FD_SET(sock, &fd_recv);
+    size_t n_added = 0;
+    // BKL-30: sockets an fd_set cannot hold (value >= FD_SETSIZE on POSIX, set
+    // full on Win32). They are handed back as error-ready so their owner
+    // disconnects them; they are never FD_SET (UB) nor FD_ISSET (also UB).
+    std::set<socket_t> unselectable;
+    auto add_all = [&](const std::set<socket_t>& src, fd_set* dst) {
+        for (socket_t sock : src) {
+            if (!FdSetAdd(sock, dst)) {
+                unselectable.insert(sock);
+                continue;
+            }
+            ++n_added;
 #ifndef _WIN32
-        if (sock > max_fd) max_fd = sock;
+            if (sock > max_fd) max_fd = sock;
 #endif
-    }
-    for (socket_t sock : send_set) {
-        FD_SET(sock, &fd_send);
-#ifndef _WIN32
-        if (sock > max_fd) max_fd = sock;
-#endif
-    }
-    for (socket_t sock : error_set) {
-        FD_SET(sock, &fd_error);
-#ifndef _WIN32
-        if (sock > max_fd) max_fd = sock;
-#endif
+        }
+    };
+    add_all(recv_set, &fd_recv);
+    add_all(send_set, &fd_send);
+    add_all(error_set, &fd_error);
+    if (!unselectable.empty()) {
+        static std::atomic<uint64_t> s_refusals{0};
+        const uint64_t n = ++s_refusals;
+        if (ShouldLogRefusal(n)) {
+            LogPrintf(NET, ERROR, "[CSock] WaitMany: %zu socket(s) with descriptor >= FD_SETSIZE (%d) "
+                      "cannot be waited on; reporting them as errors (refusal #%llu)\n",
+                      unselectable.size(), static_cast<int>(FD_SETSIZE),
+                      static_cast<unsigned long long>(n));
+        }
     }
 
     struct timeval tv;
     tv.tv_sec = static_cast<long>(timeout.count() / 1000);
     tv.tv_usec = static_cast<long>((timeout.count() % 1000) * 1000);
 
+    int result = 0;
+    if (n_added > 0) {
 #ifdef _WIN32
-    int result = select(0, &fd_recv, &fd_send, &fd_error, &tv);
+        result = select(0, &fd_recv, &fd_send, &fd_error, &tv);
 #else
-    int result = select(max_fd + 1, &fd_recv, &fd_send, &fd_error, &tv);
+        result = select(max_fd + 1, &fd_recv, &fd_send, &fd_error, &tv);
 #endif
+    }
 
-    if (result <= 0) {
+    if (result < 0 || (result == 0 && unselectable.empty())) {
         recv_set.clear();
         send_set.clear();
         error_set.clear();
         return result;
     }
 
-    // Filter to only ready sockets
+    // Filter to only ready sockets (never FD_ISSET an unselectable one)
     std::set<socket_t> ready_recv, ready_send, ready_error;
 
-    for (socket_t sock : recv_set) {
-        if (FD_ISSET(sock, &fd_recv)) ready_recv.insert(sock);
+    if (result > 0) {
+        for (socket_t sock : recv_set) {
+            if (!unselectable.count(sock) && FD_ISSET(sock, &fd_recv)) ready_recv.insert(sock);
+        }
+        for (socket_t sock : send_set) {
+            if (!unselectable.count(sock) && FD_ISSET(sock, &fd_send)) ready_send.insert(sock);
+        }
+        for (socket_t sock : error_set) {
+            if (!unselectable.count(sock) && FD_ISSET(sock, &fd_error)) ready_error.insert(sock);
+        }
     }
-    for (socket_t sock : send_set) {
-        if (FD_ISSET(sock, &fd_send)) ready_send.insert(sock);
-    }
-    for (socket_t sock : error_set) {
-        if (FD_ISSET(sock, &fd_error)) ready_error.insert(sock);
-    }
+    for (socket_t sock : unselectable) ready_error.insert(sock);
 
     recv_set = std::move(ready_recv);
     send_set = std::move(ready_send);
     error_set = std::move(ready_error);
 
-    return result;
+    return result + static_cast<int>(unselectable.size());
 }
 
 int CSock::GetLastError() {
