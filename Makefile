@@ -1060,6 +1060,11 @@ chain_case_2_5_equivalence_tests: $(CORE_OBJECTS) $(OBJ_DIR)/test/chain_case_2_5
 	@echo "$(COLOR_GREEN)✓ chain_case_2_5_equivalence_tests built successfully$(COLOR_RESET)"
 
 # Phase 5 Day 4 V1: chain_work bit-equivalence smoke test.
+p2p14_headers_randomx_stall_tsan_tests: $(CORE_OBJECTS) $(OBJ_DIR)/test/p2p14_headers_randomx_stall_tsan_tests.o $(DILITHIUM_OBJECTS) $(CHIAVDF_OBJECTS)
+	@echo "$(COLOR_BLUE)[LINK]$(COLOR_RESET) $@"
+	@$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS) $(LIBS)
+	@echo "$(COLOR_GREEN)+ p2p14_headers_randomx_stall_tsan_tests built successfully$(COLOR_RESET)"
+
 p2p14_lock_inversion_tsan_tests: $(CORE_OBJECTS) $(OBJ_DIR)/test/p2p14_lock_inversion_tsan_tests.o $(DILITHIUM_OBJECTS) $(CHIAVDF_OBJECTS)
 	@echo "$(COLOR_BLUE)[LINK]$(COLOR_RESET) $@"
 	@$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS) $(LIBS)
