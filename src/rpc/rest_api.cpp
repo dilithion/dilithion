@@ -2,6 +2,7 @@
 // Distributed under the MIT software license
 
 #include <rpc/rest_api.h>
+#include <api/http_path_gate.h>
 #include <rpc/ratelimiter.h>
 #include <node/mempool.h>
 #include <node/blockchain_storage.h>
@@ -39,7 +40,9 @@ CRestAPI::CRestAPI()
 }
 
 bool CRestAPI::IsRESTRequest(const std::string& path) {
-    return path.find("/api/v1/") == 0;
+    // One definition of the REST prefix rule (api/http_path_gate.h). This used
+    // to be a second copy, and the wallet-gate test carried a third.
+    return api::IsRestPath(path);
 }
 
 std::string CRestAPI::HandleRequest(const std::string& method,

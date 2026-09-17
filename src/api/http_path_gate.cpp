@@ -86,7 +86,25 @@ NormalizedPath NormalizeRequestPath(const std::string& rawPath) {
     //    sensitive surface) — but returning ok with a leading '/' added keeps it
     //    classifiable. Prepend '/' so segment logic below is uniform; the gate
     //    will then evaluate it like any other path.
-    if (p.empty() || p.front() != '/') {
+    // MEDIUM-1 fold (fresh pass 2026-09-07). An EMPTY target now fails CLOSED.
+    //
+    // This block used to map "" to "/" and return ok, and the comment three
+    // lines above already said that was wrong ("normalize to '/' is wrong --
+    // would look like root, a sensitive surface") before doing it anyway.
+    // Consequence in CRPCServer: a request line with one space
+    // ("GET /favicon.ico\r\n...") or two ("GET  /wallet HTTP/1.1") left rawPath
+    // empty, which normalised to "/" and matched the WALLET branch -- serving
+    // the token-minting page for an arbitrary target. CHttpServer::ParseRequest
+    // requires three tokens and 404s the same bytes, so the parity this PR
+    // claims was false in the permissive direction.
+    //
+    // A non-absolute target (e.g. "api/v1/broadcast") still gets '/' prepended:
+    // that IS parity with CHttpServer and grants no new capability.
+    if (p.empty()) {
+        result.ok = false;  // no reason field on NormalizedPath; ok=false is the contract
+        return result;
+    }
+    if (p.front() != '/') {
         p.insert(p.begin(), '/');
     }
 
@@ -167,6 +185,25 @@ bool IsSensitiveSurface(const std::string& normalizedPath) {
     if (lp == "/metrics") return true;
 
     return false;
+}
+
+bool IsRestPath(const std::string& normalizedPath)
+{
+    return normalizedPath.rfind("/api/v1/", 0) == 0;
+}
+
+RequestKind ClassifyRequest(const std::string& method, const std::string& rawPath)
+{
+    const NormalizedPath norm = NormalizeRequestPath(rawPath);
+    if (!norm.ok) return RequestKind::Malformed;
+
+    // The wallet surface, defined once. CHttpServer serves the same three.
+    if (method == "GET" &&
+        (norm.path == "/wallet" || norm.path == "/wallet.html" || norm.path == "/")) {
+        return RequestKind::Wallet;
+    }
+    if (IsRestPath(norm.path)) return RequestKind::Rest;
+    return RequestKind::Other;
 }
 
 } // namespace api

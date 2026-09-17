@@ -582,6 +582,203 @@ static void TestQueryPreservationForHandlers() {
     CHECK(api::NormalizeRequestPath("/wallet%3fx").path == "/wallet?x");
 }
 
+// ==========================================================================
+// 10. CRPCServer <-> CHttpServer PATH-NORM PARITY (LP-12 follow-on).
+//
+//    LP-12 wired NormalizeRequestPath into the standalone CHttpServer but NOT
+//    into CRPCServer::HandleRequest (the RPC-port server), which classified on
+//    RAW request bytes: wallet-HTML on request.find("GET /wallet")/"GET / HTTP",
+//    REST on raw IsRESTRequest(path) = path.find("/api/v1/")==0. So alternate
+//    spellings classified DIFFERENTLY across the two servers. The follow-on makes
+//    CRPCServer reuse the SAME normalizer.
+//
+//    ClassifyRpcNorm CALLS api::ClassifyRequest -- the same function
+//    CRPCServer::HandleClient uses. It is not a model of it.
+//
+//    The previous header claimed these computed the decision "from the REAL
+//    production functions ... no re-modelled normalization". That was FALSE for
+//    two of the three pieces, and the false comment was the dangerous half:
+//    ClassifyRpcNorm and ClassifyHttp were token-identical bodies, so the
+//    22-entry sweep asserted f(x) == f(x) and deleting the entire server.cpp
+//    change left this file green (fresh pass 2026-09-07, HIGH-1).
+//
+//    SCOPE, stated honestly: the parity claim covers the wallet surface and
+//    /api/v1/ only. CHttpServer also serves /api/health, /x402/, /api/stats and
+//    /metrics, which CRPCServer 403s; this file links three objects and cannot
+//    reach CHttpServer's dispatch table, so those are pinned on the CRPCServer
+//    side as known divergences rather than asserted as parity.
+//    The "_RAW" helpers reproduce the PRE-FIX raw-byte logic to PROVE the named
+//    vectors diverged before the fix.
+// ==========================================================================
+
+enum class Classification { Wallet, Rest, Other, Malformed };
+
+// Verbatim model of the PRE-FIX CRPCServer raw-byte classification.
+static Classification ClassifyRpcRaw(const std::string& method,
+                                     const std::string& rawPath) {
+    // Wallet branch: request.find("GET /wallet")==0 || request.find("GET / HTTP")==0
+    const std::string reqLine = method + " " + rawPath + " HTTP";
+    if (reqLine.rfind("GET /wallet", 0) == 0 || reqLine.rfind("GET / HTTP", 0) == 0) {
+        return Classification::Wallet;
+    }
+    // REST branch: raw IsRESTRequest(path) = path.find("/api/v1/")==0
+    if (rawPath.find("/api/v1/") == 0) return Classification::Rest;
+    return Classification::Other;
+}
+
+// NOT A MODEL. This calls api::ClassifyRequest -- the SAME function
+// CRPCServer::HandleClient calls to pick its branch. The previous version
+// re-implemented the decision here, so deleting the whole server.cpp change
+// left this file at "All 171 checks passed" (fresh pass 2026-09-07, HIGH-1):
+// the sweep compared this copy to ClassifyHttp, which was token-identical to
+// it, and f(x) == f(x) cannot fail.
+//
+// Malformed now surfaces as its own verdict rather than being folded into
+// Other, because "rejected with 400" and "falls through to CSRF/auth" are
+// different observable outcomes and the old collapse hid MEDIUM-1.
+static Classification ClassifyRpcNorm(const std::string& method,
+                                      const std::string& rawPath) {
+    switch (api::ClassifyRequest(method, rawPath)) {
+        case api::RequestKind::Wallet:    return Classification::Wallet;
+        case api::RequestKind::Rest:      return Classification::Rest;
+        case api::RequestKind::Malformed: return Classification::Malformed;
+        case api::RequestKind::Other:     break;
+    }
+    return Classification::Other;
+}
+
+// Model of CHttpServer's classification (http_server.cpp): wallet on the same
+// canonical surface set, REST on norm.path prefix. Same normalizer, same verdict.
+static Classification ClassifyHttp(const std::string& method,
+                                   const std::string& rawPath) {
+    const api::NormalizedPath norm = api::NormalizeRequestPath(rawPath);
+    if (!norm.ok) return Classification::Malformed;
+    // CHttpServer serves wallet on GET to {"/wallet","/wallet.html","/"}.
+    if (method == "GET" &&
+        (norm.path == "/wallet" || norm.path == "/wallet.html" || norm.path == "/")) {
+        return Classification::Wallet;
+    }
+    // The REST prefix rule comes from the ONE definition both servers use
+    // (api::IsRestPath, which CRestAPI::IsRESTRequest also delegates to).
+    // Spelling it out again here is what made the old sweep a tautology.
+    if (api::IsRestPath(norm.path)) return Classification::Rest;
+    return Classification::Other;
+}
+
+static void TestRpcHttpClassificationParity() {
+    std::cout << "LP-12 follow-on: CRPCServer <-> CHttpServer path-norm parity..." << std::endl;
+
+    // SCOPE (honest): this verifies PATH-NORMALIZATION parity — that both servers, given
+    // the SAME (method, path) tuple, classify the canonical path identically. It does NOT
+    // verify request-LINE-parser parity: the two servers split the raw request line
+    // differently (CRPCServer: raw find(' '); CHttpServer: istringstream >> tokens), so a
+    // MALFORMED request line (e.g. tab-separated, or missing the HTTP-version token) can
+    // still produce different (method,path) tuples and thus diverge — a KNOWN residual.
+    // That residual is defense-in-depth only (the unconditional Host gate is the live
+    // backstop; the wallet UI is loopback-only), tracked as the parser-unification
+    // follow-up. Do NOT read this test as asserting byte-for-byte request-line parity.
+    //
+    // The three vectors named in the contract. POST-FIX, the normalized RPC
+    // classification MATCHES CHttpServer for every one (the parity goal). At least
+    // two of the three ALSO change verdict vs the pre-fix raw logic, proving the
+    // test is load-bearing (asserted concretely below, not vacuously).
+    struct Vec { const char* method; const char* path; };
+    const Vec namedVectors[] = {
+        {"POST", "//api//v1//broadcast"},      // duplicate slashes  (raw: Other, norm: Rest)
+        {"POST", "/API/v1/broadcast"},         // mixed case         (both Other: IsRESTRequest is case-sensitive)
+        {"POST", "/api/v1/%2e%2e/balance"},    // pct-encoded dot-seg (raw: Rest, norm: Other -> /api/balance)
+    };
+
+    for (const auto& v : namedVectors) {
+        // POST-FIX: the normalized RPC classification MATCHES CHttpServer exactly.
+        const Classification httpCls = ClassifyHttp(v.method, v.path);
+        const Classification normRpc = ClassifyRpcNorm(v.method, v.path);
+        CHECK(normRpc == httpCls);
+    }
+    // Load-bearing: at least 2 of the 3 named vectors changed verdict raw->norm.
+    int diverged = 0;
+    for (const auto& v : namedVectors) {
+        if (ClassifyRpcRaw(v.method, v.path) != ClassifyRpcNorm(v.method, v.path)) ++diverged;
+    }
+    CHECK(diverged >= 2);
+
+    // Concrete expected canonical verdicts for the named vectors:
+    //  //api//v1//broadcast      -> /api/v1/broadcast  => REST on both
+    CHECK(ClassifyRpcNorm("POST", "//api//v1//broadcast") == Classification::Rest);
+    CHECK(ClassifyHttp("POST", "//api//v1//broadcast") == Classification::Rest);
+    CHECK(ClassifyRpcRaw("POST", "//api//v1//broadcast") == Classification::Other); // pre-fix miss
+    //  /API/v1/broadcast         -> /API/v1/broadcast (case preserved by normalizer);
+    //  IsRESTRequest is case-SENSITIVE, so both servers route it as Other (not REST).
+    //  The PARITY point: both agree. Pre-fix raw RPC also said Other here, but the
+    //  divergence is covered by the other two vectors; assert agreement regardless.
+    CHECK(ClassifyRpcNorm("POST", "/API/v1/broadcast") ==
+          ClassifyHttp("POST", "/API/v1/broadcast"));
+    //  /api/v1/%2e%2e/balance    -> /api/balance => NOT /api/v1/* => Other on both
+    //  (the '..' pops v1). Pre-fix raw RPC saw the literal "/api/v1/%2e%2e/balance"
+    //  which DOES start with "/api/v1/" => raw said REST (divergence!).
+    CHECK(ClassifyRpcRaw("POST", "/api/v1/%2e%2e/balance") == Classification::Rest);   // pre-fix
+    CHECK(ClassifyRpcNorm("POST", "/api/v1/%2e%2e/balance") == Classification::Other); // post-fix
+    CHECK(ClassifyHttp("POST", "/api/v1/%2e%2e/balance") == Classification::Other);
+
+    // Broad parity sweep: across a spelling matrix, the normalized RPC verdict
+    // EQUALS the CHttpServer verdict for every entry (same normalizer, same set).
+    const Vec sweep[] = {
+        {"GET",  "/wallet"}, {"GET", "/wallet.html"}, {"GET", "/"},
+        {"GET",  "/wallet/"}, {"GET", "//wallet"}, {"GET", "/WALLET"},
+        {"GET",  "/%77allet"}, {"GET", "/./wallet"}, {"GET", "/x402/../wallet"},
+        {"POST", "/"}, {"POST", "/wallet"},          // POST is never wallet
+        {"POST", "/api/v1/broadcast"}, {"POST", "//api//v1//broadcast"},
+        {"GET",  "/api/v1/balance/ADDR"}, {"GET", "/api/v1/balance/ADDR?foo=bar"},
+        {"POST", "/api/v1/"}, {"POST", "/api/v1"},   // bare prefix: Other on both
+        {"GET",  "/miner"},
+        {"GET",  "/favicon.ico"}, {"GET", "/nope"}, {"POST", "/api/v2/info"},
+        // MEDIUM-1: an empty target. One-space and double-space request lines
+        // used to leave rawPath empty, normalise to "/" and hit the WALLET
+        // branch -- serving the token-minting page for an arbitrary target.
+        {"GET",  ""}, {"POST", ""},
+    };
+    for (const auto& v : sweep) {
+        CHECK(ClassifyRpcNorm(v.method, v.path) == ClassifyHttp(v.method, v.path));
+    }
+
+    // MEDIUM-2: the parity claim is SCOPED, and the known divergences are
+    // asserted as divergences rather than quietly omitted.
+    //
+    // /metrics and /api/stats were in the sweep above and "passed" only because
+    // BOTH models said Other -- while CHttpServer actually SERVES them
+    // (http_server.cpp:582, :599), as it does /api/health (:400) and /x402/
+    // (:471). CRPCServer 403s all four. That is a real divergence and the sweep
+    // was asserting the opposite of the truth about it.
+    //
+    // These routes are deliberately NOT modelled in ClassifyHttp: this file
+    // links three objects and cannot reach CHttpServer's dispatch table. So the
+    // parity claim is limited to the wallet surface and /api/v1/, and the
+    // divergent routes are pinned on the CRPCServer side only -- what this test
+    // can actually observe.
+    for (const char* diverging : {"/metrics", "/api/stats", "/api/health",
+                                  "/x402/dna-attest"}) {
+        CHECK(ClassifyRpcNorm("GET", diverging) == Classification::Other);
+        CHECK(ClassifyRpcNorm("POST", diverging) == Classification::Other);
+    }
+
+    // MEDIUM-1, stated directly: an empty target must be MALFORMED on the
+    // CRPCServer side, never Wallet. This is the assertion the PR needed and
+    // did not have.
+    CHECK(ClassifyRpcNorm("GET", "") == Classification::Malformed);
+    CHECK(ClassifyRpcNorm("GET", "") != Classification::Wallet);
+
+    // A JSON-RPC POST to "/" must NOT be classified as wallet (method-gated) — it
+    // flows on to CSRF/auth/RPC. Regression guard for the most load-bearing case.
+    CHECK(ClassifyRpcNorm("POST", "/") == Classification::Other);
+    CHECK(ClassifyRpcNorm("GET", "/") == Classification::Wallet);
+
+    // Malformed targets fail-closed to Other (rejected before REST/RPC dispatch),
+    // matching CHttpServer's !norm.ok handling.
+    CHECK(ClassifyRpcNorm("POST", "/api/v1/%zz") == Classification::Malformed);
+    CHECK(ClassifyRpcNorm("POST", "/../etc/passwd") == Classification::Malformed);
+    CHECK(ClassifyRpcNorm("GET", "/wallet%00.html") == Classification::Malformed);
+}
+
 int main() {
     std::cout << "=== LP-12 CHttpServer wallet-HTML gate tests ===" << std::endl;
     TestPublicApiDisablesWalletEntirely();
@@ -593,6 +790,7 @@ int main() {
     TestPathNormalizationGateBypassMatrix(); // gate-bypass fold (finding #1+#2)
     TestNormalizerCanonicalForm();           // gate-bypass fold (normalizer contract)
     TestQueryPreservationForHandlers();      // x402 dna-attest query-preservation fix
+    TestRpcHttpClassificationParity();       // LP-12 follow-on: CRPCServer<->CHttpServer parity
     std::cout << "All " << g_checks << " checks passed." << std::endl;
     return 0;
 }
