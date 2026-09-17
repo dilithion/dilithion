@@ -13,6 +13,7 @@
 
 class CChainState;
 class CUTXOSet;
+class CBlockIndex;
 struct UndoIntegrityFailure;
 
 namespace Dilithion {
@@ -205,6 +206,51 @@ private:
     // cleared when a cycle completes healthy. Read by IsIntegrityHealthDegraded().
     static std::atomic<bool> s_health_degraded;
 };
+
+/**
+ * The STARTUP integrity check: retry loop + classification + marker write.
+ *
+ * WHY THIS IS A FUNCTION AND NOT INLINE IN main(). It used to live inside
+ * main() in both daemons (dilithion-node.cpp and dilv-node.cpp, byte-identical
+ * copies), and the test suite could not reach it: chainstate_integrity_tests
+ * links the core objects and its own driver, never a daemon TU, so the test
+ * re-implemented the decision in a lambda and asserted against that copy.
+ *
+ * Fresh pass 2026-09-07 (dilithion-fe, HIGH-1) established the consequence by
+ * construction: inverting the StopNoWipe branch, or swapping return 1 for
+ * return 2, or deleting the wipe block entirely -- the exact regression #120 is
+ * about -- left the suite reporting "All 14 tests passed". A test that
+ * re-implements the code it is checking agrees with its own copy no matter what
+ * the product does.
+ *
+ * Extracted here so the test drives the REAL path. Both daemons call this and
+ * nothing else; the decision exists in exactly one place.
+ *
+ * @param utxo_set   walked via VerifyUndoDataInRange
+ * @param pindexTip  tip to walk down from
+ * @param fromHeight inclusive lower bound
+ * @param toHeight   inclusive upper bound
+ * @param datadir    where an auto_rebuild marker is written, on the wipe path only
+ * @param attempts   walk attempts before acting (production: kRevalidateAttempts)
+ * @param backoff    pause between attempts (production: kRevalidateBackoff;
+ *                   tests pass 0ms, which is why it is a parameter)
+ * @param failure_out receives the classification of the final failing attempt
+ *
+ * @return 0 = clean (boot continues)
+ *         1 = STOP, no wipe, no marker  (persistent transient storage fault)
+ *         2 = wipe-and-resync, marker written (confirmed corruption)
+ *
+ * The return values ARE the daemon exit codes; the wrapper scripts branch on
+ * them. Changing one changes operator-visible behaviour.
+ */
+int RunStartupIntegrityCheck(CUTXOSet& utxo_set,
+                             CBlockIndex* pindexTip,
+                             int fromHeight,
+                             int toHeight,
+                             const std::string& datadir,
+                             int attempts,
+                             std::chrono::milliseconds backoff,
+                             UndoIntegrityFailure& failure_out);
 
 }  // namespace Dilithion
 

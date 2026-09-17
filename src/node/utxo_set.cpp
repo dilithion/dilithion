@@ -148,11 +148,21 @@ bool FetchAndVerifyUndo(leveldb::DB* db,
             failure_out.height = height;
             failure_out.blockHash = blockHash;
             failure_out.cause = "size_invalid";
+            // MEDIUM-5 fold: set it EXPLICITLY rather than relying on the
+            // caller handing us a fresh struct. One hoisted UndoIntegrityFailure
+            // away from "io_error then size_invalid reads transient=true",
+            // which routes real corruption to StopNoWipe.
+            failure_out.transient = false;
             return false;
         case UndoChecksumResult::ChecksumMismatch:
             failure_out.height = height;
             failure_out.blockHash = blockHash;
             failure_out.cause = "checksum_mismatch";
+            // MEDIUM-5 fold: set it EXPLICITLY rather than relying on the
+            // caller handing us a fresh struct. One hoisted UndoIntegrityFailure
+            // away from "io_error then checksum_mismatch reads transient=true",
+            // which routes real corruption to StopNoWipe.
+            failure_out.transient = false;
             return false;
     }
     return false;  // Unreachable; silences -Werror=return-type warnings.
