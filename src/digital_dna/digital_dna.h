@@ -99,6 +99,16 @@ struct SimilarityScore {
     double behavioral_similarity = 0.0;    // BP: Activity patterns
 
     // Data availability flags (0.0 is a valid score — "completely different")
+    //
+    // has_latency (H-1 / HIGH-C): latency used to be scored UNCONDITIONALLY at
+    // weight 1.0. Two fingerprints with no comparable seed pair produce
+    // distance() == 1000.0 and so latency_similarity == exp(-10) ~= 0 — meaning
+    // "we have no shared measurement" was averaged in as "these are maximally
+    // different". Four zero doubles on the wire therefore bought an attacker a
+    // free ~0 at full weight, pulling a Sybil pair's combined_score BELOW an
+    // honest pair's: opting out of the discriminator by omission. Absence of
+    // evidence is now excluded from the average instead of counted as evidence.
+    bool has_latency = false;      // Core dim, but false when no seed pair is comparable
     bool has_perspective = true;   // Core dim, but false when peer data unavailable
     bool has_memory = false;
     bool has_clock_drift = false;

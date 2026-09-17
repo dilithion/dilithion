@@ -494,10 +494,29 @@ TEST(discovery_source_dil_empty_cooldown_tracker_returns_registry_miks) {
     // The Phase 1.2 fix sources from dna_registry first so discovery can
     // still fire. This test asserts the in-memory path used by unit tests
     // and by relay-only nodes that haven't opened a LevelDB registry.
+    // SUCCESS *or* SYBIL_FLAGGED — both mean STORED, which is all this test is
+    // about (it asserts discovery sourcing, not Sybil scoring). It is the same
+    // predicate the node itself uses: `stored = SUCCESS || SYBIL_FLAGGED`
+    // (dilithion-node.cpp, first-seen registration).
+    //
+    // These fixtures now come back SYBIL_FLAGGED, and that is the HIGH-C fix
+    // working. make_dna() gives every identity an EMPTY latency fingerprint and
+    // an identical timing signature, so before the has_latency gate each pair
+    // scored (latency ~0 + timing 1.0) / 2 = 0.50 — sitting just under
+    // SUSPICIOUS_THRESHOLD (0.55) purely because a dimension nobody measured
+    // was averaged in as evidence of DIFFERENCE. That is the attacker opt-out,
+    // reproduced by our own fixtures. With latency excluded when no seed pair is
+    // comparable, two identities identical in every measured dimension score 1.0
+    // and are flagged, which is the correct verdict. See
+    // latency_gate_flags_identical_identities in dna_serialization_test.cpp.
+    auto stored = [](IDNARegistry::RegisterResult r) {
+        return r == IDNARegistry::RegisterResult::SUCCESS ||
+               r == IDNARegistry::RegisterResult::SYBIL_FLAGGED;
+    };
     digital_dna::DigitalDNARegistry reg;
-    ASSERT(reg.register_identity(make_dna(0x10)) == IDNARegistry::RegisterResult::SUCCESS, "r1");
-    ASSERT(reg.register_identity(make_dna(0x20)) == IDNARegistry::RegisterResult::SUCCESS, "r2");
-    ASSERT(reg.register_identity(make_dna(0x30)) == IDNARegistry::RegisterResult::SUCCESS, "r3");
+    ASSERT(stored(reg.register_identity(make_dna(0x10))), "r1");
+    ASSERT(stored(reg.register_identity(make_dna(0x20))), "r2");
+    ASSERT(stored(reg.register_identity(make_dna(0x30))), "r3");
 
     std::vector<std::array<uint8_t, 20>> empty_cooldown;
     auto sourced = union_dedupe_miks(reg.get_all_miks(), empty_cooldown);
@@ -513,8 +532,15 @@ TEST(discovery_source_union_dedupes_overlap) {
     digital_dna::DigitalDNARegistry reg;
     auto dna_a = make_dna(0xA0);
     auto dna_b = make_dna(0xB0);
-    ASSERT(reg.register_identity(dna_a) == IDNARegistry::RegisterResult::SUCCESS, "ra");
-    ASSERT(reg.register_identity(dna_b) == IDNARegistry::RegisterResult::SUCCESS, "rb");
+    // SUCCESS or SYBIL_FLAGGED — both mean stored; see the note in
+    // discovery_source_dil_empty_cooldown_tracker_returns_registry_miks for why
+    // these fixtures are now flagged (HIGH-C has_latency gate).
+    auto stored = [](IDNARegistry::RegisterResult r) {
+        return r == IDNARegistry::RegisterResult::SUCCESS ||
+               r == IDNARegistry::RegisterResult::SYBIL_FLAGGED;
+    };
+    ASSERT(stored(reg.register_identity(dna_a)), "ra");
+    ASSERT(stored(reg.register_identity(dna_b)), "rb");
 
     std::vector<std::array<uint8_t, 20>> cooldown{
         dna_a.mik_identity,              // overlap with registry

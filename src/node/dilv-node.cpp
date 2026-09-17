@@ -4744,6 +4744,15 @@ load_genesis_block:  // Bug #29: Label for automatic retry after blockchain wipe
 
             auto existing = g_node_context.dna_registry->get_identity_by_mik(mik);
             if (!existing) {
+                // H-1 DoS fix: rate-cap unsolicited new-MIK registrations per peer.
+                // The first-seen path otherwise returns before the existing-MIK
+                // pipeline's per-peer token bucket, letting one peer flood distinct
+                // MIKs (each = a permanent registry write + Sybil-compare work). A
+                // legitimate miner broadcasting its own single registration consumes
+                // one token; a flood is throttled to the bucket rate.
+                if (!g_dna_sample_limiter.consume_peer_bucket(peer_id, now_sec)) {
+                    return;
+                }
                 auto result = g_node_context.dna_registry->register_identity(*dna);
                 const bool stored =
                     (result == digital_dna::IDNARegistry::RegisterResult::SUCCESS ||
@@ -4773,6 +4782,14 @@ load_genesis_block:  // Bug #29: Label for automatic retry after blockchain wipe
             const bool signed_envelope = !envelope.signature.empty();
 
             if (mapped && !signed_envelope) {
+                // OPEN (fresh-pass MEDIUM, H-1 adjacency) — NOT fixed here.
+                // Identical to the dilithion-node site; the full reasoning lives
+                // there. Short form: append_sample creates an entry keyed by the
+                // sender-chosen dna.address, H-1 capped only the first-seen-MIK
+                // handler, so a mapped MIK can still mint entries by rotating
+                // the address. check_mik_limits below bounds the RATE, not the
+                // TOTAL. The gate does not belong in append_sample — that
+                // contradicts its documented create-on-first-sample contract.
                 if (!g_dna_sample_limiter.check_mik_limits(peer_id, mik, now_sec)) return;
                 auto result = g_node_context.dna_registry->append_sample(*dna);
                 if (result == digital_dna::IDNARegistry::RegisterResult::UPDATED ||

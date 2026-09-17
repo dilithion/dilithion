@@ -19,13 +19,13 @@ struct SeedNode {
 // Latency statistics for one seed node
 struct LatencyStats {
     std::string seed_name;
-    double median_ms;
-    double p10_ms;
-    double p90_ms;
-    double mean_ms;
-    double stddev_ms;
-    uint32_t samples;
-    uint32_t failures;
+    double median_ms = 0.0;
+    double p10_ms = 0.0;
+    double p90_ms = 0.0;
+    double mean_ms = 0.0;
+    double stddev_ms = 0.0;
+    uint32_t samples = 0;
+    uint32_t failures = 0;
 
     // Raw measurements for analysis
     std::vector<double> measurements;
@@ -43,6 +43,23 @@ struct LatencyFingerprint {
 
     // Comparison
     static double distance(const LatencyFingerprint& a, const LatencyFingerprint& b);
+
+    // How many positional seed pairs are actually comparable — i.e. both sides
+    // hold a real median (> 0.0). distance() averages over exactly these.
+    //
+    // This exists because distance() returns the sentinel 1000.0 when there are
+    // none, and exp(-1000/100) ~= 0 made "we measured nothing in common" score
+    // identically to "these two nodes are maximally far apart". An attacker who
+    // serialized four zero doubles therefore bought a latency_similarity of ~0
+    // at full weight and diluted their own combined_score BELOW an honest
+    // node's — opting out of the discriminator by omission. Callers must ask
+    // this first and treat 0 as "dimension unavailable", never as evidence.
+    static size_t comparable_seed_count(const LatencyFingerprint& a,
+                                        const LatencyFingerprint& b);
+
+    // True if this fingerprint carries at least one real measurement. An
+    // all-zero fingerprint is an omission wearing the shape of data.
+    bool has_any_measurement() const;
     static double wasserstein_distance(const std::vector<double>& a, const std::vector<double>& b);
 };
 
@@ -74,7 +91,12 @@ private:
     static double compute_stddev(const std::vector<double>& values, double mean);
 };
 
-// Default mainnet seed nodes
+// Default mainnet seed nodes.
+// APPEND-ONLY CONSTRAINT: LatencyFingerprint::distance() compares per-seed medians
+// POSITIONALLY (index i in one fingerprint vs index i in another). These ordered seed
+// lists are what the collector probes, so the list must only ever grow — never remove
+// or reorder an entry — or cross-version fingerprint comparisons would silently compare
+// different cities (e.g. London-vs-Singapore) and produce meaningless distances.
 const std::array<SeedNode, 4> MAINNET_SEEDS = {{
     {"NYC", "138.197.68.128", 8444},
     {"London", "167.172.56.119", 8444},
