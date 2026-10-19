@@ -2060,6 +2060,12 @@ fuzz_tx_validation: $(FUZZ_TX_VALIDATION_OBJ) $(FUZZ_COMMON_OBJECTS) $(FUZZ_CONS
 	@$(FUZZ_CXX) $(FUZZ_CXXFLAGS) -o $@ $^ -L $(RANDOMX_BUILD_DIR) -lleveldb -lrandomx -lpthread
 	@echo "$(COLOR_GREEN)✓ $@ built$(COLOR_RESET)"
 
+# fuzz_p2p_validation: P2P message deserialization + validation paths (network-facing)
+fuzz_p2p_validation: $(OBJ_DIR)/test/fuzz/fuzz_p2p_validation.o $(FUZZ_COMMON_OBJECTS) $(FUZZ_CONSENSUS_OBJECTS) $(FUZZ_DFMP_OBJECTS) $(FUZZ_NODE_OBJECTS) $(FUZZ_STUBS_OBJ) $(FUZZ_EXTRA_OBJECTS) $(DILITHIUM_OBJECTS)
+	@echo "$(COLOR_BLUE)[FUZZ-LINK]$(COLOR_RESET) $@"
+	@$(FUZZ_CXX) $(FUZZ_CXXFLAGS) -o $@ $^ -L $(RANDOMX_BUILD_DIR) -lleveldb -lrandomx -lpthread
+	@echo "$(COLOR_GREEN)✓ $@ built$(COLOR_RESET)"
+
 # fuzz_utxo: Full consensus + UTXO + DFMP dependencies
 fuzz_utxo: $(FUZZ_UTXO_OBJ) $(FUZZ_COMMON_OBJECTS) $(FUZZ_CONSENSUS_OBJECTS) $(FUZZ_DFMP_OBJECTS) $(FUZZ_NODE_OBJECTS) $(FUZZ_STUBS_OBJ) $(FUZZ_EXTRA_OBJECTS) $(DILITHIUM_OBJECTS)
 	@echo "$(COLOR_BLUE)[FUZZ-LINK]$(COLOR_RESET) $@ (4 targets)"
