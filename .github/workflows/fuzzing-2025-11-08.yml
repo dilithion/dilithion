@@ -103,22 +103,29 @@ jobs:
           test -f fuzz_base58
           echo "✅ All 20 fuzzers built successfully"
 
-      - name: Quick fuzzing smoke tests (30s each)
+      - name: Fuzzer startup check (no fuzzing)
         run: |
-          echo "Running smoke tests on all 20 fuzzers..."
+          # Real fuzzing runs only in the private extended campaign. Here each binary is run
+          # with -runs=0 on an empty input directory: it must load and initialise, nothing more.
+          # With -runs=0 nothing is fuzzed, so a non-zero exit is a build or startup fault.
+          echo "Checking startup of all 20 fuzzers..."
+          mkdir -p empty_corpus
           FUZZERS="fuzz_sha3 fuzz_transaction fuzz_block fuzz_compactsize fuzz_network_message fuzz_address fuzz_difficulty fuzz_subsidy fuzz_merkle fuzz_tx_validation fuzz_utxo fuzz_address_encode fuzz_address_validate fuzz_address_bech32 fuzz_address_type fuzz_network_create fuzz_network_checksum fuzz_network_command fuzz_signature fuzz_base58"
 
           for fuzzer in $FUZZERS; do
             if [ -x "$fuzzer" ]; then
-              echo "Testing $fuzzer..."
-              timeout 30 ./$fuzzer -max_total_time=30 || true
-              echo "✅ $fuzzer smoke test complete"
+              echo "Checking $fuzzer..."
+              if ! timeout 60 ./$fuzzer -runs=0 empty_corpus/ > /dev/null 2>&1; then
+                echo "❌ $fuzzer failed to start (build or startup fault)"
+                exit 1
+              fi
+              echo "✅ $fuzzer starts"
             else
               echo "❌ $fuzzer not executable"
               exit 1
             fi
           done
-          echo "✅ All 20 fuzzer smoke tests passed"
+          echo "✅ All 20 fuzzers start"
 
       - name: Upload fuzzer artifacts
         uses: actions/upload-artifact@v7

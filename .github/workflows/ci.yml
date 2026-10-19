@@ -1090,11 +1090,13 @@ jobs:
         make fuzz_sha3
         echo "✅ Fuzz harnesses built successfully"
 
-    - name: Run short fuzz test (smoke test)
+    - name: Fuzz startup check
       run: |
-        # Run each fuzz harness for 10 seconds as smoke test
-        timeout 10 ./fuzz_sha3 || true
-        echo "✅ Fuzz smoke test completed"
+        # Startup check only: -runs=0 on an empty input dir proves the binary loads and
+        # initialises. Real fuzzing runs only in the private extended campaign.
+        mkdir -p empty_corpus
+        timeout 60 ./fuzz_sha3 -runs=0 empty_corpus/ > /dev/null 2>&1
+        echo "✅ Fuzz startup check completed"
 
   security-checks:
     name: Security Checks
