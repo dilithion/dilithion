@@ -1,42 +1,100 @@
 name: Fuzzing Extended Campaigns
 
+# PRIVATE REPO ONLY. Findings, logs and artifacts from this campaign must stay private
+# until a fix ships, so every job is guarded with
+# `github.repository == 'dilithion/dilithion-private'`. On any other repository the jobs
+# are skipped at the workflow level (the `if:` is evaluated before the matrix expands),
+# so no runner is started, nothing is uploaded and no issue is opened.
+
+# Weekly fuzzing campaign (Sunday 02:00 UTC).
+#
+# Job-minute budget per run. "Fuzz" is the libFuzzer -max_total_time; "Cap" is the
+# job timeout-minutes (setup + build + fuzz + corpus merge + upload), so the Cap column
+# is the guaranteed upper bound on billed minutes.
+#
+# Fuzz is set so that  fuzz + 2 x build + merge + grace  <=  Cap - 10, where
+#   build = 5 min  (measured locally, 2 vCPU, clean tree: RandomX + Dilithium + target =
+#                   22 to 35 s depending on the target; apt install and submodule checkout
+#                   are not in that figure, so the allowance is rounded well above it,
+#                   then doubled for a hosted runner),
+#   merge = 8 min  (the merge step is bounded by `timeout 480s`),
+#   grace = 5 min  (the run step's `timeout` is fuzz + 300 s).
+# i.e. Fuzz <= Cap - 28; the table uses Cap - 30.
+#
+#   Target             Group                 Fuzz  Cap   Jobs  Cap total
+#   difficulty         consensus             220   250   1     250
+#   tx_validation      consensus             220   250   1     250
+#   utxo               consensus             220   250   1     250
+#   network_message    network-facing        220   250   1     250
+#   p2p_validation     network-facing        220   250   1     250
+#   serialize          network-facing        140   170   1     170
+#   signature          network-facing         80   110   1     110
+#   block              high-priority          80   110   1     110
+#   merkle             high-priority          80   110   1     110
+#   transaction        high-priority          80   110   1     110
+#   subsidy            fast                   35    65   1      65
+#   compactsize        fast                   35    65   1      65
+#   sha3               fast                   35    65   1      65
+#   report             (issue + summary)       -    10   1      10
+#   TOTAL per run (worst case, all caps hit)                  2,065
+#
+# Monthly: a month with 4 Sundays = 4 x 2,065 = 8,260; a month with 5 Sundays =
+# 5 x 2,065 = 10,325 (of the 50,000 included). This is the first stage; the remaining
+# headroom is for a fuller schedule, and other private-repo workflows share the same pool.
+#
+# Previous layout gave 6 h fuzz to a job capped at 360 min (build time pushed it over the
+# cap), ran nightly, and started every run from an empty corpus.
+#
+# Reporting: every target writes a status artifact. The report job turns those into a
+# per-target table using distinct words (NO FINDINGS / FINDING / BUILD FAILED /
+# INCOMPLETE / DID NOT RUN) and, on anything but NO FINDINGS, opens or updates the one
+# open issue labelled "fuzz-campaign" in this repository.
+#
+# Corpus: kept per target in the Actions cache only (never uploaded as an artifact).
+# Caches unused for 7 days are evicted; the weekly cadence restores each cache before
+# that, which also refreshes it.
+
 on:
-  workflow_dispatch:  # Manual trigger
+  workflow_dispatch:
     inputs:
-      tier1_hours:
-        description: 'Tier 1 (Consensus-critical) duration (hours)'
-        required: true
-        default: '6'
-        type: choice
-        options:
-          - '2'
-          - '4'
-          - '6'
-      tier2_hours:
-        description: 'Tier 2 (High-priority) duration (hours)'
-        required: true
-        default: '4'
-        type: choice
-        options:
-          - '2'
-          - '4'
-      tier3_hours:
-        description: 'Tier 3 (Fast fuzzers) duration (hours)'
-        required: true
-        default: '2'
-        type: choice
-        options:
-          - '2'
+      minutes_override:
+        description: 'Optional: fuzz minutes per target (smoke test). Empty = full budget.'
+        required: false
+        default: ''
+        type: string
   schedule:
-    # Run nightly at 2 AM UTC (optional)
-    - cron: '0 2 * * *'
+    - cron: '0 2 * * 0'  # Sundays 02:00 UTC
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fuzz-extended-campaigns
+  cancel-in-progress: false
 
 jobs:
-  # Tier 1: Consensus-critical fuzzers (6 hours each)
-  fuzz-difficulty:
-    name: "Difficulty Adjustment (Tier 1)"
+  fuzz:
+    name: "fuzz_${{ matrix.target }}"
+    if: github.repository == 'dilithion/dilithion-private'
     runs-on: ubuntu-24.04
-    timeout-minutes: 360  # 6 hours
+    timeout-minutes: ${{ matrix.cap }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { target: difficulty,      fuzz_min: 220, cap: 250 }
+          - { target: tx_validation,   fuzz_min: 220, cap: 250 }
+          - { target: utxo,            fuzz_min: 220, cap: 250 }
+          - { target: network_message, fuzz_min: 220, cap: 250 }
+          - { target: p2p_validation,  fuzz_min: 220, cap: 250 }
+          - { target: serialize,       fuzz_min: 140, cap: 170 }
+          - { target: signature,       fuzz_min: 80,  cap: 110 }
+          - { target: block,           fuzz_min: 80,  cap: 110 }
+          - { target: merkle,          fuzz_min: 80,  cap: 110 }
+          - { target: transaction,     fuzz_min: 80,  cap: 110 }
+          - { target: subsidy,         fuzz_min: 35,  cap: 65 }
+          - { target: compactsize,     fuzz_min: 35,  cap: 65 }
+          - { target: sha3,            fuzz_min: 35,  cap: 65 }
 
     steps:
       - name: Checkout code
@@ -44,13 +102,29 @@ jobs:
         with:
           submodules: recursive
 
-      - name: Install dependencies
+      - name: Restore corpus
+        id: corpus_restore
+        uses: actions/cache/restore@v4
+        with:
+          path: corpus
+          key: fuzz-corpus-${{ matrix.target }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            fuzz-corpus-${{ matrix.target }}-
+
+      - name: Install dependencies and build libraries
+        id: deps
         run: |
+          # clang-14 ASan can segfault at startup under high ASLR entropy (vm.mmap_rnd_bits=32),
+          # which would be misreported as a fuzz finding. Measured locally: 6/25 start-ups
+          # crashed at 32, 0/25 at 28.
+          # If this fails or does not take effect, later steps label the target "ENV WARNING"
+          # rather than a plain pass or finding. It is not fatal.
+          if ! sudo sysctl -w vm.mmap_rnd_bits=28 || [ "$(sysctl -n vm.mmap_rnd_bits)" != "28" ]; then
+            echo "::warning::could not set vm.mmap_rnd_bits=28; an ASan start-up segfault in this job is likely an environment fault"
+            echo "ENV_WARNING=1" >> "$GITHUB_ENV"
+          fi
           sudo apt-get update
           sudo apt-get install -y clang-14 libc++-14-dev libc++abi-14-dev cmake build-essential libleveldb-dev
-
-      - name: Build dependencies
-        run: |
           # Build RandomX library
           cd depends/randomx && mkdir -p build && cd build
           cmake -DCMAKE_BUILD_TYPE=Release .. && make -j$(nproc)
@@ -70,636 +144,253 @@ jobs:
           make clean || true
           make -j$(nproc)
 
-      - name: Build fuzz_difficulty
+      - name: Build fuzz target
+        id: build
         run: |
           # Makefile automatically builds all required object files
-          FUZZ_CXX=clang++-14 make fuzz_difficulty
+          FUZZ_STRICT=1 FUZZ_CXX=clang++-14 make -j$(nproc) fuzz_${{ matrix.target }}
 
       - name: Run fuzzing campaign
+        id: run
+        env:
+          TARGET: ${{ matrix.target }}
+          FUZZ_MIN: ${{ inputs.minutes_override || matrix.fuzz_min }}
+          # UBSan is built with -fno-sanitize-recover=undefined (FUZZ_STRICT=1 in the build step); these make a
+          # report halt the run with a non-zero exit and a reproducer file.
+          UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+          ASAN_OPTIONS: halt_on_error=1:detect_leaks=1
         run: |
-          mkdir -p fuzz_corpus/difficulty
-          DURATION=${{ github.event.inputs.tier1_hours || '6' }}
-          DURATION_SECONDS=$((DURATION * 3600))
+          mkdir -p corpus findings
+          echo "Restored corpus entries: $(ls corpus | wc -l)"
+          DURATION_SECONDS=$((FUZZ_MIN * 60))
 
-          timeout ${DURATION_SECONDS}s ./fuzz_difficulty \
+          set +e
+          timeout $((DURATION_SECONDS + 300))s ./fuzz_${TARGET} \
             -max_total_time=${DURATION_SECONDS} \
-            -workers=2 \
             -timeout=60 \
             -rss_limit_mb=2048 \
+            -artifact_prefix=findings/ \
             -print_final_stats=1 \
-            fuzz_corpus/difficulty/ \
-            2>&1 | tee fuzz_difficulty_campaign.log || true
+            corpus/ \
+            2>&1 | tee campaign.log
+          RC=${PIPESTATUS[0]}
+          set -e
+          echo "fuzzer exit code: ${RC}"
 
-      - name: Check for crashes
-        run: |
-          if ls crash-* 2>/dev/null || ls leak-* 2>/dev/null || ls timeout-* 2>/dev/null; then
-            echo "⚠️ CRASHES FOUND!"
-            ls -lh crash-* leak-* timeout-* 2>/dev/null || true
+          # Any crash, leak, OOM or timeout artifact, any non-zero exit, or any sanitizer
+          # report in the log fails the job. slow-unit-* files are only slow inputs, not
+          # findings: they are uploaded as information and do not count.
+          mv -f crash-* leak-* timeout-* oom-* findings/ 2>/dev/null || true
+          REAL=$(find findings -maxdepth 1 -type f ! -name 'slow-unit-*' | wc -l)
+          SAN=$(grep -cE 'runtime error:|ERROR: AddressSanitizer|ERROR: LeakSanitizer|deadly signal' campaign.log || true)
+          if [ "${REAL}" -ne 0 ] || [ "${RC}" -ne 0 ] || [ "${SAN}" -ne 0 ]; then
+            echo "FUZZ FINDING for ${TARGET} (exit ${RC}, artifacts ${REAL}, sanitizer lines ${SAN})"
+            grep -E 'runtime error:|ERROR: AddressSanitizer|ERROR: LeakSanitizer|deadly signal' campaign.log | head -20 || true
+            ls -lh findings/ || true
             exit 1
+          fi
+          echo "No findings for ${TARGET}"
+
+      - name: Minimise corpus
+        id: merge
+        if: steps.run.outcome == 'success' || steps.run.outcome == 'failure'
+        env:
+          TARGET: ${{ matrix.target }}
+          UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+          ASAN_OPTIONS: halt_on_error=1:detect_leaks=1
+        run: |
+          # Bounded; a failed merge keeps the existing corpus. A sanitizer report during the
+          # merge is still a finding, so it fails this step and is recorded as one.
+          mkdir -p corpus_min findings
+          if timeout 480s ./fuzz_${TARGET} -merge=1 -rss_limit_mb=2048 -artifact_prefix=findings/ corpus_min/ corpus/ > merge.log 2>&1 \
+             && [ -n "$(ls -A corpus_min)" ]; then
+            rm -rf corpus && mv corpus_min corpus
+            echo "Corpus minimised to $(ls corpus | wc -l) entries"
           else
-            echo "✅ No crashes found"
+            echo "::warning::corpus merge did not complete for ${TARGET}; keeping unminimised corpus"
           fi
-
-      - name: Upload results
-        if: always()
-        uses: actions/upload-artifact@v7
-        with:
-          name: fuzz-difficulty-results
-          path: |
-            fuzz_difficulty_campaign.log
-            crash-*
-            leak-*
-            timeout-*
-            fuzz_corpus/difficulty/
-          retention-days: 30
-
-  fuzz-tx-validation:
-    name: "Transaction Validation (Tier 1)"
-    runs-on: ubuntu-24.04
-    timeout-minutes: 360
-
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v7
-        with:
-          submodules: recursive
-
-      - name: Install dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y clang-14 libc++-14-dev libc++abi-14-dev cmake build-essential libleveldb-dev
-
-      - name: Build dependencies
-        run: |
-          # Build RandomX library
-          cd depends/randomx && mkdir -p build && cd build
-          cmake -DCMAKE_BUILD_TYPE=Release .. && make -j$(nproc)
-          cd ../../..
-          # Build Dilithium library
-          cd depends/dilithium/ref
-          if [ ! -f Makefile ]; then
-            echo 'CC ?= /usr/bin/cc' > Makefile
-            echo 'CFLAGS += -Wall -O3 -fomit-frame-pointer' >> Makefile
-            echo 'SOURCES = sign.c packing.c polyvec.c poly.c ntt.c reduce.c rounding.c fips202.c symmetric-shake.c randombytes.c' >> Makefile
-            echo '.PHONY: all clean' >> Makefile
-            echo 'all:' >> Makefile
-            printf '\t$(CC) $(CFLAGS) -DDILITHIUM_MODE=3 -c $(SOURCES)\n' >> Makefile
-            echo 'clean:' >> Makefile
-            printf '\trm -f *.o\n' >> Makefile
-          fi
-          make clean || true
-          make -j$(nproc)
-
-      - name: Build fuzz_tx_validation
-        run: |
-          # Makefile automatically builds all required object files
-          FUZZ_CXX=clang++-14 make fuzz_tx_validation
-
-      - name: Run fuzzing campaign
-        run: |
-          mkdir -p fuzz_corpus/tx_validation
-          DURATION=${{ github.event.inputs.tier1_hours || '6' }}
-          DURATION_SECONDS=$((DURATION * 3600))
-
-          timeout ${DURATION_SECONDS}s ./fuzz_tx_validation \
-            -max_total_time=${DURATION_SECONDS} \
-            -workers=2 \
-            -timeout=60 \
-            -rss_limit_mb=2048 \
-            -print_final_stats=1 \
-            fuzz_corpus/tx_validation/ \
-            2>&1 | tee fuzz_tx_validation_campaign.log || true
-
-      - name: Check for crashes
-        run: |
-          if ls crash-* 2>/dev/null || ls leak-* 2>/dev/null || ls timeout-* 2>/dev/null; then
-            echo "⚠️ CRASHES FOUND!"
-            ls -lh crash-* leak-* timeout-* 2>/dev/null || true
+          mv -f crash-* leak-* timeout-* oom-* findings/ 2>/dev/null || true
+          REAL=$(find findings -maxdepth 1 -type f ! -name 'slow-unit-*' | wc -l)
+          SAN=$(grep -cE 'runtime error:|ERROR: AddressSanitizer|ERROR: LeakSanitizer|deadly signal' merge.log || true)
+          if [ "${REAL}" -ne 0 ] || [ "${SAN}" -ne 0 ]; then
+            echo "FUZZ FINDING during merge for ${TARGET} (artifacts ${REAL}, sanitizer lines ${SAN})"
+            grep -E 'runtime error:|ERROR: AddressSanitizer|ERROR: LeakSanitizer|deadly signal' merge.log | head -20 || true
+            cp merge.log findings/merge.log
             exit 1
-          else
-            echo "✅ No crashes found"
           fi
 
-      - name: Upload results
+      - name: Save corpus
+        if: always() && hashFiles('corpus/**') != ''
+        uses: actions/cache/save@v4
+        with:
+          path: corpus
+          key: fuzz-corpus-${{ matrix.target }}-${{ github.run_id }}-${{ github.run_attempt }}
+
+      - name: Record status
+        if: always()
+        env:
+          TARGET: ${{ matrix.target }}
+          SETUP_OUTCOME: ${{ steps.deps.outcome }}
+          BUILD_OUTCOME: ${{ steps.build.outcome }}
+          RUN_OUTCOME: ${{ steps.run.outcome }}
+          MERGE_OUTCOME: ${{ steps.merge.outcome }}
+          FUZZ_MIN: ${{ inputs.minutes_override || matrix.fuzz_min }}
+        run: |
+          mkdir -p status findings
+          if [ "${SETUP_OUTCOME}" != "success" ] || [ "${BUILD_OUTCOME}" != "success" ]; then
+            RESULT="BUILD FAILED"
+          elif [ "${RUN_OUTCOME}" = "failure" ] && [ -n "${ENV_WARNING}" ]                && [ -z "$(find findings -maxdepth 1 -type f ! -name 'slow-unit-*' 2>/dev/null)" ]                && [ "$(grep -cE 'runtime error:|ERROR: AddressSanitizer|ERROR: LeakSanitizer|deadly signal' campaign.log 2>/dev/null || true)" = "0" ]; then
+            # vm.mmap_rnd_bits could not be lowered AND there is no crash artifact and no
+            # sanitizer line: only then is a failure labelled an environment fault. Any
+            # artifact or sanitizer line is a FINDING whatever the sysctl state.
+            RESULT="ENV WARNING"
+          elif [ "${RUN_OUTCOME}" = "failure" ] || [ "${MERGE_OUTCOME}" = "failure" ]; then
+            RESULT="FINDING"
+          elif [ "${RUN_OUTCOME}" = "success" ]; then
+            RESULT="NO FINDINGS"
+          else
+            RESULT="INCOMPLETE"
+          fi
+          STATS=$(grep -E "stat::number_of_executed_units|stat::average_exec_per_sec" campaign.log 2>/dev/null | tr -s ' ' | tr '\n' ';' || true)
+          {
+            echo "result=${RESULT}"
+            echo "target=${TARGET}"
+            echo "fuzz_minutes=${FUZZ_MIN}"
+            echo "outcomes=setup:${SETUP_OUTCOME} build:${BUILD_OUTCOME} run:${RUN_OUTCOME}"
+            echo "stats=${STATS}"
+            echo "findings=$(find findings -maxdepth 1 -type f ! -name 'slow-unit-*' -printf '%f ' 2>/dev/null)"
+            echo "slow_units=$(find findings -maxdepth 1 -type f -name 'slow-unit-*' -printf '%f ' 2>/dev/null)"
+            echo "env_warning=${ENV_WARNING:-0}"
+          } > status/status.txt
+          cat status/status.txt
+
+      - name: Upload status
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: fuzz-tx-validation-results
-          path: |
-            fuzz_tx_validation_campaign.log
-            crash-*
-            leak-*
-            timeout-*
-            fuzz_corpus/tx_validation/
-          retention-days: 30
+          name: fuzz-status-${{ matrix.target }}
+          path: status/status.txt
+          retention-days: 90
 
-  fuzz-utxo:
-    name: "UTXO Management (Tier 1)"
-    runs-on: ubuntu-24.04
-    timeout-minutes: 360
-
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v7
-        with:
-          submodules: recursive
-
-      - name: Install dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y clang-14 libc++-14-dev libc++abi-14-dev cmake build-essential libleveldb-dev
-
-      - name: Build dependencies
-        run: |
-          # Build RandomX library
-          cd depends/randomx && mkdir -p build && cd build
-          cmake -DCMAKE_BUILD_TYPE=Release .. && make -j$(nproc)
-          cd ../../..
-          # Build Dilithium library
-          cd depends/dilithium/ref
-          if [ ! -f Makefile ]; then
-            echo 'CC ?= /usr/bin/cc' > Makefile
-            echo 'CFLAGS += -Wall -O3 -fomit-frame-pointer' >> Makefile
-            echo 'SOURCES = sign.c packing.c polyvec.c poly.c ntt.c reduce.c rounding.c fips202.c symmetric-shake.c randombytes.c' >> Makefile
-            echo '.PHONY: all clean' >> Makefile
-            echo 'all:' >> Makefile
-            printf '\t$(CC) $(CFLAGS) -DDILITHIUM_MODE=3 -c $(SOURCES)\n' >> Makefile
-            echo 'clean:' >> Makefile
-            printf '\trm -f *.o\n' >> Makefile
-          fi
-          make clean || true
-          make -j$(nproc)
-
-      - name: Build fuzz_utxo
-        run: |
-          # Makefile automatically builds all required object files
-          FUZZ_CXX=clang++-14 make fuzz_utxo
-
-      - name: Run fuzzing campaign
-        run: |
-          mkdir -p fuzz_corpus/utxo
-          DURATION=${{ github.event.inputs.tier1_hours || '6' }}
-          DURATION_SECONDS=$((DURATION * 3600))
-
-          timeout ${DURATION_SECONDS}s ./fuzz_utxo \
-            -max_total_time=${DURATION_SECONDS} \
-            -workers=2 \
-            -timeout=60 \
-            -rss_limit_mb=2048 \
-            -print_final_stats=1 \
-            fuzz_corpus/utxo/ \
-            2>&1 | tee fuzz_utxo_campaign.log || true
-
-      - name: Check for crashes
-        run: |
-          if ls crash-* 2>/dev/null || ls leak-* 2>/dev/null || ls timeout-* 2>/dev/null; then
-            echo "⚠️ CRASHES FOUND!"
-            ls -lh crash-* leak-* timeout-* 2>/dev/null || true
-            exit 1
-          else
-            echo "✅ No crashes found"
-          fi
-
-      - name: Upload results
+      - name: Upload log
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: fuzz-utxo-results
-          path: |
-            fuzz_utxo_campaign.log
-            crash-*
-            leak-*
-            timeout-*
-            fuzz_corpus/utxo/
-          retention-days: 30
+          name: fuzz-log-${{ matrix.target }}
+          path: campaign.log
+          retention-days: 90
+          if-no-files-found: ignore
 
-  # Tier 2: High-priority fuzzers (4 hours each)
-  fuzz-block:
-    name: "Block Headers (Tier 2)"
-    runs-on: ubuntu-24.04
-    timeout-minutes: 240  # 4 hours
-
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v7
-        with:
-          submodules: recursive
-
-      - name: Install dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y clang-14 libc++-14-dev libc++abi-14-dev cmake build-essential libleveldb-dev
-
-      - name: Build dependencies
-        run: |
-          # Build RandomX library
-          cd depends/randomx && mkdir -p build && cd build
-          cmake -DCMAKE_BUILD_TYPE=Release .. && make -j$(nproc)
-          cd ../../..
-          # Build Dilithium library
-          cd depends/dilithium/ref
-          if [ ! -f Makefile ]; then
-            echo 'CC ?= /usr/bin/cc' > Makefile
-            echo 'CFLAGS += -Wall -O3 -fomit-frame-pointer' >> Makefile
-            echo 'SOURCES = sign.c packing.c polyvec.c poly.c ntt.c reduce.c rounding.c fips202.c symmetric-shake.c randombytes.c' >> Makefile
-            echo '.PHONY: all clean' >> Makefile
-            echo 'all:' >> Makefile
-            printf '\t$(CC) $(CFLAGS) -DDILITHIUM_MODE=3 -c $(SOURCES)\n' >> Makefile
-            echo 'clean:' >> Makefile
-            printf '\trm -f *.o\n' >> Makefile
-          fi
-          make clean || true
-          make -j$(nproc)
-
-      - name: Build and run fuzzer
-        run: |
-          # Makefile automatically builds all required object files
-          FUZZ_CXX=clang++-14 make fuzz_block
-          mkdir -p fuzz_corpus/block
-          DURATION=${{ github.event.inputs.tier2_hours || '4' }}
-          DURATION_SECONDS=$((DURATION * 3600))
-
-          timeout ${DURATION_SECONDS}s ./fuzz_block \
-            -max_total_time=${DURATION_SECONDS} \
-            -workers=2 \
-            -print_final_stats=1 \
-            fuzz_corpus/block/ \
-            2>&1 | tee fuzz_block_campaign.log || true
-
-      - name: Check for crashes
-        run: |
-          if ls crash-* leak-* timeout-* 2>/dev/null; then
-            echo "⚠️ CRASHES FOUND!" && exit 1
-          else
-            echo "✅ No crashes"
-          fi
-
-      - name: Upload results
-        if: always()
+      - name: Upload findings
+        if: always() && hashFiles('findings/**') != ''
         uses: actions/upload-artifact@v7
         with:
-          name: fuzz-block-results
-          path: |
-            fuzz_block_campaign.log
-            crash-*
-            leak-*
-            timeout-*
-          retention-days: 30
+          name: fuzz-findings-${{ matrix.target }}
+          path: findings/
+          retention-days: 90
 
-  fuzz-merkle:
-    name: "Merkle Trees (Tier 2)"
-    runs-on: ubuntu-24.04
-    timeout-minutes: 240
-
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v7
-        with:
-          submodules: recursive
-
-      - name: Install dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y clang-14 libc++-14-dev libc++abi-14-dev cmake build-essential libleveldb-dev
-
-      - name: Build dependencies
-        run: |
-          # Build RandomX library
-          cd depends/randomx && mkdir -p build && cd build
-          cmake -DCMAKE_BUILD_TYPE=Release .. && make -j$(nproc)
-          cd ../../..
-          # Build Dilithium library
-          cd depends/dilithium/ref
-          if [ ! -f Makefile ]; then
-            echo 'CC ?= /usr/bin/cc' > Makefile
-            echo 'CFLAGS += -Wall -O3 -fomit-frame-pointer' >> Makefile
-            echo 'SOURCES = sign.c packing.c polyvec.c poly.c ntt.c reduce.c rounding.c fips202.c symmetric-shake.c randombytes.c' >> Makefile
-            echo '.PHONY: all clean' >> Makefile
-            echo 'all:' >> Makefile
-            printf '\t$(CC) $(CFLAGS) -DDILITHIUM_MODE=3 -c $(SOURCES)\n' >> Makefile
-            echo 'clean:' >> Makefile
-            printf '\trm -f *.o\n' >> Makefile
-          fi
-          make clean || true
-          make -j$(nproc)
-
-      - name: Build and run fuzzer
-        run: |
-          # Makefile automatically builds all required object files
-          FUZZ_CXX=clang++-14 make fuzz_merkle
-          mkdir -p fuzz_corpus/merkle
-          DURATION=${{ github.event.inputs.tier2_hours || '4' }}
-          DURATION_SECONDS=$((DURATION * 3600))
-
-          timeout ${DURATION_SECONDS}s ./fuzz_merkle \
-            -max_total_time=${DURATION_SECONDS} \
-            -workers=2 \
-            -print_final_stats=1 \
-            fuzz_corpus/merkle/ \
-            2>&1 | tee fuzz_merkle_campaign.log || true
-
-      - name: Check for crashes
-        run: |
-          if ls crash-* leak-* timeout-* 2>/dev/null; then
-            echo "⚠️ CRASHES FOUND!" && exit 1
-          else
-            echo "✅ No crashes"
-          fi
-
-      - name: Upload results
-        if: always()
-        uses: actions/upload-artifact@v7
-        with:
-          name: fuzz-merkle-results
-          path: |
-            fuzz_merkle_campaign.log
-            crash-*
-            leak-*
-            timeout-*
-          retention-days: 30
-
-  fuzz-transaction:
-    name: "Transaction Parsing (Tier 2)"
-    runs-on: ubuntu-24.04
-    timeout-minutes: 240
-
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v7
-        with:
-          submodules: recursive
-
-      - name: Install dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y clang-14 libc++-14-dev libc++abi-14-dev cmake build-essential libleveldb-dev
-
-      - name: Build dependencies
-        run: |
-          # Build RandomX library
-          cd depends/randomx && mkdir -p build && cd build
-          cmake -DCMAKE_BUILD_TYPE=Release .. && make -j$(nproc)
-          cd ../../..
-          # Build Dilithium library
-          cd depends/dilithium/ref
-          if [ ! -f Makefile ]; then
-            echo 'CC ?= /usr/bin/cc' > Makefile
-            echo 'CFLAGS += -Wall -O3 -fomit-frame-pointer' >> Makefile
-            echo 'SOURCES = sign.c packing.c polyvec.c poly.c ntt.c reduce.c rounding.c fips202.c symmetric-shake.c randombytes.c' >> Makefile
-            echo '.PHONY: all clean' >> Makefile
-            echo 'all:' >> Makefile
-            printf '\t$(CC) $(CFLAGS) -DDILITHIUM_MODE=3 -c $(SOURCES)\n' >> Makefile
-            echo 'clean:' >> Makefile
-            printf '\trm -f *.o\n' >> Makefile
-          fi
-          make clean || true
-          make -j$(nproc)
-
-      - name: Build and run fuzzer
-        run: |
-          # Makefile automatically builds all required object files
-          FUZZ_CXX=clang++-14 make fuzz_transaction
-          mkdir -p fuzz_corpus/transaction
-          DURATION=${{ github.event.inputs.tier2_hours || '4' }}
-          DURATION_SECONDS=$((DURATION * 3600))
-
-          timeout ${DURATION_SECONDS}s ./fuzz_transaction \
-            -max_total_time=${DURATION_SECONDS} \
-            -workers=2 \
-            -print_final_stats=1 \
-            fuzz_corpus/transaction/ \
-            2>&1 | tee fuzz_transaction_campaign.log || true
-
-      - name: Check for crashes
-        run: |
-          if ls crash-* leak-* timeout-* 2>/dev/null; then
-            echo "⚠️ CRASHES FOUND!" && exit 1
-          else
-            echo "✅ No crashes"
-          fi
-
-      - name: Upload results
-        if: always()
-        uses: actions/upload-artifact@v7
-        with:
-          name: fuzz-transaction-results
-          path: |
-            fuzz_transaction_campaign.log
-            crash-*
-            leak-*
-            timeout-*
-          retention-days: 30
-
-  # Tier 3: Fast fuzzers (2 hours each)
-  fuzz-subsidy:
-    name: "Block Subsidy (Tier 3)"
-    runs-on: ubuntu-24.04
-    timeout-minutes: 120
-
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v7
-        with:
-          submodules: recursive
-
-      - name: Install dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y clang-14 libc++-14-dev libc++abi-14-dev
-
-      - name: Build and run fuzzer
-        run: |
-          # Makefile automatically builds all required object files (including Dilithium)
-          FUZZ_CXX=clang++-14 make fuzz_subsidy
-          mkdir -p fuzz_corpus/subsidy
-          DURATION=${{ github.event.inputs.tier3_hours || '2' }}
-          DURATION_SECONDS=$((DURATION * 3600))
-
-          timeout ${DURATION_SECONDS}s ./fuzz_subsidy \
-            -max_total_time=${DURATION_SECONDS} \
-            -workers=2 \
-            -print_final_stats=1 \
-            fuzz_corpus/subsidy/ \
-            2>&1 | tee fuzz_subsidy_campaign.log || true
-
-      - name: Check for crashes
-        run: |
-          if ls crash-* leak-* timeout-* 2>/dev/null; then
-            echo "⚠️ CRASHES FOUND!" && exit 1
-          else
-            echo "✅ No crashes"
-          fi
-
-      - name: Upload results
-        if: always()
-        uses: actions/upload-artifact@v7
-        with:
-          name: fuzz-subsidy-results
-          path: |
-            fuzz_subsidy_campaign.log
-            crash-*
-            leak-*
-            timeout-*
-          retention-days: 30
-
-  fuzz-compactsize:
-    name: "CompactSize Encoding (Tier 3)"
-    runs-on: ubuntu-24.04
-    timeout-minutes: 120
-
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v7
-        with:
-          submodules: recursive
-
-      - name: Install dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y clang-14 libc++-14-dev libc++abi-14-dev
-
-      - name: Build and run fuzzer
-        run: |
-          # Makefile automatically builds all required object files (including Dilithium)
-          FUZZ_CXX=clang++-14 make fuzz_compactsize
-          mkdir -p fuzz_corpus/compactsize
-          DURATION=${{ github.event.inputs.tier3_hours || '2' }}
-          DURATION_SECONDS=$((DURATION * 3600))
-
-          timeout ${DURATION_SECONDS}s ./fuzz_compactsize \
-            -max_total_time=${DURATION_SECONDS} \
-            -workers=2 \
-            -print_final_stats=1 \
-            fuzz_corpus/compactsize/ \
-            2>&1 | tee fuzz_compactsize_campaign.log || true
-
-      - name: Check for crashes
-        run: |
-          if ls crash-* leak-* timeout-* 2>/dev/null; then
-            echo "⚠️ CRASHES FOUND!" && exit 1
-          else
-            echo "✅ No crashes"
-          fi
-
-      - name: Upload results
-        if: always()
-        uses: actions/upload-artifact@v7
-        with:
-          name: fuzz-compactsize-results
-          path: |
-            fuzz_compactsize_campaign.log
-            crash-*
-            leak-*
-            timeout-*
-          retention-days: 30
-
-  fuzz-sha3:
-    name: "SHA3-256 (Tier 3)"
-    runs-on: ubuntu-24.04
-    timeout-minutes: 120
-
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v7
-        with:
-          submodules: recursive
-
-      - name: Install dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y clang-14 libc++-14-dev libc++abi-14-dev
-
-      - name: Build and run fuzzer
-        run: |
-          # Makefile automatically builds all required object files (including Dilithium)
-          FUZZ_CXX=clang++-14 make fuzz_sha3
-          mkdir -p fuzz_corpus/sha3
-          DURATION=${{ github.event.inputs.tier3_hours || '2' }}
-          DURATION_SECONDS=$((DURATION * 3600))
-
-          timeout ${DURATION_SECONDS}s ./fuzz_sha3 \
-            -max_total_time=${DURATION_SECONDS} \
-            -workers=2 \
-            -print_final_stats=1 \
-            fuzz_corpus/sha3/ \
-            2>&1 | tee fuzz_sha3_campaign.log || true
-
-      - name: Check for crashes
-        run: |
-          if ls crash-* leak-* timeout-* 2>/dev/null; then
-            echo "⚠️ CRASHES FOUND!" && exit 1
-          else
-            echo "✅ No crashes"
-          fi
-
-      - name: Upload results
-        if: always()
-        uses: actions/upload-artifact@v7
-        with:
-          name: fuzz-sha3-results
-          path: |
-            fuzz_sha3_campaign.log
-            crash-*
-            leak-*
-            timeout-*
-          retention-days: 30
-
-  # Summary job - collects results from all fuzzers
-  summary:
-    name: "Campaign Summary"
+  report:
+    name: "Campaign report"
     runs-on: ubuntu-latest
-    needs: [fuzz-difficulty, fuzz-tx-validation, fuzz-utxo, fuzz-block, fuzz-merkle, fuzz-transaction, fuzz-subsidy, fuzz-compactsize, fuzz-sha3]
-    if: always()
+    needs: [fuzz]
+    if: always() && github.repository == 'dilithion/dilithion-private'
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      issues: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+      TARGETS: difficulty tx_validation utxo network_message p2p_validation serialize signature block merkle transaction subsidy compactsize sha3
+      FUZZ_JOB_RESULT: ${{ needs.fuzz.result }}
 
     steps:
-      - name: Download all artifacts
+      - name: Download status artifacts
+        continue-on-error: true
         uses: actions/download-artifact@v8
         with:
-          path: campaign-results
+          pattern: fuzz-status-*
+          path: status
 
-      - name: Generate summary report
+      - name: Build summary
+        id: summary
+        if: always()
         run: |
-          echo "# Fuzzing Campaign Results" > summary.md
-          echo "" >> summary.md
-          echo "**Date:** $(date)" >> summary.md
-          echo "**Duration:**" >> summary.md
-          echo "- Tier 1 (Consensus): ${{ github.event.inputs.tier1_hours || '6' }} hours" >> summary.md
-          echo "- Tier 2 (High-priority): ${{ github.event.inputs.tier2_hours || '4' }} hours" >> summary.md
-          echo "- Tier 3 (Fast): ${{ github.event.inputs.tier3_hours || '2' }} hours" >> summary.md
-          echo "" >> summary.md
-
-          echo "## Results by Fuzzer" >> summary.md
-          echo "" >> summary.md
-
-          for dir in campaign-results/*/; do
-            fuzzer=$(basename "$dir" | sed 's/-results$//')
-            echo "### $fuzzer" >> summary.md
-
-            if ls "$dir"crash-* 2>/dev/null || ls "$dir"leak-* 2>/dev/null; then
-              echo "⚠️ **CRASHES FOUND**" >> summary.md
-              echo '```' >> summary.md
-              ls -lh "$dir"crash-* "$dir"leak-* "$dir"timeout-* 2>/dev/null || true
-              echo '```' >> summary.md
+          : > table.md
+          : > problems.md
+          BAD=0
+          for t in ${TARGETS}; do
+            f="status/fuzz-status-${t}/status.txt"
+            if [ -f "$f" ]; then
+              result=$(sed -n 's/^result=//p' "$f")
+              mins=$(sed -n 's/^fuzz_minutes=//p' "$f")
+              stats=$(sed -n 's/^stats=//p' "$f")
+              findings=$(sed -n 's/^findings=//p' "$f")
             else
-              echo "✅ No crashes detected" >> summary.md
+              result="DID NOT RUN"; mins="-"; stats=""; findings=""
             fi
-
-            if [ -f "$dir"*.log ]; then
-              echo "" >> summary.md
-              echo "**Stats:**" >> summary.md
-              echo '```' >> summary.md
-              grep -E "Done|exec/s|cov:|ft:" "$dir"*.log | tail -5 || echo "No stats found"
-              echo '```' >> summary.md
+            echo "| ${t} | ${result} | ${mins} | ${stats} |" >> table.md
+            if [ "${result}" != "NO FINDINGS" ]; then
+              BAD=1
+              art="fuzz-log-${t}"
+              if [ -n "${findings}" ]; then art="fuzz-findings-${t}, fuzz-log-${t}"; fi
+              if [ "${result}" = "DID NOT RUN" ]; then art="(none: the job produced no artifacts)"; fi
+              echo "- ${t}: ${result}; artifacts: ${art}" >> problems.md
             fi
-
-            echo "" >> summary.md
           done
+          {
+            echo "# Fuzzing campaign result"
+            echo ""
+            echo "Run: ${RUN_URL}"
+            echo ""
+            echo "NO FINDINGS means the fuzzer ran for the full duration and found nothing."
+            echo "BUILD FAILED, INCOMPLETE and DID NOT RUN mean that target was NOT fuzzed to completion."
+            echo "ENV WARNING means the runner could not lower ASLR entropy, so a start-up crash is likely an environment fault; check the log before treating it as a finding."
+            echo ""
+            echo "| Target | Result | Fuzz minutes | Stats |"
+            echo "|---|---|---|---|"
+            cat table.md
+          } > summary.md
+          cat summary.md >> "$GITHUB_STEP_SUMMARY"
+          echo "bad=${BAD}" >> "$GITHUB_OUTPUT"
 
-          cat summary.md
+      - name: Open or update fuzz-campaign issue
+        if: always() && steps.summary.outputs.bad == '1'
+        run: |
+          {
+            echo "Fuzz campaign failure report."
+            echo ""
+            echo "Run: ${RUN_URL}"
+            echo "Fuzz job group result: ${FUZZ_JOB_RESULT}"
+            echo ""
+            echo "Targets needing attention (fuzz findings, build failures, incomplete or not-started jobs):"
+            cat problems.md
+            echo ""
+            echo "Artifacts named fuzz-findings-<target> hold the reproducer inputs and fuzz-log-<target> the fuzzer log. Both are attached to the run above and kept for 90 days. Corpora are not uploaded."
+            echo ""
+            echo "Full per-target table:"
+            echo ""
+            echo "| Target | Result | Fuzz minutes | Stats |"
+            echo "|---|---|---|---|"
+            cat table.md
+          } > issue_body.md
 
-      - name: Upload summary
-        uses: actions/upload-artifact@v7
-        with:
-          name: campaign-summary
-          path: summary.md
-          retention-days: 90
+          gh label create fuzz-campaign --repo "$GITHUB_REPOSITORY" \
+            --description "Fuzz campaign findings and failures" --color B60205 2>/dev/null || true
+
+          EXISTING=$(gh issue list --repo "$GITHUB_REPOSITORY" --label fuzz-campaign --state open \
+                       --json number --jq '.[0].number // empty')
+          if [ -n "${EXISTING}" ]; then
+            gh issue comment "${EXISTING}" --repo "$GITHUB_REPOSITORY" --body-file issue_body.md
+            echo "Updated issue #${EXISTING}"
+          else
+            gh issue create --repo "$GITHUB_REPOSITORY" --label fuzz-campaign \
+              --title "Fuzz campaign: failure report" --body-file issue_body.md
+          fi
+
+      - name: Fail the run if any target did not finish clean
+        if: always() && steps.summary.outputs.bad == '1'
+        run: |
+          echo "One or more targets did not finish with NO FINDINGS:"
+          cat problems.md
+          exit 1

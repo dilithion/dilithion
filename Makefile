@@ -1874,7 +1874,13 @@ FUZZ_CXX ?= $(shell command -v clang++-14 2>/dev/null || command -v clang++ 2>/d
 # attributed heat functions overflow silently, while an unattributed function in
 # the SAME translation unit still reports -- so the exemption does not leak.
 # ---------------------------------------------------------------------------
+# FUZZ_STRICT=1 makes a UBSan report fatal (-fno-sanitize-recover=undefined). Default 0 keeps
+# the recoverable behaviour; the scheduled campaign opts in explicitly.
+FUZZ_STRICT ?= 0
 FUZZ_CXXFLAGS := -fsanitize=fuzzer,address,undefined -std=c++17 -O1 -g $(INCLUDES) -DDILITHIUM_MODE=3
+ifeq ($(FUZZ_STRICT),1)
+FUZZ_CXXFLAGS += -fno-sanitize-recover=undefined
+endif
 
 # Fuzz test sources (Week 3 Phase 4 - 9 harnesses, 42+ targets)
 # Week 6 Phase 3 - Added tx_validation and utxo fuzzers (11 harnesses total)
@@ -1916,6 +1922,7 @@ FUZZ_DIFFICULTY_OBJ := $(OBJ_DIR)/test/fuzz/fuzz_difficulty.o
 FUZZ_SUBSIDY_OBJ := $(OBJ_DIR)/test/fuzz/fuzz_subsidy.o
 FUZZ_MERKLE_OBJ := $(OBJ_DIR)/test/fuzz/fuzz_merkle.o
 FUZZ_TX_VALIDATION_OBJ := $(OBJ_DIR)/test/fuzz/fuzz_tx_validation.o
+FUZZ_P2P_VALIDATION_OBJ := $(OBJ_DIR)/test/fuzz/fuzz_p2p_validation.o
 FUZZ_UTXO_OBJ := $(OBJ_DIR)/test/fuzz/fuzz_utxo.o
 # New split fuzzer objects
 FUZZ_ADDRESS_ENCODE_OBJ := $(OBJ_DIR)/test/fuzz/fuzz_address_encode.o
@@ -2057,6 +2064,12 @@ fuzz_merkle: $(FUZZ_MERKLE_OBJ) $(FUZZ_COMMON_OBJECTS) $(FUZZ_CONSENSUS_OBJECTS)
 # fuzz_tx_validation: Full consensus + UTXO + DFMP dependencies
 fuzz_tx_validation: $(FUZZ_TX_VALIDATION_OBJ) $(FUZZ_COMMON_OBJECTS) $(FUZZ_CONSENSUS_OBJECTS) $(FUZZ_DFMP_OBJECTS) $(FUZZ_NODE_OBJECTS) $(FUZZ_STUBS_OBJ) $(FUZZ_EXTRA_OBJECTS) $(DILITHIUM_OBJECTS)
 	@echo "$(COLOR_BLUE)[FUZZ-LINK]$(COLOR_RESET) $@ (4 targets)"
+	@$(FUZZ_CXX) $(FUZZ_CXXFLAGS) -o $@ $^ -L $(RANDOMX_BUILD_DIR) -lleveldb -lrandomx -lpthread
+	@echo "$(COLOR_GREEN)✓ $@ built$(COLOR_RESET)"
+
+# fuzz_p2p_validation: P2P message deserialization + validation paths (network-facing)
+fuzz_p2p_validation: $(FUZZ_P2P_VALIDATION_OBJ) $(FUZZ_COMMON_OBJECTS) $(FUZZ_CONSENSUS_OBJECTS) $(FUZZ_DFMP_OBJECTS) $(FUZZ_NODE_OBJECTS) $(FUZZ_STUBS_OBJ) $(FUZZ_EXTRA_OBJECTS) $(DILITHIUM_OBJECTS)
+	@echo "$(COLOR_BLUE)[FUZZ-LINK]$(COLOR_RESET) $@"
 	@$(FUZZ_CXX) $(FUZZ_CXXFLAGS) -o $@ $^ -L $(RANDOMX_BUILD_DIR) -lleveldb -lrandomx -lpthread
 	@echo "$(COLOR_GREEN)✓ $@ built$(COLOR_RESET)"
 
