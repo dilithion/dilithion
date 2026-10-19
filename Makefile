@@ -1874,7 +1874,7 @@ FUZZ_CXX ?= $(shell command -v clang++-14 2>/dev/null || command -v clang++ 2>/d
 # attributed heat functions overflow silently, while an unattributed function in
 # the SAME translation unit still reports -- so the exemption does not leak.
 # ---------------------------------------------------------------------------
-FUZZ_CXXFLAGS := -fsanitize=fuzzer,address,undefined -std=c++17 -O1 -g $(INCLUDES) -DDILITHIUM_MODE=3
+FUZZ_CXXFLAGS := -fsanitize=fuzzer,address,undefined -fno-sanitize-recover=undefined -std=c++17 -O1 -g $(INCLUDES) -DDILITHIUM_MODE=3
 
 # Fuzz test sources (Week 3 Phase 4 - 9 harnesses, 42+ targets)
 # Week 6 Phase 3 - Added tx_validation and utxo fuzzers (11 harnesses total)
