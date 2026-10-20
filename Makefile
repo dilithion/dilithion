@@ -1877,7 +1877,16 @@ FUZZ_CXX ?= $(shell command -v clang++-14 2>/dev/null || command -v clang++ 2>/d
 # FUZZ_STRICT=1 makes a UBSan report fatal (-fno-sanitize-recover=undefined). Default 0 keeps
 # the recoverable behaviour; the scheduled campaign opts in explicitly.
 FUZZ_STRICT ?= 0
-FUZZ_CXXFLAGS := -fsanitize=fuzzer,address,undefined -std=c++17 -O1 -g $(INCLUDES) -DDILITHIUM_MODE=3
+FUZZ_CXXFLAGS := -fsanitize=fuzzer,address,undefined -std=c++17 -O1 -g -fno-omit-frame-pointer $(INCLUDES) -DDILITHIUM_MODE=3
+
+# Frame pointers for every object linked into a fuzz binary. ASan's fast unwinder follows the rbp chain
+# when it records an allocation stack; the shared objects below are built at -O2 (CXXFLAGS) which uses rbp
+# as a general register, so the chain is garbage and every call records a "new" stack that the sanitizer
+# keeps for the life of the process (rss grows without bound while the live heap stays small).
+ifneq (,$(filter fuzz fuzz_% run_fuzz,$(MAKECMDGOALS)))
+CXXFLAGS += -fno-omit-frame-pointer
+CFLAGS += -fno-omit-frame-pointer
+endif
 ifeq ($(FUZZ_STRICT),1)
 FUZZ_CXXFLAGS += -fno-sanitize-recover=undefined
 endif
