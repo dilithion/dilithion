@@ -1883,7 +1883,7 @@ FUZZ_CXXFLAGS := -fsanitize=fuzzer,address,undefined -std=c++17 -O1 -g -fno-omit
 # when it records an allocation stack; the shared objects below are built at -O2 (CXXFLAGS) which uses rbp
 # as a general register, so the chain is garbage and every call records a "new" stack that the sanitizer
 # keeps for the life of the process (rss grows without bound while the live heap stays small).
-ifneq (,$(filter fuzz fuzz_%,$(MAKECMDGOALS)))
+ifneq (,$(filter fuzz fuzz_% run_fuzz,$(MAKECMDGOALS)))
 CXXFLAGS += -fno-omit-frame-pointer
 CFLAGS += -fno-omit-frame-pointer
 endif
