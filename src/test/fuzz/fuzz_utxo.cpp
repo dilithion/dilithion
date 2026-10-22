@@ -23,6 +23,7 @@
 
 #include "fuzz.h"
 #include "util.h"
+#include "fuzz_tmpdb.h"
 #include "../../primitives/transaction.h"
 #include "../../primitives/block.h"
 #include "../../node/utxo_set.h"
@@ -65,7 +66,8 @@ FUZZ_TARGET(utxo)
         switch (test_selector) {
             case 0: {
                 // Test 1: Random sequence of UTXO operations
-                std::string temp_path = "/tmp/fuzz_utxo_ops_" + std::to_string(rand());
+                FuzzTmpDbDir tmp_dir;
+                const std::string& temp_path = tmp_dir.path();
                 CUTXOSet utxo;
                 if (!utxo.Open(temp_path)) {
                     return;
@@ -209,13 +211,13 @@ FUZZ_TARGET(utxo)
                 }
 
                 utxo.Close();
-                std::filesystem::remove_all(temp_path);
                 break;
             }
 
             case 1: {
                 // Test 2: Cache synchronization
-                std::string temp_path = "/tmp/fuzz_cache_" + std::to_string(rand());
+                FuzzTmpDbDir tmp_dir;
+                const std::string& temp_path = tmp_dir.path();
                 CUTXOSet utxo;
                 if (!utxo.Open(temp_path)) {
                     return;
@@ -274,13 +276,13 @@ FUZZ_TARGET(utxo)
                 }
 
                 utxo.Close();
-                std::filesystem::remove_all(temp_path);
                 break;
             }
 
             case 2: {
                 // Test 3: Block apply/undo
-                std::string temp_path = "/tmp/fuzz_blocks_" + std::to_string(rand());
+                FuzzTmpDbDir tmp_dir;
+                const std::string& temp_path = tmp_dir.path();
                 CUTXOSet utxo;
                 if (!utxo.Open(temp_path)) {
                     return;
@@ -340,7 +342,6 @@ FUZZ_TARGET(utxo)
                 }
 
                 utxo.Close();
-                std::filesystem::remove_all(temp_path);
                 break;
             }
         }

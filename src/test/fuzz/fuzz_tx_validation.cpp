@@ -20,6 +20,7 @@
 
 #include "fuzz.h"
 #include "util.h"
+#include "fuzz_tmpdb.h"
 #include "../../primitives/transaction.h"
 #include "../../consensus/tx_validation.h"
 #include "../../node/utxo_set.h"
@@ -87,7 +88,8 @@ FUZZ_TARGET(tx_validation)
                 }
 
                 // Create temporary UTXO set
-                std::string temp_path = "/tmp/fuzz_utxo_" + std::to_string(rand());
+                FuzzTmpDbDir tmp_dir;
+                const std::string& temp_path = tmp_dir.path();
                 CUTXOSet utxo;
                 if (!utxo.Open(temp_path)) {
                     return;
@@ -120,7 +122,6 @@ FUZZ_TARGET(tx_validation)
                 }
 
                 utxo.Close();
-                std::filesystem::remove_all(temp_path);
                 break;
             }
 
@@ -141,7 +142,8 @@ FUZZ_TARGET(tx_validation)
                 (void)validator.CheckTransactionBasic(tx, validation_error);
 
                 if (!tx.vin.empty() && !tx.vout.empty()) {
-                    std::string temp_path = "/tmp/fuzz_coinbase_" + std::to_string(rand());
+                    FuzzTmpDbDir tmp_dir;
+                    const std::string& temp_path = tmp_dir.path();
                     CUTXOSet utxo;
                     if (utxo.Open(temp_path)) {
                         COutPoint outpoint(tx.GetHash(), 0);
@@ -152,7 +154,6 @@ FUZZ_TARGET(tx_validation)
                         (void)utxo.IsCoinBaseMature(outpoint, test_height);
 
                         utxo.Close();
-                        std::filesystem::remove_all(temp_path);
                     }
                 }
                 break;
@@ -171,7 +172,8 @@ FUZZ_TARGET(tx_validation)
                     return;
                 }
 
-                std::string temp_path = "/tmp/fuzz_fees_" + std::to_string(rand());
+                FuzzTmpDbDir tmp_dir;
+                const std::string& temp_path = tmp_dir.path();
                 CUTXOSet utxo;
                 if (!utxo.Open(temp_path)) {
                     return;
@@ -193,7 +195,6 @@ FUZZ_TARGET(tx_validation)
                 (void)validator.CheckTransactionInputs(tx, utxo, 200, fee, validation_error);
 
                 utxo.Close();
-                std::filesystem::remove_all(temp_path);
                 break;
             }
         }
