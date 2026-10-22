@@ -55,6 +55,18 @@
 #include <thread>
 #include <vector>
 
+// Sanitizer detection, same idiom as blockindex_uaf_asan_arm.cpp.
+#if defined(__SANITIZE_ADDRESS__)
+#  define DIL_MINER_TEST_ASAN 1
+#elif defined(__has_feature)
+#  if __has_feature(address_sanitizer)
+#    define DIL_MINER_TEST_ASAN 1
+#  endif
+#endif
+#ifndef DIL_MINER_TEST_ASAN
+#  define DIL_MINER_TEST_ASAN 0
+#endif
+
 namespace {
 
 // A template header with every field distinct and non-zero, so a
@@ -194,7 +206,14 @@ BOOST_AUTO_TEST_CASE(real_miner_submits_blocks_that_validate)
 
     BOOST_REQUIRE(miner.StartMining(blockTemplate));
 
-    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(180);
+    // Deadline. At a 1/32 target, 6 blocks need ~192 hashes on average, and the
+    // number of blocks found after N hashes is Poisson(N/32). Under ASan the
+    // LIGHT-mode rate falls to a few H/s: one CI run did 419 hashes in 180s
+    // (mean 13 blocks) and still got only 5, a ~1% tail in a slow run. The
+    // sanitizer deadline is 600s, ~3.3x longer: ~1400 hashes at that rate, mean
+    // ~43 blocks, P(fewer than 6) < 1e-12. Plain builds keep 180s.
+    const int kDeadlineSeconds = DIL_MINER_TEST_ASAN ? 600 : 180;
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(kDeadlineSeconds);
     for (;;) {
         {
             std::lock_guard<std::mutex> lock(mu);
