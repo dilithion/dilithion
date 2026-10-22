@@ -54,7 +54,44 @@ namespace {
 // Per-test unique port allocator. Starts at 18500 to avoid colliding with
 // rpc_tests.cpp's 18432-18435 range and any production defaults.
 std::atomic<uint16_t> g_port_counter{18500};
-uint16_t NextPort() { return g_port_counter.fetch_add(1); }
+
+// True if 127.0.0.1:port can be bound right now. CRPCServer listens on the
+// IPv4 loopback address for the default (non-public) configuration, so probe
+// the same address family and interface, with SO_REUSEADDR left off so that a
+// port held by another process is reported as busy. The probe socket is
+// closed before returning.
+bool PortIsFree(uint16_t port) {
+#ifdef _WIN32
+    SOCKET s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (s == INVALID_SOCKET) return false;
+#else
+    int s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (s < 0) return false;
+#endif
+    sockaddr_in addr;
+    std::memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(port);
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    const bool free_port =
+        bind(s, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == 0;
+    closesocket(s);
+    return free_port;
+}
+
+// Hands out ports that are unique within the process and not in use by any
+// other program on the host. The search is bounded.
+uint16_t NextPort() {
+    constexpr int kMaxAttempts = 200;
+    for (int i = 0; i < kMaxAttempts; ++i) {
+        const uint16_t candidate = g_port_counter.fetch_add(1);
+        if (PortIsFree(candidate)) return candidate;
+    }
+    BOOST_FAIL("NextPort: no free loopback port found after " +
+               std::to_string(kMaxAttempts) + " attempts starting below " +
+               std::to_string(g_port_counter.load()));
+    return 0;
+}
 
 // Boost global fixture: WSAStartup/WSACleanup once per process. Tests
 // use raw sockets to send HTTP requests; without this the first socket()
