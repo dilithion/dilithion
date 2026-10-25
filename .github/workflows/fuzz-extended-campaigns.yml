@@ -104,7 +104,7 @@ jobs:
 
       - name: Restore corpus
         id: corpus_restore
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@v6
         with:
           path: corpus
           key: fuzz-corpus-${{ matrix.target }}-${{ github.run_id }}-${{ github.run_attempt }}
@@ -221,7 +221,7 @@ jobs:
 
       - name: Save corpus
         if: always() && hashFiles('corpus/**') != ''
-        uses: actions/cache/save@v4
+        uses: actions/cache/save@v6
         with:
           path: corpus
           key: fuzz-corpus-${{ matrix.target }}-${{ github.run_id }}-${{ github.run_attempt }}
